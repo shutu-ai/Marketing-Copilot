@@ -1,0 +1,10 @@
+[Unit]
+Description=Backup Marketing Copilot DuckDB
+
+[Service]
+Type=oneshot
+User=marketing-copilot
+WorkingDirectory=/opt/marketing-copilot/backend
+EnvironmentFile=/etc/marketing-copilot.env
+StateDirectory=marketing-copilot
+ExecStart=/opt/marketing-copilot/venv/bin/python -m tools.backup_database

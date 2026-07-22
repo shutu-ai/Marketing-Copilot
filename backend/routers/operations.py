@@ -1,0 +1,132 @@
+import csv
+import io
+import json
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from database import get_connection
+from services import p1_service
+
+router = APIRouter(prefix="/api/operations", tags=["Operations"])
+
+
+class CampaignActionRequest(BaseModel):
+    campaign_type: str
+    campaign_id: int
+    action: str
+
+
+class BulkTaskRequest(BaseModel):
+    action: str
+    task_ids: list[int] = []
+    campaign_type: str = ""
+    campaign_id: int = 0
+
+
+class ResolveRequest(BaseModel):
+    resolved: bool = True
+
+
+@router.post("/campaigns/action")
+def campaign_action(body: CampaignActionRequest):
+    try:
+        return p1_service.campaign_action(body.campaign_type, body.campaign_id, body.action)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/progress")
+def progress():
+    return p1_service.all_campaign_progress()
+
+
+@router.get("/progress/{campaign_type}/{campaign_id}")
+def campaign_progress(campaign_type: str, campaign_id: int):
+    try:
+        return p1_service.campaign_progress(campaign_type, campaign_id)
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(404, str(exc))
+
+
+@router.post("/tasks/bulk")
+def bulk_tasks(body: BulkTaskRequest):
+    try:
+        return p1_service.bulk_failed_tasks(body.action, body.task_ids, body.campaign_type, body.campaign_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/tasks/archive")
+def failure_archive(page: int = 1, page_size: int = Query(50, le=200)):
+    return p1_service.list_failure_archive(page, page_size)
+
+
+@router.get("/tasks/{task_id}/timeline")
+def task_timeline(task_id: int):
+    try:
+        return p1_service.task_timeline(task_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@router.get("/exceptions")
+def exceptions(resolved: Optional[bool] = None, severity: str = "", page: int = 1,
+               page_size: int = Query(50, le=200)):
+    return p1_service.list_events(resolved, severity, page, page_size)
+
+
+@router.put("/exceptions/{event_id}/resolve")
+def resolve_exception(event_id: int, body: ResolveRequest):
+    if not p1_service.resolve_event(event_id, body.resolved):
+        raise HTTPException(404, "event not found")
+    return {"success": True, "resolved": body.resolved}
+
+
+@router.get("/configuration-health")
+def configuration_health(record_events: bool = False):
+    return p1_service.configuration_health(record_events)
+
+
+@router.get("/audits")
+def audits(page: int = 1, page_size: int = Query(100, le=500), action: str = ""):
+    return p1_service.list_audit_logs(page, page_size, action)
+
+
+def _export_rows(report: str):
+    conn = get_connection()
+    if report == "tasks":
+        rows = conn.execute("SELECT * FROM sms_tasks ORDER BY created_at DESC").fetchall()
+    elif report == "files":
+        rows = conn.execute("SELECT * FROM processed_files ORDER BY detected_at DESC").fetchall()
+    elif report == "failures":
+        rows = conn.execute("SELECT * FROM failed_task_archive ORDER BY archived_at DESC").fetchall()
+    elif report == "audits":
+        rows = conn.execute("SELECT * FROM audit_logs ORDER BY created_at DESC").fetchall()
+    else:
+        conn.close()
+        raise ValueError("report must be tasks, files, failures or audits")
+    result = [dict(r) for r in rows]
+    conn.close()
+    return result
+
+
+@router.get("/export/{report}")
+def export_report(report: str):
+    try:
+        rows = _export_rows(report)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    output = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value for key, value in row.items()})
+    content = "\ufeff" + output.getvalue()
+    headers = {"Content-Disposition": f'attachment; filename="marketing-copilot-{report}.csv"'}
+    return StreamingResponse(iter([content]), media_type="text/csv; charset=utf-8", headers=headers)

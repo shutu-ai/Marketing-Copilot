@@ -1,0 +1,38 @@
+<template>
+  <div>
+    <div class="page-header">
+      <div><h2>容量与高可用</h2><p>Worker、SMSC 主备连接池、队列和自动告警状态</p></div>
+      <div><el-button @click="evaluate">立即评估告警</el-button><el-button type="primary" :loading="loading" @click="load">刷新</el-button></div>
+    </div>
+    <el-row :gutter="16" class="summary">
+      <el-col :span="8"><el-card><el-statistic title="运行 Worker" :value="status.workers?.running || 0"><template #suffix>/ {{ status.workers?.configured || 0 }}</template></el-statistic></el-card></el-col>
+      <el-col :span="8"><el-card><el-statistic title="启用 SMSC" :value="status.smpp?.enabled_configs || 0" /></el-card></el-col>
+      <el-col :span="8"><el-card><el-statistic title="活动 SMSC" :value="status.smpp?.active_config_id || 0" /></el-card></el-col>
+    </el-row>
+    <el-card shadow="never" header="SMSC 连接池">
+      <el-table :data="status.smpp?.pools || []" stripe>
+        <el-table-column prop="priority" label="优先级" width="90" />
+        <el-table-column prop="name" label="SMSC" />
+        <el-table-column prop="desired_pool_size" label="期望连接" width="100" />
+        <el-table-column label="健康连接" width="100"><template #default="{ row }">{{ row.connections.filter((c:any) => c.connected).length }}</template></el-table-column>
+        <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="row.healthy ? 'success' : 'danger'">{{ row.healthy ? '健康' : '不可用' }}</el-tag></template></el-table-column>
+        <el-table-column prop="cooldown_seconds" label="冷却秒数" width="110" />
+        <el-table-column label="最近错误"><template #default="{ row }">{{ row.connections.map((c:any) => c.last_error).filter(Boolean).join('; ') || '—' }}</template></el-table-column>
+      </el-table>
+    </el-card>
+    <el-card shadow="never" header="运行指标" class="metrics">
+      <el-table :data="metricRows" stripe><el-table-column prop="name" label="指标" /><el-table-column prop="labels" label="标签" /><el-table-column prop="value" label="值" width="140" /></el-table>
+    </el-card>
+  </div>
+</template>
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { evaluateCapacityAlerts, getCapacityStatus } from '@/api/capacity'
+const loading = ref(false); const status = ref<any>({}); let timer = 0
+const metricRows = computed(() => [...(status.value.metrics?.gauges || []), ...(status.value.metrics?.counters || [])].map((m:any) => ({ ...m, labels: Object.entries(m.labels || {}).map(([k,v]) => `${k}=${v}`).join(', ') || '—' })))
+async function load(){ loading.value=true; try { status.value=(await getCapacityStatus()).data } finally { loading.value=false } }
+async function evaluate(){ const result=(await evaluateCapacityAlerts()).data; ElMessage.success(`告警评估完成：${result.alerts.length} 个活动告警`); await load() }
+onMounted(() => { load(); timer=window.setInterval(load, 15000) }); onBeforeUnmount(() => window.clearInterval(timer))
+</script>
+<style scoped>.page-header{display:flex;justify-content:space-between;margin-bottom:16px}.page-header h2{margin:0}.page-header p{color:#909399}.summary{margin-bottom:16px}.metrics{margin-top:16px}</style>

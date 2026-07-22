@@ -1,0 +1,39 @@
+# Local agent and editor state
+.agents/
+.codegraph/
+.omo/
+.codex/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.p0-test-venv/
+
+# Frontend dependencies and generated output
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+playwright-report/
+
+# Runtime data, credentials and logs
+.env
+*.env.local
+backend/db_config.json
+backend/*.db
+backend/*.db-*
+backend/*.duckdb
+backend/*.duckdb.*
+backend/*.wal
+backend/logs/
+backend/server*.log
+backend/uploads/
+backend/monitor_dir/
+old_script/*.csv
+
+# OS and tooling
+.DS_Store
+Thumbs.db
+*.tmp

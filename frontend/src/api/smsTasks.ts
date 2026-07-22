@@ -1,0 +1,19 @@
+import api from './index'
+
+export function getSmsTasks(params: { page?: number; page_size?: number; status?: string; campaign_type?: string }) {
+  return api.get<any>('/sms-tasks', { params })
+}
+
+export function getSmsTaskStats() {
+  return api.get<Record<string, number>>('/sms-tasks/stats')
+}
+
+export function retrySmsTask(id: number) {
+  return api.post(`/sms-tasks/${id}/retry`)
+}
+
+export function getExclusions() { return api.get<any[]>('/sms-tasks/exclusions/list') }
+export function addExclusion(msisdn: string, reason: string) {
+  return api.post('/sms-tasks/exclusions', { msisdn, reason })
+}
+export function deleteExclusion(id: number) { return api.delete(`/sms-tasks/exclusions/${id}`) }

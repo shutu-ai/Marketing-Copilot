@@ -1,0 +1,265 @@
+import json
+import os
+from datetime import datetime
+from typing import Optional
+
+from database import get_connection, get_database_file
+from models.batch_campaign import BatchCampaignUpdate
+from models.realtime_campaign import RealtimeCampaignUpdate
+from services import batch_campaign_service, operations_service, realtime_campaign_service
+
+
+CAMPAIGN_TRANSITIONS = {
+    "not_started": {"start": "in_progress", "cancel": "cancelled"},
+    "in_progress": {"pause": "paused", "cancel": "cancelled", "complete": "completed"},
+    "paused": {"resume": "in_progress", "cancel": "cancelled", "complete": "completed"},
+}
+
+
+def _campaign_service(campaign_type: str):
+    if campaign_type == "batch":
+        return batch_campaign_service, BatchCampaignUpdate
+    if campaign_type == "realtime":
+        return realtime_campaign_service, RealtimeCampaignUpdate
+    raise ValueError("campaign_type must be batch or realtime")
+
+
+def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic: bool = False) -> dict:
+    service, update_model = _campaign_service(campaign_type)
+    campaign = service.get_one(campaign_id)
+    if not campaign:
+        raise LookupError("campaign not found")
+    current = campaign.get("status") or "not_started"
+    target = CAMPAIGN_TRANSITIONS.get(current, {}).get(action)
+    if not target:
+        raise ValueError(f"cannot {action} campaign from {current}")
+    updated = service.update(campaign_id, update_model(status=target))
+    conn = get_connection()
+    if target == "cancelled":
+        conn.execute(
+            """UPDATE sms_tasks SET status='cancelled', error_msg='campaign cancelled',
+               updated_at=CURRENT_TIMESTAMP WHERE campaign_type=? AND campaign_id=?
+               AND status IN ('queued','retrying','sending')""",
+            (campaign_type, campaign_id),
+        )
+    elif target == "completed":
+        conn.execute(
+            """UPDATE sms_tasks SET status='expired', error_msg='campaign completed',
+               updated_at=CURRENT_TIMESTAMP WHERE campaign_type=? AND campaign_id=?
+               AND status IN ('queued','retrying','sending')""",
+            (campaign_type, campaign_id),
+        )
+    conn.commit()
+    conn.close()
+    operations_service.audit(
+        "campaign.auto_complete" if automatic else f"campaign.{action}",
+        f"{campaign_type}_campaign", campaign_id,
+        {"from_status": current, "to_status": target},
+    )
+    return updated
+
+
+def _parse_time(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def auto_complete_campaigns() -> int:
+    now = datetime.now()
+    completed = 0
+    for campaign_type, service in (("batch", batch_campaign_service), ("realtime", realtime_campaign_service)):
+        for campaign in service.get_all():
+            if campaign.get("status") != "in_progress":
+                continue
+            end_time = _parse_time(campaign.get("end_time", ""))
+            should_complete = bool(end_time and end_time <= now)
+            if campaign_type == "batch" and not should_complete:
+                conn = get_connection()
+                batch_counts = conn.execute(
+                    """SELECT COUNT(*) total,
+                       SUM(CASE WHEN status IN ('sent','skipped','failed') THEN 1 ELSE 0 END) terminal
+                       FROM batch_campaign_batches WHERE campaign_id=?""", (campaign["id"],)).fetchone()
+                open_tasks = conn.execute(
+                    """SELECT COUNT(*) cnt FROM sms_tasks WHERE campaign_type='batch' AND campaign_id=?
+                       AND status NOT IN ('delivered','failed','expired','cancelled','archived')""",
+                    (campaign["id"],)).fetchone()["cnt"]
+                conn.close()
+                should_complete = bool(batch_counts["total"] and batch_counts["total"] == batch_counts["terminal"] and not open_tasks)
+            if should_complete:
+                campaign_action(campaign_type, campaign["id"], "complete", automatic=True)
+                completed += 1
+    return completed
+
+
+def campaign_progress(campaign_type: str, campaign_id: int) -> dict:
+    service, _ = _campaign_service(campaign_type)
+    campaign = service.get_one(campaign_id)
+    if not campaign:
+        raise LookupError("campaign not found")
+    conn = get_connection()
+    task_rows = conn.execute(
+        "SELECT status,COUNT(*) count FROM sms_tasks WHERE campaign_type=? AND campaign_id=? GROUP BY status",
+        (campaign_type, campaign_id)).fetchall()
+    task_counts = {row["status"]: row["count"] for row in task_rows}
+    task_total = sum(task_counts.values())
+    task_terminal = sum(task_counts.get(s, 0) for s in ("delivered", "failed", "expired", "cancelled", "archived"))
+    files = conn.execute(
+        """SELECT COUNT(*) total, SUM(CASE WHEN status IN ('completed','quarantined','failed') THEN 1 ELSE 0 END) finished,
+           COALESCE(SUM(total_rows),0) row_count, COALESCE(SUM(created_tasks),0) task_count
+           FROM processed_files WHERE campaign_type=? AND campaign_id=?""",
+        (campaign_type, campaign_id)).fetchone()
+    batches = None
+    if campaign_type == "batch":
+        row = conn.execute(
+            """SELECT COUNT(*) total, SUM(CASE WHEN status IN ('sent','skipped','failed') THEN 1 ELSE 0 END) finished
+               FROM batch_campaign_batches WHERE campaign_id=?""", (campaign_id,)).fetchone()
+        batches = {"total": int(row["total"] or 0), "finished": int(row["finished"] or 0)}
+    conn.close()
+    return {
+        "campaign_type": campaign_type, "campaign_id": campaign_id,
+        "name": campaign.get("name", ""), "status": campaign.get("status", ""),
+        "tasks": {"total": task_total, "finished": task_terminal, "percent": round(task_terminal * 100 / task_total, 1) if task_total else 0, "by_status": task_counts},
+        "files": {"total": int(files["total"] or 0), "finished": int(files["finished"] or 0), "rows": int(files["row_count"] or 0), "created_tasks": int(files["task_count"] or 0)},
+        "batches": batches,
+    }
+
+
+def all_campaign_progress() -> list:
+    result = []
+    for campaign_type, service in (("batch", batch_campaign_service), ("realtime", realtime_campaign_service)):
+        for campaign in service.get_all():
+            result.append(campaign_progress(campaign_type, campaign["id"]))
+    return result
+
+
+def bulk_failed_tasks(action: str, task_ids=None, campaign_type: str = "", campaign_id: int = 0) -> dict:
+    conditions = ["status IN ('failed','expired')"]
+    params = []
+    if task_ids:
+        conditions.append("id IN (" + ",".join("?" for _ in task_ids) + ")")
+        params.extend(task_ids)
+    if campaign_type:
+        conditions.append("campaign_type=?")
+        params.append(campaign_type)
+    if campaign_id:
+        conditions.append("campaign_id=?")
+        params.append(campaign_id)
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM sms_tasks WHERE " + " AND ".join(conditions), params).fetchall()
+    if action == "retry":
+        for row in rows:
+            conn.execute(
+                """UPDATE sms_tasks SET status='queued',attempts=0,error_msg='',failure_class='',
+                   next_attempt_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""", (row["id"],))
+            _task_event(conn, row["id"], "bulk_retry", row["status"], "queued", "bulk retry requested")
+    elif action == "archive":
+        for raw in rows:
+            row = dict(raw)
+            conn.execute(
+                """INSERT OR IGNORE INTO failed_task_archive
+                   (task_id,campaign_type,campaign_id,campaign_name,msisdn,content,final_status,attempts,failure_class,error_msg,snapshot)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (row["id"], row["campaign_type"], row["campaign_id"], row["campaign_name"], row["msisdn"],
+                 row["content"], row["status"], row["attempts"], row.get("failure_class") or "", row.get("error_msg") or "",
+                 json.dumps(row, ensure_ascii=False, default=str)))
+            conn.execute("UPDATE sms_tasks SET status='archived',updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+            _task_event(conn, row["id"], "archived", row["status"], "archived", "failure archived")
+    else:
+        conn.close()
+        raise ValueError("action must be retry or archive")
+    conn.commit()
+    conn.close()
+    operations_service.audit(f"tasks.bulk_{action}", "sms_task", "bulk", {"count": len(rows), "task_ids": [r["id"] for r in rows]})
+    return {"success": True, "action": action, "count": len(rows)}
+
+
+def _task_event(conn, task_id: int, event_type: str, from_status: str, to_status: str, message: str, detail=None):
+    conn.execute(
+        """INSERT INTO task_events(task_id,event_type,from_status,to_status,message,detail)
+           VALUES (?,?,?,?,?,?)""",
+        (task_id, event_type, from_status or "", to_status or "", message or "",
+         json.dumps(detail or {}, ensure_ascii=False, default=str)))
+
+
+def list_failure_archive(page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) cnt FROM failed_task_archive").fetchone()["cnt"]
+    rows = conn.execute("SELECT * FROM failed_task_archive ORDER BY archived_at DESC LIMIT ? OFFSET ?",
+                        (page_size, max(0, page - 1) * page_size)).fetchall()
+    conn.close()
+    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+
+
+def task_timeline(task_id: int) -> dict:
+    conn = get_connection()
+    task = conn.execute("SELECT * FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
+    if not task:
+        conn.close()
+        raise LookupError("task not found")
+    events = conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY created_at,id", (task_id,)).fetchall()
+    receipts = conn.execute("SELECT * FROM delivery_receipts WHERE task_id=? ORDER BY received_at,id", (task_id,)).fetchall()
+    conn.close()
+    return {"task": dict(task), "events": [dict(r) for r in events], "receipts": [dict(r) for r in receipts]}
+
+
+def list_events(resolved: Optional[bool] = None, severity: str = "", page: int = 1, page_size: int = 50) -> dict:
+    conditions, params = [], []
+    if resolved is not None:
+        conditions.append("resolved=?"); params.append(1 if resolved else 0)
+    if severity:
+        conditions.append("severity=?"); params.append(severity)
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    conn = get_connection()
+    total = conn.execute(f"SELECT COUNT(*) cnt FROM system_events {where}", params).fetchone()["cnt"]
+    rows = conn.execute(f"SELECT * FROM system_events {where} ORDER BY resolved,severity DESC,created_at DESC LIMIT ? OFFSET ?",
+                        params + [page_size, max(0, page - 1) * page_size]).fetchall()
+    conn.close()
+    return {"total": total, "items": [dict(r) for r in rows], "page": page, "page_size": page_size}
+
+
+def resolve_event(event_id: int, resolved: bool = True) -> bool:
+    conn = get_connection()
+    row = conn.execute("SELECT id FROM system_events WHERE id=?", (event_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE system_events SET resolved=? WHERE id=?", (1 if resolved else 0, event_id)); conn.commit()
+    conn.close()
+    if row:
+        operations_service.audit("exception.resolve" if resolved else "exception.reopen", "system_event", event_id)
+    return bool(row)
+
+
+def configuration_health(record_events: bool = False) -> list:
+    checks = []
+    conn = get_connection()
+    smpp = conn.execute("SELECT COUNT(*) cnt FROM smpp_configs WHERE enabled=1").fetchone()["cnt"]
+    checks.append({"code": "SMPP_ENABLED", "category": "smpp", "ok": bool(smpp), "severity": "error", "message": "No enabled SMPP configuration"})
+    templates = conn.execute("SELECT COUNT(*) cnt FROM sms_templates WHERE enabled=1").fetchone()["cnt"]
+    checks.append({"code": "TEMPLATE_ENABLED", "category": "template", "ok": bool(templates), "severity": "error", "message": "No enabled SMS template"})
+    monitors = [dict(r) for r in conn.execute("SELECT id,directory_path FROM monitor_configs WHERE enabled=1").fetchall()]
+    conn.close()
+    db_path = get_database_file()
+    checks.append({"code": "DATABASE_PATH", "category": "database", "ok": db_path == ":memory:" or os.path.isdir(os.path.dirname(os.path.abspath(db_path))), "severity": "error", "message": "Database directory does not exist"})
+    for monitor in monitors:
+        checks.append({"code": "MONITOR_DIRECTORY", "category": "file", "ok": os.path.isdir(monitor["directory_path"]), "severity": "warning", "message": f"Monitor directory does not exist: {monitor['directory_path']}", "context": {"config_id": monitor["id"]}})
+    if record_events:
+        for check in checks:
+            if not check["ok"]:
+                operations_service.event(check["category"], check["code"], check["message"], check["severity"], check.get("context"))
+    return checks
+
+
+def list_audit_logs(page: int = 1, page_size: int = 100, action: str = "") -> dict:
+    where, params = ("WHERE action LIKE ?", [f"%{action}%"]) if action else ("", [])
+    conn = get_connection()
+    total = conn.execute(f"SELECT COUNT(*) cnt FROM audit_logs {where}", params).fetchone()["cnt"]
+    rows = conn.execute(f"SELECT * FROM audit_logs {where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                        params + [page_size, max(0, page - 1) * page_size]).fetchall()
+    conn.close()
+    return {"total": total, "items": [dict(r) for r in rows], "page": page, "page_size": page_size}
