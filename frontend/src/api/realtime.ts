@@ -10,12 +10,12 @@ export function getRealtimeStats(campaignId: number) {
   return api.get<RealtimeStats>(`/realtime-campaigns/${campaignId}/stats`)
 }
 
-export function getRealtimeFiles(campaignId: number) {
-  return api.get<any[]>(`/realtime-campaigns/${campaignId}/files`)
+export function getRealtimeFiles(campaignId: number, params: { page?: number; page_size?: number } = {}) {
+  return api.get<any>(`/realtime-campaigns/${campaignId}/files`, { params })
 }
 
-export function getRealtimeSentRecords(campaignId: number) {
-  return api.get<any[]>(`/realtime-campaigns/${campaignId}/sent-records`)
+export function getRealtimeSentRecords(campaignId: number, params: { page?: number; page_size?: number } = {}) {
+  return api.get<any>(`/realtime-campaigns/${campaignId}/sent-records`, { params })
 }
 
 export function downloadRealtimeSentRecord(campaignId: number, filename: string) {

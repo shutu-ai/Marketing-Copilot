@@ -85,6 +85,23 @@ def get_all() -> list:
     return [_enrich(dict(r)) for r in rows]
 
 
+def list_campaigns(page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) cnt FROM realtime_campaigns").fetchone()["cnt"]
+    offset = max(0, page - 1) * page_size
+    rows = conn.execute(
+        "SELECT * FROM realtime_campaigns ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (page_size, offset),
+    ).fetchall()
+    conn.close()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [_enrich(dict(r)) for r in rows],
+    }
+
+
 def get_one(campaign_id: int) -> Optional[dict]:
     conn = get_connection()
     row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
@@ -437,23 +454,34 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
     }
 
 
-def get_realtime_files(campaign_id: int) -> list:
+def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
     conn = get_connection()
+    total = conn.execute(
+        "SELECT COUNT(*) cnt FROM realtime_campaign_files WHERE campaign_id=?",
+        (campaign_id,),
+    ).fetchone()["cnt"]
     rows = conn.execute(
-        "SELECT * FROM realtime_campaign_files WHERE campaign_id=? ORDER BY created_at DESC",
-        (campaign_id,)
+        """SELECT * FROM realtime_campaign_files
+           WHERE campaign_id=?
+           ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+        (campaign_id, page_size, max(0, page - 1) * page_size),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [dict(r) for r in rows],
+    }
 
 
-def get_realtime_sent_records(campaign_id: int) -> list:
+def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
     campaign = get_one(campaign_id)
     if not campaign:
-        return []
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
     output_dir = os.path.join(campaign.get("campaign_dir", ""), "output")
     if not os.path.isdir(output_dir):
-        return []
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
     records = []
     for fname in sorted(os.listdir(output_dir), reverse=True):
         if not re.match(r"^\d{8}\.csv$", fname):
@@ -471,7 +499,15 @@ def get_realtime_sent_records(campaign_id: int) -> list:
         except ValueError:
             date = date_raw
         records.append({"date": date, "filename": fname, "user_count": user_count})
-    return records
+    records.sort(key=lambda item: item["filename"], reverse=True)
+    total = len(records)
+    offset = max(0, page - 1) * page_size
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": records[offset:offset + page_size],
+    }
 
 
 def get_realtime_stats(campaign_id: int) -> dict:

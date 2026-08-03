@@ -41,8 +41,8 @@ def campaign_action(body: CampaignActionRequest):
 
 
 @router.get("/progress")
-def progress():
-    return p1_service.all_campaign_progress()
+def progress(page: int = 1, page_size: int = Query(50, le=200)):
+    return p1_service.list_campaign_progress(page, page_size)
 
 
 @router.get("/progress/{campaign_type}/{campaign_id}")
@@ -64,6 +64,11 @@ def bulk_tasks(body: BulkTaskRequest):
 @router.get("/tasks/archive")
 def failure_archive(page: int = 1, page_size: int = Query(50, le=200)):
     return p1_service.list_failure_archive(page, page_size)
+
+
+@router.get("/tasks/failures")
+def failed_tasks(page: int = 1, page_size: int = Query(50, le=200)):
+    return p1_service.list_failed_tasks(page, page_size)
 
 
 @router.get("/tasks/{task_id}/timeline")

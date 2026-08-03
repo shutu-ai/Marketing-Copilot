@@ -75,7 +75,7 @@
               v-model:current-page="receivedPage"
               :page-size="receivedPageSize"
               :page-sizes="[10, 25, 50, 100]"
-              :total="files.length"
+              :total="receivedTotal"
               layout="total, sizes, prev, pager, next"
               @size-change="handleReceivedSizeChange"
               @current-change="handleReceivedCurrentChange"
@@ -83,7 +83,7 @@
           </div>
         </el-tab-pane>
         <el-tab-pane label="已发送记录" name="sent">
-          <el-table :data="sentRecordsDisplay" stripe style="width: 100%" v-loading="sentRecordsLoading">
+          <el-table :data="sentRecords" stripe style="width: 100%" v-loading="sentRecordsLoading">
             <el-table-column prop="date" label="日期" width="140" />
             <el-table-column prop="filename" label="文件名" min-width="220" />
             <el-table-column prop="user_count" label="用户数" width="100" />
@@ -100,7 +100,7 @@
               v-model:current-page="sentRecordsPage"
               :page-size="sentRecordsPageSize"
               :page-sizes="[10, 25, 50, 100]"
-              :total="sentRecords.length"
+              :total="sentRecordsTotal"
               layout="total, sizes, prev, pager, next"
               @size-change="handleSentRecordsSizeChange"
               @current-change="handleSentRecordsCurrentChange"
@@ -118,7 +118,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import StatusTag from '@/components/StatusTag.vue'
 import * as api from '@/api/realtime-campaign'
@@ -126,9 +126,11 @@ import * as rtApi from '@/api/realtime'
 
 const route = useRoute()
 const campaign = ref<any>(null)
-const files = ref<any[]>([])
+const receivedFiles = ref<any[]>([])
+const receivedTotal = ref(0)
 const filesLoading = ref(false)
 const sentRecords = ref<any[]>([])
+const sentRecordsTotal = ref(0)
 const sentRecordsLoading = ref(false)
 const activeTab = ref('received')
 const stats = reactive({ file_count: 0, total_msisdn_sum: 0, total_matched: 0 })
@@ -145,49 +147,49 @@ function asArray(value: any): any[] {
 const RECEIVED_PAGE_SIZE_KEY = 'mc.realtime-received.page-size'
 const receivedPage = ref(1)
 const receivedPageSize = ref(Number(localStorage.getItem(RECEIVED_PAGE_SIZE_KEY)) || 25)
-const receivedFiles = computed(() => {
-  const start = (receivedPage.value - 1) * receivedPageSize.value
-  return files.value.slice(start, start + receivedPageSize.value)
-})
 const SENT_RECORDS_PAGE_SIZE_KEY = 'mc.realtime-sent.page-size'
 const sentRecordsPage = ref(1)
 const sentRecordsPageSize = ref(Number(localStorage.getItem(SENT_RECORDS_PAGE_SIZE_KEY)) || 25)
-const sentRecordsDisplay = computed(() => {
-  const start = (sentRecordsPage.value - 1) * sentRecordsPageSize.value
-  return sentRecords.value.slice(start, start + sentRecordsPageSize.value)
-})
 
 function handleReceivedSizeChange(size: number) {
   receivedPageSize.value = size
   localStorage.setItem(RECEIVED_PAGE_SIZE_KEY, String(size))
   receivedPage.value = 1
+  void loadReceivedData(false)
 }
 
 function handleReceivedCurrentChange(page: number) {
   receivedPage.value = page
+  void loadReceivedData(false)
 }
 
 function handleSentRecordsSizeChange(size: number) {
   sentRecordsPageSize.value = size
   localStorage.setItem(SENT_RECORDS_PAGE_SIZE_KEY, String(size))
   sentRecordsPage.value = 1
+  void loadSentRecords(false)
 }
 
 function handleSentRecordsCurrentChange(page: number) {
   sentRecordsPage.value = page
+  void loadSentRecords(false)
 }
 
-async function loadSentRecords() {
+async function loadSentRecords(reset = true) {
   sentRecordsLoading.value = true
   try {
-    const rr = await rtApi.getRealtimeSentRecords(Number(route.params.id))
+    if (reset) sentRecordsPage.value = 1
+    const rr = await rtApi.getRealtimeSentRecords(Number(route.params.id), {
+      page: sentRecordsPage.value,
+      page_size: sentRecordsPageSize.value,
+    })
     sentRecords.value = asArray(rr.data)
-    sentRecordsPage.value = 1
+    sentRecordsTotal.value = rr.data.total ?? sentRecords.value.length
   } catch { /* ignore */ }
   sentRecordsLoading.value = false
 }
 
-async function loadReceivedData() {
+async function loadReceivedData(reset = true) {
   const id = Number(route.params.id)
   try {
     const sr = await rtApi.getRealtimeStats(id)
@@ -195,16 +197,20 @@ async function loadReceivedData() {
   } catch { /* ignore */ }
   filesLoading.value = true
   try {
-    const fr = await rtApi.getRealtimeFiles(id)
-    files.value = asArray(fr.data)
-    receivedPage.value = 1
+    if (reset) receivedPage.value = 1
+    const fr = await rtApi.getRealtimeFiles(id, {
+      page: receivedPage.value,
+      page_size: receivedPageSize.value,
+    })
+    receivedFiles.value = asArray(fr.data)
+    receivedTotal.value = fr.data.total ?? receivedFiles.value.length
   } catch { /* ignore */ }
   filesLoading.value = false
 }
 
 function refreshActiveTab() {
-  if (activeTab.value === 'sent') void loadSentRecords()
-  else void loadReceivedData()
+  if (activeTab.value === 'sent') void loadSentRecords(true)
+  else void loadReceivedData(true)
 }
 
 async function loadDetail() {
@@ -215,8 +221,8 @@ async function loadDetail() {
   } catch (e) {
     console.error(e)
   }
-  await loadReceivedData()
-  await loadSentRecords()
+  await loadReceivedData(true)
+  await loadSentRecords(true)
 }
 
 async function downloadSentRecord(row: any) {
@@ -232,7 +238,7 @@ async function downloadSentRecord(row: any) {
 
 onMounted(loadDetail)
 watch(activeTab, (tab) => {
-  if (tab === 'sent') void loadSentRecords()
+  if (tab === 'sent') void loadSentRecords(true)
 })
 </script>
 

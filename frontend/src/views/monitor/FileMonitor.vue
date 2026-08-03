@@ -65,7 +65,7 @@
 
     <el-card shadow="never" style="margin-bottom: 20px">
       <template #header>
-        <span>监听目录当前文件 <el-tag type="info" size="small">{{ state.source_files.length }}</el-tag></span>
+        <span>监听目录当前文件 <el-tag type="info" size="small">{{ state.source_files_total }}</el-tag></span>
       </template>
       <el-table :data="state.source_files" stripe v-loading="loading" style="width: 100%">
         <el-table-column prop="filename" label="文件名" min-width="260" />
@@ -97,11 +97,19 @@
         </el-table-column>
         <el-table-column prop="row_count" label="行数" width="90" />
       </el-table>
+      <el-pagination
+        v-model:current-page="sourcePage"
+        :page-size="sourcePageSize"
+        :total="state.source_files_total"
+        layout="total, prev, pager, next"
+        class="pagination"
+        @current-change="changeSourcePage"
+      />
     </el-card>
 
     <el-card shadow="never">
       <template #header>
-        <span>已处理实时营销文件记录 <el-tag type="info" size="small">{{ state.processed_files.length }}</el-tag></span>
+        <span>已处理实时营销文件记录 <el-tag type="info" size="small">{{ state.processed_files_total }}</el-tag></span>
       </template>
       <el-table :data="state.processed_files" stripe v-loading="loading" style="width: 100%">
         <el-table-column prop="filename" label="文件名" min-width="220" />
@@ -119,6 +127,14 @@
         </el-table-column>
         <el-table-column prop="detected_at" label="创建时间" width="180" />
       </el-table>
+      <el-pagination
+        v-model:current-page="processedPage"
+        :page-size="processedPageSize"
+        :total="state.processed_files_total"
+        layout="total, prev, pager, next"
+        class="pagination"
+        @current-change="changeProcessedPage"
+      />
     </el-card>
   </div>
 </template>
@@ -134,6 +150,10 @@ const loading = ref(false)
 const scanning = ref(false)
 const autoRefresh = ref(false)
 const selectedCampaignId = ref(0)
+const sourcePage = ref(1)
+const sourcePageSize = ref(50)
+const processedPage = ref(1)
+const processedPageSize = ref(50)
 const state = reactive({
   campaign_id: 0,
   watch_dir: '',
@@ -142,7 +162,13 @@ const state = reactive({
   exists: false,
   active_campaigns: 0,
   source_files: [] as any[],
+  source_files_total: 0,
+  source_files_page: 1,
+  source_files_page_size: 50,
   processed_files: [] as any[],
+  processed_files_total: 0,
+  processed_files_page: 1,
+  processed_files_page_size: 50,
 })
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
@@ -154,13 +180,24 @@ function applyState(next: any) {
   state.exists = Boolean(next.exists)
   state.active_campaigns = Number(next.active_campaigns || 0)
   state.source_files = next.source_files || []
+  state.source_files_total = Number(next.source_files_total ?? state.source_files.length)
+  state.source_files_page = Number(next.source_files_page || 1)
+  state.source_files_page_size = Number(next.source_files_page_size || 50)
   state.processed_files = next.processed_files || []
+  state.processed_files_total = Number(next.processed_files_total ?? state.processed_files.length)
+  state.processed_files_page = Number(next.processed_files_page || 1)
+  state.processed_files_page_size = Number(next.processed_files_page_size || 50)
 }
 
 async function load() {
   loading.value = true
   try {
-    const res = await getRealtimeMonitor(selectedCampaignId.value || undefined)
+    const res = await getRealtimeMonitor(selectedCampaignId.value || undefined, {
+      source_page: sourcePage.value,
+      source_page_size: sourcePageSize.value,
+      processed_page: processedPage.value,
+      processed_page_size: processedPageSize.value,
+    })
     applyState(res.data)
   } catch (e: any) {
     ElMessage.error(e.response?.data?.detail || '加载失败')
@@ -170,14 +207,31 @@ async function load() {
 }
 
 async function handleCampaignChange() {
+  sourcePage.value = 1
+  processedPage.value = 1
   await load()
+}
+
+function changeSourcePage(page: number) {
+  sourcePage.value = page
+  void load()
+}
+
+function changeProcessedPage(page: number) {
+  processedPage.value = page
+  void load()
 }
 
 async function scanNow() {
   scanning.value = true
   try {
     const campaignId = selectedCampaignId.value || undefined
-    const res = await scanRealtimeMonitor(campaignId)
+    const res = await scanRealtimeMonitor(campaignId, {
+      source_page: sourcePage.value,
+      source_page_size: sourcePageSize.value,
+      processed_page: processedPage.value,
+      processed_page_size: processedPageSize.value,
+    })
     applyState(res.data.monitor)
     ElMessage.success(`扫描完成，复制 ${res.data.sync?.copied || 0} 个文件，处理 ${res.data.processing?.processed || 0} 个文件`)
   } catch (e: any) {
@@ -250,5 +304,9 @@ onUnmounted(stopAutoRefresh)
   margin-top: 4px;
   color: var(--mc-text-tertiary);
   font-size: 12px;
+}
+.pagination {
+  justify-content: flex-end;
+  padding: 12px 0;
 }
 </style>

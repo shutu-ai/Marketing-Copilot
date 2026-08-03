@@ -12,7 +12,9 @@ export function retrySmsTask(id: number) {
   return api.post(`/sms-tasks/${id}/retry`)
 }
 
-export function getExclusions() { return api.get<any[]>('/sms-tasks/exclusions/list') }
+export function getExclusions(params: { page?: number; page_size?: number } = {}) {
+  return api.get<any>('/sms-tasks/exclusions/list', { params })
+}
 export function addExclusion(msisdn: string, reason: string) {
   return api.post('/sms-tasks/exclusions', { msisdn, reason })
 }

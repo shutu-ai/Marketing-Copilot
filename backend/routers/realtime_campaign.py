@@ -2,7 +2,7 @@ import os
 
 import tempfile
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 
 from fastapi.responses import FileResponse
 
@@ -20,9 +20,9 @@ router = APIRouter(prefix="/api/realtime-campaigns", tags=["Realtime Campaign"])
 
 @router.get("")
 
-def list_campaigns():
+def list_campaigns(page: int = 1, page_size: int = Query(50, le=200)):
 
-    return realtime_campaign_service.get_all()
+    return realtime_campaign_service.list_campaigns(page, page_size)
 
 
 
@@ -224,16 +224,16 @@ def receive_file(campaign_id: int, file: UploadFile = File(...)):
 
 @router.get("/{campaign_id}/files")
 
-def list_files(campaign_id: int):
+def list_files(campaign_id: int, page: int = 1, page_size: int = Query(50, le=200)):
 
-    return realtime_campaign_service.get_realtime_files(campaign_id)
+    return realtime_campaign_service.get_realtime_files(campaign_id, page, page_size)
 
 
 @router.get("/{campaign_id}/sent-records")
 
-def sent_records(campaign_id: int):
+def sent_records(campaign_id: int, page: int = 1, page_size: int = Query(50, le=200)):
 
-    return realtime_campaign_service.get_realtime_sent_records(campaign_id)
+    return realtime_campaign_service.get_realtime_sent_records(campaign_id, page, page_size)
 
 
 

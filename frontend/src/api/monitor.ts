@@ -9,18 +9,31 @@ export interface RealtimeMonitorState {
   exists: boolean
   active_campaigns: number
   source_files: any[]
+  source_files_total: number
+  source_files_page: number
+  source_files_page_size: number
   processed_files: any[]
+  processed_files_total: number
+  processed_files_page: number
+  processed_files_page_size: number
 }
 
-export function getRealtimeMonitor(campaignId?: number) {
+export interface MonitorPageParams {
+  source_page?: number
+  source_page_size?: number
+  processed_page?: number
+  processed_page_size?: number
+}
+
+export function getRealtimeMonitor(campaignId?: number, params: MonitorPageParams = {}) {
   return api.get<RealtimeMonitorState>('/monitor/realtime', {
-    params: campaignId ? { campaign_id: campaignId } : undefined,
+    params: { campaign_id: campaignId || undefined, ...params },
   })
 }
 
-export function scanRealtimeMonitor(campaignId?: number) {
+export function scanRealtimeMonitor(campaignId?: number, params: MonitorPageParams = {}) {
   return api.post<{ sync: any; processing: any; monitor: RealtimeMonitorState }>('/monitor/realtime/scan', null, {
-    params: campaignId ? { campaign_id: campaignId } : undefined,
+    params: { campaign_id: campaignId || undefined, ...params },
   })
 }
 

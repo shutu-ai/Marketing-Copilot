@@ -31,8 +31,12 @@ export function deleteCampaign(id: number) {
   return api.delete(`/sms-content/campaigns/${id}`)
 }
 
+export function getTemplatesPage(params: { page?: number; page_size?: number } = {}) {
+  return api.get<any>('/sms-content/templates', { params })
+}
+
 export function getAllTemplates() {
-  return api.get<any[]>('/sms-content/templates')
+  return api.get<any[]>('/sms-content/templates/all')
 }
 
 export function getTemplatesForSelect() {
@@ -65,8 +69,8 @@ export function validateTemplate(content: string, available_variables: string[] 
   return api.post('/sms-content/templates/validate', { content, available_variables })
 }
 
-export function getTemplateVersions(id: number) {
-  return api.get<any[]>(`/sms-content/templates/${id}/versions`)
+export function getTemplateVersions(id: number, params: { page?: number; page_size?: number } = {}) {
+  return api.get<any>(`/sms-content/templates/${id}/versions`, { params })
 }
 
 export function restoreTemplateVersion(id: number, version_no: number) {

@@ -21,8 +21,15 @@ export interface RealtimeCampaign {
   created_at: string
 }
 
-export function getRealtimeCampaigns() {
-  return api.get<RealtimeCampaign[]>('/realtime-campaigns')
+export interface RealtimeCampaignListResult {
+  total: number
+  page: number
+  page_size: number
+  items: RealtimeCampaign[]
+}
+
+export function getRealtimeCampaigns(params: { page?: number; page_size?: number } = {}) {
+  return api.get<RealtimeCampaignListResult>('/realtime-campaigns', { params })
 }
 
 export function getRealtimeCampaign(id: number) {

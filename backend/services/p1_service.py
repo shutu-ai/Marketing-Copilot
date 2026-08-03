@@ -144,6 +144,25 @@ def all_campaign_progress() -> list:
     return result
 
 
+def list_campaign_progress(page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute(
+        """SELECT (SELECT COUNT(*) FROM batch_campaigns) +
+                  (SELECT COUNT(*) FROM realtime_campaigns) cnt"""
+    ).fetchone()["cnt"]
+    rows = conn.execute(
+        """SELECT campaign_type, campaign_id FROM (
+               SELECT 'batch' AS campaign_type, id AS campaign_id, created_at FROM batch_campaigns
+               UNION ALL
+               SELECT 'realtime' AS campaign_type, id AS campaign_id, created_at FROM realtime_campaigns
+           ) ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+        (page_size, max(0, page - 1) * page_size),
+    ).fetchall()
+    conn.close()
+    items = [campaign_progress(row["campaign_type"], row["campaign_id"]) for row in rows]
+    return {"total": total, "page": page, "page_size": page_size, "items": items}
+
+
 def bulk_failed_tasks(action: str, task_ids=None, campaign_type: str = "", campaign_id: int = 0) -> dict:
     conditions = ["status IN ('failed','expired')"]
     params = []
@@ -198,6 +217,21 @@ def list_failure_archive(page: int = 1, page_size: int = 50) -> dict:
     total = conn.execute("SELECT COUNT(*) cnt FROM failed_task_archive").fetchone()["cnt"]
     rows = conn.execute("SELECT * FROM failed_task_archive ORDER BY archived_at DESC LIMIT ? OFFSET ?",
                         (page_size, max(0, page - 1) * page_size)).fetchall()
+    conn.close()
+    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+
+
+def list_failed_tasks(page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute(
+        "SELECT COUNT(*) cnt FROM sms_tasks WHERE status IN ('failed','expired')"
+    ).fetchone()["cnt"]
+    rows = conn.execute(
+        """SELECT * FROM sms_tasks
+           WHERE status IN ('failed','expired')
+           ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+        (page_size, max(0, page - 1) * page_size),
+    ).fetchall()
     conn.close()
     return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
 

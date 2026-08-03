@@ -409,6 +409,17 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
 
 
+def list_exclusions(page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) cnt FROM exclusion_users").fetchone()["cnt"]
+    rows = conn.execute(
+        "SELECT * FROM exclusion_users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (page_size, max(0, page - 1) * page_size),
+    ).fetchall()
+    conn.close()
+    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+
+
 def task_stats() -> dict:
     conn = get_connection()
     rows = conn.execute("SELECT status, COUNT(*) count FROM sms_tasks GROUP BY status").fetchall()

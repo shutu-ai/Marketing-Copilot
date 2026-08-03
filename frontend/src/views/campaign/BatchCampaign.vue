@@ -117,6 +117,14 @@
         </template>
       </el-table-column>
     </el-table>
+    <el-pagination
+      v-model:current-page="page"
+      :page-size="pageSize"
+      :total="total"
+      layout="total, prev, pager, next"
+      class="pagination"
+      @current-change="changePage"
+    />
     </div>
 
     <el-dialog
@@ -270,6 +278,9 @@ interface Campaign {
 }
 
 const campaigns = ref<Campaign[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = ref(50)
 const loading = ref(false)
 const dialogVisible = ref(false)
 const saving = ref(false)
@@ -292,11 +303,17 @@ const directoryPickerVisible = ref(false)
 async function fetchList() {
   loading.value = true
   try {
-    const res = await api.getCampaigns()
-    campaigns.value = res.data
+    const res = await api.getCampaigns({ page: page.value, page_size: pageSize.value })
+    campaigns.value = res.data.items || []
+    total.value = res.data.total ?? campaigns.value.length
   } finally {
     loading.value = false
   }
+}
+
+function changePage(nextPage: number) {
+  page.value = nextPage
+  void fetchList()
 }
 
 function showDialog(row: Campaign | null) {
@@ -521,5 +538,6 @@ onMounted(() => fetchList())
 .readiness-item { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--mc-text-secondary); }
 .readiness-item .el-icon.ok { color:var(--mc-success); }
 .readiness-item .el-icon:not(.ok) { color:var(--mc-warning); }
+.pagination { justify-content:flex-end; padding:12px 0; }
 
 </style>

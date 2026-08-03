@@ -58,6 +58,17 @@
           <el-table-column v-for="col in resultColumns" :key="col" :prop="col" :label="col" min-width="120" show-overflow-tooltip />
           <template #empty><el-empty description="暂无数据" /></template>
         </el-table>
+        <el-pagination
+          v-if="result.type === 'select'"
+          v-model:current-page="resultPage"
+          :page-size="resultPageSize"
+          :page-sizes="[100, 500, 1000]"
+          :total="resultTotal"
+          layout="total, sizes, prev, pager, next"
+          class="pagination"
+          @size-change="handleResultSizeChange"
+          @current-change="handleResultCurrentChange"
+        />
       </div>
     </el-card>
     </div>
@@ -142,6 +153,9 @@ const executing = ref(false)
 const confirmWrite = ref(false)
 const execTime = ref<number | null>(null)
 const result = ref<api.QueryResult | null>(null)
+const resultPage = ref(1)
+const resultPageSize = ref(100)
+const resultTotal = ref(0)
 
 const filteredTables = computed(() => {
   if (!filterText.value) return tables.value
@@ -152,12 +166,23 @@ const filteredTables = computed(() => {
 const resultColumns = computed(() => result.value?.columns || [])
 const resultData = computed(() => {
   if (!result.value?.rows) return []
-  return result.value.rows.map((row: any[]) => {
+  const allRows = result.value.rows.map((row: any[]) => {
     const obj: Record<string, any> = {}
     result.value?.columns?.forEach((col, i) => { obj[col] = row[i] })
     return obj
   })
+  const start = (resultPage.value - 1) * resultPageSize.value
+  return allRows.slice(start, start + resultPageSize.value)
 })
+
+function handleResultSizeChange(size: number) {
+  resultPageSize.value = size
+  resultPage.value = 1
+}
+
+function handleResultCurrentChange(page: number) {
+  resultPage.value = page
+}
 
 onMounted(() => fetchTables())
 
@@ -229,6 +254,8 @@ async function handleExecute() {
   try {
     const res = await api.executeQuery({ sql: trimmed })
     result.value = res.data
+    resultPage.value = 1
+    resultTotal.value = res.data.row_count || 0
     execTime.value = Math.round(performance.now() - start)
     if (res.data.type === 'error') ElMessage.error(res.data.error)
   } catch (e: any) {
@@ -294,5 +321,9 @@ async function handleExecute() {
 .col-comment { font-size: 12px; color: var(--mc-text-tertiary); }
 .schema-col-actions {
   display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--mc-border);
+}
+.pagination {
+  justify-content: flex-end;
+  margin-top: 10px;
 }
 </style>

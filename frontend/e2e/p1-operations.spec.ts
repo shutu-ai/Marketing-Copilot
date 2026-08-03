@@ -15,11 +15,11 @@ test('P1 operations center actions, failures, health and audits', async ({ page 
     const url = new URL(request.url())
     apiCalls.push(`${request.method()} ${url.pathname}${url.search}`)
     const json = (body: unknown) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-    if (url.pathname === '/api/operations/progress') return json([{
+    if (url.pathname === '/api/operations/progress') return json({ items: [{
       campaign_type: 'realtime', campaign_id: 7, name: 'P1 UI campaign', status,
       tasks: { total: 10, finished: status === 'paused' ? 4 : 3, percent: status === 'paused' ? 40 : 30 },
       files: { total: 1, finished: 1 }, batches: null,
-    }])
+    }], total: 1, page: 1, page_size: 50 })
     if (url.pathname === '/api/operations/campaigns/action') {
       status = JSON.parse(request.postData() || '{}').action === 'pause' ? 'paused' : status
       return json({ status })
@@ -27,14 +27,15 @@ test('P1 operations center actions, failures, health and audits', async ({ page 
     if (url.pathname === '/api/sms-tasks') {
       return json({ items: failed && url.searchParams.get('status') === 'failed' ? [{ id: 91, campaign_name: 'P1 UI campaign', msisdn: '251900000091', status: 'failed', failure_class: 'transport', error_msg: 'timeout' }] : [] })
     }
-    if (url.pathname === '/api/operations/tasks/archive') return json({ items: [] })
+    if (url.pathname === '/api/operations/tasks/failures') return json({ items: failed ? [{ id: 91, campaign_name: 'P1 UI campaign', msisdn: '251900000091', status: 'failed', failure_class: 'transport', error_msg: 'timeout' }] : [], total: failed ? 1 : 0, page: 1, page_size: 50 })
+    if (url.pathname === '/api/operations/tasks/archive') return json({ items: [], total: 0, page: 1, page_size: 50 })
     if (url.pathname === '/api/operations/tasks/bulk') { failed = false; return json({ success: true, count: 1 }) }
     if (url.pathname === '/api/operations/configuration-health') {
       if (url.searchParams.get('record_events') === 'true') healthRecorded = true
       return json([{ code: 'SMPP_ENABLED', ok: false, severity: 'error', message: 'No enabled SMPP configuration' }])
     }
-    if (url.pathname === '/api/operations/exceptions') return json({ items: healthRecorded ? [{ id: 3, severity: 'error', category: 'smpp', code: 'SMPP_ENABLED', message: 'No enabled SMPP configuration' }] : [] })
-    if (url.pathname === '/api/operations/audits') return json({ items: [{ id: 1, username: 'system', action: 'campaign.pause', resource: 'realtime_campaign', resource_id: '7', detail: '{}' }] })
+    if (url.pathname === '/api/operations/exceptions') return json({ items: healthRecorded ? [{ id: 3, severity: 'error', category: 'smpp', code: 'SMPP_ENABLED', message: 'No enabled SMPP configuration' }] : [], total: healthRecorded ? 1 : 0, page: 1, page_size: 50 })
+    if (url.pathname === '/api/operations/audits') return json({ items: [{ id: 1, username: 'system', action: 'campaign.pause', resource: 'realtime_campaign', resource_id: '7', detail: '{}' }], total: 1, page: 1, page_size: 50 })
     if (url.pathname === '/api/sms-tasks/dlr-codes') return json({ DELIVRD: { label: 'Delivered', status: 'delivered', retryable: false } })
     if (/\/api\/operations\/exceptions\/\d+\/resolve/.test(url.pathname)) return json({ success: true })
     return json({})

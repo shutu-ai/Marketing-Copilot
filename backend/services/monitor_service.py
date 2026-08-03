@@ -375,7 +375,13 @@ def _count_rows(file_path: str) -> int:
     return 0
 
 
-def get_realtime_monitor(campaign_id: Optional[int] = None) -> dict:
+def get_realtime_monitor(
+    campaign_id: Optional[int] = None,
+    source_page: int = 1,
+    source_page_size: int = 50,
+    processed_page: int = 1,
+    processed_page_size: int = 50,
+) -> dict:
     source_files = []
     conn = get_connection()
     all_campaign_rows = conn.execute(
@@ -391,15 +397,22 @@ def get_realtime_monitor(campaign_id: Optional[int] = None) -> dict:
             "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC"
         ).fetchall()
     active_campaigns = conn.execute("SELECT COUNT(*) AS count FROM realtime_campaigns WHERE status='in_progress'").fetchone()
+    processed_where = "campaign_type='realtime'"
+    processed_params = []
     if campaign_id:
-        processed_rows = conn.execute(
-            "SELECT * FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? ORDER BY detected_at DESC LIMIT 200",
-            (campaign_id,),
-        ).fetchall()
-    else:
-        processed_rows = conn.execute(
-            "SELECT * FROM processed_files WHERE campaign_type='realtime' ORDER BY detected_at DESC LIMIT 200"
-        ).fetchall()
+        processed_where += " AND campaign_id=?"
+        processed_params.append(campaign_id)
+    processed_total = conn.execute(
+        f"SELECT COUNT(*) cnt FROM processed_files WHERE {processed_where}",
+        tuple(processed_params),
+    ).fetchone()["cnt"]
+    processed_offset = max(0, processed_page - 1) * processed_page_size
+    processed_rows = conn.execute(
+        f"""SELECT * FROM processed_files
+            WHERE {processed_where}
+            ORDER BY detected_at DESC LIMIT ? OFFSET ?""",
+        tuple(processed_params + [processed_page_size, processed_offset]),
+    ).fetchall()
     conn.close()
 
     selected_campaign = dict(campaign_rows[0]) if campaign_id and campaign_rows else None
@@ -472,6 +485,11 @@ def get_realtime_monitor(campaign_id: Optional[int] = None) -> dict:
                 "updated_at": "",
             })
 
+    source_files.sort(key=lambda item: item["filename"])
+    source_files_total = len(source_files)
+    source_offset = max(0, source_page - 1) * source_page_size
+    source_files = source_files[source_offset:source_offset + source_page_size]
+
     return {
         "campaign_id": campaign_id,
         "watch_dir": "",
@@ -480,12 +498,34 @@ def get_realtime_monitor(campaign_id: Optional[int] = None) -> dict:
         "campaigns": [dict(row) for row in all_campaign_rows],
         "active_campaigns": active_campaigns["count"] if active_campaigns else 0,
         "source_files": source_files,
+        "source_files_total": source_files_total,
+        "source_files_page": source_page,
+        "source_files_page_size": source_page_size,
         "processed_files": [dict(row) for row in processed_rows],
+        "processed_files_total": processed_total,
+        "processed_files_page": processed_page,
+        "processed_files_page_size": processed_page_size,
     }
 
 
-def scan_realtime_watch_dir(campaign_id: Optional[int] = None) -> dict:
+def scan_realtime_watch_dir(
+    campaign_id: Optional[int] = None,
+    source_page: int = 1,
+    source_page_size: int = 50,
+    processed_page: int = 1,
+    processed_page_size: int = 50,
+) -> dict:
     from services import realtime_campaign_service
     sync_result = realtime_campaign_service.sync_watch_dirs_to_inboxes(campaign_id=campaign_id)
     process_result = realtime_campaign_service.process_realtime_inboxes(campaign_id=campaign_id)
-    return {"sync": sync_result, "processing": process_result, "monitor": get_realtime_monitor(campaign_id)}
+    return {
+        "sync": sync_result,
+        "processing": process_result,
+        "monitor": get_realtime_monitor(
+            campaign_id,
+            source_page,
+            source_page_size,
+            processed_page,
+            processed_page_size,
+        ),
+    }

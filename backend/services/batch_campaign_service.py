@@ -122,6 +122,23 @@ def get_all() -> list:
     return [_enrich(dict(r)) for r in rows]
 
 
+def list_campaigns(page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) cnt FROM batch_campaigns").fetchone()["cnt"]
+    offset = max(0, page - 1) * page_size
+    rows = conn.execute(
+        "SELECT * FROM batch_campaigns ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (page_size, offset),
+    ).fetchall()
+    conn.close()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [_enrich(dict(r)) for r in rows],
+    }
+
+
 def get_one(campaign_id: int) -> Optional[dict]:
     conn = get_connection()
     row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()

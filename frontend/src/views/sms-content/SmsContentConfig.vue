@@ -36,6 +36,14 @@
         </template>
       </el-table-column>
     </el-table>
+    <el-pagination
+      v-model:current-page="page"
+      :page-size="pageSize"
+      :total="total"
+      layout="total, prev, pager, next"
+      class="pagination"
+      @current-change="changePage"
+    />
 
     <el-dialog v-model="versionVisible" title="模板版本历史" width="760px">
       <el-alert v-if="validation" :type="validation.valid ? 'success' : 'error'" :closable="false" show-icon>
@@ -50,6 +58,14 @@
         <el-table-column prop="created_at" label="时间" width="180" />
         <el-table-column label="操作" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row.version_no)">恢复</el-button></template></el-table-column>
       </el-table>
+      <el-pagination
+        v-model:current-page="versionPage"
+        :page-size="versionPageSize"
+        :total="versionTotal"
+        layout="total, prev, pager, next"
+        class="pagination"
+        @current-change="changeVersionPage"
+      />
     </el-dialog>
   </div>
 </template>
@@ -61,8 +77,14 @@ import * as api from '@/api/smsContent'
 
 const loading = ref(false)
 const tableData = ref<any[]>([])
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
 const versionVisible = ref(false)
 const versions = ref<any[]>([])
+const versionPage = ref(1)
+const versionPageSize = ref(50)
+const versionTotal = ref(0)
 const activeTemplate = ref<any>(null)
 const validation = ref<any>(null)
 
@@ -101,14 +123,20 @@ function spanMethod({ rowIndex, columnIndex }: { rowIndex: number; columnIndex: 
 async function fetchTable() {
   loading.value = true
   try {
-    const res = await api.getAllTemplates()
-    tableData.value = res.data || []
+    const res = await api.getTemplatesPage({ page: page.value, page_size: pageSize.value })
+    tableData.value = res.data.items || []
+    total.value = res.data.total ?? tableData.value.length
     buildSpanMap(tableData.value)
   } catch { /* ignore */ }
   loading.value = false
 }
 
 onMounted(fetchTable)
+
+function changePage(nextPage: number) {
+  page.value = nextPage
+  void fetchTable()
+}
 
 async function handleDeleteTemplate(row: any) {
   if (!canDeleteTemplate(row)) return
@@ -132,13 +160,31 @@ function deleteDisabledReason(row: any) {
 
 async function openVersions(row: any) {
   activeTemplate.value = row
+  versionPage.value = 1
   const [history, check] = await Promise.all([
-    api.getTemplateVersions(row.template_id),
+    api.getTemplateVersions(row.template_id, { page: versionPage.value, page_size: versionPageSize.value }),
     api.validateTemplate(row.content || ''),
   ])
-  versions.value = history.data
+  versions.value = history.data.items || []
+  versionTotal.value = history.data.total ?? versions.value.length
   validation.value = check.data
   versionVisible.value = true
+}
+
+async function loadVersions() {
+  if (!activeTemplate.value) return
+  const history = await api.getTemplateVersions(activeTemplate.value.template_id, {
+    page: versionPage.value,
+    page_size: versionPageSize.value,
+  })
+  versions.value = history.data.items || []
+  versionTotal.value = history.data.total ?? versions.value.length
+}
+
+function changeVersionPage(nextPage: number) {
+  if (!activeTemplate.value) return
+  versionPage.value = nextPage
+  void loadVersions()
 }
 
 async function restoreVersion(versionNo: number) {
@@ -157,4 +203,5 @@ async function restoreVersion(versionNo: number) {
   margin-bottom: 16px;
 }
 .page-header h2 { margin: 0; font-size: 22px; font-weight: 600; }
+.pagination { justify-content: flex-end; padding: 12px 0; }
 </style>

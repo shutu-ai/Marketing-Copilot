@@ -132,6 +132,14 @@
           </template>
         </el-table-column>
       </el-table>
+      <el-pagination
+        v-model:current-page="page"
+        :page-size="pageSize"
+        :total="total"
+        layout="total, prev, pager, next"
+        class="pagination"
+        @current-change="changePage"
+      />
     </div>
 
     <el-dialog
@@ -298,6 +306,9 @@ interface Campaign {
 }
 
 const campaigns = ref<Campaign[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = ref(50)
 const rtStats = reactive<Record<number, { file_count: number; total_msisdn_sum: number; total_matched: number }>>({})
 const loading = ref(false)
 const dialogVisible = ref(false)
@@ -345,9 +356,10 @@ const directoryPickerTarget = ref<'campaign' | 'watch'>('campaign')
 async function fetchList() {
   loading.value = true
   try {
-    const res = await api.getRealtimeCampaigns()
-    campaigns.value = res.data
-    for (const campaign of res.data) {
+    const res = await api.getRealtimeCampaigns({ page: page.value, page_size: pageSize.value })
+    campaigns.value = res.data.items || []
+    total.value = res.data.total ?? campaigns.value.length
+    for (const campaign of campaigns.value) {
       try {
         const sr = await rtApi.getRealtimeStats(campaign.id)
         rtStats[campaign.id] = sr.data
@@ -358,6 +370,11 @@ async function fetchList() {
   } finally {
     loading.value = false
   }
+}
+
+function changePage(nextPage: number) {
+  page.value = nextPage
+  void fetchList()
 }
 
 function showDialog(row: Campaign | null) {
@@ -647,5 +664,9 @@ onMounted(() => {
 }
 .muted {
   color: #999;
+}
+.pagination {
+  justify-content: flex-end;
+  padding: 12px 0;
 }
 </style>

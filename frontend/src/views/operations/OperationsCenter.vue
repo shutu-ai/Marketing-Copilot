@@ -26,6 +26,14 @@
             </template>
           </el-table-column>
         </el-table>
+        <el-pagination
+          v-model:current-page="progressPage"
+          :page-size="progressPageSize"
+          :total="progressTotal"
+          layout="total, prev, pager, next"
+          class="pagination"
+          @current-change="changeProgressPage"
+        />
       </el-tab-pane>
 
       <el-tab-pane label="短信任务" name="sms-tasks">
@@ -48,6 +56,14 @@
           <el-table-column prop="error_msg" label="错误" show-overflow-tooltip />
           <el-table-column label="时间线" width="90"><template #default="{ row }"><el-button link type="primary" @click="openTimeline(row.id)">查看</el-button></template></el-table-column>
         </el-table>
+        <el-pagination
+          v-model:current-page="failedPage"
+          :page-size="failedPageSize"
+          :total="failedTotal"
+          layout="total, prev, pager, next"
+          class="pagination"
+          @current-change="changeFailedPage"
+        />
         <h3 class="section-title">失败归档</h3>
         <el-table :data="archivedTasks" stripe>
           <el-table-column prop="task_id" label="任务 ID" width="90" />
@@ -58,6 +74,14 @@
           <el-table-column prop="error_msg" label="错误" show-overflow-tooltip />
           <el-table-column prop="archived_at" label="归档时间" width="180" />
         </el-table>
+        <el-pagination
+          v-model:current-page="archivePage"
+          :page-size="archivePageSize"
+          :total="archiveTotal"
+          layout="total, prev, pager, next"
+          class="pagination"
+          @current-change="changeArchivePage"
+        />
       </el-tab-pane>
 
       <el-tab-pane label="异常中心" name="exceptions">
@@ -75,6 +99,14 @@
           <el-table-column prop="created_at" label="时间" width="180" />
           <el-table-column label="操作" width="90"><template #default="{ row }"><el-button link type="primary" @click="resolve(row.id)">解决</el-button></template></el-table-column>
         </el-table>
+        <el-pagination
+          v-model:current-page="exceptionPage"
+          :page-size="exceptionPageSize"
+          :total="exceptionTotal"
+          layout="total, prev, pager, next"
+          class="pagination"
+          @current-change="changeExceptionPage"
+        />
       </el-tab-pane>
 
       <el-tab-pane label="容量与高可用" name="capacity">
@@ -92,7 +124,7 @@
 
       <el-tab-pane label="审计与报表" name="audits">
         <div class="toolbar">
-          <el-input v-model="auditAction" placeholder="按动作筛选" clearable style="width:220px" @change="loadAudits" />
+          <el-input v-model="auditAction" placeholder="按动作筛选" clearable style="width:220px" @change="handleAuditFilter" />
           <el-button v-for="report in reports" :key="report.value" @click="download(report.value)">导出{{ report.label }}</el-button>
         </div>
         <el-table v-loading="loading" :data="audits">
@@ -103,6 +135,14 @@
           <el-table-column prop="resource_id" label="资源 ID" width="100" />
           <el-table-column prop="detail" label="详情" show-overflow-tooltip />
         </el-table>
+        <el-pagination
+          v-model:current-page="auditPage"
+          :page-size="auditPageSize"
+          :total="auditTotal"
+          layout="total, prev, pager, next"
+          class="pagination"
+          @current-change="changeAuditPage"
+        />
       </el-tab-pane>
     </el-tabs>
 
@@ -120,7 +160,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
 import SmsTasks from '@/views/sms-tasks/SmsTasks.vue'
 import CapacityCenter from './CapacityCenter.vue'
-import { getSmsTasks } from '@/api/smsTasks'
 import * as ops from '@/api/operations'
 
 const route = useRoute()
@@ -130,32 +169,71 @@ const activeTab = ref(validTabs.includes(String(route.query.tab)) ? String(route
 const showGlobalRefresh = computed(() => !['sms-tasks', 'capacity'].includes(activeTab.value))
 const loading = ref(false)
 const progressRows = ref<any[]>([])
+const progressPage = ref(1)
+const progressPageSize = ref(50)
+const progressTotal = ref(0)
 const failedTasks = ref<any[]>([])
+const failedPage = ref(1)
+const failedPageSize = ref(50)
+const failedTotal = ref(0)
 const archivedTasks = ref<any[]>([])
+const archivePage = ref(1)
+const archivePageSize = ref(50)
+const archiveTotal = ref(0)
 const selectedTasks = ref<any[]>([])
 const exceptions = ref<any[]>([])
+const exceptionPage = ref(1)
+const exceptionPageSize = ref(50)
+const exceptionTotal = ref(0)
 const health = ref<any[]>([])
 const dlrRows = ref<any[]>([])
 const audits = ref<any[]>([])
+const auditPage = ref(1)
+const auditPageSize = ref(50)
+const auditTotal = ref(0)
 const auditAction = ref('')
 const timelineVisible = ref(false)
 const timeline = ref<any>({ task: null, events: [] })
 const reports = [{ value: 'tasks', label: '任务' }, { value: 'files', label: '文件' }, { value: 'failures', label: '失败' }, { value: 'audits', label: '审计' }]
 
 async function withLoading(work: () => Promise<void>) { loading.value = true; try { await work() } finally { loading.value = false } }
-const loadProgress = () => withLoading(async () => { progressRows.value = (await ops.getOperationsProgress()).data })
-const loadFailures = () => withLoading(async () => {
-  const [failed, expired, archived] = await Promise.all([
-    getSmsTasks({ page: 1, page_size: 200, status: 'failed' }),
-    getSmsTasks({ page: 1, page_size: 200, status: 'expired' }),
-    ops.getFailureArchive(),
-  ])
-  failedTasks.value = [...failed.data.items, ...expired.data.items]
-  archivedTasks.value = archived.data.items
+const loadProgress = () => withLoading(async () => {
+  const res = await ops.getOperationsProgress(progressPage.value, progressPageSize.value)
+  progressRows.value = res.data.items || []
+  progressTotal.value = res.data.total ?? progressRows.value.length
 })
-const loadExceptions = () => withLoading(async () => { const [events, checks] = await Promise.all([ops.getExceptions({ resolved: false }), ops.getConfigurationHealth()]); exceptions.value = events.data.items; health.value = checks.data })
+const loadFailures = () => withLoading(async () => {
+  const [failed, archived] = await Promise.all([
+    ops.getFailedTasks(failedPage.value, failedPageSize.value),
+    ops.getFailureArchive(archivePage.value, archivePageSize.value),
+  ])
+  failedTasks.value = failed.data.items || []
+  failedTotal.value = failed.data.total ?? failedTasks.value.length
+  archivedTasks.value = archived.data.items || []
+  archiveTotal.value = archived.data.total ?? archivedTasks.value.length
+})
+const loadExceptions = () => withLoading(async () => {
+  const [events, checks] = await Promise.all([
+    ops.getExceptions({ resolved: false, page: exceptionPage.value, page_size: exceptionPageSize.value }),
+    ops.getConfigurationHealth(),
+  ])
+  exceptions.value = events.data.items || []
+  exceptionTotal.value = events.data.total ?? exceptions.value.length
+  health.value = checks.data
+})
 const loadDlr = () => withLoading(async () => { const data = (await ops.getDlrCodes()).data; dlrRows.value = Object.entries(data).map(([code, value]: any) => ({ code, ...value })) })
-const loadAudits = () => withLoading(async () => { audits.value = (await ops.getAuditLogs(1, auditAction.value)).data.items })
+const loadAudits = () => withLoading(async () => {
+  const res = await ops.getAuditLogs(auditPage.value, auditPageSize.value, auditAction.value)
+  audits.value = res.data.items || []
+  auditTotal.value = res.data.total ?? audits.value.length
+})
+
+function changeProgressPage(page: number) { progressPage.value = page; void loadProgress() }
+function changeFailedPage(page: number) { failedPage.value = page; void loadFailures() }
+function changeArchivePage(page: number) { archivePage.value = page; void loadFailures() }
+function changeExceptionPage(page: number) { exceptionPage.value = page; void loadExceptions() }
+function changeAuditPage(page: number) { auditPage.value = page; void loadAudits() }
+function handleAuditFilter() { auditPage.value = 1; void loadAudits() }
 
 function refreshActive() {
   const loaders: Record<string, () => Promise<void>> = { progress: loadProgress, failures: loadFailures, exceptions: loadExceptions, dlr: loadDlr, audits: loadAudits }
@@ -182,5 +260,5 @@ onMounted(refreshActive)
 </script>
 
 <style scoped>
-.page-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}.page-header h2{margin:0}.page-header p{margin:6px 0 0;color:var(--mc-text-secondary)}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}.health-grid{margin-bottom:14px}.health-grid .el-col{margin-bottom:10px}.timeline{margin-top:24px}.section-title{margin:24px 0 12px;color:var(--mc-text);font-size:16px}small{color:var(--mc-text-tertiary)}.operations-center :deep(.el-tabs__header){overflow:hidden}.operations-center :deep(.el-tabs__nav-wrap){overflow-x:auto;scrollbar-width:none}.operations-center :deep(.el-tabs__nav-wrap::-webkit-scrollbar){display:none}.operations-center :deep(.el-tabs__content){padding-top:10px}@media(max-width:767px){.operations-center :deep(.el-tabs__item){padding:0 14px;white-space:nowrap}.page-header{flex-direction:column;gap:10px}}
+.page-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}.page-header h2{margin:0}.page-header p{margin:6px 0 0;color:var(--mc-text-secondary)}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}.health-grid{margin-bottom:14px}.health-grid .el-col{margin-bottom:10px}.timeline{margin-top:24px}.section-title{margin:24px 0 12px;color:var(--mc-text);font-size:16px}small{color:var(--mc-text-tertiary)}.operations-center :deep(.el-tabs__header){overflow:hidden}.operations-center :deep(.el-tabs__nav-wrap){overflow-x:auto;scrollbar-width:none}.operations-center :deep(.el-tabs__nav-wrap::-webkit-scrollbar){display:none}.operations-center :deep(.el-tabs__content){padding-top:10px}.pagination{justify-content:flex-end;padding:12px 0}@media(max-width:767px){.operations-center :deep(.el-tabs__item){padding:0 14px;white-space:nowrap}.page-header{flex-direction:column;gap:10px}}
 </style>

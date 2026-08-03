@@ -1,6 +1,6 @@
 import os
 import tempfile
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
 from services import batch_campaign_service
 
@@ -8,8 +8,8 @@ router = APIRouter(prefix="/api/batch-campaigns", tags=["Batch Campaign"])
 
 
 @router.get("")
-def list_campaigns():
-    return batch_campaign_service.get_all()
+def list_campaigns(page: int = 1, page_size: int = Query(50, le=200)):
+    return batch_campaign_service.list_campaigns(page, page_size)
 
 
 @router.get("/{campaign_id}")

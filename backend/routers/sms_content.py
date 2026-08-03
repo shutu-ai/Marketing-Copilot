@@ -76,7 +76,12 @@ def delete_campaign(campaign_id: int):
 
 
 @router.get("/templates")
-def list_all_templates():
+def list_all_templates(page: int = 1, page_size: int = Query(50, le=200)):
+    return sms_content_service.get_all_templates_with_campaigns(page, page_size)
+
+
+@router.get("/templates/all")
+def list_all_templates_unpaged():
     return sms_content_service.get_all_templates_with_campaigns()
 
 
@@ -104,8 +109,8 @@ def validate_template(body: TemplateValidationRequest):
 
 
 @router.get("/templates/{template_id}/versions")
-def template_versions(template_id: int):
-    return sms_content_service.get_template_versions(template_id)
+def template_versions(template_id: int, page: int = 1, page_size: int = Query(50, le=200)):
+    return sms_content_service.list_template_versions(template_id, page, page_size)
 
 
 @router.post("/templates/{template_id}/restore")

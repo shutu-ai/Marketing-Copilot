@@ -35,11 +35,8 @@ def retry(task_id: int):
 
 
 @router.get("/exclusions/list")
-def exclusions():
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM exclusion_users ORDER BY created_at DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def exclusions(page: int = 1, page_size: int = Query(50, le=200)):
+    return sms_task_service.list_exclusions(page, page_size)
 
 
 @router.post("/exclusions")

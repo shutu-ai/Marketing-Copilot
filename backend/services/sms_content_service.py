@@ -209,9 +209,9 @@ def delete_campaign(campaign_id: int) -> bool:
     return deleted
 
 
-def get_all_templates_with_campaigns() -> list:
+def get_all_templates_with_campaigns(page: Optional[int] = None, page_size: int = 50):
     conn = get_connection()
-    rows = conn.execute("""
+    query = """
         SELECT t.id AS template_id, t.language, t.content, t.source_addr, t.enabled AS template_enabled,
                c.id AS campaign_id, c.name AS campaign_name, c.description, c.enabled, c.marketing_type, c.marketing_campaign_id,
                c.created_at, c.updated_at,
@@ -241,9 +241,25 @@ def get_all_templates_with_campaigns() -> list:
         FROM sms_templates t
         JOIN campaigns c ON c.id = t.campaign_id
         ORDER BY c.created_at DESC, t.language
-    """).fetchall()
+    """
+    total = conn.execute(
+        "SELECT COUNT(*) cnt FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id"
+    ).fetchone()["cnt"]
+    if page is None:
+        rows = conn.execute(query).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    rows = conn.execute(
+        query + " LIMIT ? OFFSET ?",
+        (page_size, max(0, page - 1) * page_size),
+    ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [dict(r) for r in rows],
+    }
 
 
 def get_templates_by_campaign(campaign_id: int) -> list:
@@ -332,6 +348,27 @@ def get_template_versions(template_id: int) -> list:
                         (template_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def list_template_versions(template_id: int, page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute(
+        "SELECT COUNT(*) cnt FROM template_versions WHERE template_id=?",
+        (template_id,),
+    ).fetchone()["cnt"]
+    rows = conn.execute(
+        """SELECT * FROM template_versions
+           WHERE template_id=?
+           ORDER BY version_no DESC LIMIT ? OFFSET ?""",
+        (template_id, page_size, max(0, page - 1) * page_size),
+    ).fetchall()
+    conn.close()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [dict(r) for r in rows],
+    }
 
 
 def restore_template_version(template_id: int, version_no: int) -> Optional[dict]:

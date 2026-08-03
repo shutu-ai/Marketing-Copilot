@@ -19,8 +19,15 @@ export interface BatchCampaign {
   created_at: string
 }
 
-export function getCampaigns() {
-  return api.get<BatchCampaign[]>('/batch-campaigns')
+export interface CampaignListResult {
+  total: number
+  page: number
+  page_size: number
+  items: BatchCampaign[]
+}
+
+export function getCampaigns(params: { page?: number; page_size?: number } = {}) {
+  return api.get<CampaignListResult>('/batch-campaigns', { params })
 }
 
 export function getCampaign(id: number) {

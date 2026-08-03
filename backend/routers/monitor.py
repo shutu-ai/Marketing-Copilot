@@ -24,13 +24,37 @@ class PublishFileReq(BaseModel):
 
 
 @router.get("/realtime")
-def realtime_monitor(campaign_id: int = Query(None)):
-    return monitor_service.get_realtime_monitor(campaign_id)
+def realtime_monitor(
+    campaign_id: int = Query(None),
+    source_page: int = Query(1, ge=1),
+    source_page_size: int = Query(50, ge=1, le=200),
+    processed_page: int = Query(1, ge=1),
+    processed_page_size: int = Query(50, ge=1, le=200),
+):
+    return monitor_service.get_realtime_monitor(
+        campaign_id,
+        source_page,
+        source_page_size,
+        processed_page,
+        processed_page_size,
+    )
 
 
 @router.post("/realtime/scan")
-def scan_realtime_monitor(campaign_id: int = Query(None)):
-    return monitor_service.scan_realtime_watch_dir(campaign_id)
+def scan_realtime_monitor(
+    campaign_id: int = Query(None),
+    source_page: int = Query(1, ge=1),
+    source_page_size: int = Query(50, ge=1, le=200),
+    processed_page: int = Query(1, ge=1),
+    processed_page_size: int = Query(50, ge=1, le=200),
+):
+    return monitor_service.scan_realtime_watch_dir(
+        campaign_id,
+        source_page,
+        source_page_size,
+        processed_page,
+        processed_page_size,
+    )
 
 
 @router.get("/configs")
