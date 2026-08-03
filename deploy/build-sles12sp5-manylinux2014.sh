@@ -64,7 +64,12 @@ cp -a "$WORK/runtime/." "$STAGE/runtime/"
 
 # Node runs only on the builder. The archive gets frontend/dist, never node_modules.
 (cd "$ROOT/frontend" && npm ci && npm run build)
-tar -C "$ROOT/backend" --exclude='__pycache__' --exclude='*.pyc' --exclude='uploads' --exclude='monitor_dir' -cf - . | tar -C "$STAGE/payload/backend" -xf -
+tar -C "$ROOT/backend" \
+  --exclude='__pycache__' --exclude='*.pyc' \
+  --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
+  --exclude='*.db*' --exclude='*.duckdb*' \
+  --exclude='uploads' --exclude='monitor_dir' \
+  -cf - . | tar -C "$STAGE/payload/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/payload/frontend/"
 cp "$ROOT/deploy/marketing-copilot.env.example" "$ROOT/deploy/marketing-copilot.service" "$ROOT/deploy/marketing-copilot-backup.service" "$ROOT/deploy/marketing-copilot-backup.timer" "$ROOT/deploy/marketing-copilot-smsc-simulator.service" "$STAGE/payload/deploy/"
 

@@ -42,7 +42,12 @@ tar -xzf "$OPENSSL_SOURCE" -C "$BUILD_SOURCE"
 # Node/npm are used only here. Only the generated dist directory is copied into the package.
 (cd "$ROOT/frontend" && npm ci && npm run build)
 mkdir -p "$STAGE/payload/backend" "$STAGE/payload/frontend" "$STAGE/payload/deploy"
-tar -C "$ROOT/backend" --exclude='__pycache__' --exclude='*.pyc' --exclude='uploads' --exclude='monitor_dir' -cf - . | tar -C "$STAGE/payload/backend" -xf -
+tar -C "$ROOT/backend" \
+  --exclude='__pycache__' --exclude='*.pyc' \
+  --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
+  --exclude='*.db*' --exclude='*.duckdb*' \
+  --exclude='uploads' --exclude='monitor_dir' \
+  -cf - . | tar -C "$STAGE/payload/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/payload/frontend/"
 cp "$ROOT/deploy/marketing-copilot.env.example" "$ROOT/deploy/marketing-copilot.service" "$ROOT/deploy/marketing-copilot-backup.service" "$ROOT/deploy/marketing-copilot-backup.timer" "$ROOT/deploy/marketing-copilot-smsc-simulator.service" "$STAGE/payload/deploy/"
 

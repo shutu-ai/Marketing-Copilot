@@ -30,7 +30,12 @@ tar -xzf "$WHEELHOUSE" -C "$WORK"
 SOURCE_WHEEL_DIR=$(find "$WORK" -path '*/wheels/app' -type d -print -quit)
 [ -n "$SOURCE_WHEEL_DIR" ] || { echo 'Application wheel directory is missing from wheelhouse.' >&2; exit 1; }
 
-tar -C "$ROOT/backend" --exclude='__pycache__' --exclude='*.pyc' --exclude='*.duckdb' --exclude='*.duckdb.wal' --exclude='uploads' --exclude='monitor_dir' -cf - . | tar -C "$STAGE/backend" -xf -
+tar -C "$ROOT/backend" \
+  --exclude='__pycache__' --exclude='*.pyc' \
+  --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
+  --exclude='*.db*' --exclude='*.duckdb*' \
+  --exclude='uploads' --exclude='monitor_dir' \
+  -cf - . | tar -C "$STAGE/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/frontend/"
 cp -a "$SOURCE_WHEEL_DIR" "$STAGE/offline/wheels"
 cp "$ROOT/backend/requirements.txt" "$STAGE/offline/requirements.txt"
