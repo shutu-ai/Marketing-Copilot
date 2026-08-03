@@ -1,11 +1,11 @@
 <template>
   <div class="operations-center">
     <div class="page-header">
-      <div><h2>运营中心</h2><p>P1 活动、失败、异常、进度、DLR、审计与报表</p></div>
-      <el-button :loading="loading" @click="refreshActive"><el-icon><Refresh /></el-icon>刷新</el-button>
+      <div><h2>运营中心</h2><p>统一管理活动进度、短信任务、异常、容量和审计</p></div>
+      <el-button v-if="showGlobalRefresh" :loading="loading" @click="refreshActive"><el-icon><Refresh /></el-icon>刷新</el-button>
     </div>
 
-    <el-tabs v-model="activeTab" @tab-change="refreshActive">
+    <el-tabs v-model="activeTab" class="operations-tabs" @tab-change="changeTab">
       <el-tab-pane label="活动与进度" name="progress">
         <el-table v-loading="loading" :data="progressRows" stripe>
           <el-table-column prop="campaign_type" label="类型" width="90" />
@@ -26,6 +26,10 @@
             </template>
           </el-table-column>
         </el-table>
+      </el-tab-pane>
+
+      <el-tab-pane label="短信任务" name="sms-tasks">
+        <SmsTasks v-if="activeTab === 'sms-tasks'" embedded />
       </el-tab-pane>
 
       <el-tab-pane label="失败处理" name="failures">
@@ -73,6 +77,10 @@
         </el-table>
       </el-tab-pane>
 
+      <el-tab-pane label="容量与高可用" name="capacity">
+        <CapacityCenter v-if="activeTab === 'capacity'" embedded />
+      </el-tab-pane>
+
       <el-tab-pane label="DLR 映射" name="dlr">
         <el-table :data="dlrRows" stripe>
           <el-table-column prop="code" label="DLR 状态码" width="160" />
@@ -106,13 +114,20 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
+import SmsTasks from '@/views/sms-tasks/SmsTasks.vue'
+import CapacityCenter from './CapacityCenter.vue'
 import { getSmsTasks } from '@/api/smsTasks'
 import * as ops from '@/api/operations'
 
-const activeTab = ref('progress')
+const route = useRoute()
+const router = useRouter()
+const validTabs = ['progress', 'sms-tasks', 'failures', 'exceptions', 'capacity', 'dlr', 'audits']
+const activeTab = ref(validTabs.includes(String(route.query.tab)) ? String(route.query.tab) : 'progress')
+const showGlobalRefresh = computed(() => !['sms-tasks', 'capacity'].includes(activeTab.value))
 const loading = ref(false)
 const progressRows = ref<any[]>([])
 const failedTasks = ref<any[]>([])
@@ -146,15 +161,26 @@ function refreshActive() {
   const loaders: Record<string, () => Promise<void>> = { progress: loadProgress, failures: loadFailures, exceptions: loadExceptions, dlr: loadDlr, audits: loadAudits }
   return loaders[activeTab.value]?.()
 }
+function changeTab() {
+  router.replace({ query: { ...route.query, tab: activeTab.value === 'progress' ? undefined : activeTab.value } })
+  if (showGlobalRefresh.value) refreshActive()
+}
 async function campaignAction(row: any, action: string) { await ElMessageBox.confirm(`确认${action}活动“${row.name}”？`, '活动操作'); await ops.runCampaignAction(row.campaign_type, row.campaign_id, action); ElMessage.success('活动状态已更新'); await loadProgress() }
 async function bulkAction(action: 'retry' | 'archive') { await ops.bulkFailedTasks(action, selectedTasks.value.map(item => item.id)); ElMessage.success(`已处理 ${selectedTasks.value.length} 个任务`); selectedTasks.value = []; await loadFailures() }
 async function runHealthCheck() { await ops.getConfigurationHealth(true); await loadExceptions(); ElMessage.success('配置检查完成') }
 async function resolve(id: number) { await ops.resolveException(id); await loadExceptions() }
 async function openTimeline(id: number) { timeline.value = (await ops.getTaskTimeline(id)).data; timelineVisible.value = true }
 async function download(report: string) { const response = await ops.exportReport(report); const url = URL.createObjectURL(response.data); const link = document.createElement('a'); link.href = url; link.download = `marketing-copilot-${report}.csv`; link.click(); URL.revokeObjectURL(url) }
-onMounted(loadProgress)
+watch(() => route.query.tab, value => {
+  const nextTab = validTabs.includes(String(value)) ? String(value) : 'progress'
+  if (nextTab !== activeTab.value) {
+    activeTab.value = nextTab
+    if (!['sms-tasks', 'capacity'].includes(nextTab)) refreshActive()
+  }
+})
+onMounted(refreshActive)
 </script>
 
 <style scoped>
-.page-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}.page-header h2{margin:0}.page-header p{margin:6px 0 0;color:#909399}.toolbar{display:flex;gap:10px;margin-bottom:14px}.health-grid{margin-bottom:14px}.health-grid .el-col{margin-bottom:10px}.timeline{margin-top:24px}.section-title{margin:24px 0 12px;font-size:16px}small{color:#909399}.operations-center :deep(.el-tabs__content){padding-top:8px}
+.page-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}.page-header h2{margin:0}.page-header p{margin:6px 0 0;color:var(--mc-text-secondary)}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}.health-grid{margin-bottom:14px}.health-grid .el-col{margin-bottom:10px}.timeline{margin-top:24px}.section-title{margin:24px 0 12px;color:var(--mc-text);font-size:16px}small{color:var(--mc-text-tertiary)}.operations-center :deep(.el-tabs__header){overflow:hidden}.operations-center :deep(.el-tabs__nav-wrap){overflow-x:auto;scrollbar-width:none}.operations-center :deep(.el-tabs__nav-wrap::-webkit-scrollbar){display:none}.operations-center :deep(.el-tabs__content){padding-top:10px}@media(max-width:767px){.operations-center :deep(.el-tabs__item){padding:0 14px;white-space:nowrap}.page-header{flex-direction:column;gap:10px}}
 </style>

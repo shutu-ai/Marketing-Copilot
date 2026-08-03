@@ -105,5 +105,9 @@ def upload_customer_list(campaign_id: int, file: UploadFile = File(...)):
             except Exception:
                 pass
         return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")

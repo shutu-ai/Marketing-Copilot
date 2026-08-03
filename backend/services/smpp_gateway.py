@@ -6,6 +6,7 @@ from database import get_connection
 from services import metrics_service, sms_task_service
 
 logger = logging.getLogger(__name__)
+detail_logger = logging.getLogger("mc.detail")
 
 
 class SmppSubmitError(RuntimeError):
@@ -54,8 +55,8 @@ class _SmppConnection:
             if ok and task_id and outcome["message_id"]:
                 sms_task_service.append_message_id(task_id, outcome["message_id"])
             self._condition.notify_all()
-        logger.info("SMPP response config=%s slot=%s sequence=%s task=%s status=%s message_id=%s",
-                    self.config["id"], self.slot, sequence, task_id, outcome["status"], outcome["message_id"])
+        detail_logger.info("SMPP response config=%s slot=%s sequence=%s task=%s status=%s message_id=%s",
+                           self.config["id"], self.slot, sequence, task_id, outcome["status"], outcome["message_id"])
 
     def _on_delivery(self, pdu, **kwargs):
         import smpplib.consts
@@ -149,9 +150,9 @@ class _SmppConnection:
                 for part in parts:
                     self._throttle()
                     pdu = self.client.send_message(
-                        source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
-                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
-                        source_addr=task["source_addr"], dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
+                       source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
+                       source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
+                       source_addr=task["source_addr"] or self.config.get("source_addr") or "Marketing", dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
                         dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
                         short_message=part, data_coding=coding, esm_class=esm_class, registered_delivery=True)
                     submitted_any = True

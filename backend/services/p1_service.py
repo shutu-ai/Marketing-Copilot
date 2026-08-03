@@ -50,6 +50,11 @@ def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic
             (campaign_type, campaign_id),
         )
     conn.commit()
+    realtime_watch_dirs = [
+        dict(row) for row in conn.execute(
+            "SELECT id,name,watch_dir FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>''"
+        ).fetchall()
+    ]
     conn.close()
     operations_service.audit(
         "campaign.auto_complete" if automatic else f"campaign.{action}",
@@ -242,12 +247,19 @@ def configuration_health(record_events: bool = False) -> list:
     checks.append({"code": "SMPP_ENABLED", "category": "smpp", "ok": bool(smpp), "severity": "error", "message": "No enabled SMPP configuration"})
     templates = conn.execute("SELECT COUNT(*) cnt FROM sms_templates WHERE enabled=1").fetchone()["cnt"]
     checks.append({"code": "TEMPLATE_ENABLED", "category": "template", "ok": bool(templates), "severity": "error", "message": "No enabled SMS template"})
-    monitors = [dict(r) for r in conn.execute("SELECT id,directory_path FROM monitor_configs WHERE enabled=1").fetchall()]
     conn.close()
     db_path = get_database_file()
     checks.append({"code": "DATABASE_PATH", "category": "database", "ok": db_path == ":memory:" or os.path.isdir(os.path.dirname(os.path.abspath(db_path))), "severity": "error", "message": "Database directory does not exist"})
-    for monitor in monitors:
-        checks.append({"code": "MONITOR_DIRECTORY", "category": "file", "ok": os.path.isdir(monitor["directory_path"]), "severity": "warning", "message": f"Monitor directory does not exist: {monitor['directory_path']}", "context": {"config_id": monitor["id"]}})
+    for item in realtime_watch_dirs:
+        watch_dir = item.get("watch_dir", "")
+        checks.append({
+            "code": "REALTIME_WATCH_DIRECTORY",
+            "category": "file",
+            "ok": bool(watch_dir and os.path.isdir(watch_dir)),
+            "severity": "warning",
+            "message": f"Realtime watch directory does not exist: {watch_dir}",
+            "context": {"campaign_id": item["id"], "campaign_name": item["name"]},
+        })
     if record_events:
         for check in checks:
             if not check["ok"]:

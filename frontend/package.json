@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:fullstack": "playwright test -c playwright.green.config.ts"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",

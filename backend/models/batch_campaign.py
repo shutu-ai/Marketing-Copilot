@@ -12,6 +12,7 @@ class BatchCampaignCreate(BaseModel):
     send_days: Optional[list] = None
     batch_size: Optional[int] = 500
     campaign_dir: Optional[str] = None
+    use_custom_directory: Optional[bool] = False
     sms_template_id: Optional[int] = None
 
 
@@ -25,4 +26,5 @@ class BatchCampaignUpdate(BaseModel):
     send_days: Optional[list] = None
     batch_size: Optional[int] = None
     campaign_dir: Optional[str] = None
+    use_custom_directory: Optional[bool] = None
     sms_template_id: Optional[int] = None

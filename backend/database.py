@@ -15,14 +15,11 @@ DATABASE_FILE = os.environ.get(
 
 TABLE_SEQUENCES = {
     "smpp_configs": "seq_smpp_configs",
-    "upload_history": "seq_upload_history",
-    "whitelist_users": "seq_whitelist_users",
     "campaigns": "seq_campaigns",
     "sms_templates": "seq_sms_templates",
     "monitor_configs": "seq_monitor_configs",
     "monitor_files": "seq_monitor_files",
     "rabbitmq_configs": "seq_rabbitmq_configs",
-    "whitelist_subscriptions": "seq_whitelist_subscriptions",
     "sms_log": "seq_sms_log",
     "batch_campaigns": "seq_batch_campaigns",
     "batch_campaign_daily_stats": "seq_batch_campaign_daily_stats",
@@ -182,7 +179,7 @@ def init_db():
         try:
             conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1")
         except Exception as e:
-            print(f"[DB] Skipping sequence {seq}: {e}")
+            logger.warning("[DB] Skipping sequence %s: %s", seq, e)
 
     ddl = [
         """CREATE TABLE IF NOT EXISTS smpp_configs (
@@ -204,25 +201,6 @@ def init_db():
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-        )""",
-        """CREATE TABLE IF NOT EXISTS upload_history (
-            id INTEGER DEFAULT nextval('seq_upload_history') PRIMARY KEY,
-            filename TEXT NOT NULL,
-            total_rows INTEGER NOT NULL DEFAULT 0,
-            success_rows INTEGER NOT NULL DEFAULT 0,
-            failed_rows INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            import_mode TEXT NOT NULL DEFAULT 'append',
-            error_detail TEXT DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-        )""",
-        """CREATE TABLE IF NOT EXISTS whitelist_users (
-            id INTEGER DEFAULT nextval('seq_whitelist_users') PRIMARY KEY,
-            msisdn TEXT NOT NULL, region TEXT NOT NULL DEFAULT '',
-            language TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
-            upload_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            FOREIGN KEY (upload_id) REFERENCES upload_history(id)
         )""",
         """CREATE TABLE IF NOT EXISTS campaigns (
             id INTEGER DEFAULT nextval('seq_campaigns') PRIMARY KEY,
@@ -273,13 +251,6 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
-        """CREATE TABLE IF NOT EXISTS whitelist_subscriptions (
-            id INTEGER DEFAULT nextval('seq_whitelist_subscriptions') PRIMARY KEY,
-            whitelist_id INTEGER NOT NULL, topic_pattern TEXT NOT NULL,
-            campaign_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            FOREIGN KEY (whitelist_id) REFERENCES whitelist_users(id)
-        )""",
         """CREATE TABLE IF NOT EXISTS batch_campaigns (
             id INTEGER DEFAULT nextval('seq_batch_campaigns') PRIMARY KEY,
             name TEXT NOT NULL,
@@ -294,8 +265,10 @@ def init_db():
             customer_list_path TEXT DEFAULT '',
             row_count INTEGER DEFAULT 0,
             campaign_dir TEXT DEFAULT '',
-            sms_template_id INTEGER DEFAULT NULL,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            use_custom_directory BOOLEAN NOT NULL DEFAULT FALSE,
+           sms_template_id INTEGER DEFAULT NULL,
+           phone_prefix TEXT NOT NULL DEFAULT '',
+           created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
         """CREATE TABLE IF NOT EXISTS batch_campaign_batches (
@@ -334,6 +307,9 @@ def init_db():
             customer_list_path TEXT DEFAULT '',
             row_count INTEGER DEFAULT 0,
             campaign_dir TEXT DEFAULT '',
+            use_custom_directory BOOLEAN NOT NULL DEFAULT FALSE,
+            watch_dir TEXT NOT NULL DEFAULT '',
+            watch_filename_prefix TEXT NOT NULL DEFAULT 'Android_4G_Switch_Somali_',
             sms_template_id INTEGER DEFAULT NULL,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
@@ -377,6 +353,7 @@ def init_db():
             campaign_name TEXT NOT NULL DEFAULT '',
             msisdn TEXT NOT NULL,
             language TEXT NOT NULL DEFAULT '',
+            sms_template_id INTEGER,
             content TEXT NOT NULL,
             source_addr TEXT NOT NULL DEFAULT '',
             payload TEXT NOT NULL DEFAULT '{}',
@@ -413,7 +390,7 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'detected', total_rows INTEGER NOT NULL DEFAULT 0,
             created_tasks INTEGER NOT NULL DEFAULT 0, error_detail TEXT NOT NULL DEFAULT '',
             detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
-            UNIQUE(campaign_type, campaign_id, file_hash)
+            UNIQUE(campaign_type, campaign_id, filename)
         )""",
         """CREATE TABLE IF NOT EXISTS system_events (
             id INTEGER DEFAULT nextval('seq_system_events') PRIMARY KEY,
@@ -460,26 +437,78 @@ def init_db():
         try:
             conn.execute(stmt)
         except Exception as e:
-            print(f"[DB] Skipping DDL: {e}")
+            logger.warning("[DB] Skipping DDL: %s", e)
 
     try:
         conn.execute("ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS batch_id INTEGER")
     except Exception as e:
-        print(f"[DB] Skipping sms_tasks.batch_id migration: {e}")
+        logger.warning("[DB] Skipping sms_tasks.batch_id migration: %s", e)
     migrations = [
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS claim_token TEXT",
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS sms_template_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS last_smpp_status INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS failure_class TEXT",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS receipt_retry_count INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS tps INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS priority INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS reconnect_max_seconds INTEGER",
-    ]
+        "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS use_custom_directory BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS use_custom_directory BOOLEAN DEFAULT FALSE",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_dir TEXT DEFAULT ''",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_filename_prefix TEXT DEFAULT 'Android_4G_Switch_Somali_'",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS phone_prefix TEXT DEFAULT ''",
+   ]
     for stmt in migrations:
         try:
             conn.execute(stmt)
         except Exception as e:
-            print(f"[DB] Skipping migration: {e}")
+            logger.warning("[DB] Skipping migration: %s", e)
+    for stmt in [
+        "DELETE FROM app_settings WHERE key='realtime_watch_dir'",
+        "DELETE FROM app_settings WHERE key='realtime_watch_filename_prefix'",
+        "ALTER TABLE realtime_campaigns DROP COLUMN IF EXISTS first_listen_offset",
+    ]:
+        try:
+            conn.execute(stmt)
+        except Exception as e:
+            logger.warning("[DB] Skipping obsolete realtime cleanup: %s", e)
+    try:
+        constraints = conn.execute(
+            """SELECT constraint_column_names
+               FROM duckdb_constraints()
+               WHERE table_name='processed_files' AND constraint_type='UNIQUE'"""
+        ).fetchall()
+        has_hash_unique = any("file_hash" in set(row["constraint_column_names"] or []) for row in constraints)
+        has_name_unique = any("filename" in set(row["constraint_column_names"] or []) for row in constraints)
+        if has_hash_unique and not has_name_unique:
+            conn.execute(
+                """CREATE TABLE processed_files_new (
+                    id INTEGER DEFAULT nextval('seq_processed_files') PRIMARY KEY,
+                    campaign_type TEXT NOT NULL, campaign_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL, file_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL DEFAULT '', file_size BIGINT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'detected', total_rows INTEGER NOT NULL DEFAULT 0,
+                    created_tasks INTEGER NOT NULL DEFAULT 0, error_detail TEXT NOT NULL DEFAULT '',
+                    detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
+                    UNIQUE(campaign_type, campaign_id, filename)
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO processed_files_new
+                   (id,campaign_type,campaign_id,filename,file_hash,file_path,file_size,status,
+                    total_rows,created_tasks,error_detail,detected_at,completed_at)
+                   SELECT id,campaign_type,campaign_id,filename,file_hash,file_path,file_size,status,
+                          total_rows,created_tasks,error_detail,detected_at,completed_at
+                   FROM processed_files
+                   QUALIFY row_number() OVER (
+                       PARTITION BY campaign_type,campaign_id,filename
+                       ORDER BY detected_at DESC,id DESC
+                   )=1"""
+            )
+            conn.execute("DROP TABLE processed_files")
+            conn.execute("ALTER TABLE processed_files_new RENAME TO processed_files")
+    except Exception as e:
+        logger.warning("[DB] Skipping processed_files uniqueness migration: %s", e)
     for stmt in [
         "UPDATE sms_tasks SET claim_token='' WHERE claim_token IS NULL",
         "UPDATE sms_tasks SET failure_class='' WHERE failure_class IS NULL",
@@ -487,17 +516,16 @@ def init_db():
         "UPDATE smpp_configs SET tps=20 WHERE tps IS NULL",
         "UPDATE smpp_configs SET priority=100 WHERE priority IS NULL",
         "UPDATE smpp_configs SET reconnect_max_seconds=60 WHERE reconnect_max_seconds IS NULL",
+        "UPDATE realtime_campaigns SET watch_filename_prefix='Android_4G_Switch_Somali_' WHERE watch_filename_prefix IS NULL OR watch_filename_prefix=''",
     ]:
         try:
             conn.execute(stmt)
         except Exception as e:
-            print(f"[DB] Skipping migration backfill: {e}")
+            logger.warning("[DB] Skipping migration backfill: %s", e)
 
     conn.commit()
 
     indexes = [
-        "CREATE INDEX IF NOT EXISTS idx_whitelist_msisdn ON whitelist_users(msisdn)",
-        "CREATE INDEX IF NOT EXISTS idx_whitelist_upload ON whitelist_users(upload_id)",
         "CREATE INDEX IF NOT EXISTS idx_sms_campaign ON sms_templates(campaign_id)",
         "CREATE INDEX IF NOT EXISTS idx_monitor_file ON monitor_files(filename, directory_path)",
         "CREATE INDEX IF NOT EXISTS idx_sms_log_msisdn ON sms_log(msisdn)",
@@ -507,6 +535,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(smsc_message_id)",
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
         "CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(campaign_type,campaign_id,file_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_name_unique ON processed_files(campaign_type,campaign_id,filename)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique ON delivery_receipts(smsc_message_id,message_state)",
         "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_events_open ON system_events(resolved,severity,created_at)",

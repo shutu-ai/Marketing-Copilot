@@ -14,6 +14,7 @@ export interface BatchCampaign {
   customer_list_path: string
   row_count: number
   campaign_dir: string
+  use_custom_directory: boolean
   sms_template_id: number | null
   created_at: string
 }
@@ -29,7 +30,7 @@ export function getCampaign(id: number) {
 export function createCampaign(data: {
   name: string; start_time?: string; end_time?: string;
   send_start_time?: string; send_end_time?: string; send_days?: string[];
-  batch_size?: number; campaign_dir?: string;
+  batch_size?: number; campaign_dir?: string; use_custom_directory?: boolean;
 }) {
   return api.post<BatchCampaign>('/batch-campaigns', data)
 }

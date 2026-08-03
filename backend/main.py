@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
-from routers import smpp, whitelist, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router
+from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router
 
 from services.runtime_service import configure_logging, acquire_instance_lock, release_instance_lock
 configure_logging()
@@ -27,7 +27,6 @@ app.add_middleware(
 )
 
 app.include_router(smpp.router)
-app.include_router(whitelist.router)
 app.include_router(sms_content.router)
 app.include_router(monitor.router)
 app.include_router(rabbitmq_router.router)
@@ -40,6 +39,7 @@ app.include_router(db_query_router.router)
 app.include_router(sms_tasks_router.router)
 app.include_router(operations_router.router)
 app.include_router(metrics_router.router)
+app.include_router(filesystem_router.router)
 
 
 @app.on_event("startup")

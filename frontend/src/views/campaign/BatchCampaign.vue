@@ -1,12 +1,14 @@
 <template>
   <div class="batch-campaign">
-    <div class="page-header">
-      <h2>{{ $t('campaign.batchTitle') }}</h2>
-      <el-button type="primary" @click="showDialog(null)">
+    <PageHeader :title="$t('campaign.batchTitle')" :description="$t('campaign.batchDesc')">
+      <template #actions>
+        <el-button type="primary" @click="showDialog(null)">
         <el-icon><Plus /></el-icon>{{ $t('campaign.addCampaign') }}
-      </el-button>
-    </div>
+        </el-button>
+      </template>
+    </PageHeader>
 
+    <div class="table-shell">
     <el-table :data="campaigns" stripe v-loading="loading" style="width: 100%">
       <el-table-column prop="id" label="ID" width="70" />
       <el-table-column prop="name" :label="$t('campaign.name')" min-width="140" />
@@ -37,7 +39,7 @@
           <StatusTag :status="row.status">{{ $t('campaign.status_' + row.status) }}</StatusTag>
         </template>
       </el-table-column>
-      <el-table-column :label="$t('campaign.customerList')" min-width="180">
+      <el-table-column :label="$t('campaign.targetList')" min-width="180">
         <template #default="{ row }">
           <template v-if="row.customer_list_filename">
             <span>{{ row.customer_list_filename }}</span>
@@ -46,7 +48,7 @@
           <span v-else style="color: #999">-</span>
         </template>
       </el-table-column>
-      <el-table-column :label="$t('campaign.dirRoot')" min-width="200">
+      <el-table-column :label="$t('campaign.dirRoot')" min-width="200" class-name="desktop-only" label-class-name="desktop-only">
         <template #default="{ row }">
           <code style="font-size: 11px">{{ row.campaign_dir || '-' }}</code>
         </template>
@@ -72,48 +74,50 @@
       <span v-else style="color:#ccc">-</span>
     </template>
   </el-table-column>
+  <el-table-column :label="$t('campaign.readiness')" width="130" fixed="right">
+    <template #default="{ row }">
+      <el-popover placement="left" :width="280" trigger="hover">
+        <template #reference>
+          <div class="readiness">
+            <el-tag :type="isReady(row) ? 'success' : 'warning'" effect="light">
+              {{ isReady(row) ? $t('campaign.ready') : $t('campaign.notReady') }}
+            </el-tag>
+            <span class="readiness__summary">{{ readinessItems(row).filter(item => item.ok).length }}/3</span>
+          </div>
+        </template>
+        <strong>{{ $t('campaign.checklist') }}</strong>
+        <div v-for="item in readinessItems(row)" :key="item.label" class="readiness-item">
+          <el-icon :class="{ ok: item.ok }"><CircleCheck v-if="item.ok" /><Warning v-else /></el-icon>
+          <span>{{ item.label }}</span>
+        </div>
+      </el-popover>
+    </template>
+  </el-table-column>
   <el-table-column prop="created_at" :label="$t('common.created_at')" width="180" />
-      <el-table-column :label="$t('common.action')" width="380" fixed="right">
+      <el-table-column :label="$t('common.action')" width="210" fixed="right">
         <template #default="{ row }">
+          <div class="campaign-actions">
           <el-button text type="primary" size="small" @click="$router.push('/campaign/batch/' + row.id)">
             {{ $t('campaign.detail') }}
           </el-button>
-          <el-button v-if="row.status === 'not_started'" text type="primary" size="small" @click="showDialog(row)">
-            {{ $t('common.edit') }}
-          </el-button>
           <template v-if="row.status === 'not_started'">
-            <el-button text type="success" size="small" @click="handleUpload(row)">
-              {{ $t('campaign.uploadList') }}
-            </el-button>
-            <el-button text type="warning" size="small" @click="$router.push({ path: '/sms-content/campaign/new', query: { from: 'batch', campaignId: String(row.id), campaignName: row.name } })">
-              {{ $t('smsContent.configSms') }}
-            </el-button>
-            <el-button v-if="row.row_count > 0 && row.sms_template_id" text type="warning" size="small" @click="handleStart(row)">
-              {{ $t('campaign.start') }}
-            </el-button>
+            <span :title="startHint(row)">
+              <el-button text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
+                {{ $t('campaign.start') }}
+              </el-button>
+            </span>
           </template>
           <template v-else-if="row.status === 'in_progress'">
             <el-button text type="danger" size="small" @click="handleEnd(row)">
               {{ $t('campaign.end') }}
             </el-button>
           </template>
-          <template v-else-if="row.status === 'ended'">
-            <el-button text type="success" size="small" @click="handleUpload(row)">
-              {{ $t('campaign.uploadList') }}
-            </el-button>
-            <el-button text type="warning" size="small" @click="$router.push({ path: '/sms-content/campaign/new', query: { from: 'batch', campaignId: String(row.id), campaignName: row.name } })">
-              {{ $t('smsContent.configSms') }}
-            </el-button>
-          </template>
-          <el-button text type="info" size="small" @click="handleCopy(row.id)">
-            {{ $t('campaign.copy') }}
-          </el-button>
-          <el-button v-if="row.status !== 'in_progress'" text type="danger" size="small" @click="handleDelete(row.id)">
-            {{ $t('common.delete') }}
-          </el-button>
+          <el-dropdown trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-if="row.status==='not_started' || row.status==='ended'" command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+          </div>
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
     <el-dialog
       :model-value="dialogVisible"
@@ -125,8 +129,14 @@
         <el-form-item :label="$t('campaign.name')" required>
           <el-input v-model="editForm.name" />
         </el-form-item>
-        <el-form-item :label="$t('campaign.campaignDir')">
-          <el-input v-model="editForm.campaign_dir" placeholder="$t('campaign.campaignDirPlaceholder')" />
+        <div v-if="editForm.status !== 'ended'" class="advanced-toggle">
+          <el-switch v-model="customDirectory" :active-text="$t('campaign.customDirectory')" @change="handleCustomDirectoryChange" />
+          <el-tag size="small" type="info" effect="plain">{{ $t('campaign.optional') }}</el-tag>
+        </div>
+        <el-form-item v-if="customDirectory" :label="$t('campaign.campaignDir')">
+          <el-input v-model="editForm.campaign_dir" :placeholder="$t('campaign.campaignDirPlaceholder')">
+            <template #append><el-button @click="directoryPickerVisible = true">{{ $t('campaign.browseDirectory') }}</el-button></template>
+          </el-input>
           <div style="font-size:12px;color:#909399;margin-top:4px">{{ $t('campaign.campaignDirTip') }}</div>
         </el-form-item>
         <el-form-item :label="$t('campaign.startTime')">
@@ -135,6 +145,7 @@
             type="datetime"
             :placeholder="$t('campaign.selectTime')"
             value-format="YYYY-MM-DD HH:mm:ss"
+            :disabled="editForm.status === 'ended'"
             style="width: 100%"
           />
         </el-form-item>
@@ -166,7 +177,7 @@
           />
         </el-form-item>
         <el-form-item :label="$t('campaign.batchSize')">
-          <el-input-number v-model="editForm.batch_size" :min="1" :max="10000" style="width: 100%" />
+          <el-input-number v-model="editForm.batch_size" :min="1" :max="10000" :disabled="editForm.status === 'ended'" style="width: 100%" />
         </el-form-item>
         <el-form-item :label="$t('campaign.sendDays')">
           <el-checkbox-group v-model="editForm.send_days">
@@ -182,9 +193,10 @@
       </template>
     </el-dialog>
 
+    <DirectoryPicker v-model="directoryPickerVisible" :initial-path="editForm.campaign_dir" @select="selectDirectory" />
     <el-dialog
       :model-value="uploadVisible"
-      :title="$t('campaign.uploadList')"
+      :title="$t('campaign.uploadTargetList')"
       width="480px"
       @close="uploadVisible = false"
     >
@@ -216,9 +228,17 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
+import PageHeader from '@/components/PageHeader.vue'
+import DirectoryPicker from '@/components/DirectoryPicker.vue'
 import * as api from '@/api/campaign'
+import * as smsApi from '@/api/smsContent'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
+const router = useRouter()
 
 const weekDays = [
   { value: '1', labelKey: 'day_mon' },
@@ -244,6 +264,8 @@ interface Campaign {
   customer_list_path: string
   row_count: number
   campaign_dir: string
+  use_custom_directory: boolean
+  sms_template_id: number | null
   created_at: string
 }
 
@@ -254,16 +276,18 @@ const saving = ref(false)
 const editForm = ref<{
   id: number; name: string; start_time: string; end_time: string;
   send_start_time: string; send_end_time: string; send_days: string[];
-  batch_size: number; campaign_dir: string
+  batch_size: number; campaign_dir: string; status: string
 }>({
   id: 0, name: '', start_time: '', end_time: '',
   send_start_time: '', send_end_time: '', send_days: [],
-  batch_size: 500, campaign_dir: ''
+  batch_size: 500, campaign_dir: '', status: 'not_started'
 })
 const uploadVisible = ref(false)
 const uploading = ref(false)
 const uploadCampaignId = ref(0)
 const selectedFile = ref<File | null>(null)
+const customDirectory = ref(false)
+const directoryPickerVisible = ref(false)
 
 async function fetchList() {
   loading.value = true
@@ -277,19 +301,47 @@ async function fetchList() {
 
 function showDialog(row: Campaign | null) {
   if (row) {
+    customDirectory.value = Boolean(row.use_custom_directory)
     editForm.value = {
       id: row.id, name: row.name, start_time: row.start_time, end_time: row.end_time,
       send_start_time: row.send_start_time || '', send_end_time: row.send_end_time || '',
       send_days: row.send_days || [], batch_size: row.batch_size || 500,
-      campaign_dir: row.campaign_dir || '',
+      campaign_dir: row.campaign_dir || '', status: row.status,
     }
   } else {
+    customDirectory.value = false
     editForm.value = {
       id: 0, name: '', start_time: '', end_time: '',
-      send_start_time: '', send_end_time: '', send_days: [], batch_size: 500, campaign_dir: '',
+      send_start_time: '', send_end_time: '', send_days: [], batch_size: 500, campaign_dir: '', status: 'not_started',
     }
   }
   dialogVisible.value = true
+}
+
+function readinessItems(row: Campaign) {
+  const scheduleReady = Boolean(row.start_time && row.end_time && row.send_start_time && row.send_end_time)
+  return [
+    { ok: row.row_count > 0, label: t(row.row_count > 0 ? 'campaign.listReady' : 'campaign.listMissing') },
+    { ok: Boolean(row.sms_template_id), label: t(row.sms_template_id ? 'campaign.templateReady' : 'campaign.templateMissing') },
+    { ok: scheduleReady, label: t(scheduleReady ? 'campaign.scheduleReady' : 'campaign.scheduleMissing') },
+  ]
+}
+
+function handleCustomDirectoryChange(enabled: boolean) {
+  if (!enabled) editForm.value.campaign_dir = ''
+}
+
+function selectDirectory(path: string) {
+  editForm.value.campaign_dir = path
+  customDirectory.value = true
+}
+
+function isReady(row: Campaign) {
+  return readinessItems(row).every(item => item.ok)
+}
+
+function startHint(row: Campaign) {
+  return isReady(row) ? t('campaign.ready') : readinessItems(row).filter(item => !item.ok).map(item => item.label).join('；')
 }
 
 async function handleSave() {
@@ -299,7 +351,7 @@ async function handleSave() {
   }
   saving.value = true
   try {
-    const payload = {
+    let payload: any = {
       name: editForm.value.name,
       start_time: editForm.value.start_time,
       end_time: editForm.value.end_time,
@@ -307,7 +359,17 @@ async function handleSave() {
       send_end_time: editForm.value.send_end_time,
       send_days: editForm.value.send_days,
       batch_size: editForm.value.batch_size,
-      campaign_dir: editForm.value.campaign_dir || undefined,
+      campaign_dir: customDirectory.value ? editForm.value.campaign_dir : '',
+      use_custom_directory: customDirectory.value,
+    }
+    if (editForm.value.id && editForm.value.status === 'ended') {
+      payload = {
+        name: editForm.value.name,
+        end_time: editForm.value.end_time,
+        send_start_time: editForm.value.send_start_time,
+        send_end_time: editForm.value.send_end_time,
+        send_days: editForm.value.send_days,
+      }
     }
     if (editForm.value.id) {
       await api.updateCampaign(editForm.value.id, payload)
@@ -394,20 +456,70 @@ async function handleCopy(id: number) {
 async function handleDelete(id: number) {
   try {
     await ElMessageBox.confirm('确认删除该活动？', '提示')
+  } catch {
+    return
+  }
+
+  try {
     await api.deleteCampaign(id)
+    campaigns.value = campaigns.value.filter(item => item.id !== id)
     ElMessage.success('删除成功')
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.detail || '删除失败')
+    // Reconcile with the server even when an older backend deleted the row but
+    // incorrectly returned an error response.
     await fetchList()
-  } catch {}
+  }
+}
+
+async function openSmsConfig(row: Campaign) {
+  try {
+    const res = await smsApi.getCampaignByMarketing('batch', row.id)
+    let smsCampaignId = res.data?.id
+    if (!smsCampaignId && row.sms_template_id) {
+      const templates = await smsApi.getAllTemplates()
+      smsCampaignId = templates.data.find((item: any) => item.template_id === row.sms_template_id)?.campaign_id
+    }
+    await router.push({
+      path: smsCampaignId ? `/sms-content/campaign/${smsCampaignId}` : '/sms-content/campaign/new',
+      query: {
+        from: 'batch',
+        campaignId: String(row.id),
+        campaignName: row.name,
+        smsTemplateId: row.sms_template_id ? String(row.sms_template_id) : undefined,
+      },
+    })
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.detail || '加载短信配置失败')
+  }
+}
+
+function handleMore(command: string, row: Campaign) {
+  if (command === 'edit') showDialog(row)
+  if (command === 'upload') handleUpload(row)
+  if (command === 'sms') void openSmsConfig(row)
+  if (command === 'copy') handleCopy(row.id)
+  if (command === 'delete') handleDelete(row.id)
 }
 
 onMounted(() => fetchList())
 </script>
 
 <style scoped>
+.campaign-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
 .page-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 20px;
 }
 .page-header h2 { margin: 0; font-size: 22px; font-weight: 600; }
+.advanced-toggle { display:flex; align-items:center; gap:8px; }
+.readiness-item { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--mc-text-secondary); }
+.readiness-item .el-icon.ok { color:var(--mc-success); }
+.readiness-item .el-icon:not(.ok) { color:var(--mc-warning); }
 
 </style>

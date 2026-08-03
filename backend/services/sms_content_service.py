@@ -9,6 +9,10 @@ VARIABLE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 COMMON_VARIABLES = {"msisdn", "language", "campaign_name", "event_filter_id", "cell_id"}
 
 
+def _normalize_language(language: str) -> str:
+    return (language or "").strip().lower()
+
+
 def validate_template(content: str, available_variables=None) -> dict:
     content = content or ""
     placeholders = sorted(set(VARIABLE_PATTERN.findall(content)))
@@ -45,6 +49,18 @@ def get_all_campaigns() -> list:
 def get_campaign(campaign_id: int) -> Optional[dict]:
     conn = get_connection()
     row = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_campaign_by_marketing(marketing_type: str, marketing_campaign_id: int) -> Optional[dict]:
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT * FROM campaigns
+           WHERE marketing_type=? AND marketing_campaign_id=?
+           ORDER BY id DESC LIMIT 1""",
+        (marketing_type, marketing_campaign_id),
+    ).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -86,8 +102,106 @@ def update_campaign(campaign_id: int, data: CampaignUpdate) -> Optional[dict]:
     return dict(row)
 
 
+def _template_usage_count(conn, template_id: int) -> int:
+    row = conn.execute(
+        """SELECT COUNT(*) AS cnt
+           FROM sms_tasks st
+           JOIN campaigns c
+             ON c.marketing_type=st.campaign_type
+            AND c.marketing_campaign_id=st.campaign_id
+           JOIN sms_templates t ON t.campaign_id=c.id
+           WHERE t.id=?
+             AND (
+               (
+                 st.sms_template_id=t.id
+                 AND (
+                   (st.campaign_type='batch' AND EXISTS (SELECT 1 FROM batch_campaigns bc WHERE bc.id=st.campaign_id))
+                   OR (st.campaign_type='realtime' AND EXISTS (SELECT 1 FROM realtime_campaigns rc WHERE rc.id=st.campaign_id))
+                 )
+               )
+               OR (
+                 st.sms_template_id IS NULL
+                 AND LOWER(COALESCE(st.language,''))=LOWER(COALESCE(t.language,''))
+                 AND (
+                   (st.campaign_type='batch' AND EXISTS (SELECT 1 FROM batch_campaigns bc WHERE bc.id=st.campaign_id))
+                   OR (st.campaign_type='realtime' AND EXISTS (SELECT 1 FROM realtime_campaigns rc WHERE rc.id=st.campaign_id))
+                 )
+               )
+             )""",
+        (template_id,),
+    ).fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def _campaign_template_usage_count(conn, campaign_id: int) -> int:
+    row = conn.execute(
+        """SELECT COUNT(*) AS cnt
+           FROM sms_tasks st
+           JOIN campaigns c
+             ON c.marketing_type=st.campaign_type
+            AND c.marketing_campaign_id=st.campaign_id
+           JOIN sms_templates t ON t.campaign_id=c.id
+           WHERE c.id=?
+             AND (
+               (
+                 st.sms_template_id=t.id
+                 AND (
+                   (st.campaign_type='batch' AND EXISTS (SELECT 1 FROM batch_campaigns bc WHERE bc.id=st.campaign_id))
+                   OR (st.campaign_type='realtime' AND EXISTS (SELECT 1 FROM realtime_campaigns rc WHERE rc.id=st.campaign_id))
+                 )
+               )
+               OR (
+                 st.sms_template_id IS NULL
+                 AND LOWER(COALESCE(st.language,''))=LOWER(COALESCE(t.language,''))
+                 AND (
+                   (st.campaign_type='batch' AND EXISTS (SELECT 1 FROM batch_campaigns bc WHERE bc.id=st.campaign_id))
+                   OR (st.campaign_type='realtime' AND EXISTS (SELECT 1 FROM realtime_campaigns rc WHERE rc.id=st.campaign_id))
+                 )
+               )
+             )""",
+        (campaign_id,),
+    ).fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def _template_activity_reference_count(conn, template_id: int) -> int:
+    row = conn.execute(
+        """SELECT
+             (SELECT COUNT(*) FROM batch_campaigns WHERE sms_template_id=?) +
+             (SELECT COUNT(*) FROM realtime_campaigns WHERE sms_template_id=?) AS cnt""",
+        (template_id, template_id),
+    ).fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+
+def _campaign_template_activity_reference_count(conn, campaign_id: int) -> int:
+    row = conn.execute(
+        """SELECT
+             (SELECT COUNT(*)
+                FROM batch_campaigns bc
+                JOIN sms_templates t ON t.id=bc.sms_template_id
+               WHERE t.campaign_id=?) +
+             (SELECT COUNT(*)
+                FROM realtime_campaigns rc
+                JOIN sms_templates t ON t.id=rc.sms_template_id
+               WHERE t.campaign_id=?) AS cnt""",
+        (campaign_id, campaign_id),
+    ).fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+
 def delete_campaign(campaign_id: int) -> bool:
     conn = get_connection()
+    exists = conn.execute("SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if not exists:
+        conn.close()
+        return False
+    if _campaign_template_activity_reference_count(conn, campaign_id) > 0:
+        conn.close()
+        raise ValueError("短信内容已被营销活动引用，不能删除")
+    if _campaign_template_usage_count(conn, campaign_id) > 0:
+        conn.close()
+        raise ValueError("短信内容已被短信任务引用，不能删除")
     cursor = conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
     deleted = cursor.rowcount > 0
     conn.commit()
@@ -100,7 +214,30 @@ def get_all_templates_with_campaigns() -> list:
     rows = conn.execute("""
         SELECT t.id AS template_id, t.language, t.content, t.source_addr, t.enabled AS template_enabled,
                c.id AS campaign_id, c.name AS campaign_name, c.description, c.enabled, c.marketing_type, c.marketing_campaign_id,
-               c.created_at, c.updated_at
+               c.created_at, c.updated_at,
+               (
+                 (SELECT COUNT(*) FROM batch_campaigns bc WHERE bc.sms_template_id=t.id) +
+                 (SELECT COUNT(*) FROM realtime_campaigns rc WHERE rc.sms_template_id=t.id)
+               ) AS activity_reference_count,
+               (
+                 SELECT COUNT(*)
+                 FROM sms_tasks st
+                 WHERE st.sms_template_id=t.id
+                   AND (
+                     (st.campaign_type='batch' AND EXISTS (SELECT 1 FROM batch_campaigns bc WHERE bc.id=st.campaign_id))
+                     OR (st.campaign_type='realtime' AND EXISTS (SELECT 1 FROM realtime_campaigns rc WHERE rc.id=st.campaign_id))
+                   )
+                    OR (
+                      st.sms_template_id IS NULL
+                      AND st.campaign_type=c.marketing_type
+                      AND st.campaign_id=c.marketing_campaign_id
+                      AND LOWER(COALESCE(st.language,''))=LOWER(COALESCE(t.language,''))
+                      AND (
+                        (st.campaign_type='batch' AND EXISTS (SELECT 1 FROM batch_campaigns bc WHERE bc.id=st.campaign_id))
+                        OR (st.campaign_type='realtime' AND EXISTS (SELECT 1 FROM realtime_campaigns rc WHERE rc.id=st.campaign_id))
+                      )
+                    )
+               ) AS task_reference_count
         FROM sms_templates t
         JOIN campaigns c ON c.id = t.campaign_id
         ORDER BY c.created_at DESC, t.language
@@ -124,6 +261,13 @@ def create_template(data: SmsTemplateCreate) -> dict:
     if not validation["valid"]:
         raise ValueError("; ".join(validation["errors"]))
     conn = get_connection()
+    duplicate = conn.execute(
+        "SELECT id FROM sms_templates WHERE campaign_id=? AND LOWER(language)=? LIMIT 1",
+        (data.campaign_id, _normalize_language(data.language)),
+    ).fetchone()
+    if duplicate:
+        conn.close()
+        raise ValueError("同一活动同一种语言只能配置一条短信内容")
     cursor = conn.execute(
         """INSERT INTO sms_templates (campaign_id, language, content, source_addr)
            VALUES (?,?,?,?)""",
@@ -152,6 +296,16 @@ def update_template(template_id: int, data: SmsTemplateUpdate) -> Optional[dict]
             fields[field] = val
 
     if fields:
+        if "language" in fields:
+            duplicate = conn.execute(
+                """SELECT id FROM sms_templates
+                   WHERE campaign_id=? AND LOWER(language)=? AND id<>?
+                   LIMIT 1""",
+                (existing["campaign_id"], _normalize_language(fields["language"]), template_id),
+            ).fetchone()
+            if duplicate:
+                conn.close()
+                raise ValueError("同一活动同一种语言只能配置一条短信内容")
         content = fields.get("content", dict(existing).get("content", ""))
         validation = validate_template(content)
         if not validation["valid"]:
@@ -201,11 +355,20 @@ def restore_template_version(template_id: int, version_no: int) -> Optional[dict
 
 def delete_template(template_id: int) -> bool:
     conn = get_connection()
-    cursor = conn.execute("DELETE FROM sms_templates WHERE id=?", (template_id,))
-    deleted = cursor.rowcount > 0
+    exists = conn.execute("SELECT 1 FROM sms_templates WHERE id=?", (template_id,)).fetchone()
+    if not exists:
+        conn.close()
+        return False
+    if _template_activity_reference_count(conn, template_id) > 0:
+        conn.close()
+        raise ValueError("短信内容已被营销活动引用，不能删除")
+    if _template_usage_count(conn, template_id) > 0:
+        conn.close()
+        raise ValueError("短信内容已被短信任务引用，不能删除")
+    conn.execute("DELETE FROM sms_templates WHERE id=?", (template_id,))
     conn.commit()
     conn.close()
-    return deleted
+    return True
 
 
 def get_all_templates_for_select() -> list:
@@ -215,6 +378,7 @@ def get_all_templates_for_select() -> list:
                c.name AS campaign_name, c.marketing_type, c.marketing_campaign_id
         FROM sms_templates t
         JOIN campaigns c ON c.id = t.campaign_id
+        WHERE c.enabled=1 AND t.enabled=1
         ORDER BY c.name, t.language
     """).fetchall()
     conn.close()

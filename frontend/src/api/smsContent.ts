@@ -13,6 +13,12 @@ export function getCampaign(id: number) {
   return api.get<Campaign>(`/sms-content/campaigns/${id}`)
 }
 
+export function getCampaignByMarketing(type: string, marketingCampaignId: number) {
+  return api.get<Campaign | null>('/sms-content/campaigns/by-marketing', {
+    params: { type, marketing_campaign_id: marketingCampaignId }
+  })
+}
+
 export function createCampaign(data: { name: string; description?: string; marketing_type?: string; marketing_campaign_id?: number; language?: string; content?: string }) {
   return api.post<Campaign>('/sms-content/campaigns', data)
 }

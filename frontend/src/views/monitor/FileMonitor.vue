@@ -1,269 +1,197 @@
 <template>
   <div class="file-monitor">
     <div class="page-header">
-      <h2>{{ $t('monitor.title') }}</h2>
+      <h2>实时营销监听状态</h2>
+      <p>查看任务级监听目录、文件名前缀、源目录当前文件和已处理记录。前端关闭不影响后台调度执行。</p>
     </div>
 
     <el-card shadow="never" style="margin-bottom: 20px">
       <template #header>
-        <div style="display: flex; align-items: center; justify-content: space-between">
-          <span>{{ $t('monitor.configs') }}</span>
-          <el-button size="small" type="primary" @click="showEditDialog(null)">
-            <el-icon><Plus /></el-icon>{{ $t('monitor.startMonitor') }}
-          </el-button>
+        <div class="card-header">
+          <span>任务级监听目录</span>
+          <el-tag :type="state.exists ? 'success' : 'warning'" effect="light">
+            {{ state.exists ? '目录可用' : '目录未配置或不可用' }}
+          </el-tag>
         </div>
       </template>
-      <el-table :data="store.configs" stripe style="width: 100%">
-        <el-table-column prop="directory_path" :label="$t('monitor.directoryPath')" min-width="250" />
-        <el-table-column :label="$t('monitor.targetDirectories')" min-width="250">
-          <template #default="{ row }">
-            <div v-if="row.target_directories?.length">
-              <el-tag v-for="d in row.target_directories" :key="d" size="small" style="margin: 2px">{{ d }}</el-tag>
+
+      <el-form label-width="160px" size="small">
+        <el-form-item label="实时营销活动">
+          <el-select v-model="selectedCampaignId" filterable style="width: 360px" @change="handleCampaignChange">
+            <el-option :value="0" label="全部实时活动" />
+            <el-option
+              v-for="campaign in state.campaigns"
+              :key="campaign.id"
+              :value="campaign.id"
+              :label="`#${campaign.id} ${campaign.name}`"
+            />
+          </el-select>
+        </el-form-item>
+
+        <el-form-item label="监听目录">
+          <div v-if="state.watch_dirs.length" class="watch-dir-list">
+            <div v-for="item in state.watch_dirs" :key="item.directory_path" class="watch-dir-item">
+              <code class="watch-dir">{{ item.directory_path }}</code>
+              <el-tag size="small" :type="item.exists ? 'success' : 'warning'" effect="light">
+                {{ item.exists ? 'OK' : 'Missing' }}
+              </el-tag>
+              <el-tag v-for="campaign in item.campaigns" :key="campaign.id" size="small" type="info" effect="plain">
+                #{{ campaign.id }} {{ campaign.name }} / {{ campaign.watch_filename_prefix || '-' }}
+              </el-tag>
             </div>
-            <span v-else style="color: #999">-</span>
-          </template>
-        </el-table-column>
-        <el-table-column :label="$t('common.status')" width="100">
-          <template #default="{ row }">
-            <StatusTag :status="row.enabled ? 'enabled' : 'disabled'" />
-          </template>
-        </el-table-column>
-        <el-table-column prop="created_at" :label="$t('common.created_at')" width="180" />
-        <el-table-column :label="$t('common.action')" width="200" fixed="right">
-          <template #default="{ row }">
-            <el-button text type="primary" size="small" @click="showEditDialog(row)">
-              {{ $t('common.edit') }}
-            </el-button>
-            <el-button
-              text
-              :type="row.enabled ? 'warning' : 'success'"
-              size="small"
-              @click="store.toggleConfig(row.id, row.enabled ? 0 : 1)"
-            >
-              {{ row.enabled ? $t('monitor.stopMonitor') : $t('monitor.startMonitor') }}
-            </el-button>
-            <el-button text type="danger" size="small" @click="handleDelete(row.id)">
-              {{ $t('common.delete') }}
-            </el-button>
-          </template>
-        </el-table-column>
-      </el-table>
+          </div>
+          <code v-else class="watch-dir">-</code>
+          <div class="form-tip">监听目录和文件名前缀在实时营销活动的新建/编辑界面维护；数据监控只负责查看和手动触发扫描。</div>
+        </el-form-item>
+
+        <el-form-item label="运行中实时活动">
+          <el-tag type="info">{{ state.active_campaigns }}</el-tag>
+        </el-form-item>
+
+        <el-form-item>
+          <el-button :loading="scanning" @click="scanNow">
+            <el-icon><Refresh /></el-icon>
+            {{ selectedCampaignId ? '扫描当前活动' : '扫描全部活动' }}
+          </el-button>
+          <el-switch
+            v-model="autoRefresh"
+            active-text="自动刷新"
+            style="margin-left: 12px"
+            @change="handleAutoRefresh"
+          />
+        </el-form-item>
+      </el-form>
     </el-card>
 
     <el-card shadow="never" style="margin-bottom: 20px">
       <template #header>
-        <div style="display: flex; align-items: center; justify-content: space-between">
-          <span>{{ $t('monitor.files') }} <el-tag type="info" size="small">{{ filteredFiles.length }}</el-tag></span>
-          <div>
-            <el-select
-              v-model="filterDir"
-              clearable
-              :placeholder="$t('monitor.filterDirectory')"
-              size="small"
-              style="width: 200px; margin-right: 8px"
-            >
-              <el-option
-                v-for="d in dirOptions"
-                :key="d"
-                :label="d"
-                :value="d"
-              />
-            </el-select>
-            <el-select
-              v-model="filterStatus"
-              clearable
-              :placeholder="$t('common.status')"
-              size="small"
-              style="width: 120px; margin-right: 8px"
-            >
-              <el-option :label="$t('monitor.status_pending')" value="pending" />
-              <el-option :label="$t('monitor.status_processing')" value="processing" />
-              <el-option :label="$t('monitor.status_completed')" value="completed" />
-              <el-option :label="$t('monitor.status_failed')" value="failed" />
-              <el-option :label="$t('monitor.status_distributed')" value="distributed" />
-            </el-select>
-            <el-button size="small" @click="handleSyncSource" style="margin-right: 8px">
-              <el-icon><Refresh /></el-icon>
-              {{ $t('monitor.syncSource') }}
-            </el-button>
-            <el-switch
-              v-model="autoRefresh"
-              :active-text="$t('monitor.autoRefresh')"
-              style="margin-right: 12px"
-              @change="handleAutoRefresh"
-            />
-            <el-button size="small" @click="refreshAll">
-              <el-icon><Download /></el-icon>
-              {{ $t('monitor.scanNow') }}
-            </el-button>
-          </div>
-        </div>
+        <span>监听目录当前文件 <el-tag type="info" size="small">{{ state.source_files.length }}</el-tag></span>
       </template>
-      <el-table :data="filteredFiles" stripe v-loading="store.loading" style="width: 100%">
-        <el-table-column prop="filename" :label="$t('monitor.filename')" min-width="200" />
-        <el-table-column prop="directory_path" :label="$t('monitor.directoryPath')" min-width="200" />
-        <el-table-column :label="$t('monitor.fileSize')" width="100">
+      <el-table :data="state.source_files" stripe v-loading="loading" style="width: 100%">
+        <el-table-column prop="filename" label="文件名" min-width="260" />
+        <el-table-column prop="directory_path" label="监听目录" min-width="260" />
+        <el-table-column v-if="selectedCampaignId" label="匹配前缀" width="100">
           <template #default="{ row }">
-            {{ formatFileSize(row.file_size) }}
+            <el-tag :type="row.match_prefix ? 'success' : 'info'" size="small">
+              {{ row.match_prefix ? '是' : '否' }}
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="row_count" :label="$t('monitor.rowCount')" width="80" />
-        <el-table-column :label="$t('common.status')" width="120">
+        <el-table-column v-if="selectedCampaignId" label="匹配发送规则" width="120">
+          <template #default="{ row }">
+            <el-tag :type="row.match_schedule ? 'success' : 'info'" size="small">
+              {{ row.match_schedule ? '是' : '否' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="处理判断" width="120">
+          <template #default="{ row }">
+            <el-tag :type="row.status === 'processed' ? 'success' : row.status === 'ignored' ? 'info' : 'warning'" size="small">
+              {{ row.status_label || row.status }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="skip_reason" label="原因" min-width="220" show-overflow-tooltip />
+        <el-table-column label="文件大小" width="120">
+          <template #default="{ row }">{{ formatFileSize(row.file_size || 0) }}</template>
+        </el-table-column>
+        <el-table-column prop="row_count" label="行数" width="90" />
+      </el-table>
+    </el-card>
+
+    <el-card shadow="never">
+      <template #header>
+        <span>已处理实时营销文件记录 <el-tag type="info" size="small">{{ state.processed_files.length }}</el-tag></span>
+      </template>
+      <el-table :data="state.processed_files" stripe v-loading="loading" style="width: 100%">
+        <el-table-column prop="filename" label="文件名" min-width="220" />
+        <el-table-column prop="campaign_id" label="活动ID" width="90" />
+        <el-table-column prop="file_path" label="任务文件路径" min-width="260" />
+        <el-table-column label="文件大小" width="120">
+          <template #default="{ row }">{{ formatFileSize(row.file_size || 0) }}</template>
+        </el-table-column>
+        <el-table-column prop="total_rows" label="行数" width="90" />
+        <el-table-column prop="created_tasks" label="生成短信任务数" width="130" />
+        <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <StatusTag :status="row.status" />
           </template>
         </el-table-column>
-        <el-table-column prop="created_at" :label="$t('common.created_at')" width="180" />
-        <el-table-column :label="$t('common.action')" width="300" fixed="right">
-          <template #default="{ row }">
-            <el-button text type="primary" size="small" @click="markStatus(row.id, 'processing')">
-              {{ $t('monitor.status_processing') }}
-            </el-button>
-            <el-button text type="success" size="small" @click="markStatus(row.id, 'completed')">
-              {{ $t('monitor.status_completed') }}
-            </el-button>
-            <el-button text type="warning" size="small" :loading="publishing[row.id]" @click="handlePublish(row)">
-              {{ $t('monitor.publishToMQ') }}
-            </el-button>
-            <el-button text type="info" size="small" :loading="distributing[row.id]" @click="handleDistribute(row)">
-              {{ $t('monitor.distribute') }}
-            </el-button>
-          </template>
-        </el-table-column>
+        <el-table-column prop="detected_at" label="创建时间" width="180" />
       </el-table>
     </el-card>
-
-    <el-dialog
-      :model-value="editDialogVisible"
-      :title="editForm.id ? $t('common.edit') : $t('common.add') + ' ' + $t('monitor.configs')"
-      width="650px"
-      @close="editDialogVisible = false"
-    >
-      <el-form :model="editForm" label-width="140px" size="small">
-        <el-form-item :label="$t('monitor.directoryPath')" required>
-          <el-input v-model="editForm.directory_path" :placeholder="$t('monitor.directoryPlaceholder')" />
-        </el-form-item>
-        <el-form-item :label="$t('monitor.targetDirectories')">
-          <div style="width: 100%">
-            <div v-for="(d, i) in editForm.target_directories" :key="i" style="display: flex; margin-bottom: 6px; gap: 6px">
-              <el-input v-model="editForm.target_directories[i]" :placeholder="$t('monitor.targetPlaceholder')" style="flex: 1" />
-              <el-button size="small" type="danger" @click="removeTarget(i)">
-                <el-icon><Delete /></el-icon>
-              </el-button>
-            </div>
-            <el-button size="small" type="primary" plain @click="addTarget">
-              <el-icon><Plus /></el-icon> {{ $t('monitor.addTarget') }}
-            </el-button>
-          </div>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="editDialogVisible = false">{{ $t('common.cancel') }}</el-button>
-        <el-button type="primary" :loading="editSaving" @click="handleEditSave">{{ $t('common.save') }}</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { useMonitorStore } from '@/stores/monitor'
+import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { getRealtimeMonitor, scanRealtimeMonitor } from '@/api/monitor'
 import { formatFileSize } from '@/utils/format'
-import { publishFile, distributeFile, syncSourceFiles } from '@/api/monitor'
 import StatusTag from '@/components/StatusTag.vue'
 
-const store = useMonitorStore()
+const loading = ref(false)
+const scanning = ref(false)
 const autoRefresh = ref(false)
-const publishing = ref<Record<number, boolean>>({})
-const distributing = ref<Record<number, boolean>>({})
-const editDialogVisible = ref(false)
-const editSaving = ref(false)
-const editForm = ref({ id: 0, directory_path: '', target_directories: [''] })
-const filterDir = ref('')
-const filterStatus = ref('')
+const selectedCampaignId = ref(0)
+const state = reactive({
+  campaign_id: 0,
+  watch_dir: '',
+  watch_dirs: [] as any[],
+  campaigns: [] as any[],
+  exists: false,
+  active_campaigns: 0,
+  source_files: [] as any[],
+  processed_files: [] as any[],
+})
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
-const dirOptions = computed(() => {
-  const dirs = new Set(store.files.map(f => f.directory_path))
-  return [...dirs].sort()
-})
-
-const filteredFiles = computed(() => {
-  return store.files.filter(f => {
-    if (filterDir.value && f.directory_path !== filterDir.value) return false
-    if (filterStatus.value && f.status !== filterStatus.value) return false
-    return true
-  })
-})
-
-onMounted(() => {
-  store.fetchConfigs()
-  store.fetchFiles()
-})
-
-onUnmounted(() => {
-  stopAutoRefresh()
-})
-
-function showEditDialog(row: any | null) {
-  if (row) {
-    editForm.value = {
-      id: row.id,
-      directory_path: row.directory_path,
-      target_directories: row.target_directories?.length ? [...row.target_directories] : [''],
-    }
-  } else {
-    editForm.value = { id: 0, directory_path: '', target_directories: [''] }
-  }
-  editDialogVisible.value = true
+function applyState(next: any) {
+  state.campaign_id = Number(next.campaign_id || 0)
+  state.watch_dir = next.watch_dir || ''
+  state.watch_dirs = next.watch_dirs || []
+  state.campaigns = next.campaigns || []
+  state.exists = Boolean(next.exists)
+  state.active_campaigns = Number(next.active_campaigns || 0)
+  state.source_files = next.source_files || []
+  state.processed_files = next.processed_files || []
 }
 
-function addTarget() {
-  editForm.value.target_directories.push('')
-}
-
-function removeTarget(i: number) {
-  editForm.value.target_directories.splice(i, 1)
-}
-
-async function handleEditSave() {
-  if (!editForm.value.directory_path) {
-    ElMessage.warning('请输入监控目录路径')
-    return
-  }
-  const targets = editForm.value.target_directories.filter(Boolean)
-  editSaving.value = true
+async function load() {
+  loading.value = true
   try {
-    if (editForm.value.id) {
-      await store.updateConfig(editForm.value.id, {
-        directory_path: editForm.value.directory_path,
-        target_directories: targets,
-      })
-      ElMessage.success('更新成功')
-    } else {
-      await store.addConfig(editForm.value.directory_path, targets)
-      ElMessage.success('添加成功')
-    }
-    editDialogVisible.value = false
+    const res = await getRealtimeMonitor(selectedCampaignId.value || undefined)
+    applyState(res.data)
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || '加载失败')
   } finally {
-    editSaving.value = false
+    loading.value = false
   }
 }
 
-async function handleDelete(id: number) {
+async function handleCampaignChange() {
+  await load()
+}
+
+async function scanNow() {
+  scanning.value = true
   try {
-    await ElMessageBox.confirm('确认删除该监控配置？', '提示')
-    await store.removeConfig(id)
-    ElMessage.success('删除成功')
-  } catch {}
+    const campaignId = selectedCampaignId.value || undefined
+    const res = await scanRealtimeMonitor(campaignId)
+    applyState(res.data.monitor)
+    ElMessage.success(`扫描完成，复制 ${res.data.sync?.copied || 0} 个文件，处理 ${res.data.processing?.processed || 0} 个文件`)
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.detail || '扫描失败')
+  } finally {
+    scanning.value = false
+  }
 }
 
 function handleAutoRefresh(val: boolean) {
   if (val) {
-    refreshTimer = setInterval(() => store.fetchFiles(), 5000)
+    refreshTimer = setInterval(() => {
+      void load()
+    }, 5000)
   } else {
     stopAutoRefresh()
   }
@@ -276,77 +204,51 @@ function stopAutoRefresh() {
   }
 }
 
-async function handleSyncSource() {
-  try {
-    const res = await syncSourceFiles()
-    ElMessage.success(`同步完成，${res.data.updated} 个文件已标记为已分发`)
-    await store.fetchFiles()
-  } catch {
-    ElMessage.error('同步失败')
-  }
-}
-
-async function refreshAll() {
-  let totalMoved = 0
-  for (const cfg of store.configs) {
-    if (cfg.enabled) {
-      const res = await store.scan(cfg.id)
-      totalMoved += res.moved_count || 0
-    }
-  }
-  ElMessage.success(`扫描完成，已自动分发 ${totalMoved} 个文件`)
-}
-
-async function markStatus(fileId: number, status: string) {
-  try {
-    const { updateFileStatus } = await import('@/api/monitor')
-    await updateFileStatus(fileId, status)
-    await store.fetchFiles()
-  } catch (e) {
-    ElMessage.error('更新失败')
-  }
-}
-
-async function handlePublish(row: any) {
-  const campaignName = row.filename.replace(/\.(csv|xlsx|xls)$/i, '')
-  publishing.value[row.id] = true
-  try {
-    const res = await publishFile(row.id, campaignName)
-    if (res.data.success) {
-      ElMessage.success(`发布完成: ${res.data.published}/${res.data.total_rows} 条到 ${res.data.routing_key}`)
-    } else {
-      ElMessage.error('发布失败')
-    }
-    await store.fetchFiles()
-  } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '发布失败')
-  } finally {
-    publishing.value[row.id] = false
-  }
-}
-
-async function handleDistribute(row: any) {
-  distributing.value[row.id] = true
-  try {
-    const res = await distributeFile(row.id)
-    if (res.data.success) {
-      ElMessage.success(res.data.message)
-    } else {
-      ElMessage.error(res.data.message)
-    }
-    await store.fetchFiles()
-  } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '分发失败')
-  } finally {
-    distributing.value[row.id] = false
-  }
-}
+onMounted(load)
+onUnmounted(stopAutoRefresh)
 </script>
 
 <style scoped>
+.page-header {
+  margin-bottom: 16px;
+}
 .page-header h2 {
-  margin: 0 0 16px 0;
+  margin: 0;
   font-size: 22px;
   font-weight: 600;
+}
+.page-header p {
+  margin: 6px 0 0;
+  color: var(--mc-text-secondary);
+  font-size: 13px;
+}
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.watch-dir-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.watch-dir-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.watch-dir {
+  display: inline-block;
+  max-width: 100%;
+  word-break: break-all;
+  font-size: 12px;
+}
+.form-tip {
+  width: 100%;
+  margin-top: 4px;
+  color: var(--mc-text-tertiary);
+  font-size: 12px;
 }
 </style>

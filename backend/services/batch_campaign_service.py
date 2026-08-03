@@ -12,6 +12,7 @@ from services import settings_service
 from services import sms_task_service, operations_service
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads", "campaigns")
+ALLOWED_LANGUAGES = {"amharic", "tigrigna", "somali", "english", "oromign", "en"}
 
 
 def _detect_csv_delimiter(path: str) -> str:
@@ -23,6 +24,39 @@ def _detect_csv_delimiter(path: str) -> str:
         return ","
     except Exception:
         return ","
+
+
+def _validate_customer_list(df: pd.DataFrame) -> int:
+    columns = set(df.columns)
+    errors = []
+    if "msisdn" not in columns:
+        errors.append("Customer list file must contain an msisdn column")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    if df.empty:
+        raise ValueError("Customer list file is empty")
+
+    msisdn_col = "msisdn"
+    valid_rows = 0
+    for idx, value in enumerate(df[msisdn_col]):
+        normalized = sms_task_service.normalize_msisdn(value)
+        if not normalized:
+            errors.append(f"Row {idx + 2}: msisdn is empty or invalid")
+        else:
+            valid_rows += 1
+
+    if "language" in columns:
+        language_col = "language"
+        allowed_label = ", ".join(sorted(ALLOWED_LANGUAGES))
+        for idx, value in enumerate(df[language_col]):
+            language = str(value).strip().lower() if pd.notna(value) else ""
+            if not language or language not in ALLOWED_LANGUAGES:
+                errors.append(f"Row {idx + 2}: language '{str(value).strip()}' is invalid; allowed: {allowed_label}")
+
+    if errors:
+        raise ValueError("\n".join(errors[:20]))
+    return valid_rows
 
 
 def _get_batch_base_dir() -> str:
@@ -97,13 +131,14 @@ def get_one(campaign_id: int) -> Optional[dict]:
 
 def create(data: BatchCampaignCreate) -> dict:
     conn = get_connection()
-    campaign_dir = data.campaign_dir or ""
+    use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
+    campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
     cursor = conn.execute(
-        "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, sms_template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, use_custom_directory, sms_template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (data.name, data.start_time or "", data.end_time or "",
-         data.send_start_time or "", data.send_end_time or "",
-         _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
-         data.sms_template_id)
+          data.send_start_time or "", data.send_end_time or "",
+          _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
+          use_custom_directory, data.sms_template_id)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()
@@ -131,6 +166,9 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         conn.close()
         return None
     existing_dict = dict(existing)
+    if data.use_custom_directory is not None and existing_dict.get("customer_list_path"):
+        conn.close()
+        raise ValueError("Cannot change campaign directory after a target list has been uploaded")
     if data.status == "in_progress":
         validation_errors = operations_service.validate_campaign("batch", {**existing_dict, "id": campaign_id})
         if validation_errors:
@@ -143,18 +181,32 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         if not existing_dict.get("sms_template_id"):
             conn.close()
             raise ValueError("请先配置短信模板")
-    if existing_dict.get("status") != "not_started":
-        only_allowed = all(getattr(data, f, None) is None for f in ["name", "start_time", "end_time", "send_start_time", "send_end_time", "send_days", "batch_size", "campaign_dir"])
+    if existing_dict.get("status") == "ended":
+        only_allowed = all(getattr(data, f, None) is None for f in ["start_time", "batch_size", "campaign_dir", "use_custom_directory"])
+        if not only_allowed:
+            conn.close()
+            raise ValueError("Ended campaign can only edit name, end time, send window, send days, and SMS template")
+    elif existing_dict.get("status") != "not_started":
+        only_allowed = all(getattr(data, f, None) is None for f in ["name", "start_time", "end_time", "send_start_time", "send_end_time", "send_days", "batch_size", "campaign_dir", "use_custom_directory"])
         if not only_allowed:
             conn.close()
             raise ValueError("Campaign has already started — cannot edit")
     fields = {}
-    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "batch_size", "campaign_dir", "sms_template_id"]:
+    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "batch_size", "campaign_dir", "use_custom_directory", "sms_template_id"]:
         val = getattr(data, field, None)
         if val is not None:
             fields[field] = val
     if data.send_days is not None:
         fields["send_days"] = _fmt_days(data.send_days)
+    if data.use_custom_directory is not None:
+        if data.use_custom_directory:
+            campaign_dir = (data.campaign_dir or "").strip()
+            if not campaign_dir:
+                conn.close()
+                raise ValueError("Custom campaign directory is required")
+            fields["campaign_dir"] = campaign_dir
+        else:
+            fields["campaign_dir"] = _ensure_campaign_dir({**existing_dict, **fields})
 
     if fields:
         set_clause = ", ".join(f"{k}=?" for k in fields)
@@ -165,13 +217,17 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         conn.commit()
     row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
+    updated_campaign = _enrich(dict(row))
+    if data.use_custom_directory is not None:
+        os.makedirs(os.path.join(updated_campaign["campaign_dir"], "whitelist"), exist_ok=True)
+        os.makedirs(os.path.join(updated_campaign["campaign_dir"], "output"), exist_ok=True)
 
     # Auto: generate batches on start (no auto-send)
     if data.status == "in_progress":
         batch_size = existing_dict.get("batch_size") or 500
         generate_batches(campaign_id, batch_size)
 
-    return _enrich(dict(row))
+    return updated_campaign
 
 
 def get_prospects(campaign_id: int, search: str = "", field: str = "", value: str = "", page: int = 1, page_size: int = 50) -> dict:
@@ -224,11 +280,13 @@ def delete(campaign_id: int) -> bool:
                 pass
     conn.execute("DELETE FROM batch_campaign_daily_stats WHERE campaign_id=?", (campaign_id,))
     conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,))
-    cursor = conn.execute("DELETE FROM batch_campaigns WHERE id=?", (campaign_id,))
-    deleted = cursor.rowcount > 0
+    conn.execute("DELETE FROM batch_campaigns WHERE id=?", (campaign_id,))
     conn.commit()
     conn.close()
-    return deleted
+    # DuckDB does not provide a reliable DB-API rowcount for DELETE and may
+    # return -1 even when the row was removed. The lookup above is the source
+    # of truth for whether this campaign existed.
+    return row is not None
 
 
 def copy(campaign_id: int) -> Optional[dict]:
@@ -470,28 +528,18 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
     whitelist_dir = os.path.join(campaign_dir, "whitelist")
     os.makedirs(whitelist_dir, exist_ok=True)
     ext = os.path.splitext(original_filename)[1].lower()
-    dest = os.path.join(whitelist_dir, f"whitelist{ext}")
-    shutil.move(file_path, dest)
-
-    ALLOWED_LANGUAGES = {"Amharic", "Tigrigna", "Somali", "English", "Oromign"}
 
     try:
-        sep = _detect_csv_delimiter(dest)
-        df = pd.read_csv(dest, dtype=str, sep=sep)
-        row_count = len(df)
-
-        if "language" in df.columns:
-            errors = []
-            for idx, val in enumerate(df["language"]):
-                val_str = str(val).strip() if pd.notna(val) else ""
-                if not val_str or val_str not in ALLOWED_LANGUAGES:
-                    errors.append(f"行{idx + 2}: language 值 '{val_str}' 无效，允许值: {', '.join(sorted(ALLOWED_LANGUAGES))}")
-            if errors:
-                raise ValueError("\n".join(errors[:20]))
+        sep = _detect_csv_delimiter(file_path)
+        df = pd.read_csv(file_path, dtype=str, sep=sep)
+        row_count = _validate_customer_list(df)
     except ValueError:
         raise
-    except Exception:
-        row_count = 0
+    except Exception as exc:
+        raise ValueError(f"Cannot read customer list file: {exc}") from exc
+
+    dest = os.path.join(whitelist_dir, f"whitelist{ext}")
+    shutil.move(file_path, dest)
 
     conn = get_connection()
     conn.execute(

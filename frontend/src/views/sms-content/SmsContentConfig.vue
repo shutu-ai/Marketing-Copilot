@@ -27,9 +27,11 @@
           <el-button text type="primary" size="small" @click="$router.push('/sms-content/campaign/' + row.campaign_id)">
             {{ $t('common.edit') }}
           </el-button>
-          <el-button text type="danger" size="small" @click="handleDeleteTemplate(row)">
-            {{ $t('common.delete') }}
-          </el-button>
+          <span :title="deleteDisabledReason(row)">
+            <el-button text type="danger" size="small" :disabled="!canDeleteTemplate(row)" @click="handleDeleteTemplate(row)">
+              {{ $t('common.delete') }}
+            </el-button>
+          </span>
           <el-button text type="primary" size="small" @click="openVersions(row)">版本</el-button>
         </template>
       </el-table-column>
@@ -109,12 +111,23 @@ async function fetchTable() {
 onMounted(fetchTable)
 
 async function handleDeleteTemplate(row: any) {
+  if (!canDeleteTemplate(row)) return
   try {
     await ElMessageBox.confirm('确认删除该语言模板？', '提示')
     await api.deleteTemplate(row.template_id)
     ElMessage.success('删除成功')
     await fetchTable()
   } catch { /* ignore */ }
+}
+
+function canDeleteTemplate(row: any) {
+  return Number(row.activity_reference_count || 0) === 0 && Number(row.task_reference_count || 0) === 0
+}
+
+function deleteDisabledReason(row: any) {
+  if (Number(row.activity_reference_count || 0) > 0) return '短信内容已被营销活动引用，不能删除'
+  if (Number(row.task_reference_count || 0) > 0) return '短信内容已被短信任务引用，不能删除'
+  return ''
 }
 
 async function openVersions(row: any) {

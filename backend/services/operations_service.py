@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import json
 import os
 import shutil
@@ -7,7 +7,7 @@ from datetime import datetime
 from database import get_connection
 
 ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
-MAX_FILE_BYTES = int(os.environ.get("MC_MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+MAX_FILE_BYTES = int(os.environ.get("MC_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
 
 
 def file_digest(path: str) -> str:
@@ -25,11 +25,23 @@ def register_file(campaign_type: str, campaign_id: int, path: str, filename: str
     if os.path.splitext(filename)[1].lower() not in ALLOWED_EXTENSIONS:
         raise ValueError("unsupported file type")
     digest = file_digest(path)
+    safe_filename = os.path.basename(filename)
     conn = get_connection()
     existing = conn.execute(
-        "SELECT id FROM processed_files WHERE campaign_type=? AND campaign_id=? AND file_hash=?",
-        (campaign_type, campaign_id, digest)).fetchone()
+        "SELECT id, status FROM processed_files WHERE campaign_type=? AND campaign_id=? AND filename=?",
+        (campaign_type, campaign_id, safe_filename)).fetchone()
     if existing:
+        if existing["status"] != "completed":
+            conn.execute(
+                """UPDATE processed_files
+                   SET file_hash=?, file_path=?, file_size=?, status='validating', error_detail='',
+                       completed_at=NULL
+                   WHERE id=?""",
+                (digest, os.path.abspath(path), os.path.getsize(path), existing["id"]),
+            )
+            conn.commit()
+            conn.close()
+            return existing["id"], False
         conn.close()
         return existing["id"], True
     try:
@@ -37,14 +49,14 @@ def register_file(campaign_type: str, campaign_id: int, path: str, filename: str
             """INSERT INTO processed_files
                (campaign_type,campaign_id,filename,file_hash,file_path,file_size,status)
                VALUES (?,?,?,?,?,?,'validating')""",
-            (campaign_type, campaign_id, os.path.basename(filename), digest, os.path.abspath(path), os.path.getsize(path)))
+            (campaign_type, campaign_id, safe_filename, digest, os.path.abspath(path), os.path.getsize(path)))
     except Exception as exc:
         if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
             conn.close()
             raise
         existing = conn.execute(
-            "SELECT id FROM processed_files WHERE campaign_type=? AND campaign_id=? AND file_hash=?",
-            (campaign_type, campaign_id, digest)).fetchone()
+            "SELECT id FROM processed_files WHERE campaign_type=? AND campaign_id=? AND filename=?",
+            (campaign_type, campaign_id, safe_filename)).fetchone()
         conn.close()
         if existing:
             return existing["id"], True
@@ -75,6 +87,10 @@ def quarantine(path: str, campaign_dir: str, filename: str) -> str:
     if os.path.exists(target):
         target = os.path.join(target_dir, f"{stem}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{ext}")
     shutil.move(path, target)
+    try:
+        os.utime(target, None)
+    except OSError:
+        pass
     return target
 
 
@@ -90,6 +106,10 @@ def archive_duplicate(path: str, campaign_dir: str, filename: str) -> str:
     if os.path.exists(target):
         target = os.path.join(target_dir, f"{stem}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}{ext}")
     shutil.move(path, target)
+    try:
+        os.utime(target, None)
+    except OSError:
+        pass
     return target
 
 
@@ -122,7 +142,7 @@ def audit(action: str, resource: str = "", resource_id="", detail=None,
 def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:
     errors = []
     if not campaign.get("customer_list_path") or not os.path.isfile(campaign["customer_list_path"]):
-        errors.append("customer/whitelist file is missing")
+        errors.append("campaign whitelist is missing" if campaign_type == "realtime" else "campaign target file is missing")
     if not campaign.get("campaign_dir"):
         errors.append("campaign directory is missing")
     else:
@@ -133,14 +153,29 @@ def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:
             os.unlink(probe)
         except OSError as exc:
             errors.append(f"campaign directory is not writable: {exc}")
+    if campaign_type == "realtime":
+        watch_dir = (campaign.get("watch_dir") or "").strip()
+        if not watch_dir:
+            errors.append("realtime watch directory is missing")
+        elif not os.path.isdir(watch_dir):
+            errors.append(f"realtime watch directory does not exist: {watch_dir}")
+        if not (campaign.get("watch_filename_prefix") or "").strip():
+            errors.append("realtime watch filename prefix is missing")
     conn = get_connection()
     template = conn.execute(
         """SELECT t.id FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
            WHERE c.marketing_type=? AND c.marketing_campaign_id=? AND c.enabled=1 AND t.enabled=1 LIMIT 1""",
         (campaign_type, campaign["id"])).fetchone()
+    if not template and campaign.get("sms_template_id"):
+        template = conn.execute(
+            """SELECT t.id FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
+               WHERE t.id=? AND c.enabled=1 AND t.enabled=1 LIMIT 1""",
+            (campaign["sms_template_id"],),
+        ).fetchone()
     smpp = conn.execute("SELECT id FROM smpp_configs WHERE enabled=1 LIMIT 1").fetchone()
     conn.close()
     if not template: errors.append("no enabled SMS template")
-    if os.environ.get("MC_SYSTEM_MODE", "production") == "production" and not smpp:
+    from services.settings_service import get_setting
+    if get_setting("system_mode", "production") == "production" and not smpp:
         errors.append("no enabled SMPP configuration")
     return errors

@@ -58,6 +58,14 @@ def configure_logging():
                                       backupCount=int(os.environ.get("MC_LOG_BACKUPS", "10")), encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
         root.addHandler(handler)
+    # Per-message detail logs (SMS body, RabbitMQ payload, etc.) are high-frequency
+    # and can be disabled in production with MC_DETAIL_LOGGING=0.
+    detail_logger = logging.getLogger("mc.detail")
+    if os.environ.get("MC_DETAIL_LOGGING", "0") == "1":
+        detail_logger.setLevel(logging.INFO)
+    else:
+        detail_logger.setLevel(logging.WARNING)
+    detail_logger.propagate = True
 
 
 def acquire_instance_lock():

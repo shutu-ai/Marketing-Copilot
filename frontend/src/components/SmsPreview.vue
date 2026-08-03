@@ -26,10 +26,11 @@ defineProps<{
 
 <style scoped>
 .sms-bubble {
-  background: #ecf5ff;
-  border: 1px solid #d9ecff;
-  border-radius: 12px;
-  padding: 12px 16px;
+  background: var(--mc-primary-soft);
+  border: 1px solid #ead8a4;
+  border-radius: var(--mc-radius-lg) var(--mc-radius-lg) 4px var(--mc-radius-lg);
+  padding: 14px 16px;
+  color: var(--mc-text);
   font-size: 14px;
   line-height: 1.6;
   word-break: break-all;

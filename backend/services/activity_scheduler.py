@@ -41,36 +41,18 @@ def _process_batches():
     return None
 
 
-def _process_realtime_inboxes():
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM realtime_campaigns WHERE status='in_progress'").fetchall()
-    conn.close()
-    for row in rows:
-        campaign = dict(row)
-        active, _ = sms_task_service.campaign_is_active(campaign)
-        if not active or not campaign.get("campaign_dir"):
-            continue
-        inbox = os.path.join(campaign["campaign_dir"], "inbox")
-        os.makedirs(inbox, exist_ok=True)
-        for name in sorted(os.listdir(inbox)):
-            path = os.path.join(inbox, name)
-            if not os.path.isfile(path) or os.path.splitext(name)[1].lower() not in {".csv", ".xlsx", ".xls"}:
-                continue
-            if time.time() - os.path.getmtime(path) < 2:
-                continue
-            result = realtime_campaign_service.receive_file(campaign["id"], path, name)
-            if not result.get("success"):
-                logger.error("Realtime inbox file failed %s: %s", path, result.get("message"))
-
-
 def _run():
     ticks = 0
     while not _stop.wait(3):
         try:
             ticks += 1
             _process_batches()
-            _process_realtime_inboxes()
+            realtime_campaign_service.sync_watch_dirs_to_inboxes()
+            realtime_result = realtime_campaign_service.process_realtime_inboxes()
+            for error in realtime_result.get("errors", []):
+                logger.error("Realtime inbox file failed %s: %s", error.get("filename"), error.get("message"))
             if ticks % 20 == 0:
+                realtime_campaign_service.cleanup_realtime_retention()
                 p1_service.auto_complete_campaigns()
                 from services import metrics_service, task_worker
                 from services.smpp_gateway import gateway

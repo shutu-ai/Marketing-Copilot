@@ -48,10 +48,11 @@ def add_exclusion(body: ExclusionRequest):
     if not msisdn:
         raise HTTPException(400, "Invalid msisdn")
     conn = get_connection()
-    conn.execute(
-        "INSERT OR REPLACE INTO exclusion_users (msisdn,reason,enabled) VALUES (?,?,1)",
-        (msisdn, body.reason),
-    )
+    existing = conn.execute("SELECT id FROM exclusion_users WHERE msisdn=?", (msisdn,)).fetchone()
+    if existing:
+        conn.execute("UPDATE exclusion_users SET reason=?,enabled=1 WHERE msisdn=?", (body.reason, msisdn))
+    else:
+        conn.execute("INSERT INTO exclusion_users (msisdn,reason,enabled) VALUES (?,?,1)", (msisdn, body.reason))
     conn.commit()
     conn.close()
     return {"success": True, "msisdn": msisdn}

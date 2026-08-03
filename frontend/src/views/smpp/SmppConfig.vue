@@ -169,6 +169,8 @@ import { useSmppStore } from '@/stores/smpp'
 import type { SmppConfig, SmppConfigForm } from '@/types/smpp'
 import StatusTag from '@/components/StatusTag.vue'
 
+withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
+
 const store = useSmppStore()
 const dialogVisible = ref(false)
 const editingId = ref<number | null>(null)
@@ -249,6 +251,9 @@ async function testConfig(row: SmppConfig) {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 16px;
+}
+.page-header.embedded {
+  justify-content: flex-end;
 }
 .page-header h2 {
   margin: 0;

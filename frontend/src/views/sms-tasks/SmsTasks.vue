@@ -1,159 +1,37 @@
 <template>
   <div>
-    <div class="page-header">
-      <h2>短信任务实时状态</h2>
-      <div class="header-actions">
-        <el-button @click="openExclusions">排除名单</el-button>
-        <el-switch v-model="autoRefresh" active-text="自动刷新" />
-      </div>
+    <PageHeader v-if="!embedded" title="短信任务实时状态" description="跟踪发送、回执与失败重试">
+      <template #actions><PollingStatus :state="pollState" :updated-at="lastUpdated"/><el-button @click="openExclusions">排除名单</el-button><el-switch v-model="autoRefresh" active-text="自动刷新"/></template>
+    </PageHeader>
+    <div v-else class="embedded-header">
+      <div><h3>短信任务实时状态</h3><p>跟踪发送、回执与失败重试</p></div>
+      <div class="embedded-actions"><PollingStatus :state="pollState" :updated-at="lastUpdated"/><el-button @click="openExclusions">排除名单</el-button><el-switch v-model="autoRefresh" active-text="自动刷新"/></div>
     </div>
-
-    <el-row :gutter="12" class="stats">
-      <el-col v-for="item in statItems" :key="item.key" :span="4">
-        <el-card shadow="never">
-          <div class="stat-label">{{ item.label }}</div>
-          <div class="stat-value">{{ stats[item.key] || 0 }}</div>
-        </el-card>
-      </el-col>
-    </el-row>
-
-    <el-card shadow="never" class="filters">
-      <el-form inline>
-        <el-form-item label="状态">
-          <el-select v-model="status" clearable style="width: 150px" @change="reload">
-            <el-option v-for="value in statuses" :key="value" :label="value" :value="value" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="活动类型">
-          <el-select v-model="campaignType" clearable style="width: 140px" @change="reload">
-            <el-option label="批量" value="batch" />
-            <el-option label="实时" value="realtime" />
-          </el-select>
-        </el-form-item>
-        <el-button @click="fetchData"><el-icon><Refresh /></el-icon>刷新</el-button>
-      </el-form>
-    </el-card>
-
-    <el-card shadow="never">
-      <el-table :data="items" stripe v-loading="loading">
-        <el-table-column prop="id" label="ID" width="70" />
-        <el-table-column prop="campaign_name" label="活动" min-width="150" />
-        <el-table-column prop="campaign_type" label="类型" width="90" />
-        <el-table-column prop="msisdn" label="手机号" width="150" />
-        <el-table-column prop="language" label="语言" width="100" />
-        <el-table-column prop="content" label="内容" min-width="220" show-overflow-tooltip />
-        <el-table-column label="状态" width="110">
-          <template #default="{ row }"><StatusTag :status="row.status" /></template>
-        </el-table-column>
-        <el-table-column prop="attempts" label="尝试" width="70" />
-        <el-table-column prop="smsc_message_ids" label="SMSC Message ID" min-width="170" show-overflow-tooltip />
-        <el-table-column prop="error_msg" label="错误" min-width="150" show-overflow-tooltip />
-        <el-table-column prop="updated_at" label="更新时间" width="180" />
-        <el-table-column label="操作" width="90" fixed="right">
-          <template #default="{ row }">
-            <el-button v-if="['failed', 'expired'].includes(row.status)" link type="primary" @click="retry(row.id)">重试</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-      <el-pagination
-        v-model:current-page="page" :page-size="pageSize" :total="total"
-        layout="total, prev, pager, next" class="pagination" @current-change="fetchData"
-      />
-    </el-card>
-
-    <el-dialog v-model="exclusionVisible" title="排除名单" width="620px">
-      <el-form inline>
-        <el-form-item label="手机号"><el-input v-model="exclusionForm.msisdn" /></el-form-item>
-        <el-form-item label="原因"><el-input v-model="exclusionForm.reason" /></el-form-item>
-        <el-button type="primary" @click="createExclusion">添加</el-button>
-      </el-form>
-      <el-table :data="exclusions" max-height="360">
-        <el-table-column prop="msisdn" label="手机号" />
-        <el-table-column prop="reason" label="原因" />
-        <el-table-column prop="created_at" label="创建时间" width="180" />
-        <el-table-column label="操作" width="80">
-          <template #default="{ row }"><el-button link type="danger" @click="removeExclusion(row.id)">删除</el-button></template>
-        </el-table-column>
-      </el-table>
-    </el-dialog>
+    <el-row :gutter="12" class="stats"><el-col v-for="item in statItems" :key="item.key" :xs="12" :sm="8" :lg="4"><el-card shadow="never"><div class="stat-label">{{ item.label }}</div><div class="stat-value">{{ stats[item.key]||0 }}</div></el-card></el-col></el-row>
+    <el-card shadow="never" class="filters"><el-form inline><el-form-item label="状态"><el-select v-model="status" clearable style="width:150px" @change="applyFilters"><el-option v-for="value in statuses" :key="value" :label="value" :value="value"/></el-select></el-form-item><el-form-item label="活动类型"><el-select v-model="campaignType" clearable style="width:140px" @change="applyFilters"><el-option label="批量" value="batch"/><el-option label="实时" value="realtime"/></el-select></el-form-item><el-button :loading="loading" @click="fetchData()"><el-icon><Refresh /></el-icon>刷新</el-button></el-form></el-card>
+    <div class="table-shell"><DataState :loading="loading" :has-data="items.length>0" :empty="!loading&&!error&&!items.length" :error="error" empty-title="没有符合条件的任务" empty-description="调整筛选条件后再试" @retry="fetchData()">
+      <el-alert v-if="error" type="warning" :closable="false" show-icon title="刷新失败，当前展示上次成功获取的数据"/>
+      <el-table :data="items" stripe><el-table-column prop="id" label="ID" width="70"/><el-table-column prop="campaign_name" label="活动" min-width="150"/><el-table-column prop="campaign_type" label="类型" width="90"/><el-table-column prop="msisdn" label="手机号" width="150"/><el-table-column prop="language" label="语言" width="80"/><el-table-column prop="content" label="内容" min-width="220" show-overflow-tooltip/><el-table-column label="状态" width="110"><template #default="{row}"><StatusTag :status="row.status"/></template></el-table-column><el-table-column prop="attempts" label="尝试" width="70"/><el-table-column prop="error_msg" label="错误" min-width="160" show-overflow-tooltip/><el-table-column prop="updated_at" label="更新时间" width="180"/><el-table-column label="操作" width="90" fixed="right"><template #default="{row}"><el-dropdown v-if="['failed','expired'].includes(row.status)" trigger="click" @command="retry(row.id)"><el-button link type="primary">更多<el-icon><ArrowDown/></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="retry">重新入队</el-dropdown-item></el-dropdown-menu></template></el-dropdown><span v-else class="muted">—</span></template></el-table-column></el-table>
+      <el-pagination v-model:current-page="page" :page-size="pageSize" :total="total" layout="total, prev, pager, next" class="pagination" @current-change="changePage"/>
+    </DataState></div>
+    <el-dialog v-model="exclusionVisible" title="排除名单" width="620px"><el-form inline><el-form-item label="手机号"><el-input v-model="exclusionForm.msisdn"/></el-form-item><el-form-item label="原因"><el-input v-model="exclusionForm.reason"/></el-form-item><el-button type="primary" @click="createExclusion">添加</el-button></el-form><el-table :data="exclusions" max-height="360"><el-table-column prop="msisdn" label="手机号"/><el-table-column prop="reason" label="原因"/><el-table-column prop="created_at" label="创建时间" width="180"/><el-table-column label="操作" width="80"><template #default="{row}"><el-button link type="danger" @click="removeExclusion(row.id)">删除</el-button></template></el-table-column></el-table></el-dialog>
   </div>
 </template>
-
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed,onBeforeUnmount,onMounted,ref,watch } from 'vue'
+import { useRoute,useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import StatusTag from '@/components/StatusTag.vue'
-import { addExclusion, deleteExclusion, getExclusions, getSmsTasks, getSmsTaskStats, retrySmsTask } from '@/api/smsTasks'
-
-const items = ref<any[]>([])
-const stats = ref<Record<string, number>>({})
-const loading = ref(false)
-const total = ref(0)
-const page = ref(1)
-const pageSize = 50
-const status = ref('')
-const campaignType = ref('')
-const autoRefresh = ref(true)
-const exclusionVisible = ref(false)
-const exclusions = ref<any[]>([])
-const exclusionForm = ref({ msisdn: '', reason: '' })
-const statuses = ['queued', 'sending', 'submitted', 'delivered', 'retrying', 'failed', 'expired']
-const statItems = computed(() => [
-  { key: 'total', label: '总任务' }, { key: 'queued', label: '排队中' },
-  { key: 'submitted', label: '已提交' }, { key: 'delivered', label: '已送达' },
-  { key: 'retrying', label: '重试中' }, { key: 'failed', label: '失败' },
-])
-let timer: number | undefined
-
-async function fetchData(silent = false) {
-  if (!silent) loading.value = true
-  try {
-    const [tasks, summary] = await Promise.all([
-      getSmsTasks({ page: page.value, page_size: pageSize, status: status.value || undefined, campaign_type: campaignType.value || undefined }),
-      getSmsTaskStats(),
-    ])
-    items.value = tasks.data.items
-    total.value = tasks.data.total
-    stats.value = summary.data
-  } finally {
-    loading.value = false
-  }
-}
-
-function reload() { page.value = 1; fetchData() }
-async function retry(id: number) {
-  await retrySmsTask(id)
-  ElMessage.success('任务已重新入队')
-  fetchData()
-}
-async function openExclusions() {
-  exclusionVisible.value = true
-  exclusions.value = (await getExclusions()).data
-}
-async function createExclusion() {
-  if (!exclusionForm.value.msisdn) return ElMessage.warning('请输入手机号')
-  await addExclusion(exclusionForm.value.msisdn, exclusionForm.value.reason)
-  exclusionForm.value = { msisdn: '', reason: '' }
-  await openExclusions()
-}
-async function removeExclusion(id: number) {
-  await deleteExclusion(id)
-  await openExclusions()
-}
-
-onMounted(() => {
-  fetchData()
-  timer = window.setInterval(() => { if (autoRefresh.value) fetchData(true) }, 3000)
-})
-onBeforeUnmount(() => { if (timer) window.clearInterval(timer) })
+import StatusTag from '@/components/StatusTag.vue';import PageHeader from '@/components/PageHeader.vue';import DataState from '@/components/DataState.vue';import PollingStatus from '@/components/PollingStatus.vue'
+import {addExclusion,deleteExclusion,getExclusions,getSmsTasks,getSmsTaskStats,retrySmsTask} from '@/api/smsTasks'
+withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
+const route=useRoute(),router=useRouter(),items=ref<any[]>([]),stats=ref<Record<string,number>>({}),loading=ref(false),error=ref(''),total=ref(0),page=ref(Math.max(1,Number(route.query.page)||1)),pageSize=50,status=ref(typeof route.query.status==='string'?route.query.status:''),campaignType=ref(typeof route.query.type==='string'?route.query.type:''),autoRefresh=ref(true),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale'),exclusionVisible=ref(false),exclusions=ref<any[]>([]),exclusionForm=ref({msisdn:'',reason:''})
+const statuses=['queued','sending','submitted','delivered','retrying','failed','expired'],statItems=computed(()=>[{key:'total',label:'总任务'},{key:'queued',label:'排队中'},{key:'submitted',label:'已提交'},{key:'delivered',label:'已送达'},{key:'retrying',label:'重试中'},{key:'failed',label:'失败'}]);let timer=0
+function syncUrl(){router.replace({query:{...route.query,status:status.value||undefined,type:campaignType.value||undefined,page:page.value>1?String(page.value):undefined}})}
+async function fetchData(silent=false){if(!silent)loading.value=true;try{const [tasks,summary]=await Promise.all([getSmsTasks({page:page.value,page_size:pageSize,status:status.value||undefined,campaign_type:campaignType.value||undefined}),getSmsTaskStats()]);items.value=tasks.data.items;total.value=tasks.data.total;stats.value=summary.data;lastUpdated.value=new Date();pollState.value='live';error.value=''}catch(e:any){error.value=e.response?.data?.detail||'无法连接到服务';pollState.value=lastUpdated.value?'stale':'offline'}finally{loading.value=false}}
+function applyFilters(){page.value=1;syncUrl();fetchData()} function changePage(){syncUrl();fetchData()}
+async function retry(id:number){await retrySmsTask(id);ElMessage.success('任务已重新入队');fetchData()}
+async function openExclusions(){exclusionVisible.value=true;exclusions.value=(await getExclusions()).data} async function createExclusion(){if(!exclusionForm.value.msisdn)return ElMessage.warning('请输入手机号');await addExclusion(exclusionForm.value.msisdn,exclusionForm.value.reason);exclusionForm.value={msisdn:'',reason:''};await openExclusions()} async function removeExclusion(id:number){await deleteExclusion(id);await openExclusions()}
+watch(autoRefresh,value=>{pollState.value=value?(lastUpdated.value?'live':'stale'):'stale'})
+onMounted(()=>{fetchData();timer=window.setInterval(()=>{if(autoRefresh.value&&!document.hidden)fetchData(true)},3000)});onBeforeUnmount(()=>window.clearInterval(timer))
 </script>
-
-<style scoped>
-.page-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
-.page-header h2 { margin:0; font-size:22px; }
-.header-actions { display:flex; align-items:center; gap:16px; }
-.stats, .filters { margin-bottom:16px; }
-.stat-label { color:#909399; font-size:13px; }
-.stat-value { margin-top:8px; font-size:26px; font-weight:600; }
-.pagination { justify-content:flex-end; margin-top:16px; }
-</style>
+<style scoped>.embedded-header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:16px}.embedded-header h3{margin:0;color:var(--mc-text);font-size:16px}.embedded-header p{margin:5px 0 0;color:var(--mc-text-secondary);font-size:12px}.embedded-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px}.stats,.filters{margin-bottom:16px}.stats .el-col{margin-bottom:12px}.stat-label{color:var(--mc-text-secondary);font-size:13px}.stat-value{margin-top:8px;font-size:26px;font-weight:600}.pagination{justify-content:flex-end;padding:16px}.muted{color:var(--mc-text-tertiary)}@media(max-width:767px){.embedded-header{flex-direction:column;gap:10px}.embedded-actions{width:100%;justify-content:flex-start}:deep(.page-actions){align-items:center}.filters :deep(.el-form-item){width:100%;margin-right:0}.filters :deep(.el-select){width:100%!important}}</style>

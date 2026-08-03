@@ -1,0 +1,4 @@
+# The SMSC simulator (backend/tools/smsc_simulator.py) uses only Python's
+# standard library. This file deliberately has no install requirements.
+# Keep it separate from backend/requirements.txt: a test SMSC can be started
+# without installing the web application or its third-party dependencies.

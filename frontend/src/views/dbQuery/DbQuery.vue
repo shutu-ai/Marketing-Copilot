@@ -3,6 +3,10 @@
     <div class="page-header">
       <h2>数据库 Schema</h2>
       <div style="display:flex;gap:10px;align-items:center">
+        <el-button type="primary" size="small" @click="showSqlPanel = true; scrollToSql()">
+          <el-icon><Edit /></el-icon>
+          SQL 查询
+        </el-button>
         <el-input v-model="filterText" placeholder="搜索表名..." prefix-icon="Search" clearable style="width:220px" size="small" />
         <el-button :loading="loadingTables" @click="fetchTables" size="small">
           <el-icon><Refresh /></el-icon>
@@ -11,12 +15,13 @@
       </div>
     </div>
 
-    <el-card ref="sqlCardRef" v-show="showSqlPanel" shadow="never" style="margin-bottom:16px">
+    <div ref="sqlCardRef">
+    <el-card v-show="showSqlPanel" shadow="never" style="margin-bottom:16px">
       <template #header>
         <div style="display:flex;align-items:center;justify-content:space-between">
           <span>SQL 查询</span>
           <div style="display:flex;gap:8px">
-            <span v-if="execTime !== null" style="font-size:12px;color:#909399;margin-right:8px">耗时: {{ execTime }}ms</span>
+            <span v-if="execTime !== null" style="font-size:12px;color:var(--mc-text-tertiary);margin-right:8px">耗时: {{ execTime }}ms</span>
             <el-button text @click="showSqlPanel = false"><el-icon><Close /></el-icon></el-button>
           </div>
         </div>
@@ -41,7 +46,7 @@
 
       <div v-if="result" style="margin-top:16px">
         <el-alert v-if="result.type === 'error'" :title="result.error" type="error" show-icon :closable="false" />
-        <div v-else style="font-size:13px;margin-bottom:8px;color:#606266">
+        <div v-else style="font-size:13px;margin-bottom:8px;color:var(--mc-text-secondary)">
           <template v-if="result.type === 'select'">查询结果 — {{ result.row_count }} 行, {{ result.columns?.length }} 列</template>
           <template v-else>成功 — 影响 {{ result.affected_rows }} 行</template>
         </div>
@@ -55,12 +60,13 @@
         </el-table>
       </div>
     </el-card>
+    </div>
 
     <div v-loading="loadingTables" class="schema-list">
       <div v-for="tbl in filteredTables" :key="tbl.table_name" class="schema-table">
         <div class="schema-table-header" @click="toggleExpand(tbl.table_name)">
           <div class="schema-table-title">
-            <el-icon :style="{ color: '#409eff', fontSize: '18px' }"><Collection /></el-icon>
+            <el-icon :style="{ color: 'var(--mc-primary)', fontSize: '18px' }"><Collection /></el-icon>
             <span class="schema-table-name">{{ tbl.table_name }}</span>
             <el-tag v-if="tbl.table_comment" size="small" type="info" style="margin-left:8px">{{ tbl.table_comment }}</el-tag>
           </div>
@@ -88,7 +94,7 @@
             <tbody>
               <tr v-for="col in tbl.columns" :key="col.column_name">
                 <td style="text-align:center">
-                  <el-icon v-if="col.is_pk" style="color:#e6a23c;font-size:16px" title="主键"><Key /></el-icon>
+                  <el-icon v-if="col.is_pk" style="color:var(--mc-primary);font-size:16px" title="主键"><Key /></el-icon>
                 </td>
                 <td><span class="col-name">{{ col.column_name }}</span></td>
                 <td><el-tag size="small" :type="typeTag(col.data_type)">{{ col.data_type }}</el-tag></td>
@@ -109,8 +115,8 @@
             </tbody>
           </table>
           <div class="schema-col-actions">
-            <el-button size="small" text type="primary" :icon="Search" @click="quickQuery(tbl.table_name)">查询全部</el-button>
-            <el-button size="small" text type="primary" :icon="Edit" @click="openSqlEditor(tbl.table_name)">自定义查询</el-button>
+            <el-button size="small" text type="primary" :icon="Search" @click.stop="quickQuery(tbl.table_name)">查询全部</el-button>
+            <el-button size="small" text type="primary" :icon="Edit" @click.stop="openSqlEditor(tbl)">自定义 SQL</el-button>
           </div>
         </div>
       </div>
@@ -130,7 +136,7 @@ const filterText = ref('')
 const expandedTables = ref<Record<string, boolean>>({})
 
 const sqlCardRef = ref<HTMLElement | null>(null)
-const showSqlPanel = ref(false)
+const showSqlPanel = ref(true)
 const sql = ref('')
 const executing = ref(false)
 const confirmWrite = ref(false)
@@ -188,16 +194,21 @@ function scrollToSql() {
   })
 }
 
-function quickQuery(name: string) {
+async function quickQuery(name: string) {
   sql.value = `SELECT * FROM ${name} LIMIT 100`
   showSqlPanel.value = true
   result.value = null
+  await nextTick()
   scrollToSql()
+  await handleExecute()
 }
 
-function openSqlEditor(name: string) {
-  sql.value = sql.value || `SELECT * FROM ${name} LIMIT 100`
+function openSqlEditor(table: api.TableInfo) {
+  const columns = table.columns.map(column => `  ${column.column_name}`).join(',\n')
+  sql.value = `SELECT\n${columns}\nFROM ${table.table_name}\nLIMIT 100`
   showSqlPanel.value = true
+  result.value = null
+  execTime.value = null
   scrollToSql()
 }
 
@@ -238,14 +249,15 @@ async function handleExecute() {
   display: flex; flex-direction: column; gap: 12px;
 }
 .schema-table {
-  border: 1px solid #e4e7ed; border-radius: 8px; overflow: hidden; background: #fff;
+  border: 1px solid var(--mc-border); border-radius: var(--mc-radius-lg); overflow: hidden; background: var(--mc-surface);
+  box-shadow: var(--mc-shadow);
 }
 .schema-table-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 16px; cursor: pointer; user-select: none;
-  background: #fafafa; transition: background .15s;
+  background: var(--mc-surface-muted); transition: background .15s;
 }
-.schema-table-header:hover { background: #ecf5ff; }
+.schema-table-header:hover { background: var(--mc-primary-soft); }
 .schema-table-title {
   display: flex; align-items: center; gap: 8px;
 }
@@ -254,33 +266,33 @@ async function handleExecute() {
   font-family: 'Consolas', 'Courier New', monospace;
 }
 .schema-table-meta {
-  display: flex; align-items: center; font-size: 12px; color: #909399;
+  display: flex; align-items: center; font-size: 12px; color: var(--mc-text-tertiary);
 }
 .schema-columns {
-  border-top: 1px solid #e4e7ed;
+  border-top: 1px solid var(--mc-border);
 }
 .schema-col-table {
   width: 100%; border-collapse: collapse; font-size: 13px;
 }
 .schema-col-table th {
-  background: #f5f7fa; padding: 8px 10px; text-align: left;
-  font-weight: 500; color: #606266; border-bottom: 1px solid #e4e7ed;
+  background: var(--mc-surface-muted); padding: 8px 10px; text-align: left;
+  font-weight: 600; color: var(--mc-text-secondary); border-bottom: 1px solid var(--mc-border);
   font-size: 12px;
 }
 .schema-col-table td {
-  padding: 7px 10px; border-bottom: 1px solid #f0f0f0;
+  padding: 8px 10px; border-bottom: 1px solid #edf2f1;
 }
-.schema-col-table tbody tr:hover { background: #f5faff; }
+.schema-col-table tbody tr:hover { background: #f7f9f8; }
 .col-name {
   font-family: 'Consolas', 'Courier New', monospace;
-  color: #409eff; font-weight: 500; font-size: 13px;
+  color: var(--mc-primary-hover); font-weight: 600; font-size: 13px;
 }
 .default-val {
   font-family: 'Consolas', 'Courier New', monospace;
-  font-size: 12px; color: #67c23a;
+  font-size: 12px; color: var(--mc-success);
 }
-.col-comment { font-size: 12px; color: #909399; }
+.col-comment { font-size: 12px; color: var(--mc-text-tertiary); }
 .schema-col-actions {
-  display: flex; gap: 8px; padding: 8px 16px; border-top: 1px solid #f0f0f0;
+  display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--mc-border);
 }
 </style>

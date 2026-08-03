@@ -41,6 +41,8 @@ import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getDbConfig, saveDbConfig, testDbConnection } from '@/api/dbConfig'
 
+withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
+
 const connected = ref(false)
 const saving = ref(false)
 const testing = ref(false)
@@ -96,6 +98,9 @@ async function handleTest() {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 16px;
+}
+.page-header.embedded {
+  justify-content: flex-end;
 }
 .page-header h2 {
   margin: 0;

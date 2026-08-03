@@ -1,9 +1,15 @@
+import json
+
 from fastapi import APIRouter, HTTPException, Query
-from models.sms_content import (
-    CampaignCreate, CampaignUpdate, SmsTemplateCreate, SmsTemplateUpdate
-)
-from services import sms_content_service, batch_campaign_service, realtime_campaign_service
 from pydantic import BaseModel
+
+from models.sms_content import (
+    CampaignCreate,
+    CampaignUpdate,
+    SmsTemplateCreate,
+    SmsTemplateUpdate,
+)
+from services import batch_campaign_service, realtime_campaign_service, sms_content_service
 
 router = APIRouter(prefix="/api/sms-content", tags=["SMS Content"])
 
@@ -29,11 +35,19 @@ def list_campaigns():
     return sms_content_service.get_all_campaigns()
 
 
+@router.get("/campaigns/by-marketing")
+def get_campaign_by_marketing(
+    type: str = Query(..., alias="type"),
+    marketing_campaign_id: int = Query(...),
+):
+    return sms_content_service.get_campaign_by_marketing(type, marketing_campaign_id)
+
+
 @router.get("/campaigns/{campaign_id}")
 def get_campaign(campaign_id: int):
     campaign = sms_content_service.get_campaign(campaign_id)
     if not campaign:
-        raise HTTPException(status_code=404, detail="活动不存在")
+        raise HTTPException(status_code=404, detail="Campaign not found")
     return campaign
 
 
@@ -46,15 +60,19 @@ def create_campaign(data: CampaignCreate):
 def update_campaign(campaign_id: int, data: CampaignUpdate):
     campaign = sms_content_service.update_campaign(campaign_id, data)
     if not campaign:
-        raise HTTPException(status_code=404, detail="活动不存在")
+        raise HTTPException(status_code=404, detail="Campaign not found")
     return campaign
 
 
 @router.delete("/campaigns/{campaign_id}")
 def delete_campaign(campaign_id: int):
-    if not sms_content_service.delete_campaign(campaign_id):
-        raise HTTPException(status_code=404, detail="活动不存在")
-    return {"message": "删除成功"}
+    try:
+        deleted = sms_content_service.delete_campaign(campaign_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"message": "Deleted successfully"}
 
 
 @router.get("/templates")
@@ -105,20 +123,23 @@ def update_template(template_id: int, data: SmsTemplateUpdate):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     if not template:
-        raise HTTPException(status_code=404, detail="模板不存在")
+        raise HTTPException(status_code=404, detail="Template not found")
     return template
 
 
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int):
-    if not sms_content_service.delete_template(template_id):
-        raise HTTPException(status_code=404, detail="模板不存在")
-    return {"message": "删除成功"}
+    try:
+        deleted = sms_content_service.delete_template(template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"message": "Deleted successfully"}
 
 
 @router.post("/preview")
 def preview_template(content: str, variables: str = "{}"):
-    import json
     try:
         var_dict = json.loads(variables)
     except json.JSONDecodeError:

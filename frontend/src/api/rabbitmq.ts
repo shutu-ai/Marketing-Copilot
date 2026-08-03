@@ -20,18 +20,6 @@ export function testPublish(routingKey: string, message: any) {
   return api.post<{ success: boolean; message: string }>('/rabbitmq/test', { routing_key: routingKey, message })
 }
 
-export function getSubscriptions(whitelistId?: number) {
-  return api.get<any[]>('/rabbitmq/subscriptions', { params: { whitelist_id: whitelistId } })
-}
-
-export function createSubscription(data: { whitelist_id: number; topic_pattern: string; campaign_id?: number }) {
-  return api.post<any>('/rabbitmq/subscriptions', data)
-}
-
-export function deleteSubscription(subId: number) {
-  return api.delete(`/rabbitmq/subscriptions/${subId}`)
-}
-
 export function getSmsLog(params: { page?: number; page_size?: number; status?: string; msisdn?: string }) {
   return api.get<{ total: number; page: number; page_size: number; items: any[] }>('/rabbitmq/sms-log', { params })
 }

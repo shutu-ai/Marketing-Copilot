@@ -22,6 +22,7 @@ def main():
 
     submitted = threading.Event()
     delivered = threading.Event()
+    stopping = threading.Event()
     parts, coding, esm_class = smpplib.gsm.make_parts(args.message)
     result = {"message_ids": set(), "receipt_ids": set(), "state": None, "expected": len(parts)}
     client = smpplib.client.Client(args.host, args.port, timeout=2, allow_unknown_opt_params=True)
@@ -47,7 +48,14 @@ def main():
     client.set_message_received_handler(on_received)
     client.connect()
     client.bind_transceiver(system_id=args.system_id, password=args.password)
-    listener = threading.Thread(target=client.listen, daemon=True)
+    def listen_until_stopped():
+        try:
+            client.listen()
+        except Exception:
+            if not stopping.is_set():
+                raise
+
+    listener = threading.Thread(target=listen_until_stopped, daemon=True)
     listener.start()
 
     for part in parts:
@@ -69,7 +77,12 @@ def main():
     if not delivered.wait(args.timeout):
         raise SystemExit("FAILED: delivery receipt timeout")
     print(f"PASS: {len(parts)} submit_sm_resp and DELIVRD receipt(s) received", flush=True)
+    stopping.set()
+    # smpplib.listen() blocks in recv(). Closing the socket wakes it with an
+    # expected Windows WSAENOTSOCK error; suppress shutdown-only library logs.
+    client.logger.disabled = True
     client.disconnect()
+    listener.join(timeout=2)
 
 
 if __name__ == "__main__":

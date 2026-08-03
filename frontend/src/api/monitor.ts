@@ -1,6 +1,29 @@
 import api from './index'
 import type { MonitorConfig, MonitorFile } from '@/types/monitor'
 
+export interface RealtimeMonitorState {
+  campaign_id?: number
+  watch_dir: string
+  watch_dirs: any[]
+  campaigns: any[]
+  exists: boolean
+  active_campaigns: number
+  source_files: any[]
+  processed_files: any[]
+}
+
+export function getRealtimeMonitor(campaignId?: number) {
+  return api.get<RealtimeMonitorState>('/monitor/realtime', {
+    params: campaignId ? { campaign_id: campaignId } : undefined,
+  })
+}
+
+export function scanRealtimeMonitor(campaignId?: number) {
+  return api.post<{ sync: any; processing: any; monitor: RealtimeMonitorState }>('/monitor/realtime/scan', null, {
+    params: campaignId ? { campaign_id: campaignId } : undefined,
+  })
+}
+
 export function getMonitorConfigs() {
   return api.get<MonitorConfig[]>('/monitor/configs')
 }

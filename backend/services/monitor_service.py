@@ -3,7 +3,9 @@ import json
 from database import get_connection
 import os
 import pandas as pd
+from datetime import datetime
 from typing import Optional
+from services import settings_service
 
 
 def _parse_targets(val) -> list:
@@ -371,3 +373,119 @@ def _count_rows(file_path: str) -> int:
     except Exception:
         pass
     return 0
+
+
+def get_realtime_monitor(campaign_id: Optional[int] = None) -> dict:
+    source_files = []
+    conn = get_connection()
+    all_campaign_rows = conn.execute(
+        "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns ORDER BY created_at DESC"
+    ).fetchall()
+    if campaign_id:
+        campaign_rows = conn.execute(
+            "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns WHERE id=? AND COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC",
+            (campaign_id,),
+        ).fetchall()
+    else:
+        campaign_rows = conn.execute(
+            "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC"
+        ).fetchall()
+    active_campaigns = conn.execute("SELECT COUNT(*) AS count FROM realtime_campaigns WHERE status='in_progress'").fetchone()
+    if campaign_id:
+        processed_rows = conn.execute(
+            "SELECT * FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? ORDER BY detected_at DESC LIMIT 200",
+            (campaign_id,),
+        ).fetchall()
+    else:
+        processed_rows = conn.execute(
+            "SELECT * FROM processed_files WHERE campaign_type='realtime' ORDER BY detected_at DESC LIMIT 200"
+        ).fetchall()
+    conn.close()
+
+    selected_campaign = dict(campaign_rows[0]) if campaign_id and campaign_rows else None
+    watch_dirs = {}
+    for row in campaign_rows:
+        campaign = dict(row)
+        watch_dir = os.path.abspath(campaign.get("watch_dir", ""))
+        item = watch_dirs.setdefault(watch_dir, {
+            "directory_path": watch_dir,
+            "exists": os.path.isdir(watch_dir),
+            "campaigns": [],
+        })
+        item["campaigns"].append({
+            "id": campaign["id"],
+            "name": campaign["name"],
+            "status": campaign["status"],
+            "watch_filename_prefix": campaign.get("watch_filename_prefix", ""),
+        })
+
+    for watch_dir, meta in watch_dirs.items():
+        if not meta["exists"]:
+            continue
+        for name in sorted(os.listdir(watch_dir)):
+            path = os.path.join(watch_dir, name)
+            if not os.path.isfile(path) or os.path.splitext(name)[1].lower() != ".csv":
+                continue
+            match_prefix = None
+            match_schedule = None
+            if selected_campaign:
+                from services import realtime_campaign_service
+                prefix = selected_campaign.get("watch_filename_prefix", "")
+                match_prefix = bool(prefix and name.startswith(prefix))
+                match_schedule = realtime_campaign_service._watch_file_matches_campaign(name, selected_campaign)
+                processed_record = realtime_campaign_service._processed_file_record(selected_campaign["id"], name)
+                if processed_record:
+                    status = "processed"
+                    status_label = "已处理过"
+                    skip_reason = f"同名文件已处理: {processed_record.get('filename')}"
+                elif not match_prefix:
+                    status = "ignored"
+                    status_label = "前缀不匹配"
+                    skip_reason = "文件名不符合当前活动前缀"
+                elif not match_schedule:
+                    status = "ignored"
+                    status_label = "发送规则不匹配"
+                    skip_reason = "文件名时间不在当前活动发送日期或时间段内"
+                elif datetime.now().timestamp() - os.path.getmtime(path) < 2:
+                    status = "pending"
+                    status_label = "写入中"
+                    skip_reason = "文件仍在写入稳定等待期内"
+                else:
+                    status = "pending"
+                    status_label = "待处理"
+                    skip_reason = ""
+            else:
+                status = "watching"
+                status_label = "监听中"
+                skip_reason = ""
+            source_files.append({
+                "filename": name,
+                "directory_path": watch_dir,
+                "file_size": os.path.getsize(path),
+                "row_count": _count_rows(path),
+                "match_prefix": match_prefix,
+                "match_schedule": match_schedule,
+                "status": status,
+                "status_label": status_label,
+                "skip_reason": skip_reason,
+                "created_at": "",
+                "updated_at": "",
+            })
+
+    return {
+        "campaign_id": campaign_id,
+        "watch_dir": "",
+        "exists": all(item["exists"] for item in watch_dirs.values()) if watch_dirs else False,
+        "watch_dirs": list(watch_dirs.values()),
+        "campaigns": [dict(row) for row in all_campaign_rows],
+        "active_campaigns": active_campaigns["count"] if active_campaigns else 0,
+        "source_files": source_files,
+        "processed_files": [dict(row) for row in processed_rows],
+    }
+
+
+def scan_realtime_watch_dir(campaign_id: Optional[int] = None) -> dict:
+    from services import realtime_campaign_service
+    sync_result = realtime_campaign_service.sync_watch_dirs_to_inboxes(campaign_id=campaign_id)
+    process_result = realtime_campaign_service.process_realtime_inboxes(campaign_id=campaign_id)
+    return {"sync": sync_result, "processing": process_result, "monitor": get_realtime_monitor(campaign_id)}

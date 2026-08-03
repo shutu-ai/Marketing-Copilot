@@ -2,10 +2,9 @@
   <el-menu
     :default-active="route.path"
     :collapse="collapse"
+    unique-opened
     router
-    background-color="#1d1e1f"
-    text-color="#bfcbd9"
-    active-text-color="#409eff"
+    @select="emit('navigate')"
   >
     <el-menu-item index="/dashboard">
       <el-icon><DataBoard /></el-icon>
@@ -29,66 +28,25 @@
         <span>{{ $t('menu.realtimeCampaign') }}</span>
       </el-menu-item>
     </el-sub-menu>
-    <el-menu-item index="/smpp-config">
-      <el-icon><Connection /></el-icon>
-      <span>{{ $t('menu.smppConfig') }}</span>
-    </el-menu-item>
-    <el-sub-menu index="/whitelist">
-      <template #title>
-        <el-icon><UserFilled /></el-icon>
-        <span>{{ $t('menu.whitelist') }}</span>
-      </template>
-      <el-menu-item index="/whitelist/upload">
-        <el-icon><Upload /></el-icon>
-        <span>{{ $t('menu.whitelistUpload') }}</span>
-      </el-menu-item>
-      <el-menu-item index="/whitelist/history">
-        <el-icon><Clock /></el-icon>
-        <span>{{ $t('menu.uploadHistory') }}</span>
-      </el-menu-item>
-    </el-sub-menu>
+
     <el-menu-item index="/sms-content">
       <el-icon><ChatDotSquare /></el-icon>
       <span>{{ $t('menu.smsContent') }}</span>
     </el-menu-item>
-    <el-menu-item index="/sms-tasks">
-      <el-icon><List /></el-icon>
-      <span>短信任务</span>
-    </el-menu-item>
     <el-menu-item index="/operations">
       <el-icon><Operation /></el-icon>
-      <span>运营中心</span>
-    </el-menu-item>
-    <el-menu-item index="/capacity">
-      <el-icon><TrendCharts /></el-icon>
-      <span>容量与高可用</span>
+      <span>{{ $t('menu.operations') }}</span>
     </el-menu-item>
     <el-menu-item index="/db-query">
       <el-icon><Search /></el-icon>
       <span>{{ $t('menu.dbQuery') }}</span>
     </el-menu-item>
-    <el-menu-item index="/db-config">
-      <el-icon><Setting /></el-icon>
-      <span>{{ $t('menu.dbConfig') }}</span>
-    </el-menu-item>
+
+
     <el-menu-item index="/settings">
       <el-icon><Tools /></el-icon>
       <span>{{ $t('menu.settings') }}</span>
     </el-menu-item>
-    <el-sub-menu index="/rabbitmq">
-      <template #title>
-        <el-icon><Connection /></el-icon>
-        <span>{{ $t('menu.rabbitmq') }}</span>
-      </template>
-      <el-menu-item index="/rabbitmq">
-        <el-icon><Setting /></el-icon>
-        <span>{{ $t('menu.rabbitmqConfig') }}</span>
-      </el-menu-item>
-      <el-menu-item index="/sms-log">
-        <el-icon><List /></el-icon>
-        <span>{{ $t('menu.smsLog') }}</span>
-      </el-menu-item>
-    </el-sub-menu>
   </el-menu>
 </template>
 
@@ -96,6 +54,81 @@
 import { useRoute } from 'vue-router'
 
 defineProps<{ collapse: boolean }>()
+const emit = defineEmits<{ navigate: [] }>()
 
 const route = useRoute()
 </script>
+
+<style scoped>
+.el-menu {
+  --el-menu-bg-color: transparent;
+  --el-menu-text-color: var(--mc-sidebar-text);
+  --el-menu-hover-bg-color: rgb(255 255 255 / 8%);
+  --el-menu-active-color: #273f3d;
+  width: 100%;
+  padding: 14px 10px 28px;
+  border-right: 0;
+  background: transparent;
+}
+
+.el-menu:not(.el-menu--collapse) {
+  width: 248px;
+}
+
+:deep(.el-menu-item),
+:deep(.el-sub-menu__title) {
+  height: 46px;
+  margin: 3px 0;
+  padding: 0 14px !important;
+  border-radius: 12px;
+  color: var(--mc-sidebar-text);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 46px;
+}
+
+:deep(.el-menu-item .el-icon),
+:deep(.el-sub-menu__title .el-icon) {
+  width: 22px;
+  margin-right: 11px;
+  color: #c7d5d3;
+  font-size: 18px;
+}
+
+:deep(.el-menu-item:hover),
+:deep(.el-sub-menu__title:hover) {
+  color: #fff;
+  background: rgb(255 255 255 / 8%);
+}
+
+:deep(.el-menu-item.is-active) {
+  color: #273f3d;
+  background: #f7faf9;
+  box-shadow: 0 8px 20px rgb(27 43 41 / 15%);
+}
+
+:deep(.el-menu-item.is-active .el-icon) {
+  color: var(--mc-primary);
+}
+
+:deep(.el-sub-menu .el-menu) {
+  padding: 2px 0 4px 10px;
+}
+
+:deep(.el-sub-menu .el-menu-item) {
+  min-width: 0;
+  padding-left: 41px !important;
+  color: #cfdddb;
+  font-size: 12px;
+}
+
+:deep(.el-menu--collapse .el-menu-item),
+:deep(.el-menu--collapse .el-sub-menu__title) {
+  justify-content: center;
+  padding: 0 !important;
+}
+
+:deep(.el-menu--collapse .el-icon) {
+  margin-right: 0;
+}
+</style>

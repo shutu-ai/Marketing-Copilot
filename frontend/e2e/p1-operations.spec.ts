@@ -49,6 +49,10 @@ test('P1 operations center actions, failures, health and audits', async ({ page 
   await expect(page.getByRole('button', { name: '恢复' })).toBeVisible()
   expect(apiCalls.some(item => item === 'POST /api/operations/campaigns/action')).toBeTruthy()
 
+  await page.getByRole('tab', { name: '短信任务' }).click()
+  await expect(page).toHaveURL(/\/operations\?tab=sms-tasks/)
+  await expect(page.getByRole('heading', { name: '短信任务实时状态' })).toBeVisible()
+
   await page.getByRole('tab', { name: '失败处理' }).click()
   await expect(page.getByText('251900000091')).toBeVisible()
   await page.locator('.el-table__body-wrapper .el-checkbox').first().click()

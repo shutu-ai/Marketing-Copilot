@@ -37,20 +37,6 @@ class RabbitMQConfigResponse(BaseModel):
     updated_at: str
 
 
-class SubscriptionCreate(BaseModel):
-    whitelist_id: int
-    topic_pattern: str
-    campaign_id: Optional[int] = None
-
-
-class SubscriptionResponse(BaseModel):
-    id: int
-    whitelist_id: int
-    topic_pattern: str
-    campaign_id: Optional[int]
-    created_at: str
-
-
 class PublishTestData(BaseModel):
     routing_key: str
     message: dict

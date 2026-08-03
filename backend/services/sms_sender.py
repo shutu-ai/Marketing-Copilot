@@ -5,12 +5,13 @@ from database import get_connection
 from services.settings_service import get_setting
 
 logger = logging.getLogger(__name__)
+detail_logger = logging.getLogger("mc.detail")
 
 
 def process_message(routing_key: str, message: dict):
     """
     Called by RabbitMQ consumer when a message arrives.
-    Looks up whitelist by msisdn, finds the campaign/language template, and sends SMS.
+    Uses the message language to find the campaign template and sends SMS.
     """
     msisdn = str(message.get("msisdn", "")).strip()
     if not msisdn:
@@ -21,18 +22,7 @@ def process_message(routing_key: str, message: dict):
 
     conn = get_connection()
     try:
-        user = conn.execute(
-            "SELECT * FROM whitelist_users WHERE msisdn=? AND status='active' LIMIT 1",
-            (msisdn,)
-        ).fetchone()
-
-        if not user:
-            logger.info(f"msisdn {msisdn} not in whitelist, skipping")
-            return
-
-        user = dict(user)
-        language = user.get("language", "en")
-        region = user.get("region", "")
+        language = str(message.get("language", ""))
 
         campaign = conn.execute(
             "SELECT * FROM campaigns WHERE name=? AND enabled=1 LIMIT 1",
@@ -85,7 +75,7 @@ def process_message(routing_key: str, message: dict):
         error = "" if sms_success else "SMPP send failed"
 
         _log_sms(conn, msisdn, campaign_name, language, content, source_addr, status, error)
-        logger.info(f"SMS {'sent' if sms_success else 'failed'} to {msisdn} [{language}]: {content[:50]}...")
+        detail_logger.info(f"SMS {'sent' if sms_success else 'failed'} to {msisdn} [{language}]: {content[:50]}...")
 
     except Exception as e:
         logger.error(f"SMS processing error for {msisdn}: {e}")
@@ -109,10 +99,10 @@ def _send_sms_via_smpp(msisdn: str, content: str, source_addr: str) -> bool:
 
         if smpp_config:
             config = dict(smpp_config)
-            logger.info(f"[SMPP SEND] via {config['host']}:{config['port']} "
-                        f"to {msisdn} from {source_addr}: {content[:50]}")
+            detail_logger.info(f"[SMPP SEND] via {config['host']}:{config['port']} "
+                               f"to {msisdn} from {source_addr}: {content[:50]}")
         else:
-            logger.info(f"[SMS STUB] No SMPP config, simulated send to {msisdn}: {content[:50]}")
+            detail_logger.info(f"[SMS STUB] No SMPP config, simulated send to {msisdn}: {content[:50]}")
 
         return True
     except Exception as e:

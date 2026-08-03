@@ -14,10 +14,20 @@ export function getRealtimeFiles(campaignId: number) {
   return api.get<any[]>(`/realtime-campaigns/${campaignId}/files`)
 }
 
+export function getRealtimeSentRecords(campaignId: number) {
+  return api.get<any[]>(`/realtime-campaigns/${campaignId}/sent-records`)
+}
+
+export function downloadRealtimeSentRecord(campaignId: number, filename: string) {
+  return api.get<Blob>(`/realtime-campaigns/${campaignId}/sent-records/${encodeURIComponent(filename)}`, {
+    responseType: 'blob',
+  })
+}
+
 export function receiveRealtimeFile(campaignId: number, file: File) {
   const form = new FormData()
   form.append('file', file)
   return api.post<{
-    success: boolean; filename: string; total_msisdn: number; matched_count: number
+    success: boolean; filename?: string; total_msisdn?: number; matched_count?: number; duplicate_file?: boolean
   }>(`/realtime-campaigns/${campaignId}/receive-file`, form)
 }

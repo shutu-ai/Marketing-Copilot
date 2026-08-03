@@ -33,6 +33,10 @@ backend/uploads/
 backend/monitor_dir/
 old_script/*.csv
 
+# Local build and release snapshots
+release/
+MarketingCopilot-clean-source.zip
+
 # OS and tooling
 .DS_Store
 Thumbs.db

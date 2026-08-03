@@ -23,6 +23,16 @@ class PublishFileReq(BaseModel):
     campaign_name: str = ""
 
 
+@router.get("/realtime")
+def realtime_monitor(campaign_id: int = Query(None)):
+    return monitor_service.get_realtime_monitor(campaign_id)
+
+
+@router.post("/realtime/scan")
+def scan_realtime_monitor(campaign_id: int = Query(None)):
+    return monitor_service.scan_realtime_watch_dir(campaign_id)
+
+
 @router.get("/configs")
 def list_configs():
     return monitor_service.get_all_configs()

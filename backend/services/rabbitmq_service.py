@@ -5,6 +5,7 @@ from typing import Optional, Callable
 from database import get_connection
 
 logger = logging.getLogger(__name__)
+detail_logger = logging.getLogger("mc.detail")
 
 _connection = None
 _channel = None
@@ -101,7 +102,7 @@ def publish(routing_key: str, message: dict) -> bool:
                 content_type="application/json",
             ),
         )
-        logger.info(f"Published to {routing_key}: {message}")
+        detail_logger.info(f"Published to {routing_key}: {message}")
         return True
     except Exception as e:
         logger.error(f"Publish failed: {e}")
@@ -192,7 +193,7 @@ def _consumer_loop(callback: Callable):
 def _on_message(ch, method, properties, body, callback):
     try:
         message = json.loads(body)
-        logger.info(f"Received: {method.routing_key} -> {message}")
+        detail_logger.info(f"Received: {method.routing_key} -> {message}")
         callback(method.routing_key, message)
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as e:

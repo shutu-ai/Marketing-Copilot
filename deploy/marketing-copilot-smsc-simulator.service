@@ -1,0 +1,17 @@
+[Unit]
+Description=Marketing Copilot local SMSC simulator (optional test component)
+After=network.target
+
+[Service]
+Type=simple
+User=marketing-copilot
+WorkingDirectory=/opt/marketing-copilot/backend
+ExecStart=/opt/marketing-copilot/python/bin/python3.11 -m tools.smsc_simulator --host 127.0.0.1 --port 2775 --system-id test --password test
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

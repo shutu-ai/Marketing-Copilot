@@ -18,7 +18,7 @@ test('P2 capacity dashboard renders worker, pool and alert state', async ({ page
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
   })
   await page.goto('/capacity')
-  await expect(page).toHaveURL(/\/capacity$/)
+  await expect(page).toHaveURL(/\/operations\?tab=capacity/)
   await expect(page.getByRole('heading', { name: '容量与高可用' })).toBeVisible()
   await expect(page.getByText('Primary')).toBeVisible()
   await expect(page.getByText('Backup')).toBeVisible()

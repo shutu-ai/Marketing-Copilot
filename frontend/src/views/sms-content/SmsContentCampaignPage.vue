@@ -40,7 +40,7 @@
       <template #header>
         <div style="display:flex;align-items:center;justify-content:space-between">
           <span>{{ $t('smsContent.template') }}</span>
-          <el-button size="small" @click="addRow">
+          <el-button size="small" :disabled="rows.length >= languageOptions.length" @click="addRow">
             <el-icon><Plus /></el-icon>
             {{ $t('common.add') }}
           </el-button>
@@ -57,11 +57,12 @@
         <el-form label-width="100px" size="small">
           <el-form-item :label="$t('common.language')" required>
             <el-select v-model="row.language" style="width:100%" placeholder="请选择语言">
-              <el-option label="Amharic" value="Amharic" />
-              <el-option label="Tigrigna" value="Tigrigna" />
-              <el-option label="Somali" value="Somali" />
-              <el-option label="English" value="English" />
-              <el-option label="Oromign" value="Oromign" />
+              <el-option
+                v-for="language in availableLanguages(idx)"
+                :key="language"
+                :label="language"
+                :value="language"
+              />
             </el-select>
           </el-form-item>
           <el-form-item :label="$t('smsContent.content')" required>
@@ -76,7 +77,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
@@ -93,12 +94,13 @@ const { t } = useI18n()
 const isEdit = computed(() => !!route.params.campaignId && route.params.campaignId !== 'new')
 const isFromMarketing = computed(() => !!route.query.from)
 const pageTitle = computed(() => {
-  if (isEdit.value) return t('common.edit')
+  if (isEdit.value || smsContentCampaignId.value) return t('common.edit')
   return isFromMarketing.value ? t('smsContent.configSms') : t('smsContent.addCampaign')
 })
 const saving = ref(false)
 const loadingCampaigns = ref(false)
 const campaignName = ref('')
+const smsContentCampaignId = ref<number | null>(null)
 
 const form = reactive({
   marketing_type: 'batch',
@@ -112,7 +114,7 @@ interface Row {
 }
 
 const rows = ref<Row[]>([])
-
+const languageOptions = ['Amharic', 'Tigrigna', 'Somali', 'English', 'Oromign']
 const originalTemplateIds = ref<number[]>([])
 
 function goBack() {
@@ -128,6 +130,13 @@ function addRow() {
   rows.value.push({ language: '', content: '' })
 }
 
+function availableLanguages(rowIndex: number) {
+  const selectedByOtherRows = new Set(
+    rows.value.filter((_, index) => index !== rowIndex).map(row => row.language).filter(Boolean)
+  )
+  return languageOptions.filter(language => !selectedByOtherRows.has(language))
+}
+
 async function onMarketingTypeChange(type: string) {
   form.marketing_campaign_id = null
   loadingCampaigns.value = true
@@ -135,30 +144,54 @@ async function onMarketingTypeChange(type: string) {
   loadingCampaigns.value = false
 }
 
+async function loadSmsContentCampaign(campaignId: number) {
+  const res = await api.getTemplates(campaignId)
+  const campaignRes = await api.getCampaign(campaignId)
+  const campaign = campaignRes.data
+  smsContentCampaignId.value = campaignId
+  form.marketing_type = campaign.marketing_type || 'batch'
+  form.marketing_campaign_id = campaign.marketing_campaign_id
+  campaignName.value = campaign.name || ''
+  originalTemplateIds.value = []
+  rows.value = (res.data || []).map((template: any) => {
+    originalTemplateIds.value.push(template.id)
+    return {
+      template_id: template.id,
+      language: template.language,
+      content: template.content || '',
+    }
+  })
+}
+
 async function handleSave() {
   if (!form.marketing_campaign_id && !isEdit.value) {
     ElMessage.warning('请选择营销活动')
     return
   }
-  const validRows = rows.value.filter(r => r.language && r.content?.trim())
+  const validRows = rows.value.filter(row => row.language && row.content?.trim())
   if (validRows.length === 0) {
     ElMessage.warning('请至少添加一条语言内容')
     return
   }
+  if (new Set(validRows.map(row => row.language)).size !== validRows.length) {
+    ElMessage.warning('同一种语言只能配置一次')
+    return
+  }
 
   saving.value = true
+  const editingCampaignId = smsContentCampaignId.value || (isEdit.value ? Number(route.params.campaignId) : null)
   try {
     let firstTemplateId: number | null = null
 
-    if (isEdit.value) {
-      const campaignId = Number(route.params.campaignId)
+    if (editingCampaignId) {
       const validIds = new Set<number>()
       for (const row of validRows) {
         if (row.template_id) {
-          await api.updateTemplate(row.template_id, { content: row.content })
+          await api.updateTemplate(row.template_id, { language: row.language, content: row.content })
+          if (!firstTemplateId) firstTemplateId = row.template_id
           validIds.add(row.template_id)
         } else {
-          const res = await api.createTemplate({ campaign_id: campaignId, language: row.language, content: row.content })
+          const res = await api.createTemplate({ campaign_id: editingCampaignId, language: row.language, content: row.content })
           if (!firstTemplateId) firstTemplateId = res.data.id
           validIds.add(res.data.id)
         }
@@ -169,12 +202,15 @@ async function handleSave() {
         }
       }
     } else {
-      const nameVal = isFromMarketing.value ? (route.query.campaignName as string) || '' : (store.marketingCampaigns.find((m: any) => m.id === form.marketing_campaign_id)?.name || '')
+      const nameVal = isFromMarketing.value
+        ? (route.query.campaignName as string) || ''
+        : store.marketingCampaigns.find((m: any) => m.id === form.marketing_campaign_id)?.name || ''
       const campaign = await api.createCampaign({
         name: nameVal,
         marketing_type: form.marketing_type,
         marketing_campaign_id: form.marketing_campaign_id || 0,
       })
+      smsContentCampaignId.value = campaign.data.id
       for (const row of validRows) {
         const res = await api.createTemplate({ campaign_id: campaign.data.id, language: row.language, content: row.content })
         if (!firstTemplateId) firstTemplateId = res.data.id
@@ -190,7 +226,7 @@ async function handleSave() {
       }
     }
 
-    ElMessage.success(isEdit.value ? '更新成功' : '新增成功')
+    ElMessage.success(editingCampaignId ? '更新成功' : '新增成功')
     goBack()
   } catch (e: any) {
     const msg = e?.response?.data?.detail || e?.message || '保存失败'
@@ -202,21 +238,7 @@ async function handleSave() {
 
 onMounted(async () => {
   if (isEdit.value) {
-    const campaignId = Number(route.params.campaignId)
-    const res = await api.getTemplates(campaignId)
-    const campaignRes = await api.getCampaign(campaignId)
-    const c = campaignRes.data
-    form.marketing_type = c.marketing_type || 'batch'
-    form.marketing_campaign_id = c.marketing_campaign_id
-    campaignName.value = c.name || ''
-    rows.value = (res.data || []).map((t: any) => {
-      originalTemplateIds.value.push(t.id)
-      return {
-        template_id: t.id,
-        language: t.language,
-        content: t.content || '',
-      }
-    })
+    await loadSmsContentCampaign(Number(route.params.campaignId))
   } else if (isFromMarketing.value) {
     const mkId = Number(route.query.campaignId)
     const mkName = (route.query.campaignName as string) || ''
@@ -224,6 +246,19 @@ onMounted(async () => {
     form.marketing_type = from === 'realtime' ? 'realtime' : 'batch'
     form.marketing_campaign_id = mkId
     campaignName.value = mkName
+    const existing = await api.getCampaignByMarketing(form.marketing_type, mkId)
+    if (existing.data?.id) {
+      await loadSmsContentCampaign(existing.data.id)
+      campaignName.value = mkName
+    } else if (route.query.smsTemplateId) {
+      const templateId = Number(route.query.smsTemplateId)
+      const templates = await api.getAllTemplates()
+      const linked = templates.data.find((item: any) => item.template_id === templateId)
+      if (linked?.campaign_id) {
+        await loadSmsContentCampaign(linked.campaign_id)
+        campaignName.value = mkName
+      }
+    }
   } else {
     form.marketing_type = 'batch'
     form.marketing_campaign_id = null
@@ -234,8 +269,14 @@ onMounted(async () => {
 
 <style scoped>
 .page-header {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: 16px;
 }
-.page-header h2 { margin: 0; font-size: 22px; font-weight: 600; }
+.page-header h2 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+}
 </style>

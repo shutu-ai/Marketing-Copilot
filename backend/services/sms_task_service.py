@@ -1,11 +1,15 @@
 import hashlib
 import json
+import logging
 import re
 import uuid
 from datetime import datetime
 from typing import Iterable, Optional
 
 from database import get_connection
+
+logger = logging.getLogger(__name__)
+detail_logger = logging.getLogger("mc.detail")
 
 
 FINAL_STATES = {"delivered", "failed", "expired", "cancelled", "archived"}
@@ -29,9 +33,9 @@ def _add_task_event(conn, task_id: int, event_type: str, from_status: str = "", 
                     message: str = "", detail=None):
     conn.execute(
         """INSERT INTO task_events(task_id,event_type,from_status,to_status,message,detail)
-           VALUES (?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?)""",
         (task_id, event_type, from_status or "", to_status or "", message or "",
-         json.dumps(detail or {}, ensure_ascii=False, default=str)),
+        json.dumps(detail or {}, ensure_ascii=False, default=str)),
     )
 
 
@@ -60,12 +64,24 @@ def campaign_is_active(campaign: dict, now: Optional[datetime] = None) -> tuple[
         days = campaign.get("send_days") or []
         if isinstance(days, str):
             days = json.loads(days or "[]")
-        if days and now.weekday() not in {int(v) for v in days}:
+        # API/UI use JavaScript's convention: Sunday=0 ... Saturday=6.
+        api_weekday = (now.weekday() + 1) % 7
+        if days and api_weekday not in {int(v) for v in days}:
             return False, "today is not an allowed send day"
         current = now.strftime("%H:%M")
-        if campaign.get("send_start_time") and current < campaign["send_start_time"][:5]:
+        window_start = (campaign.get("send_start_time") or "")[:5]
+        window_end = (campaign.get("send_end_time") or "")[:5]
+        if window_start and window_end:
+            # An end time earlier than the start time crosses midnight, e.g.
+            # 11:19–00:00 permits 11:34 and continues until midnight.
+            in_window = (window_start <= current <= window_end) if window_start <= window_end else (
+                current >= window_start or current <= window_end
+            )
+            if not in_window:
+                return False, "outside daily send window"
+        elif window_start and current < window_start:
             return False, "before daily send window"
-        if campaign.get("send_end_time") and current > campaign["send_end_time"][:5]:
+        elif window_end and current > window_end:
             return False, "after daily send window"
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         return False, f"invalid campaign schedule: {exc}"
@@ -75,14 +91,53 @@ def campaign_is_active(campaign: dict, now: Optional[datetime] = None) -> tuple[
 def _template_for(conn, campaign_type: str, campaign_id: int, language: str):
     rows = conn.execute(
         """SELECT t.* FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
-           WHERE c.marketing_type=? AND c.marketing_campaign_id=?
-             AND c.enabled=1 AND t.enabled=1
-           ORDER BY t.id""",
+            WHERE c.marketing_type=? AND c.marketing_campaign_id=?
+            AND c.enabled=1 AND t.enabled=1
+            ORDER BY t.id""",
         (campaign_type, campaign_id),
     ).fetchall()
     templates = [dict(r) for r in rows]
     if not templates:
-        return None
+        campaign_table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(campaign_type)
+        selected_template_id = None
+        if campaign_table:
+            selected = conn.execute(
+                f"SELECT sms_template_id FROM {campaign_table} WHERE id=?", (campaign_id,)
+            ).fetchone()
+            selected_template_id = selected["sms_template_id"] if selected else None
+        detail_logger.info(
+            "template lookup campaign_type=%s campaign_id=%s selected_template_id=%s",
+            campaign_type, campaign_id, selected_template_id,
+        )
+        if not selected_template_id:
+            # Last resort: look up campaigns table by marketing_campaign_id ignoring enabled flag
+            fallback_campaign = conn.execute(
+                """SELECT id FROM campaigns WHERE marketing_type=? AND marketing_campaign_id=?
+                    ORDER BY id LIMIT 1""",
+                (campaign_type, campaign_id),
+            ).fetchone()
+            if fallback_campaign:
+                fallback_template = conn.execute(
+                    """SELECT t.* FROM sms_templates t
+                        WHERE t.campaign_id=? AND t.enabled=1
+                        ORDER BY t.id LIMIT 1""",
+                    (fallback_campaign["id"],),
+                ).fetchone()
+                if fallback_template:
+                    detail_logger.info("template fallback campaign_type=%s campaign_id=%s template=%s",
+                                       campaign_type, campaign_id, fallback_template["id"])
+                    return dict(fallback_template)
+            detail_logger.info("template missing campaign_type=%s campaign_id=%s language=%s",
+                               campaign_type, campaign_id, language)
+            return None
+        selected_template = conn.execute(
+            """SELECT t.* FROM sms_templates t
+                WHERE t.id=? AND t.enabled=1 LIMIT 1""",
+            (selected_template_id,),
+        ).fetchone()
+        detail_logger.info("template direct campaign_type=%s campaign_id=%s template=%s",
+                           campaign_type, campaign_id, selected_template["id"] if selected_template else None)
+        return dict(selected_template) if selected_template else None
     wanted = (language or "").strip().lower()
     for item in templates:
         if item.get("language", "").strip().lower() == wanted:
@@ -91,30 +146,30 @@ def _template_for(conn, campaign_type: str, campaign_id: int, language: str):
         for item in templates:
             if item.get("language", "").strip().lower() == fallback:
                 return item
+    detail_logger.info("template default campaign_type=%s campaign_id=%s template=%s",
+                       campaign_type, campaign_id, templates[0]["id"])
     return templates[0]
 
 
 def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], source_file: str = "",
-                 batch_id: Optional[int] = None) -> dict:
-    active, reason = campaign_is_active(campaign)
-    if not active:
-        return {"success": False, "message": reason, "created": 0}
+                batch_id: Optional[int] = None, validate_schedule: bool = True) -> dict:
+    if validate_schedule:
+        active, reason = campaign_is_active(campaign)
+        if not active:
+            return {"success": False, "message": reason, "created": 0}
+    elif campaign.get("status") != "in_progress":
+        return {"success": False, "message": "campaign is not enabled", "created": 0}
 
     conn = get_connection()
-    whitelist_rows = conn.execute(
-        "SELECT msisdn, language FROM whitelist_users WHERE status='active'"
-    ).fetchall()
-    whitelist = {
-        normalize_msisdn(r["msisdn"]): (r.get("language") or "") for r in whitelist_rows
-    }
     exclusions = {
         normalize_msisdn(r["msisdn"])
         for r in conn.execute("SELECT msisdn FROM exclusion_users WHERE enabled=1").fetchall()
     }
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
-    result = {"success": True, "created": 0, "duplicate": 0, "not_whitelisted": 0,
-              "excluded": 0, "invalid": 0, "no_template": 0}
+    result = {"success": True, "created": 0, "duplicate": 0,
+                "excluded": 0, "invalid": 0, "no_template": 0}
     seen = set()
+    phone_prefix = (campaign.get("phone_prefix") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
 
     for raw in rows:
         payload = {str(k): "" if v is None else str(v) for k, v in dict(raw).items()}
@@ -122,19 +177,17 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
         if not msisdn:
             result["invalid"] += 1
             continue
+        msisdn = phone_prefix + msisdn
         payload["msisdn"] = msisdn
         if msisdn in seen:
             result["duplicate"] += 1
             continue
         seen.add(msisdn)
-        if msisdn not in whitelist:
-            result["not_whitelisted"] += 1
-            continue
         if msisdn in exclusions:
             result["excluded"] += 1
             continue
 
-        language = whitelist[msisdn] or payload.get("language", "")
+        language = payload.get("language", "")
         template = _template_for(conn, campaign_type, campaign["id"], language)
         if not template:
             result["no_template"] += 1
@@ -143,17 +196,17 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
         for key, value in payload.items():
             content = content.replace("{" + key + "}", value)
         dedupe_key = hashlib.sha256(
-            f"{campaign_type}:{campaign['id']}:{msisdn}:{today}".encode("utf-8")
+            f"{campaign_type}:{campaign['id']}:{msisdn}:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:{source_file}".encode("utf-8")
         ).hexdigest()
         try:
             cursor = conn.execute(
                 """INSERT INTO sms_tasks
-                   (campaign_type,campaign_id,batch_id,campaign_name,msisdn,language,content,
+                    (campaign_type,campaign_id,batch_id,campaign_name,msisdn,language,sms_template_id,content,
                     source_addr,payload,source_file,dedupe_key)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (campaign_type, campaign["id"], batch_id, campaign.get("name", ""), msisdn,
-                 language, content, template.get("source_addr") or "Marketing",
-                 json.dumps(payload, ensure_ascii=False), source_file, dedupe_key),
+                language, template["id"], content, template.get("source_addr") or "",
+                json.dumps(payload, ensure_ascii=False), source_file, dedupe_key),
             )
             _add_task_event(conn, cursor.lastrowid, "created", "", "queued", "task created from file",
                             {"source_file": source_file})
@@ -165,6 +218,10 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 conn.close()
                 raise
     conn.commit()
+    logger.info(
+        "Tasks enqueued campaign=%s:%s file=%s result=%s",
+        campaign_type, campaign["id"], source_file, result,
+    )
     conn.close()
     return result
 
@@ -174,10 +231,10 @@ def claim_next_task() -> Optional[dict]:
     token = uuid.uuid4().hex
     row = conn.execute(
         """UPDATE sms_tasks SET status='sending', attempts=attempts+1, claim_token=?,
-           updated_at=CURRENT_TIMESTAMP
-           WHERE id=(SELECT id FROM sms_tasks WHERE status IN ('queued','retrying')
-             AND CAST(next_attempt_at AS TIMESTAMP)<=CURRENT_TIMESTAMP ORDER BY created_at,id LIMIT 1)
-           AND status IN ('queued','retrying') RETURNING *""", (token,)
+            updated_at=CURRENT_TIMESTAMP
+            WHERE id=(SELECT id FROM sms_tasks WHERE status IN ('queued','retrying')
+            AND CAST(next_attempt_at AS TIMESTAMP)<=CURRENT_TIMESTAMP ORDER BY created_at,id LIMIT 1)
+            AND status IN ('queued','retrying') RETURNING *""", (token,)
     ).fetchone()
     if row:
         _add_task_event(conn, row["id"], "claimed", "queued", "sending", "worker claimed task",
@@ -199,8 +256,8 @@ def mark_submitted(task_id: int, message_ids: list[str]):
     message_ids = list(dict.fromkeys(existing_ids + list(message_ids or [])))
     conn.execute(
         """UPDATE sms_tasks SET status='submitted', smsc_message_ids=?, error_msg='',
-           submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)), updated_at=CURRENT_TIMESTAMP
-           WHERE id=? AND status IN ('sending','submitted')""",
+            submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)), updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status IN ('sending','submitted')""",
         (json.dumps(message_ids), task_id),
     )
     if row:
@@ -231,7 +288,7 @@ def append_message_id(task_id: int, message_id: str):
 
 
 def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
-                      retryable: bool = True, failure_class: str = "transport"):
+                        retryable: bool = True, failure_class: str = "transport"):
     retry = retryable and task["attempts"] < task.get("max_attempts", 3)
     status = "retrying" if retry else "failed"
     delay_minutes = min(30, 2 ** max(0, task["attempts"] - 1))
@@ -277,7 +334,7 @@ def record_receipt(message_id: str, state: str, raw: str):
                 expected_ids = set()
             delivered_rows = conn.execute(
                 """SELECT DISTINCT smsc_message_id FROM delivery_receipts
-                   WHERE task_id=? AND message_state IN ('DELIVRD','DELIVERED','2')""",
+                    WHERE task_id=? AND message_state IN ('DELIVRD','DELIVERED','2')""",
                 (task_id,),
             ).fetchall()
             delivered_ids = {r["smsc_message_id"] for r in delivered_rows}
@@ -298,17 +355,17 @@ def record_receipt(message_id: str, state: str, raw: str):
             f"next_attempt_at=CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP + INTERVAL '5 minutes' AS VARCHAR) ELSE next_attempt_at END, "
             f"updated_at=CURRENT_TIMESTAMP{delivered_sql} WHERE id=? AND (status<>'delivered' OR ?='delivered')",
             (status, "delivery_receipt" if status != "delivered" else "", 1 if status == "retrying" else 0,
-             status == "retrying", task_id, status),
+            status == "retrying", task_id, status),
         )
         mapping = DLR_STATE_MAP.get(normalized_state, {"label": "Unmapped DLR state", "retryable": False})
         _add_task_event(conn, task_id, "delivery_receipt", task.get("status", ""), status,
                         mapping["label"], {"message_id": message_id, "state": normalized_state,
-                                           "retryable": mapping.get("retryable", False), "raw": raw[:1000]})
+                                            "retryable": mapping.get("retryable", False), "raw": raw[:1000]})
         if status == "delivered" and task.get("batch_id"):
             batch_counts = conn.execute(
                 """SELECT COUNT(*) total,
-                          SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) delivered
-                   FROM sms_tasks WHERE batch_id=?""",
+                            SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) delivered
+                    FROM sms_tasks WHERE batch_id=?""",
                 (task["batch_id"],),
             ).fetchone()
             delivered_count = int(batch_counts["delivered"] or 0)
@@ -396,7 +453,7 @@ def defer_task(task_id: int, reason: str, expired: bool = False):
     else:
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=GREATEST(attempts-1,0), error_msg=?,
-               next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes', updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes', updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (reason, task_id),
         )
     conn.commit()
@@ -407,13 +464,13 @@ def recover_stale_tasks():
     conn = get_connection()
     conn.execute(
         """UPDATE sms_tasks SET status='retrying', error_msg='worker interrupted; recovered',
-           next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-           WHERE status='sending' AND CAST(updated_at AS TIMESTAMP) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
+            next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+            WHERE status='sending' AND CAST(updated_at AS TIMESTAMP) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
     )
     conn.execute(
         """UPDATE sms_tasks SET status='expired', error_msg='delivery receipt timeout',
-           updated_at=CURRENT_TIMESTAMP
-           WHERE status='submitted' AND CAST(submitted_at AS TIMESTAMP) < CURRENT_TIMESTAMP - INTERVAL '24 hours'"""
+            updated_at=CURRENT_TIMESTAMP
+            WHERE status='submitted' AND CAST(submitted_at AS TIMESTAMP) < CURRENT_TIMESTAMP - INTERVAL '24 hours'"""
     )
     conn.commit()
     conn.close()
