@@ -3,6 +3,7 @@ import logging
 from typing import Optional
 from database import get_connection
 from services.settings_service import get_setting
+from services.sms_task_service import normalize_language_key
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -37,26 +38,33 @@ def process_message(routing_key: str, message: dict):
 
         campaign = dict(campaign)
 
-        template = conn.execute(
-            "SELECT * FROM sms_templates WHERE campaign_id=? AND language=? AND enabled=1 LIMIT 1",
-            (campaign["id"], language)
-        ).fetchone()
+        templates = [
+            dict(row) for row in conn.execute(
+                "SELECT * FROM sms_templates WHERE campaign_id=? AND enabled=1 ORDER BY id",
+                (campaign["id"],)
+            ).fetchall()
+        ]
+        wanted = normalize_language_key(language)
+        template = next(
+            (item for item in templates if normalize_language_key(item.get("language", "")) == wanted),
+            None,
+        )
 
         if not template:
             logger.warning(f"No template for campaign {campaign_name}, lang {language}")
-            if language != "en":
-                template = conn.execute(
-                    "SELECT * FROM sms_templates WHERE campaign_id=? AND language='en' AND enabled=1 LIMIT 1",
-                    (campaign["id"],)
-                ).fetchone()
+            for fallback in ("english", "en", "amharic", "tigrigna", "somali", "oromign"):
+                template = next(
+                    (item for item in templates if normalize_language_key(item.get("language", "")) == fallback),
+                    None,
+                )
+                if template:
+                    break
 
         if not template:
             logger.error(f"No template available for campaign {campaign_name}, msisdn {msisdn}")
             _log_sms(conn, msisdn, campaign_name, language, "", "", "failed",
                      "No available template")
             return
-
-        template = dict(template)
 
         content = template["content"]
         for key, val in message.items():

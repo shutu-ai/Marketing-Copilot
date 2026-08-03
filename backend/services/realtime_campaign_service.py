@@ -21,6 +21,13 @@ detail_logger = logging.getLogger("mc.detail")
 CHUNK_SIZE = 100000  # rows per chunk for large CSV files
 
 
+def _clean_text(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "nat", "none", "<na>"} else text
+
+
 def _read_csv(path: str, chunksize: int = 0):
     """Read CSV file. If chunksize > 0, returns a chunk iterator instead of a DataFrame."""
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -348,25 +355,33 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         operations_service.event("file", "READ_FAILED", str(e), context={"campaign_id": campaign_id, "file": original_filename})
         return {"success": False, "message": f"Cannot read file: {e}"}
 
-    # Load whitelist MSISDNs into a set (chunked for large CSV files)
+    # Load whitelist MSISDNs and their preferred language (chunked for large CSV files)
     wl_ext = os.path.splitext(whitelist_path)[1].lower()
     try:
         if wl_ext == ".csv":
-            whitelist_set = set()
+            whitelist_languages = {}
             for wl_chunk in _read_csv(whitelist_path, chunksize=CHUNK_SIZE):
                 wl_msisdn_col = "msisdn" if "msisdn" in wl_chunk.columns else wl_chunk.columns[0]
-                for value in wl_chunk[wl_msisdn_col].dropna():
-                    norm = sms_task_service.normalize_msisdn(value)
-                    if norm:
-                        whitelist_set.add(norm)
+                has_language = "language" in wl_chunk.columns
+                for idx in range(len(wl_chunk)):
+                    norm = sms_task_service.normalize_msisdn(wl_chunk[wl_msisdn_col].iloc[idx])
+                    if not norm or norm in whitelist_languages:
+                        continue
+                    language = _clean_text(wl_chunk["language"].iloc[idx]) if has_language else ""
+                    whitelist_languages[norm] = language
+            whitelist_set = set(whitelist_languages)
         else:
             wl_df = pd.read_excel(whitelist_path, dtype=str)
             wl_msisdn_col = "msisdn" if "msisdn" in wl_df.columns else wl_df.columns[0]
-            whitelist_set = {
-                sms_task_service.normalize_msisdn(value)
-                for value in wl_df[wl_msisdn_col].dropna()
-                if sms_task_service.normalize_msisdn(value)
-            }
+            has_language = "language" in wl_df.columns
+            whitelist_languages = {}
+            for idx in range(len(wl_df)):
+                norm = sms_task_service.normalize_msisdn(wl_df[wl_msisdn_col].iloc[idx])
+                if not norm or norm in whitelist_languages:
+                    continue
+                language = _clean_text(wl_df["language"].iloc[idx]) if has_language else ""
+                whitelist_languages[norm] = language
+            whitelist_set = set(whitelist_languages)
     except Exception as e:
         conn.close()
         operations_service.finish_file(file_record_id, "failed", file_path, error=f"Cannot read whitelist: {e}")
@@ -390,6 +405,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     if norm in whitelist_set:
                         row_dict = chunk.iloc[idx].fillna("").to_dict()
                         row_dict["msisdn"] = norm
+                        row_dict["language"] = whitelist_languages[norm]
                         matched_row_dicts.append(row_dict)
         total_msisdn = len(received_msisdns)
         matched = received_msisdns & whitelist_set
@@ -407,8 +423,12 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         matched_count = len(matched)
         matched_rows = df[normalized_msisdns.isin(matched)].copy()
         matched_rows["msisdn"] = normalized_msisdns[normalized_msisdns.isin(matched)]
+        matched_records = matched_rows.fillna("").to_dict("records")
+        for record in matched_records:
+            msisdn = record.get("msisdn")
+            record["language"] = whitelist_languages[msisdn]
         task_result = sms_task_service.enqueue_rows(
-            "realtime", campaign, matched_rows.fillna("").to_dict("records"), original_filename
+            "realtime", campaign, matched_records, original_filename
         )
 
     campaign_dir = campaign.get("campaign_dir", "")

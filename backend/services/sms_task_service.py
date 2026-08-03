@@ -28,6 +28,24 @@ DLR_STATE_MAP = {
     "DELETED": {"status": "failed", "label": "Deleted", "retryable": False},
 }
 
+LANGUAGE_ALIASES = {
+    "en": "english",
+    "eng": "english",
+    "am": "amharic",
+    "amh": "amharic",
+    "ti": "tigrigna",
+    "tig": "tigrigna",
+    "so": "somali",
+    "som": "somali",
+    "om": "oromign",
+    "orm": "oromign",
+}
+
+
+def normalize_language_key(value) -> str:
+    key = (value or "").strip().lower()
+    return LANGUAGE_ALIASES.get(key, key)
+
 
 def _add_task_event(conn, task_id: int, event_type: str, from_status: str = "", to_status: str = "",
                     message: str = "", detail=None):
@@ -138,13 +156,13 @@ def _template_for(conn, campaign_type: str, campaign_id: int, language: str):
         detail_logger.info("template direct campaign_type=%s campaign_id=%s template=%s",
                            campaign_type, campaign_id, selected_template["id"] if selected_template else None)
         return dict(selected_template) if selected_template else None
-    wanted = (language or "").strip().lower()
+    wanted = normalize_language_key(language)
     for item in templates:
-        if item.get("language", "").strip().lower() == wanted:
+        if normalize_language_key(item.get("language", "")) == wanted:
             return item
     for fallback in ("english", "en", "amharic"):
         for item in templates:
-            if item.get("language", "").strip().lower() == fallback:
+            if normalize_language_key(item.get("language", "")) == fallback:
                 return item
     detail_logger.info("template default campaign_type=%s campaign_id=%s template=%s",
                        campaign_type, campaign_id, templates[0]["id"])
