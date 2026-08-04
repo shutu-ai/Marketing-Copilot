@@ -1,6 +1,6 @@
 <template>
   <div class="update-page">
-    <PageHeader :title="$t('update.title')" :description="$t('update.description')" />
+    <PageHeader v-if="!embedded" :title="$t('update.title')" :description="$t('update.description')" />
 
     <el-row :gutter="18">
       <el-col :xs="24" :lg="10">
@@ -212,6 +212,8 @@ import {
   type UpdateHistoryRow,
   type UpdateStatus,
 } from '@/api/update'
+
+withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 
 const CHUNK_SIZE = 8 * 1024 * 1024
 

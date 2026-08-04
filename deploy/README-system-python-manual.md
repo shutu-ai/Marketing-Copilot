@@ -51,7 +51,7 @@ Logging is controlled by two settings:
 
 The admin UI requires a login (default `admin / Huawei@123`, change it in
 production via `MC_ADMIN_PASSWORD`). The optional online-update feature lives
-in the "System Update" page: it accepts the same tar.gz package, verifies it,
+in the "System Settings" → "System Update" tab: it accepts the same tar.gz package, verifies it,
 backs up the database, swaps the app directories and health-checks with
 automatic rollback. `run.sh` prepares `$APP_HOME/updates` and exports the
 `MC_UPDATE_MODE=manual` settings automatically. See

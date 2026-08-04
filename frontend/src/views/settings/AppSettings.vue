@@ -67,6 +67,14 @@
         />
         <DbConfig embedded />
       </el-tab-pane>
+
+      <el-tab-pane :label="$t('settings.logTab')" name="logs" lazy>
+        <LogViewer embedded />
+      </el-tab-pane>
+
+      <el-tab-pane :label="$t('settings.updateTab')" name="update" lazy>
+        <SystemUpdate embedded />
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -79,11 +87,13 @@ import { ElMessage } from 'element-plus'
 import { getSettings, updateSetting } from '@/api/settings'
 import SmppConfig from '@/views/smpp/SmppConfig.vue'
 import DbConfig from '@/views/dbConfig/DbConfig.vue'
+import LogViewer from '@/views/logs/LogViewer.vue'
+import SystemUpdate from '@/views/update/SystemUpdate.vue'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const validTabs = ['basic', 'smpp', 'database'] as const
+const validTabs = ['basic', 'smpp', 'database', 'logs', 'update'] as const
 
 type SettingsTab = typeof validTabs[number]
 

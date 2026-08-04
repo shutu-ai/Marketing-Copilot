@@ -352,6 +352,8 @@ export default {
     basicTab: '基础设置',
     smppTab: 'SMPP 配置',
     databaseTab: '数据库配置',
+    logTab: '日志查看',
+    updateTab: '系统更新',
     databaseWarning: '修改数据库路径会切换业务数据库。请先完成备份，并确认没有正在运行的活动。',
     batchBaseDir: '批量营销根目录',
     batchBaseDirTip: '创建活动时将在此目录下创建活动文件夹，内含 whitelist（潜客清单）和 output（发送记录输出）子目录',

@@ -110,7 +110,7 @@ MC_FRONTEND_DIR=/opt/marketing-copilot-manual/frontend/dist
 | `MC_UPDATE_MODE` | 手动部署保持 `manual` |
 | `MC_STATE_DIR` / `MC_UPDATE_DIR` | 状态与更新目录，默认在 `$APP_HOME` 下 |
 
-启动后浏览器打开页面会先要求登录。可在「系统更新」页面上传构建脚本生成的
+启动后浏览器打开页面会先要求登录。可在「系统设置」→「系统更新」Tab 上传构建脚本生成的
 tar.gz 完成应用层在线升级（自动备份、排空、切换、健康检查与失败回滚），详见
 `Docs/前端在线更新与认证.md`。
 

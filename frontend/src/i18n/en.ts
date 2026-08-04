@@ -352,6 +352,8 @@ export default {
     basicTab: 'General',
     smppTab: 'SMPP',
     databaseTab: 'Database',
+    logTab: 'Log Viewer',
+    updateTab: 'System Update',
     databaseWarning: 'Changing the database path switches the business database. Back up first and ensure no campaigns are running.',
     batchBaseDir: 'Batch Campaign Base Directory',
     batchBaseDirTip: 'Campaign folders will be created under this directory, containing whitelist (customer list) and output (sent records) subdirectories',

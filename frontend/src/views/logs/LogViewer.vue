@@ -1,6 +1,6 @@
 <template>
   <div class="log-viewer">
-    <div class="page-header">
+    <div v-if="!embedded" class="page-header">
       <div>
         <h2>{{ $t('logViewer.title') }}</h2>
         <p>
@@ -92,6 +92,8 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { getLogFiles, getLogEntries, getLogLevel, getLogDownloadUrl, type LogEntry } from '@/api/logs'
+
+withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 
 const levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 

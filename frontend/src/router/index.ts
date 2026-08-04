@@ -106,15 +106,11 @@ const router = createRouter({
         },
         {
           path: 'logs',
-          name: 'LogViewer',
-          meta: { titleKey: 'logViewer.title' },
-          component: () => import('@/views/logs/LogViewer.vue'),
+          redirect: { path: '/settings', query: { tab: 'logs' } },
         },
         {
           path: 'update',
-          name: 'SystemUpdate',
-          meta: { titleKey: 'update.title' },
-          component: () => import('@/views/update/SystemUpdate.vue'),
+          redirect: { path: '/settings', query: { tab: 'update' } },
         },
         {
           path: 'db-config',
