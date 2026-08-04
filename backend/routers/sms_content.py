@@ -95,6 +95,11 @@ def list_templates(campaign_id: int):
     return sms_content_service.get_templates_by_campaign(campaign_id)
 
 
+@router.get("/campaigns/{campaign_id}/versions")
+def campaign_versions(campaign_id: int, page: int = 1, page_size: int = Query(50, le=200)):
+    return sms_content_service.list_campaign_versions(campaign_id, page, page_size)
+
+
 @router.post("/templates")
 def create_template(data: SmsTemplateCreate):
     try:

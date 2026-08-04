@@ -9,6 +9,58 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 _lock_path = Path(os.environ.get("MC_INSTANCE_LOCK", Path(tempfile.gettempdir()) / "marketing-copilot.lock"))
 _owns_lock = False
+LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+DETAIL_LOGGER_NAME = "mc.detail"
+
+
+def get_log_path() -> Path:
+    """Absolute path of the application log file (RotatingFileHandler target)."""
+    return Path(os.environ.get("MC_LOG_PATH", Path(__file__).resolve().parents[1] / "logs" / "app.log"))
+
+
+def normalize_log_level(level: str) -> str:
+    """Validate and normalize a log level name; raise ValueError when invalid."""
+    normalized = (level or "").strip().upper()
+    if normalized not in LOG_LEVEL_NAMES:
+        raise ValueError(f"invalid log level: {level!r}, expected one of {', '.join(LOG_LEVEL_NAMES)}")
+    return normalized
+
+
+def get_log_level() -> str:
+    """Current effective level of the root logger as a name (e.g. 'INFO')."""
+    numeric = logging.getLogger().getEffectiveLevel()
+    name = logging.getLevelName(numeric)
+    return name if isinstance(name, str) and not name.startswith("Level ") else str(numeric)
+
+
+def set_log_level(level: str) -> str:
+    """Apply a validated log level to the root logger at runtime."""
+    normalized = normalize_log_level(level)
+    logging.getLogger().setLevel(getattr(logging, normalized))
+    return normalized
+
+
+def normalize_detail_logging(value) -> str:
+    """Normalize an MC_DETAIL_LOGGING-style value to '1' or '0'."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    normalized = str(value or "").strip().lower()
+    return "1" if normalized in ("1", "true", "yes", "on") else "0"
+
+
+def get_detail_logging() -> str:
+    """Current effective state of per-message detail logging ('1' or '0')."""
+    detail_logger = logging.getLogger(DETAIL_LOGGER_NAME)
+    return "1" if detail_logger.isEnabledFor(logging.INFO) else "0"
+
+
+def set_detail_logging(value) -> str:
+    """Enable or disable per-message detail logs at runtime."""
+    normalized = normalize_detail_logging(value)
+    detail_logger = logging.getLogger(DETAIL_LOGGER_NAME)
+    detail_logger.setLevel(logging.INFO if normalized == "1" else logging.WARNING)
+    detail_logger.propagate = True
+    return normalized
 
 
 def _process_is_running(pid: int) -> bool:
@@ -52,7 +104,7 @@ def configure_logging():
     root = logging.getLogger()
     root.setLevel(getattr(logging, os.environ.get("MC_LOG_LEVEL", "INFO").upper(), logging.INFO))
     if not any(isinstance(item, RotatingFileHandler) for item in root.handlers):
-        log_path = Path(os.environ.get("MC_LOG_PATH", Path(__file__).resolve().parents[1] / "logs" / "app.log"))
+        log_path = get_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(log_path, maxBytes=int(os.environ.get("MC_LOG_MAX_BYTES", "10485760")),
                                       backupCount=int(os.environ.get("MC_LOG_BACKUPS", "10")), encoding="utf-8")
@@ -60,12 +112,7 @@ def configure_logging():
         root.addHandler(handler)
     # Per-message detail logs (SMS body, RabbitMQ payload, etc.) are high-frequency
     # and can be disabled in production with MC_DETAIL_LOGGING=0.
-    detail_logger = logging.getLogger("mc.detail")
-    if os.environ.get("MC_DETAIL_LOGGING", "0") == "1":
-        detail_logger.setLevel(logging.INFO)
-    else:
-        detail_logger.setLevel(logging.WARNING)
-    detail_logger.propagate = True
+    set_detail_logging(os.environ.get("MC_DETAIL_LOGGING", "0"))
 
 
 def acquire_instance_lock():
@@ -101,6 +148,8 @@ def release_instance_lock():
 
 def backup_database(target_dir: str = "") -> str:
     import database
+    from services import db_config as db_config_service
+    database.set_database_file(db_config_service.get_effective_db_path(database.get_database_file()))
     source = Path(database.get_database_file())
     if str(source) == ":memory:" or not source.exists():
         raise RuntimeError("database file is not available for backup")

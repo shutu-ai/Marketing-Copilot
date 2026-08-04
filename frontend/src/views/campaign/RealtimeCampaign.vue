@@ -71,9 +71,9 @@
             <code class="path-code">{{ row.campaign_dir || '-' }}</code>
           </template>
         </el-table-column>
-        <el-table-column :label="$t('smsContent.template')" min-width="160">
+        <el-table-column :label="$t('campaign.associateSmpp')" min-width="180">
           <template #default="{ row }">
-            <span v-if="row.sms_template_id" style="font-size:12px">#{{ row.sms_template_id }}</span>
+            <span v-if="row.smpp_config_id" style="font-size:12px">{{ smppName(row.smpp_config_id) }}</span>
             <span v-else class="muted">-</span>
           </template>
         </el-table-column>
@@ -118,13 +118,14 @@
               <el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button>
               <template #dropdown>
                 <el-dropdown-menu>
-                  <el-dropdown-item v-if="row.status === 'not_started' || row.status === 'ended'" command="edit">{{ $t('common.edit') }}</el-dropdown-item>
+                  <el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item>
                   <el-dropdown-item command="upload">
                     {{ row.status === 'in_progress' ? '更新白名单' : $t('campaign.uploadWhitelist') }}
                   </el-dropdown-item>
                   <el-dropdown-item command="sms">
                     {{ row.status === 'in_progress' ? '更新短信' : $t('smsContent.configSms') }}
                   </el-dropdown-item>
+                  <el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item>
                   <el-dropdown-item v-if="row.status !== 'in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
@@ -146,9 +147,11 @@
       :model-value="dialogVisible"
       :title="editForm.id ? $t('common.edit') : $t('campaign.addCampaign')"
       width="560px"
+      align-center
       @close="dialogVisible = false"
     >
       <el-form :model="editForm" label-width="120px" size="small">
+        <template v-if="!inProgressEdit">
         <el-form-item :label="$t('campaign.name')" required>
           <el-input v-model="editForm.name" />
         </el-form-item>
@@ -194,7 +197,7 @@
           <div class="form-tip">{{ $t('campaign.watchFilenamePrefixTip') }}</div>
         </el-form-item>
         <el-form-item :label="$t('campaign.phonePrefix')">
-          <el-input v-model="editForm.phone_prefix" placeholder="009" :disabled="editForm.status === 'in_progress'" />
+          <el-input v-model="editForm.phone_prefix" placeholder="251" :disabled="editForm.status === 'in_progress'" />
           <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
         </el-form-item>
        <el-form-item :label="$t('campaign.sendStartTime')">
@@ -210,10 +213,20 @@
             </el-checkbox>
           </el-checkbox-group>
         </el-form-item>
-        <el-form-item :label="$t('smsContent.template')">
-          <el-select v-model="editForm.sms_template_id" clearable filterable placeholder="选择短信模板" style="width:100%">
-            <el-option v-for="tpl in templateOptions" :key="tpl.template_id" :value="tpl.template_id" :label="`#${tpl.template_id} ${tpl.campaign_name} (${tpl.language})`" />
+        </template>
+        <el-alert
+          v-if="inProgressEdit"
+          :title="$t('campaign.inProgressSmppOnly')"
+          type="info"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 12px"
+        />
+        <el-form-item :label="$t('campaign.associateSmpp')" required>
+          <el-select v-model="editForm.smpp_config_id" clearable filterable :placeholder="$t('campaign.associateSmppPlaceholder')" style="width:100%">
+            <el-option v-for="cfg in enabledSmppOptions" :key="cfg.id" :value="cfg.id" :label="`${cfg.name} (${cfg.host}:${cfg.port})`" />
           </el-select>
+          <div class="form-tip">{{ $t('campaign.associateSmppTip') }}</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -230,6 +243,12 @@
       width="480px"
       @close="uploadVisible = false"
     >
+      <div style="margin-bottom: 12px; text-align: right">
+        <el-button size="small" @click="downloadWhitelistTemplate">
+          <el-icon><Download /></el-icon>
+          {{ $t('campaign.downloadTemplate') }}
+        </el-button>
+      </div>
      <el-upload
        drag
        :key="uploadKey"
@@ -259,7 +278,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -267,6 +286,7 @@ import DirectoryPicker from '@/components/DirectoryPicker.vue'
 import * as api from '@/api/realtime-campaign'
 import * as rtApi from '@/api/realtime'
 import * as smsApi from '@/api/smsContent'
+import * as smppApi from '@/api/smpp'
 import { useI18n } from 'vue-i18n'
 import { uploadRealtimeCustomerListWithProgress } from '@/api/realtime-campaign'
 import { useRouter } from 'vue-router'
@@ -302,6 +322,7 @@ interface Campaign {
  watch_filename_prefix: string
  phone_prefix: string
  sms_template_id: number | null
+ smpp_config_id: number | null
   created_at: string
 }
 
@@ -313,7 +334,8 @@ const rtStats = reactive<Record<number, { file_count: number; total_msisdn_sum: 
 const loading = ref(false)
 const dialogVisible = ref(false)
 const saving = ref(false)
-const templateOptions = ref<any[]>([])
+const smppOptions = ref<any[]>([])
+const enabledSmppOptions = computed(() => smppOptions.value.filter((item: any) => item.enabled === 1))
 const editForm = ref<{
   id: number
   name: string
@@ -326,7 +348,7 @@ const editForm = ref<{
   watch_dir: string
  watch_filename_prefix: string
  phone_prefix: string
- sms_template_id: number | null
+ smpp_config_id: number | null
  status: string
 }>({
   id: 0,
@@ -340,7 +362,7 @@ const editForm = ref<{
   watch_dir: '',
  watch_filename_prefix: 'Android_4G_Switch_Somali_',
  phone_prefix: '',
- sms_template_id: null,
+ smpp_config_id: null,
  status: 'not_started',
 })
 const uploadVisible = ref(false)
@@ -350,6 +372,7 @@ const selectedFile = ref<File | null>(null)
 const uploadPercent = ref(0)
 const uploadKey = ref(0)
 const customDirectory = ref(false)
+const inProgressEdit = ref(false)
 const directoryPickerVisible = ref(false)
 const directoryPickerTarget = ref<'campaign' | 'watch'>('campaign')
 
@@ -379,6 +402,7 @@ function changePage(nextPage: number) {
 
 function showDialog(row: Campaign | null) {
   if (row) {
+    inProgressEdit.value = row.status !== 'not_started' && row.status !== 'ended'
     customDirectory.value = Boolean(row.use_custom_directory)
     editForm.value = {
       id: row.id,
@@ -392,10 +416,11 @@ function showDialog(row: Campaign | null) {
       watch_dir: row.watch_dir || '',
      watch_filename_prefix: row.watch_filename_prefix || 'Android_4G_Switch_Somali_',
      phone_prefix: row.phone_prefix || '',
-     sms_template_id: row.sms_template_id ?? null,
+     smpp_config_id: row.smpp_config_id ?? null,
       status: row.status,
     }
   } else {
+    inProgressEdit.value = false
     customDirectory.value = false
     editForm.value = {
       id: 0,
@@ -409,7 +434,7 @@ function showDialog(row: Campaign | null) {
       watch_dir: '',
      watch_filename_prefix: 'Android_4G_Switch_Somali_',
      phone_prefix: '',
-     sms_template_id: null,
+     smpp_config_id: null,
      status: 'not_started',
    }
  }
@@ -422,6 +447,7 @@ function readinessItems(row: Campaign) {
   return [
     { ok: row.row_count > 0, label: t(row.row_count > 0 ? 'campaign.whitelistReady' : 'campaign.whitelistMissing') },
     { ok: Boolean(row.sms_template_id), label: t(row.sms_template_id ? 'campaign.templateReady' : 'campaign.templateMissing') },
+    { ok: Boolean(row.smpp_config_id), label: t(row.smpp_config_id ? 'campaign.smppReady' : 'campaign.smppMissing') },
     { ok: scheduleReady, label: t(scheduleReady ? 'campaign.scheduleReady' : 'campaign.scheduleMissing') },
     { ok: Boolean(row.watch_dir), label: t(row.watch_dir ? 'campaign.watchDirReady' : 'campaign.watchDirMissing') },
     { ok: Boolean(watchFilenamePrefix), label: t(watchFilenamePrefix ? 'campaign.watchFilenamePrefixReady' : 'campaign.watchFilenamePrefixMissing') },
@@ -473,9 +499,11 @@ async function handleSave() {
       watch_dir: editForm.value.watch_dir,
      watch_filename_prefix: editForm.value.watch_filename_prefix,
      phone_prefix: editForm.value.phone_prefix,
-     sms_template_id: editForm.value.sms_template_id || undefined,
+     smpp_config_id: editForm.value.smpp_config_id || undefined,
    }
-    if (editForm.value.id && editForm.value.status !== 'not_started') {
+    if (editForm.value.id && editForm.value.status !== 'not_started' && editForm.value.status !== 'ended') {
+      payload = { smpp_config_id: editForm.value.smpp_config_id || undefined }
+    } else if (editForm.value.id && editForm.value.status === 'ended') {
       payload = {
         end_time: editForm.value.end_time,
        send_start_time: editForm.value.send_start_time,
@@ -484,7 +512,7 @@ async function handleSave() {
        watch_dir: editForm.value.watch_dir,
        watch_filename_prefix: editForm.value.watch_filename_prefix,
        phone_prefix: editForm.value.phone_prefix,
-       sms_template_id: editForm.value.sms_template_id || undefined,
+       smpp_config_id: editForm.value.smpp_config_id || undefined,
       }
     }
     if (editForm.value.id) {
@@ -570,13 +598,41 @@ async function handleDelete(id: number) {
   }
 }
 
-async function fetchTemplates() {
+async function handleCopy(row: Campaign) {
   try {
-    const res = await smsApi.getTemplatesForSelect()
-    templateOptions.value = res.data
+    await api.copyRealtimeCampaign(row.id)
+    ElMessage.success('复制成功')
+    await fetchList()
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.detail || '复制失败')
+  }
+}
+
+function downloadWhitelistTemplate() {
+  const blob = new Blob(
+    ['msisdn,language\n251911111111,English\n'],
+    { type: 'text/csv;charset=utf-8' }
+  )
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'whitelist_template.csv'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function fetchSmppConfigs() {
+  try {
+    const res = await smppApi.getSmppConfigs()
+    smppOptions.value = res.data
   } catch {
     // ignore
   }
+}
+
+function smppName(configId: number | null) {
+  const cfg = smppOptions.value.find((item: any) => item.id === configId)
+  return cfg ? `${cfg.name} (${cfg.host}:${cfg.port})` : `#${configId}`
 }
 
 async function openSmsConfig(row: Campaign) {
@@ -605,12 +661,13 @@ function handleMore(command: string, row: Campaign) {
   if (command === 'edit') showDialog(row)
   if (command === 'upload') handleUpload(row)
   if (command === 'sms') void openSmsConfig(row)
+  if (command === 'copy') void handleCopy(row)
   if (command === 'delete') void handleDelete(row.id)
 }
 
 onMounted(() => {
   void fetchList()
-  void fetchTemplates()
+  void fetchSmppConfigs()
 })
 </script>
 

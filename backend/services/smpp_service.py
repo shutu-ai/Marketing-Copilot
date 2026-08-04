@@ -6,6 +6,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_BIND_STATUS_MESSAGES = {
+    0x00000003: "命令无效 (ESME_RINVCMDID)",
+    0x0000000E: "密码错误 (ESME_RINVPASWD)",
+    0x0000000F: "系统ID无效 (ESME_RINVSYSID)",
+}
+
 
 def _masked(row) -> dict:
     result = dict(row)
@@ -26,6 +32,14 @@ def get_config(config_id: int) -> Optional[dict]:
     row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
     conn.close()
     return _masked(row) if row else None
+
+
+def _get_config_row(config_id: int) -> Optional[dict]:
+    """Raw config row including the real password (never exposed via API)."""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def create_config(data: SmppConfigCreate) -> dict:
@@ -60,7 +74,8 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
                    "reconnect_max_seconds", "enabled"]:
         val = getattr(data, field, None)
         if val is not None:
-            if field == "password" and val == "********":
+            # Empty or masked password means "keep the stored one" on edit.
+            if field == "password" and val in ("", "********"):
                 continue
             fields[field] = val
 
@@ -91,18 +106,63 @@ def delete_config(config_id: int) -> bool:
     return deleted
 
 
-async def test_connection(data: dict) -> dict:
+def _run_smpp_bind_test(data: dict) -> dict:
+    """Connect and perform a real SMPP bind so credentials are actually checked."""
+    import smpplib.client
+    import smpplib.exceptions
+
+    client = None
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(data["host"], data["port"]),
-            timeout=data.get("timeout", 10)
+        client = smpplib.client.Client(
+            data["host"], int(data["port"]),
+            timeout=data.get("timeout", 10),
+            allow_unknown_opt_params=True,
         )
-        writer.close()
-        await writer.wait_closed()
-        return {"success": True, "message": "TCP连接成功 (SMPP协议需进一步验证)"}
-    except asyncio.TimeoutError:
-        return {"success": False, "message": "连接超时"}
-    except ConnectionRefusedError:
-        return {"success": False, "message": "连接被拒绝"}
+        client.logger.disabled = True
+        client.connect()
+        bind_type = data.get("bind_type") or "transceiver"
+        bind_func = getattr(client, f"bind_{bind_type}", client.bind_transceiver)
+        bind_func(system_id=data.get("system_id") or "", password=data.get("password") or "")
+        return {"success": True, "message": "SMPP 连接成功，账号密码验证通过"}
+    except smpplib.exceptions.PDUError as exc:
+        status = exc.args[1] if len(exc.args) > 1 else None
+        detail = _BIND_STATUS_MESSAGES.get(status) or str(exc)
+        return {"success": False, "message": f"SMPP 绑定失败: {detail}"}
+    except smpplib.exceptions.ConnectionError as exc:
+        message = str(exc)
+        if "refused" in message.lower():
+            return {"success": False, "message": "连接被拒绝"}
+        return {"success": False, "message": message or "连接超时"}
     except Exception as e:
         return {"success": False, "message": str(e)}
+    finally:
+        if client is not None:
+            try:
+                client.unbind()
+            except Exception:
+                pass
+            client.disconnect()
+
+
+async def test_connection(data: dict) -> dict:
+    config_id = data.get("config_id")
+    if config_id:
+        config = _get_config_row(config_id)
+        if not config:
+            return {"success": False, "message": "配置不存在"}
+        # Use the real stored credentials so a masked UI value ("********")
+        # is never sent to the SMSC as the password.
+        data = {
+            **data,
+            "host": config["host"],
+            "port": config["port"],
+            "system_id": config["system_id"],
+            "password": config["password"],
+            "bind_type": config.get("bind_type") or "transceiver",
+            "timeout": config.get("timeout") or data.get("timeout", 10),
+        }
+    try:
+        return await asyncio.to_thread(_run_smpp_bind_test, data)
+    except Exception as exc:
+        logger.exception("SMPP connection test failed")
+        return {"success": False, "message": str(exc)}

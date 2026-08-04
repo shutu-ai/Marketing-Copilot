@@ -71,7 +71,7 @@ sudo vi /etc/marketing-copilot.env
 
 | 配置项 | 作用 |
 | --- | --- |
-| `DUCKDB_PATH` | DuckDB 数据库文件路径。 |
+| `DUCKDB_PATH` | DuckDB 数据库文件路径；仅首次启动且无 `db_config.json` 时作为默认值写入配置，之后以页面（UI）配置为准。 |
 | `MC_FRONTEND_DIR` | 前端静态文件路径；默认无需修改。 |
 | `MC_TASK_WORKERS` | 内部短信任务工作线程数。 |
 | `MC_ALERT_WEBHOOK_URL` | 可选告警 Webhook 地址；离线环境通常保持为空。 |

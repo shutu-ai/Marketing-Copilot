@@ -268,6 +268,7 @@ def init_db():
             use_custom_directory BOOLEAN NOT NULL DEFAULT FALSE,
            sms_template_id INTEGER DEFAULT NULL,
            phone_prefix TEXT NOT NULL DEFAULT '',
+           smpp_config_id INTEGER DEFAULT NULL,
            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
@@ -311,6 +312,7 @@ def init_db():
             watch_dir TEXT NOT NULL DEFAULT '',
             watch_filename_prefix TEXT NOT NULL DEFAULT 'Android_4G_Switch_Somali_',
             sms_template_id INTEGER DEFAULT NULL,
+            smpp_config_id INTEGER DEFAULT NULL,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
@@ -354,6 +356,7 @@ def init_db():
             msisdn TEXT NOT NULL,
             language TEXT NOT NULL DEFAULT '',
             sms_template_id INTEGER,
+            smpp_config_id INTEGER,
             content TEXT NOT NULL,
             source_addr TEXT NOT NULL DEFAULT '',
             payload TEXT NOT NULL DEFAULT '{}',
@@ -381,6 +384,11 @@ def init_db():
             message_state TEXT NOT NULL DEFAULT '',
             raw_receipt TEXT NOT NULL DEFAULT '',
             received_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
+        """CREATE TABLE IF NOT EXISTS sms_task_message_ids (
+            smsc_message_id TEXT PRIMARY KEY,
+            task_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
         """CREATE TABLE IF NOT EXISTS processed_files (
             id INTEGER DEFAULT nextval('seq_processed_files') PRIMARY KEY,
@@ -457,6 +465,9 @@ def init_db():
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_dir TEXT DEFAULT ''",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_filename_prefix TEXT DEFAULT 'Android_4G_Switch_Somali_'",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS phone_prefix TEXT DEFAULT ''",
+        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+        "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
    ]
     for stmt in migrations:
         try:
@@ -536,7 +547,13 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
         "CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(campaign_type,campaign_id,file_hash)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_name_unique ON processed_files(campaign_type,campaign_id,filename)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique ON delivery_receipts(smsc_message_id,message_state)",
+        # Receipt dedup is per-task: SMSC message ids may be reused across
+        # tasks (simulator restarts its counter, some SMSCs recycle ids), so
+        # the same (message_id, state) must be allowed on different tasks.
+        "DROP INDEX IF EXISTS idx_receipt_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique ON delivery_receipts(task_id,smsc_message_id,message_state)",
+        "CREATE INDEX IF NOT EXISTS idx_receipt_task ON delivery_receipts(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_task_msg_task ON sms_task_message_ids(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_events_open ON system_events(resolved,severity,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)",
@@ -548,10 +565,26 @@ def init_db():
         except Exception:
             pass
 
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO sms_task_message_ids (smsc_message_id, task_id)
+               SELECT mid, id FROM (
+                   SELECT id, unnest(from_json(smsc_message_ids, '["VARCHAR"]')) AS mid
+                   FROM sms_tasks
+                   WHERE smsc_message_ids IS NOT NULL AND smsc_message_ids <> '[]'
+               )
+               WHERE mid IS NOT NULL AND mid <> ''"""
+        )
+    except Exception as e:
+        logger.warning("[DB] Skipping sms_task_message_ids backfill: %s", e)
+
+    from services.runtime_service import normalize_detail_logging
     defaults = [
         ("batch_base_dir", os.path.join(os.path.dirname(__file__), "uploads", "batch_campaigns")),
         ("realtime_base_dir", os.path.join(os.path.dirname(__file__), "uploads", "realtime_campaigns")),
         ("system_mode", "production"),
+        ("log_level", "INFO"),
+        ("detail_logging", normalize_detail_logging(os.environ.get("MC_DETAIL_LOGGING", "0"))),
     ]
     for k, v in defaults:
         try:

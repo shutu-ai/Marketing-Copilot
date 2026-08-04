@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from models.db_config import DbConfigCreate, DbConfigUpdate
 from services import db_config
-from database import reconnect, init_db, set_database_file
+from database import reconnect, init_db, set_database_file, get_database_file
 
 router = APIRouter(prefix="/api/db-config", tags=["Database Config"])
 
@@ -9,6 +9,7 @@ router = APIRouter(prefix="/api/db-config", tags=["Database Config"])
 @router.get("")
 def get_config():
     cfg = db_config.get_config()
+    cfg["active_db_path"] = get_database_file()
     return cfg
 
 

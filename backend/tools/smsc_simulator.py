@@ -12,6 +12,7 @@ import json
 import logging
 import signal
 import struct
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -244,11 +245,21 @@ class Session:
                     await self.send_pdu(GENERIC_NACK, sequence, status=0x00000003)
         except asyncio.IncompleteReadError:
             pass
+        except ConnectionError:
+            # Client dropped the TCP connection abruptly (e.g. WinError 64 /
+            # WSAECONNRESET on Windows). This is a normal teardown path, not a
+            # protocol failure, so do not log a traceback.
+            logging.debug("Session %s connection reset by peer", self.peer)
         except Exception as exc:
             logging.exception("Session %s failed: %s", self.peer, exc)
         finally:
             self.writer.close()
-            await self.writer.wait_closed()
+            try:
+                await self.writer.wait_closed()
+            except ConnectionError:
+                # The reset can also surface while awaiting close, which would
+                # otherwise leak as an unhandled exception in the callback.
+                pass
             print(f"[{self.peer}] DISCONNECTED", flush=True)
 
 
@@ -264,14 +275,23 @@ class SmscSimulator:
                                    "UNKNOWN": 7, "REJECTD": 8}.get(self.receipt_state, 7)
         self.drop_receipts = drop_receipts
         self.max_pdu_size = 1024 * 1024
-        self.message_ids = itertools.count(1)
+        # Start from a time-based base so message ids are unique across
+        # simulator restarts; reusing ids (0000000001, 0000000002, ...) makes
+        # the Marketing Copilot backend match receipts to old tasks.
+        self.message_ids = itertools.count(int(time.time() * 1000))
         self.server_sequences = itertools.count(1_000_000)
 
     async def client_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer_info = writer.get_extra_info("peername")
         peer = f"{peer_info[0]}:{peer_info[1]}" if peer_info else "unknown"
         print(f"[{peer}] CONNECTED", flush=True)
-        await Session(reader, writer, self, peer).run()
+        try:
+            await Session(reader, writer, self, peer).run()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Session %s crashed", peer)
+            writer.close()
 
     async def run(self):
         server = await asyncio.start_server(self.client_connected, self.host, self.port)

@@ -26,6 +26,23 @@
               </el-radio-group>
               <div class="form-tip">{{ $t('settings.systemModeTip') }}</div>
             </el-form-item>
+            <el-form-item :label="$t('settings.logLevel')">
+              <div class="log-level-row">
+                <el-select v-model="form.log_level" style="width: 160px">
+                  <el-option v-for="lv in logLevels" :key="lv" :label="lv" :value="lv" />
+                </el-select>
+                <el-button link type="primary" @click="router.push('/logs')">
+                  {{ $t('settings.viewLogs') }}
+                </el-button>
+              </div>
+              <div class="form-tip">{{ $t('settings.logLevelTip') }}</div>
+            </el-form-item>
+            <el-form-item :label="$t('settings.detailLogging')">
+              <div>
+                <el-switch v-model="form.detail_logging" active-value="1" inactive-value="0" />
+                <div class="form-tip">{{ $t('settings.detailLoggingTip') }}</div>
+              </div>
+            </el-form-item>
             <el-form-item>
               <el-button type="primary" :loading="saving" @click="handleSave">
                 <el-icon><Check /></el-icon>
@@ -82,7 +99,10 @@ const form = reactive({
   batch_base_dir: '',
   realtime_base_dir: '',
   system_mode: 'production',
+  log_level: 'INFO',
+  detail_logging: '0',
 })
+const logLevels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
 watch(() => route.query.tab, value => {
   activeTab.value = normalizeTab(value)
@@ -109,6 +129,10 @@ onMounted(async () => {
         form.realtime_base_dir = s.value
       } else if (s.key === 'system_mode') {
         form.system_mode = s.value
+      } else if (s.key === 'log_level') {
+        form.log_level = s.value
+      } else if (s.key === 'detail_logging') {
+        form.detail_logging = s.value
       }
     }
   } catch {
@@ -122,6 +146,8 @@ async function handleSave() {
     await updateSetting('batch_base_dir', form.batch_base_dir)
     await updateSetting('realtime_base_dir', form.realtime_base_dir)
     await updateSetting('system_mode', form.system_mode)
+    await updateSetting('log_level', form.log_level)
+    await updateSetting('detail_logging', form.detail_logging)
     ElMessage.success(t('common.saveSuccess'))
   } catch (e: any) {
     ElMessage.error(e.response?.data?.detail || t('common.saveFailed'))
@@ -155,6 +181,11 @@ async function handleSave() {
 }
 .database-warning {
   margin-bottom: 16px;
+}
+.log-level-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 @media (max-width: 767px) {
   .settings-tabs :deep(.el-tabs__item) {

@@ -4,7 +4,7 @@
       <el-button text @click="$router.back()">
         <el-icon><ArrowLeft /></el-icon> {{ $t('common.back') }}
       </el-button>
-      <h2>{{ campaign?.name || $t('campaign.detailTitle') }}</h2>
+      <h2>{{ campaign?.name || $t('campaign.batchDetailTitle') }}</h2>
     </div>
 
     <el-collapse v-model="basicInfoActive" style="margin-bottom:12px">
@@ -49,44 +49,64 @@
       </el-collapse-item>
     </el-collapse>
 
-    <el-card v-if="campaign?.customer_list_path" shadow="never">
-      <template #header>
-        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
-          <span>{{ $t('campaign.customerList') }}</span>
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-            <el-select v-model="filterField" clearable placeholder="字段" size="small" style="width:100px" @change="filterValue = ''">
-              <el-option v-for="h in prospectHeaders" :key="h" :label="h" :value="h" />
-            </el-select>
-            <el-input v-if="filterField" v-model="filterValue" placeholder="筛选值" size="small" style="width:130px" clearable @input="handleFilter" />
-            <el-input v-model="searchText" placeholder="全局搜索" size="small" style="width:180px" clearable @input="handleFilter">
-              <template #prefix><el-icon><Search /></el-icon></template>
-            </el-input>
+    <el-card v-if="campaign" shadow="never">
+      <el-tabs v-model="detailTab">
+        <el-tab-pane :label="$t('campaign.customerList')" name="prospects">
+          <template v-if="campaign?.customer_list_path">
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+              <el-select v-model="filterField" clearable placeholder="字段" size="small" style="width:100px" @change="filterValue = ''">
+                <el-option v-for="h in prospectHeaders" :key="h" :label="h" :value="h" />
+              </el-select>
+              <el-input v-if="filterField" v-model="filterValue" placeholder="筛选值" size="small" style="width:130px" clearable @input="handleFilter" />
+              <el-input v-model="searchText" placeholder="全局搜索" size="small" style="width:180px" clearable @input="handleFilter">
+                <template #prefix><el-icon><Search /></el-icon></template>
+              </el-input>
+            </div>
+            <el-empty v-if="!prospectLoading && prospectTotal === 0" :description="searchText || filterField ? '无匹配数据' : '暂无数据'" />
+            <template v-else>
+              <el-table ref="prospectTableRef" :data="prospectRows" stripe border size="small" max-height="500" v-loading="prospectLoading">
+                <el-table-column v-for="h in prospectHeaders" :key="h" :prop="h" :label="h" min-width="120" />
+              </el-table>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
+                <span style="font-size:13px;color:#909399">共 {{ prospectTotal }} 条</span>
+                <el-pagination
+                  v-model:current-page="prospectPage"
+                  :page-size="prospectPageSize"
+                  :total="prospectTotal"
+                  layout="prev, pager, next"
+                  small
+                  @current-change="loadProspects"
+                />
+              </div>
+            </template>
+          </template>
+          <el-empty v-else description="暂无潜客名单" />
+        </el-tab-pane>
+        <el-tab-pane label="已发送记录" name="sent">
+          <el-table ref="sentTableRef" v-if="(campaign.daily_stats || []).length" :data="pagedStats" stripe border size="small">
+            <el-table-column prop="stats_date" label="日期" width="140" />
+            <el-table-column prop="total_prospects" label="名单总数" width="120" />
+            <el-table-column prop="sent_count" label="已发送" width="120" />
+            <el-table-column prop="smpp_label" label="SMPP" min-width="180" />
+          </el-table>
+          <el-empty v-else description="暂无发送记录" />
+          <div v-if="(campaign.daily_stats || []).length" style="display:flex;justify-content:flex-end;margin-top:12px">
+            <el-pagination
+              v-model:current-page="sentPage"
+              :page-size="sentPageSize"
+              :total="(campaign.daily_stats || []).length"
+              layout="total, prev, pager, next"
+              small
+            />
           </div>
-        </div>
-      </template>
-      <el-empty v-if="!prospectLoading && prospectTotal === 0" :description="searchText || filterField ? '无匹配数据' : '暂无数据'" />
-      <template v-else>
-        <el-table :data="prospectRows" stripe border size="small" max-height="500" v-loading="prospectLoading">
-          <el-table-column v-for="h in prospectHeaders" :key="h" :prop="h" :label="h" min-width="120" />
-        </el-table>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
-          <span style="font-size:13px;color:#909399">共 {{ prospectTotal }} 条</span>
-          <el-pagination
-            v-model:current-page="prospectPage"
-            :page-size="prospectPageSize"
-            :total="prospectTotal"
-            layout="prev, pager, next"
-            small
-            @current-change="loadProspects"
-          />
-        </div>
-      </template>
+        </el-tab-pane>
+      </el-tabs>
     </el-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import StatusTag from '@/components/StatusTag.vue'
 import * as api from '@/api/campaign'
@@ -104,6 +124,17 @@ const prospectLoading = ref(false)
 const searchText = ref('')
 const filterField = ref('')
 const filterValue = ref('')
+const sentPage = ref(1)
+const sentPageSize = ref(10)
+const detailTab = ref('prospects')
+const prospectTableRef = ref<any>(null)
+const sentTableRef = ref<any>(null)
+
+const pagedStats = computed(() => {
+  const all = campaign.value?.daily_stats || []
+  const start = (sentPage.value - 1) * sentPageSize.value
+  return all.slice(start, start + sentPageSize.value)
+})
 
 let filterTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -112,6 +143,9 @@ async function loadDetail() {
   try {
     const res = await api.getCampaignDetail(id)
     campaign.value = res.data
+    sentPage.value = 1
+    await nextTick()
+    sentTableRef.value?.doLayout?.()
     if (campaign.value?.customer_list_path) {
       loadProspects()
     }
@@ -141,6 +175,8 @@ async function loadProspects() {
     prospectPage.value = data.page
   } finally {
     prospectLoading.value = false
+    await nextTick()
+    prospectTableRef.value?.doLayout?.()
   }
 }
 

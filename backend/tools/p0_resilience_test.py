@@ -60,6 +60,37 @@ def main():
     assert race_task["status"] == "delivered", dict(race_task)
     assert json.loads(race_task["smsc_message_ids"]) == ["p0-race-msg"]
 
+    # Regression: SMSC message ids can be reused after a simulator restart.
+    # A receipt for a reused id must update the newest task, not be matched to
+    # an older task or dropped as a duplicate of the older task's receipt.
+    conn = get_connection()
+    conn.execute("""INSERT INTO sms_tasks
+        (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+        VALUES ('realtime',1,'p0','251900000002','test','p0-reuse-old','sending')""")
+    old_id = conn.execute("SELECT id FROM sms_tasks WHERE dedupe_key='p0-reuse-old'").fetchone()["id"]
+    conn.commit(); conn.close()
+    sms_task_service.mark_submitted(old_id, ["p0-reuse-msg"])
+    conn = get_connection()
+    conn.execute("""INSERT INTO sms_tasks
+        (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+        VALUES ('realtime',1,'p0','251900000003','test','p0-reuse-new','sending')""")
+    new_id = conn.execute("SELECT id FROM sms_tasks WHERE dedupe_key='p0-reuse-new'").fetchone()["id"]
+    conn.commit(); conn.close()
+    sms_task_service.mark_submitted(new_id, ["p0-reuse-msg"])
+    sms_task_service.record_receipt("p0-reuse-msg", "DELIVRD", "reused id receipt")
+    conn = get_connection()
+    new_task = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (new_id,)).fetchone()
+    old_task = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (old_id,)).fetchone()
+    conn.close()
+    assert new_task["status"] == "delivered", dict(new_task)
+    assert old_task["status"] == "submitted", dict(old_task)
+    # A repeated identical receipt is idempotent and must not error.
+    sms_task_service.record_receipt("p0-reuse-msg", "DELIVRD", "duplicate receipt")
+    conn = get_connection()
+    new_task = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (new_id,)).fetchone()
+    conn.close()
+    assert new_task["status"] == "delivered", dict(new_task)
+
     acquire_instance_lock()
     try:
         try:

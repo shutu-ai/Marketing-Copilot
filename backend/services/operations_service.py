@@ -172,10 +172,21 @@ def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:
                WHERE t.id=? AND c.enabled=1 AND t.enabled=1 LIMIT 1""",
             (campaign["sms_template_id"],),
         ).fetchone()
-    smpp = conn.execute("SELECT id FROM smpp_configs WHERE enabled=1 LIMIT 1").fetchone()
+    if campaign_type in ("realtime", "batch"):
+        smpp_id = campaign.get("smpp_config_id")
+        if smpp_id:
+            smpp = conn.execute(
+                "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (smpp_id,)
+            ).fetchone()
+            if not smpp:
+                errors.append("associated SMPP configuration is missing or disabled")
+        else:
+            errors.append(f"{campaign_type} campaign must be associated with an SMPP")
+    else:
+        smpp = conn.execute("SELECT id FROM smpp_configs WHERE enabled=1 LIMIT 1").fetchone()
     conn.close()
     if not template: errors.append("no enabled SMS template")
     from services.settings_service import get_setting
-    if get_setting("system_mode", "production") == "production" and not smpp:
+    if campaign_type not in ("realtime", "batch") and get_setting("system_mode", "production") == "production" and not smpp:
         errors.append("no enabled SMPP configuration")
     return errors

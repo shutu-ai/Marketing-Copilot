@@ -200,7 +200,7 @@ PASS: 1 submit_sm_resp and DELIVRD receipt(s) received
 其中：
 
 - `submit_sm_resp`表示模拟SMSC接受了短信提交；
-- `message_id`是模拟SMSC生成的短信编号；
+- `message_id`是模拟SMSC生成的短信编号；每次启动从当前时间戳基数重新递增，重启后不会与历史消息重复，避免后端把回执匹配到旧任务；
 - `state=2`是SMPP的`DELIVERED`状态；
 - `PASS`表示提交响应和最终状态报告都已收到。
 

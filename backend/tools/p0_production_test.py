@@ -12,6 +12,7 @@ def main():
     os.environ["DUCKDB_PATH"] = str(root / "production.duckdb")
     os.environ["MC_BACKUP_DIR"] = str(root / "backups")
     os.environ["MC_BACKUP_KEEP"] = "2"
+    os.environ["MC_DB_CONFIG_FILE"] = str(root / "db_config.json")
     from database import get_connection, init_db
     from services.runtime_service import backup_database
     from services import sms_task_service

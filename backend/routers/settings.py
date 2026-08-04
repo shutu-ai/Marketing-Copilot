@@ -24,4 +24,7 @@ def get_setting(key: str):
 def update_setting(key: str, data: SettingUpdate):
     if not key.strip():
         raise HTTPException(status_code=400, detail="Key is required")
-    return settings_service.set_setting(key, data.value)
+    try:
+        return settings_service.set_setting(key, data.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

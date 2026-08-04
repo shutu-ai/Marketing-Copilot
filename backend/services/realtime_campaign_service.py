@@ -121,12 +121,12 @@ def create(data: RealtimeCampaignCreate) -> dict:
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
     cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_dir, watch_filename_prefix, phone_prefix, sms_template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO realtime_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_dir, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (data.name, data.start_time or "", data.end_time or "",
          data.send_start_time or "", data.send_end_time or "",
          _fmt_days(data.send_days), campaign_dir, use_custom_directory,
          data.watch_dir or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
-         data.phone_prefix or "", data.sms_template_id)
+         data.phone_prefix or "", data.sms_template_id, data.smpp_config_id)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()
@@ -168,12 +168,21 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             conn.close()
             raise ValueError("Campaign has already started — cannot edit")
     fields = {}
-    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "watch_dir", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
+    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_dir", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
         val = getattr(data, field, None)
         if val is not None:
             fields[field] = val
     if data.send_days is not None:
         fields["send_days"] = _fmt_days(data.send_days)
+
+    new_smpp_id = fields.get("smpp_config_id")
+    if new_smpp_id is not None:
+        smpp = conn.execute(
+            "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (new_smpp_id,)
+        ).fetchone()
+        if not smpp:
+            conn.close()
+            raise ValueError("Associated SMPP configuration is missing or disabled")
 
     if fields:
         set_clause = ", ".join(f"{k}=?" for k in fields)
@@ -182,6 +191,17 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             (*fields.values(), campaign_id)
         )
         conn.commit()
+
+    if new_smpp_id is not None:
+        # Re-route pending SMS tasks of this campaign to the newly associated SMSC so
+        # queued/retrying messages follow the new configuration instead of the old one.
+        conn.execute(
+            """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
+            (new_smpp_id, campaign_id),
+        )
+        conn.commit()
+
     row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
     return _enrich(dict(row))
@@ -214,10 +234,10 @@ def copy(campaign_id: int) -> Optional[dict]:
     orig = dict(row)
     new_name = orig["name"] + " (Copy)"
     cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO realtime_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (new_name, orig["start_time"], orig["end_time"],
          orig.get("send_start_time", ""), orig.get("send_end_time", ""),
-         orig.get("send_days", "[]"), orig.get("sms_template_id"))
+         orig.get("send_days", "[]"), orig.get("sms_template_id"), orig.get("smpp_config_id"))
     )
     conn.commit()
     new_row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()

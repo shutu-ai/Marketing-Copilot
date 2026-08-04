@@ -34,7 +34,7 @@ export const useSmppStore = defineStore('smpp', () => {
     await fetchConfigs()
   }
 
-  async function testConnection(data: { host: string; port: number; system_id: string; password: string; bind_type: string }) {
+  async function testConnection(data: { config_id?: number; host: string; port: number; system_id: string; password: string; bind_type: string }) {
     const res = await api.testSmppConnection(data)
     return res.data
   }

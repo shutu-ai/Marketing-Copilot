@@ -83,7 +83,11 @@ def process_message(routing_key: str, message: dict):
         error = "" if sms_success else "SMPP send failed"
 
         _log_sms(conn, msisdn, campaign_name, language, content, source_addr, status, error)
-        detail_logger.info(f"SMS {'sent' if sms_success else 'failed'} to {msisdn} [{language}]: {content[:50]}...")
+        detail_logger.info(
+            "SMS %s campaign=%s:%s msisdn=%s language=%s source_addr=%s content_len=%d content=%s",
+            "sent" if sms_success else "failed", campaign.get("id"), campaign_name,
+            msisdn, language, source_addr, len(content), content[:1000],
+        )
 
     except Exception as e:
         logger.error(f"SMS processing error for {msisdn}: {e}")
@@ -107,10 +111,16 @@ def _send_sms_via_smpp(msisdn: str, content: str, source_addr: str) -> bool:
 
         if smpp_config:
             config = dict(smpp_config)
-            detail_logger.info(f"[SMPP SEND] via {config['host']}:{config['port']} "
-                               f"to {msisdn} from {source_addr}: {content[:50]}")
+            detail_logger.info(
+                "[SMPP SEND] via config=%s %s:%s msisdn=%s source_addr=%s content_len=%d content=%s",
+                config.get("id"), config.get("host"), config.get("port"), msisdn, source_addr,
+                len(content), content[:1000],
+            )
         else:
-            detail_logger.info(f"[SMS STUB] No SMPP config, simulated send to {msisdn}: {content[:50]}")
+            detail_logger.info(
+                "[SMS STUB] No SMPP config, simulated send msisdn=%s source_addr=%s content_len=%d content=%s",
+                msisdn, source_addr, len(content), content[:1000],
+            )
 
         return True
     except Exception as e:

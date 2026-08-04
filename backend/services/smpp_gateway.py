@@ -144,6 +144,16 @@ class _SmppConnection:
             import smpplib.consts
             import smpplib.gsm
             parts, coding, esm_class = smpplib.gsm.make_parts(task["content"])
+            source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
+            content = task.get("content") or ""
+            detail_logger.info(
+                "[SMPP SEND] task=%s campaign=%s/%s name=%s msisdn=%s source_addr=%s "
+                "config=%s %s:%s slot=%s parts=%d content_len=%d content=%s",
+                task.get("id"), task.get("campaign_type"), task.get("campaign_id"),
+                task.get("campaign_name", ""), task.get("msisdn"), source_addr,
+                self.config.get("id"), self.config.get("host"), self.config.get("port"), self.slot,
+                len(parts), len(content), content[:1000],
+            )
             sequences = []
             submitted_any = False
             try:
@@ -152,7 +162,7 @@ class _SmppConnection:
                     pdu = self.client.send_message(
                        source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
-                       source_addr=task["source_addr"] or self.config.get("source_addr") or "Marketing", dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
+                       source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
                         dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
                         short_message=part, data_coding=coding, esm_class=esm_class, registered_delivery=True)
                     submitted_any = True
@@ -174,6 +184,11 @@ class _SmppConnection:
                 failed = next((item for item in outcomes if not item["ok"]), None)
                 if failed:
                     raise SmppSubmitError(failed["status"])
+                detail_logger.info(
+                    "[SMPP SEND OK] task=%s sequences=%s message_ids=%s",
+                    task.get("id"), sequences,
+                    [item.get("message_id") for item in outcomes if item.get("message_id")],
+                )
                 metrics_service.inc("marketing_copilot_smpp_submitted_total",
                                     labels={"config_id": self.config["id"]})
                 return [item["message_id"] for item in outcomes if item["message_id"]]
@@ -260,6 +275,15 @@ class SmppGateway:
         configs = self._enabled_configs()
         if not configs:
             raise RuntimeError("No enabled SMPP configuration")
+        target_id = task.get("smpp_config_id")
+        if target_id:
+            config = next((c for c in configs if c["id"] == target_id), None)
+            if not config:
+                raise RuntimeError(
+                    f"Associated SMPP configuration {target_id} is missing or disabled")
+            connection = self._connection_for(config)
+            self._active_config_id = config["id"]
+            return connection.send(task)
         previous_id = None
         errors = []
         for config in configs:

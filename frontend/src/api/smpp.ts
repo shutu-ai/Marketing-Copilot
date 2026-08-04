@@ -21,6 +21,6 @@ export function deleteSmppConfig(id: number) {
   return api.delete(`/smpp/configs/${id}`)
 }
 
-export function testSmppConnection(data: { host: string; port: number; system_id: string; password: string; bind_type: string }) {
+export function testSmppConnection(data: { config_id?: number; host: string; port: number; system_id: string; password: string; bind_type: string }) {
   return api.post<{ success: boolean; message: string }>('/smpp/test', data)
 }

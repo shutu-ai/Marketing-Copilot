@@ -68,9 +68,9 @@
       {{ row.batch_size || 500 }}
     </template>
   </el-table-column>
-  <el-table-column :label="$t('smsContent.template')" width="90">
+  <el-table-column :label="$t('campaign.associateSmpp')" width="170">
     <template #default="{ row }">
-      <span v-if="row.sms_template_id">#{{ row.sms_template_id }}</span>
+      <span v-if="row.smpp_config_id" style="font-size:12px">{{ smppName(row.smpp_config_id) }}</span>
       <span v-else style="color:#ccc">-</span>
     </template>
   </el-table-column>
@@ -82,7 +82,7 @@
             <el-tag :type="isReady(row) ? 'success' : 'warning'" effect="light">
               {{ isReady(row) ? $t('campaign.ready') : $t('campaign.notReady') }}
             </el-tag>
-            <span class="readiness__summary">{{ readinessItems(row).filter(item => item.ok).length }}/3</span>
+            <span class="readiness__summary">{{ readinessItems(row).filter(item => item.ok).length }}/{{ readinessItems(row).length }}</span>
           </div>
         </template>
         <strong>{{ $t('campaign.checklist') }}</strong>
@@ -100,10 +100,10 @@
           <el-button text type="primary" size="small" @click="$router.push('/campaign/batch/' + row.id)">
             {{ $t('campaign.detail') }}
           </el-button>
-          <template v-if="row.status === 'not_started'">
+          <template v-if="row.status === 'not_started' || row.status === 'ended' || row.status === 'completed'">
             <span :title="startHint(row)">
               <el-button text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
-                {{ $t('campaign.start') }}
+                {{ row.status === 'ended' ? $t('campaign.restart') : $t('campaign.start') }}
               </el-button>
             </span>
           </template>
@@ -112,7 +112,7 @@
               {{ $t('campaign.end') }}
             </el-button>
           </template>
-          <el-dropdown trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-if="row.status==='not_started' || row.status==='ended'" command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+          <el-dropdown trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ row.status === 'in_progress' ? '更新目标清单' : $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
           </div>
         </template>
       </el-table-column>
@@ -131,9 +131,11 @@
       :model-value="dialogVisible"
       :title="editForm.id ? $t('common.edit') : $t('campaign.addCampaign')"
       width="520px"
+      align-center
       @close="dialogVisible = false"
     >
       <el-form :model="editForm" label-width="120px" size="small">
+        <template v-if="!inProgressEdit">
         <el-form-item :label="$t('campaign.name')" required>
           <el-input v-model="editForm.name" />
         </el-form-item>
@@ -194,6 +196,25 @@
             </el-checkbox>
           </el-checkbox-group>
         </el-form-item>
+        <el-form-item :label="$t('campaign.phonePrefix')">
+          <el-input v-model="editForm.phone_prefix" placeholder="251" />
+          <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
+        </el-form-item>
+        </template>
+        <el-alert
+          v-if="inProgressEdit"
+          :title="$t('campaign.inProgressSmppOnly')"
+          type="info"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 12px"
+        />
+        <el-form-item :label="$t('campaign.associateSmpp')" required>
+          <el-select v-model="editForm.smpp_config_id" clearable filterable :placeholder="$t('campaign.associateSmppPlaceholder')" style="width:100%">
+            <el-option v-for="cfg in enabledSmppOptions" :key="cfg.id" :value="cfg.id" :label="`${cfg.name} (${cfg.host}:${cfg.port})`" />
+          </el-select>
+          <div class="form-tip">{{ $t('campaign.associateSmppTip') }}</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
@@ -235,7 +256,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
@@ -243,6 +264,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import DirectoryPicker from '@/components/DirectoryPicker.vue'
 import * as api from '@/api/campaign'
 import * as smsApi from '@/api/smsContent'
+import * as smppApi from '@/api/smpp'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -274,6 +296,8 @@ interface Campaign {
   campaign_dir: string
   use_custom_directory: boolean
   sms_template_id: number | null
+  smpp_config_id: number | null
+  phone_prefix: string
   created_at: string
 }
 
@@ -287,18 +311,37 @@ const saving = ref(false)
 const editForm = ref<{
   id: number; name: string; start_time: string; end_time: string;
   send_start_time: string; send_end_time: string; send_days: string[];
-  batch_size: number; campaign_dir: string; status: string
+  batch_size: number; campaign_dir: string; status: string;
+  smpp_config_id: number | null; phone_prefix: string
 }>({
   id: 0, name: '', start_time: '', end_time: '',
   send_start_time: '', send_end_time: '', send_days: [],
-  batch_size: 500, campaign_dir: '', status: 'not_started'
+  batch_size: 500, campaign_dir: '', status: 'not_started',
+  smpp_config_id: null, phone_prefix: '',
 })
 const uploadVisible = ref(false)
 const uploading = ref(false)
 const uploadCampaignId = ref(0)
 const selectedFile = ref<File | null>(null)
 const customDirectory = ref(false)
+const inProgressEdit = ref(false)
 const directoryPickerVisible = ref(false)
+const smppOptions = ref<any[]>([])
+const enabledSmppOptions = computed(() => smppOptions.value.filter((item: any) => item.enabled === 1))
+
+function smppName(configId: number | null) {
+  const cfg = smppOptions.value.find((item: any) => item.id === configId)
+  return cfg ? `${cfg.name} (${cfg.host}:${cfg.port})` : `#${configId}`
+}
+
+async function fetchSmppConfigs() {
+  try {
+    const res = await smppApi.getSmppConfigs()
+    smppOptions.value = res.data
+  } catch {
+    // ignore
+  }
+}
 
 async function fetchList() {
   loading.value = true
@@ -318,18 +361,22 @@ function changePage(nextPage: number) {
 
 function showDialog(row: Campaign | null) {
   if (row) {
+    inProgressEdit.value = row.status !== 'not_started' && row.status !== 'ended'
     customDirectory.value = Boolean(row.use_custom_directory)
     editForm.value = {
       id: row.id, name: row.name, start_time: row.start_time, end_time: row.end_time,
       send_start_time: row.send_start_time || '', send_end_time: row.send_end_time || '',
       send_days: row.send_days || [], batch_size: row.batch_size || 500,
       campaign_dir: row.campaign_dir || '', status: row.status,
+      smpp_config_id: row.smpp_config_id ?? null, phone_prefix: row.phone_prefix || '',
     }
   } else {
+    inProgressEdit.value = false
     customDirectory.value = false
     editForm.value = {
       id: 0, name: '', start_time: '', end_time: '',
       send_start_time: '', send_end_time: '', send_days: [], batch_size: 500, campaign_dir: '', status: 'not_started',
+      smpp_config_id: null, phone_prefix: '',
     }
   }
   dialogVisible.value = true
@@ -340,6 +387,7 @@ function readinessItems(row: Campaign) {
   return [
     { ok: row.row_count > 0, label: t(row.row_count > 0 ? 'campaign.listReady' : 'campaign.listMissing') },
     { ok: Boolean(row.sms_template_id), label: t(row.sms_template_id ? 'campaign.templateReady' : 'campaign.templateMissing') },
+    { ok: Boolean(row.smpp_config_id), label: t(row.smpp_config_id ? 'campaign.smppReady' : 'campaign.smppMissing') },
     { ok: scheduleReady, label: t(scheduleReady ? 'campaign.scheduleReady' : 'campaign.scheduleMissing') },
   ]
 }
@@ -378,14 +426,19 @@ async function handleSave() {
       batch_size: editForm.value.batch_size,
       campaign_dir: customDirectory.value ? editForm.value.campaign_dir : '',
       use_custom_directory: customDirectory.value,
+      smpp_config_id: editForm.value.smpp_config_id || undefined,
+      phone_prefix: editForm.value.phone_prefix || undefined,
     }
-    if (editForm.value.id && editForm.value.status === 'ended') {
+    if (editForm.value.id && editForm.value.status !== 'not_started' && editForm.value.status !== 'ended') {
+      payload = { smpp_config_id: editForm.value.smpp_config_id || undefined }
+    } else if (editForm.value.id && editForm.value.status === 'ended') {
       payload = {
         name: editForm.value.name,
         end_time: editForm.value.end_time,
         send_start_time: editForm.value.send_start_time,
         send_end_time: editForm.value.send_end_time,
         send_days: editForm.value.send_days,
+        smpp_config_id: editForm.value.smpp_config_id || undefined,
       }
     }
     if (editForm.value.id) {
@@ -519,7 +572,10 @@ function handleMore(command: string, row: Campaign) {
   if (command === 'delete') handleDelete(row.id)
 }
 
-onMounted(() => fetchList())
+onMounted(() => {
+  void fetchList()
+  void fetchSmppConfigs()
+})
 </script>
 
 <style scoped>

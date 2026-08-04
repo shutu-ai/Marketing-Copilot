@@ -1,6 +1,6 @@
 import api from './index'
 
-export function getSmsTasks(params: { page?: number; page_size?: number; status?: string; campaign_type?: string }) {
+export function getSmsTasks(params: { page?: number; page_size?: number; status?: string; campaign_type?: string; smpp_config_id?: number }) {
   return api.get<any>('/sms-tasks', { params })
 }
 
@@ -10,6 +10,10 @@ export function getSmsTaskStats() {
 
 export function retrySmsTask(id: number) {
   return api.post(`/sms-tasks/${id}/retry`)
+}
+
+export function confirmDelivered(id: number) {
+  return api.post(`/sms-tasks/${id}/deliver`)
 }
 
 export function getExclusions(params: { page?: number; page_size?: number } = {}) {

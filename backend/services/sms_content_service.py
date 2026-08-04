@@ -202,6 +202,11 @@ def delete_campaign(campaign_id: int) -> bool:
     if _campaign_template_usage_count(conn, campaign_id) > 0:
         conn.close()
         raise ValueError("短信内容已被短信任务引用，不能删除")
+    conn.execute(
+        "DELETE FROM template_versions WHERE template_id IN (SELECT id FROM sms_templates WHERE campaign_id=?)",
+        (campaign_id,),
+    )
+    conn.execute("DELETE FROM sms_templates WHERE campaign_id=?", (campaign_id,))
     cursor = conn.execute("DELETE FROM campaigns WHERE id=?", (campaign_id,))
     deleted = cursor.rowcount > 0
     conn.commit()
@@ -240,18 +245,60 @@ def get_all_templates_with_campaigns(page: Optional[int] = None, page_size: int 
                ) AS task_reference_count
         FROM sms_templates t
         JOIN campaigns c ON c.id = t.campaign_id
-        ORDER BY c.created_at DESC, t.language
     """
-    total = conn.execute(
-        "SELECT COUNT(*) cnt FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id"
-    ).fetchone()["cnt"]
+    order_by = " ORDER BY c.created_at DESC, t.language"
     if page is None:
-        rows = conn.execute(query).fetchall()
+        rows = conn.execute(query + order_by).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    rows = conn.execute(
-        query + " LIMIT ? OFFSET ?",
+    # Paginate by campaign so all languages of one config stay on the same page
+    total = conn.execute(
+        "SELECT COUNT(DISTINCT c.id) cnt FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id"
+    ).fetchone()["cnt"]
+    campaign_rows = conn.execute(
+        """SELECT DISTINCT c.id, c.created_at
+           FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
+           ORDER BY c.created_at DESC, c.id DESC
+           LIMIT ? OFFSET ?""",
         (page_size, max(0, page - 1) * page_size),
+    ).fetchall()
+    campaign_ids = [r["id"] for r in campaign_rows]
+    if not campaign_ids:
+        conn.close()
+        return {"total": total, "page": page, "page_size": page_size, "items": []}
+    placeholders = ", ".join("?" * len(campaign_ids))
+    rows = conn.execute(
+        query + f" WHERE c.id IN ({placeholders})" + order_by,
+        campaign_ids,
+    ).fetchall()
+    items = [dict(r) for r in rows]
+    for item in items:
+        item["activity_reference_count"] = _campaign_template_activity_reference_count(conn, item["campaign_id"])
+        item["task_reference_count"] = _campaign_template_usage_count(conn, item["campaign_id"])
+    conn.close()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": items,
+    }
+
+
+def list_campaign_versions(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
+    conn = get_connection()
+    total = conn.execute(
+        """SELECT COUNT(*) cnt
+           FROM template_versions v JOIN sms_templates t ON t.id=v.template_id
+           WHERE t.campaign_id=?""",
+        (campaign_id,),
+    ).fetchone()["cnt"]
+    rows = conn.execute(
+        """SELECT v.*, t.campaign_id
+           FROM template_versions v JOIN sms_templates t ON t.id=v.template_id
+           WHERE t.campaign_id=?
+           ORDER BY v.created_at DESC, v.id DESC
+           LIMIT ? OFFSET ?""",
+        (campaign_id, page_size, max(0, page - 1) * page_size),
     ).fetchall()
     conn.close()
     return {

@@ -47,6 +47,10 @@ export function getTemplates(campaignId: number) {
   return api.get<SmsTemplate[]>(`/sms-content/campaigns/${campaignId}/templates`)
 }
 
+export function getCampaignVersions(campaignId: number, params: { page?: number; page_size?: number } = {}) {
+  return api.get<any>(`/sms-content/campaigns/${campaignId}/versions`, { params })
+}
+
 export function createTemplate(data: { campaign_id: number; language: string; content?: string; source_addr?: string }) {
   return api.post<SmsTemplate>('/sms-content/templates', data)
 }

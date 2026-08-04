@@ -15,6 +15,7 @@ class RealtimeCampaignCreate(BaseModel):
     watch_filename_prefix: Optional[str] = "Android_4G_Switch_Somali_"
     phone_prefix: Optional[str] = ""
     sms_template_id: Optional[int] = None
+    smpp_config_id: Optional[int] = None
 
 
 class RealtimeCampaignUpdate(BaseModel):
@@ -31,3 +32,4 @@ class RealtimeCampaignUpdate(BaseModel):
     watch_filename_prefix: Optional[str] = None
     phone_prefix: Optional[str] = None
     sms_template_id: Optional[int] = None
+    smpp_config_id: Optional[int] = None

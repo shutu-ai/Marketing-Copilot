@@ -19,6 +19,12 @@
             <el-form-item :label="$t('dbConfig.dbPath')" required>
               <el-input v-model="form.db_path" placeholder="marketing_copilot.duckdb" />
             </el-form-item>
+            <el-form-item :label="$t('dbConfig.activeDbPath')">
+              <el-input :model-value="activeDbPath" readonly />
+              <div v-if="activeDbPath && activeDbPath !== form.db_path" class="form-tip warn">
+                {{ $t('dbConfig.activeDbPathTip') }}
+              </div>
+            </el-form-item>
           </el-col>
         </el-row>
         <el-form-item>
@@ -46,6 +52,7 @@ withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 const connected = ref(false)
 const saving = ref(false)
 const testing = ref(false)
+const activeDbPath = ref('')
 
 const form = ref({
   db_path: '',
@@ -55,6 +62,7 @@ onMounted(async () => {
   try {
     const res = await getDbConfig()
     form.value = { db_path: res.data.db_path || '' }
+    activeDbPath.value = res.data.active_db_path || ''
     connected.value = true
   } catch {
     connected.value = false
@@ -106,5 +114,8 @@ async function handleTest() {
   margin: 0;
   font-size: 22px;
   font-weight: 600;
+}
+.form-tip.warn {
+  color: var(--mc-warning, #e6a23c);
 }
 </style>

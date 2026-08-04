@@ -9,6 +9,12 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> dict:
+    if key == "log_level":
+        from services.runtime_service import normalize_log_level, set_log_level
+        value = normalize_log_level(value)
+    if key == "detail_logging":
+        from services.runtime_service import normalize_detail_logging, set_detail_logging
+        value = normalize_detail_logging(value)
     conn = get_connection()
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=?",
@@ -16,6 +22,10 @@ def set_setting(key: str, value: str) -> dict:
     )
     conn.commit()
     conn.close()
+    if key == "log_level":
+        set_log_level(value)
+    elif key == "detail_logging":
+        set_detail_logging(value)
     return {"key": key, "value": value}
 
 

@@ -33,6 +33,7 @@
         <el-descriptions-item :label="$t('campaign.watchDir')" :span="2"><code style="font-size: 12px">{{ campaign?.watch_dir || '-' }}</code></el-descriptions-item>
        <el-descriptions-item :label="$t('campaign.watchFilenamePrefix')" :span="2"><code style="font-size: 12px">{{ campaign?.watch_filename_prefix || '-' }}</code></el-descriptions-item>
        <el-descriptions-item :label="$t('campaign.phonePrefix')" :span="2"><code style="font-size: 12px">{{ campaign?.phone_prefix || '-' }}</code></el-descriptions-item>
+       <el-descriptions-item :label="$t('campaign.associateSmpp')" :span="2">{{ smppName(campaign?.smpp_config_id) }}</el-descriptions-item>
        <el-descriptions-item :label="$t('campaign.dirRoot')" :span="2"><code style="font-size: 12px">{{ campaign?.campaign_dir || '-' }}</code></el-descriptions-item>
         <el-descriptions-item :label="$t('campaign.dirWhitelist')" :span="2"><code style="font-size: 12px">{{ campaign?.campaign_dir ? (campaign.campaign_dir + '\\whitelist\\') : '-' }}</code></el-descriptions-item>
         <el-descriptions-item label="Inbox" :span="2"><code style="font-size: 12px">{{ campaign?.campaign_dir ? (campaign.campaign_dir + '\\inbox\\') : '-' }}</code></el-descriptions-item>
@@ -123,6 +124,7 @@ import { useRoute } from 'vue-router'
 import StatusTag from '@/components/StatusTag.vue'
 import * as api from '@/api/realtime-campaign'
 import * as rtApi from '@/api/realtime'
+import * as smppApi from '@/api/smpp'
 
 const route = useRoute()
 const campaign = ref<any>(null)
@@ -134,6 +136,21 @@ const sentRecordsTotal = ref(0)
 const sentRecordsLoading = ref(false)
 const activeTab = ref('received')
 const stats = reactive({ file_count: 0, total_msisdn_sum: 0, total_matched: 0 })
+const smppOptions = ref<any[]>([])
+
+function smppName(configId: number | null) {
+  const cfg = smppOptions.value.find((item: any) => item.id === configId)
+  return cfg ? `${cfg.name} (${cfg.host}:${cfg.port})` : (configId ? `#${configId}` : '-')
+}
+
+async function loadSmppOptions() {
+  try {
+    const res = await smppApi.getSmppConfigs()
+    smppOptions.value = res.data
+  } catch {
+    // ignore
+  }
+}
 
 function asArray(value: any): any[] {
   if (Array.isArray(value)) return value
@@ -221,6 +238,7 @@ async function loadDetail() {
   } catch (e) {
     console.error(e)
   }
+  await loadSmppOptions()
   await loadReceivedData(true)
   await loadSentRecords(true)
 }

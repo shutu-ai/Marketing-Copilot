@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
-from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router
+from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router
 
 from services.runtime_service import configure_logging, acquire_instance_lock, release_instance_lock
 configure_logging()
@@ -40,12 +40,23 @@ app.include_router(sms_tasks_router.router)
 app.include_router(operations_router.router)
 app.include_router(metrics_router.router)
 app.include_router(filesystem_router.router)
+app.include_router(logs_router.router)
 
 
 @app.on_event("startup")
 def startup():
     acquire_instance_lock()
+    from services import db_config as db_config_service
+    from database import get_database_file, set_database_file
+    set_database_file(db_config_service.get_effective_db_path(get_database_file()))
     init_db()
+    from services.settings_service import get_setting
+    from services.runtime_service import set_log_level, set_detail_logging
+    try:
+        set_log_level(get_setting("log_level", "INFO") or "INFO")
+    except ValueError as exc:
+        logger.warning("Ignoring invalid persisted log level: %s", exc)
+    set_detail_logging(get_setting("detail_logging", "0") or "0")
     os.makedirs(os.path.join(os.path.dirname(__file__), "uploads"), exist_ok=True)
     os.makedirs(os.path.join(os.path.dirname(__file__), "monitor_dir"), exist_ok=True)
     from services.task_worker import start_worker

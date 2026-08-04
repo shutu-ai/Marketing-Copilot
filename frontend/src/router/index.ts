@@ -29,7 +29,7 @@ const router = createRouter({
         {
           path: 'campaign/batch/:id',
           name: 'CampaignDetail',
-          meta: { titleKey: 'campaign.detailTitle' },
+          meta: { titleKey: 'campaign.batchDetailTitle' },
           component: () => import('@/views/campaign/CampaignDetail.vue'),
         },
         {
@@ -97,6 +97,12 @@ const router = createRouter({
           name: 'DbQuery',
           meta: { titleKey: 'dbQuery.title' },
           component: () => import('@/views/dbQuery/DbQuery.vue'),
+        },
+        {
+          path: 'logs',
+          name: 'LogViewer',
+          meta: { titleKey: 'logViewer.title' },
+          component: () => import('@/views/logs/LogViewer.vue'),
         },
         {
           path: 'db-config',

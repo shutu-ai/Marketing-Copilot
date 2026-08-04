@@ -41,6 +41,10 @@
       <el-icon><Search /></el-icon>
       <span>{{ $t('menu.dbQuery') }}</span>
     </el-menu-item>
+    <el-menu-item index="/logs">
+      <el-icon><Tickets /></el-icon>
+      <span>{{ $t('menu.logViewer') }}</span>
+    </el-menu-item>
 
 
     <el-menu-item index="/settings">

@@ -85,18 +85,8 @@ def auto_complete_campaigns() -> int:
                 continue
             end_time = _parse_time(campaign.get("end_time", ""))
             should_complete = bool(end_time and end_time <= now)
-            if campaign_type == "batch" and not should_complete:
-                conn = get_connection()
-                batch_counts = conn.execute(
-                    """SELECT COUNT(*) total,
-                       SUM(CASE WHEN status IN ('sent','skipped','failed') THEN 1 ELSE 0 END) terminal
-                       FROM batch_campaign_batches WHERE campaign_id=?""", (campaign["id"],)).fetchone()
-                open_tasks = conn.execute(
-                    """SELECT COUNT(*) cnt FROM sms_tasks WHERE campaign_type='batch' AND campaign_id=?
-                       AND status NOT IN ('delivered','failed','expired','cancelled','archived')""",
-                    (campaign["id"],)).fetchone()["cnt"]
-                conn.close()
-                should_complete = bool(batch_counts["total"] and batch_counts["total"] == batch_counts["terminal"] and not open_tasks)
+            # Batch campaigns now repeat daily within their date range, so they
+            # only auto-complete when the end time has passed (or are ended manually).
             if should_complete:
                 campaign_action(campaign_type, campaign["id"], "complete", automatic=True)
                 completed += 1
@@ -284,6 +274,13 @@ def configuration_health(record_events: bool = False) -> list:
     conn.close()
     db_path = get_database_file()
     checks.append({"code": "DATABASE_PATH", "category": "database", "ok": db_path == ":memory:" or os.path.isdir(os.path.dirname(os.path.abspath(db_path))), "severity": "error", "message": "Database directory does not exist"})
+    conn = get_connection()
+    realtime_watch_dirs = [
+        dict(row) for row in conn.execute(
+            "SELECT id,name,watch_dir FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>''"
+        ).fetchall()
+    ]
+    conn.close()
     for item in realtime_watch_dirs:
         watch_dir = item.get("watch_dir", "")
         checks.append({

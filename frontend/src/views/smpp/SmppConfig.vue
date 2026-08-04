@@ -74,8 +74,13 @@
         </el-row>
         <el-row :gutter="20">
           <el-col :span="12">
-            <el-form-item :label="$t('smpp.password')" required>
-              <el-input v-model="form.password" type="password" show-password />
+            <el-form-item :label="$t('smpp.password')" :required="!editingId">
+              <el-input
+                v-model="form.password"
+                type="password"
+                show-password
+                :placeholder="editingId ? $t('smpp.passwordPlaceholder') : ''"
+              />
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -190,7 +195,7 @@ function openDialog(row?: SmppConfig) {
     editingId.value = row.id
     form.value = {
       name: row.name, host: row.host, port: row.port,
-      system_id: row.system_id, password: row.password,
+      system_id: row.system_id, password: '',
       source_addr: row.source_addr, bind_type: row.bind_type,
       address_ton: row.address_ton, address_npi: row.address_npi,
       data_coding: row.data_coding, pool_size: row.pool_size,
@@ -230,6 +235,7 @@ async function handleSave() {
 async function testConfig(row: SmppConfig) {
   try {
     const result = await store.testConnection({
+      config_id: row.id,
       host: row.host, port: row.port,
       system_id: row.system_id, password: row.password,
       bind_type: row.bind_type,

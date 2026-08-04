@@ -62,6 +62,7 @@ class SmppConfigResponse(BaseModel):
 
 
 class SmppTestRequest(BaseModel):
+    config_id: Optional[int] = None
     host: str
     port: int = 2775
     system_id: str

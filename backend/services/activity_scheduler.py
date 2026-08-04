@@ -26,6 +26,11 @@ def _process_batches():
             conn.close()
             batch_campaign_service.generate_batches(candidate["id"], candidate.get("batch_size") or 500)
             conn = get_connection()
+    # Daily-repeat batch campaigns: reset batches once per day while the campaign
+    # is still in progress, so the same target list is sent again each eligible day.
+    batch_campaign_service.reset_daily_batches()
+    # Cancel the day's unfinished tasks once the daily send window has closed.
+    batch_campaign_service.cancel_overdue_daily_tasks()
     rows = conn.execute(
         """SELECT b.id AS batch_id, c.* FROM batch_campaign_batches b
            JOIN batch_campaigns c ON c.id=b.campaign_id

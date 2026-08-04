@@ -14,6 +14,7 @@ def main():
         root = Path(temp_name)
         os.environ.update({
             "DUCKDB_PATH": str(root / "e2e.duckdb"),
+            "MC_DB_CONFIG_FILE": str(root / "db_config.json"),
             "MC_BACKUP_DIR": str(root / "backups"),
             "MC_FRONTEND_DIR": str(root / "missing-dist"),
             "MC_INSTANCE_LOCK": str(root / "instance.lock"),

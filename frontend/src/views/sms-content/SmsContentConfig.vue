@@ -28,7 +28,7 @@
             {{ $t('common.edit') }}
           </el-button>
           <span :title="deleteDisabledReason(row)">
-            <el-button text type="danger" size="small" :disabled="!canDeleteTemplate(row)" @click="handleDeleteTemplate(row)">
+            <el-button text type="danger" size="small" :disabled="!canDeleteCampaign(row)" @click="handleDeleteCampaign(row)">
               {{ $t('common.delete') }}
             </el-button>
           </span>
@@ -56,7 +56,7 @@
         <el-table-column prop="content" label="内容" show-overflow-tooltip />
         <el-table-column prop="change_note" label="变更说明" width="150" />
         <el-table-column prop="created_at" label="时间" width="180" />
-        <el-table-column label="操作" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row.version_no)">恢复</el-button></template></el-table-column>
+        <el-table-column label="操作" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row)">恢复</el-button></template></el-table-column>
       </el-table>
       <el-pagination
         v-model:current-page="versionPage"
@@ -106,6 +106,7 @@ function buildSpanMap(data: any[]) {
       map[key][0] = { rowspan: spanVal, colspan: 1 }
       map[key][1] = { rowspan: spanVal, colspan: 1 }
       map[key][2] = { rowspan: spanVal, colspan: 1 }
+      map[key][5] = { rowspan: spanVal, colspan: 1 }
     }
     idx += count
   }
@@ -138,17 +139,17 @@ function changePage(nextPage: number) {
   void fetchTable()
 }
 
-async function handleDeleteTemplate(row: any) {
-  if (!canDeleteTemplate(row)) return
+async function handleDeleteCampaign(row: any) {
+  if (!canDeleteCampaign(row)) return
   try {
-    await ElMessageBox.confirm('确认删除该语言模板？', '提示')
-    await api.deleteTemplate(row.template_id)
+    await ElMessageBox.confirm('确认删除该短信配置及其所有语言模板？', '提示')
+    await api.deleteCampaign(row.campaign_id)
     ElMessage.success('删除成功')
     await fetchTable()
   } catch { /* ignore */ }
 }
 
-function canDeleteTemplate(row: any) {
+function canDeleteCampaign(row: any) {
   return Number(row.activity_reference_count || 0) === 0 && Number(row.task_reference_count || 0) === 0
 }
 
@@ -162,7 +163,7 @@ async function openVersions(row: any) {
   activeTemplate.value = row
   versionPage.value = 1
   const [history, check] = await Promise.all([
-    api.getTemplateVersions(row.template_id, { page: versionPage.value, page_size: versionPageSize.value }),
+    api.getCampaignVersions(row.campaign_id, { page: versionPage.value, page_size: versionPageSize.value }),
     api.validateTemplate(row.content || ''),
   ])
   versions.value = history.data.items || []
@@ -173,7 +174,7 @@ async function openVersions(row: any) {
 
 async function loadVersions() {
   if (!activeTemplate.value) return
-  const history = await api.getTemplateVersions(activeTemplate.value.template_id, {
+  const history = await api.getCampaignVersions(activeTemplate.value.campaign_id, {
     page: versionPage.value,
     page_size: versionPageSize.value,
   })
@@ -187,12 +188,12 @@ function changeVersionPage(nextPage: number) {
   void loadVersions()
 }
 
-async function restoreVersion(versionNo: number) {
-  await ElMessageBox.confirm(`确认恢复到版本 ${versionNo}？当前内容会自动保存为新的历史版本。`, '恢复模板')
-  await api.restoreTemplateVersion(activeTemplate.value.template_id, versionNo)
+async function restoreVersion(version: any) {
+  await ElMessageBox.confirm(`确认将语言「${version.language}」恢复到版本 ${version.version_no}？当前内容会自动保存为新的历史版本。`, '恢复模板')
+  await api.restoreTemplateVersion(version.template_id, version.version_no)
   ElMessage.success('模板版本已恢复')
   await fetchTable()
-  const row = tableData.value.find(item => item.template_id === activeTemplate.value.template_id)
+  const row = tableData.value.find(item => item.campaign_id === activeTemplate.value.campaign_id)
   if (row) await openVersions(row)
 }
 </script>

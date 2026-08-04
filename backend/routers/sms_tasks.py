@@ -13,8 +13,9 @@ class ExclusionRequest(BaseModel):
 
 
 @router.get("")
-def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = "", campaign_type: str = ""):
-    return sms_task_service.list_tasks(page, page_size, status, campaign_type)
+def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = "",
+               campaign_type: str = "", smpp_config_id: int = Query(-1)):
+    return sms_task_service.list_tasks(page, page_size, status, campaign_type, smpp_config_id)
 
 
 @router.get("/stats")
@@ -32,6 +33,14 @@ def retry(task_id: int):
     if not sms_task_service.retry_task(task_id):
         raise HTTPException(404, "Task not found")
     return {"success": True}
+
+
+@router.post("/{task_id}/deliver")
+def confirm_delivered(task_id: int):
+    ok, message = sms_task_service.mark_delivered(task_id)
+    if not ok:
+        raise HTTPException(400, message)
+    return {"success": True, "message": message}
 
 
 @router.get("/exclusions/list")

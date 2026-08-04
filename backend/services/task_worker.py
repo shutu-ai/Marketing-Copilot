@@ -8,6 +8,7 @@ from services.settings_service import get_setting
 from services.smpp_gateway import gateway, SmppSubmitError
 
 logger = logging.getLogger(__name__)
+detail_logger = logging.getLogger("mc.detail")
 _stop = threading.Event()
 _guard = threading.RLock()
 _workers = {}
@@ -21,6 +22,14 @@ def configured_worker_count():
     except (TypeError, ValueError):
         value = 1
     return max(1, min(value, 32))
+
+
+def configured_claim_batch():
+    try:
+        value = int(os.environ.get("MC_CLAIM_BATCH", get_setting("task_claim_batch", "20")))
+    except (TypeError, ValueError):
+        value = 20
+    return max(1, min(value, 500))
 
 
 def worker_status():
@@ -42,8 +51,8 @@ def _run(worker_index):
             ticks += 1
             if worker_index == 0 and ticks % 60 == 0:
                 sms_task_service.recover_stale_tasks()
-            task = sms_task_service.claim_next_task()
-            if not task:
+            tasks = sms_task_service.claim_next_tasks(configured_claim_batch())
+            if not tasks:
                 if (worker_index == 0 and get_setting("system_mode", "production") == "production"
                         and not gateway.connected and time.monotonic() >= reconnect_after):
                     try:
@@ -53,28 +62,35 @@ def _run(worker_index):
                         reconnect_after = time.monotonic() + reconnect_delay
                         reconnect_delay = min(60.0, reconnect_delay * 2)
                 continue
-            try:
-                metrics_service.inc("marketing_copilot_tasks_claimed_total", labels={"worker": worker_index + 1})
-                active, reason = sms_task_service.validate_task_schedule(task)
-                if not active:
-                    expired = reason in {"campaign has ended", "campaign no longer exists", "campaign is not enabled"}
-                    sms_task_service.defer_task(task["id"], reason, expired); continue
-                if get_setting("system_mode", "production") == "development":
-                    message_id = f"DEV-{task['id']}"
-                    sms_task_service.mark_submitted(task["id"], [message_id])
-                    sms_task_service.record_receipt(message_id, "DELIVRD", "development simulation")
-                else:
-                    sms_task_service.mark_submitted(task["id"], gateway.send(task))
-                metrics_service.inc("marketing_copilot_tasks_submitted_total")
-            except SmppSubmitError as exc:
-                temporary = exc.status in {0x00000008, 0x00000014, 0x00000045, 0x00000058}
-                failure_class = "delivery_unknown" if exc.status == -1 else "submit_sm_resp"
-                sms_task_service.mark_send_failure(task, str(exc), exc.status, temporary, failure_class)
-                metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": failure_class})
-            except Exception as exc:
-                logger.exception("SMS task %s failed", task["id"])
-                sms_task_service.mark_send_failure(task, str(exc))
-                metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": "transport"})
+            for task in tasks:
+                try:
+                    metrics_service.inc("marketing_copilot_tasks_claimed_total", labels={"worker": worker_index + 1})
+                    active, reason = sms_task_service.validate_task_schedule(task)
+                    if not active:
+                        expired = reason in {"campaign has ended", "campaign no longer exists", "campaign is not enabled"}
+                        sms_task_service.defer_task(task["id"], reason, expired)
+                        continue
+                    if get_setting("system_mode", "production") == "development":
+                        message_id = f"DEV-{task['id']}"
+                        detail_logger.info(
+                            "[SMS STUB] dev mode simulated send task=%s campaign=%s/%s msisdn=%s content_len=%d content=%s",
+                            task["id"], task.get("campaign_type"), task.get("campaign_id"),
+                            task.get("msisdn"), len(task.get("content") or ""), (task.get("content") or "")[:1000],
+                        )
+                        sms_task_service.mark_submitted(task["id"], [message_id])
+                        sms_task_service.record_receipt(message_id, "DELIVRD", "development simulation")
+                    else:
+                        sms_task_service.mark_submitted(task["id"], gateway.send(task))
+                    metrics_service.inc("marketing_copilot_tasks_submitted_total")
+                except SmppSubmitError as exc:
+                    temporary = exc.status in {0x00000008, 0x00000014, 0x00000045, 0x00000058}
+                    failure_class = "delivery_unknown" if exc.status == -1 else "submit_sm_resp"
+                    sms_task_service.mark_send_failure(task, str(exc), exc.status, temporary, failure_class)
+                    metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": failure_class})
+                except Exception as exc:
+                    logger.exception("SMS task %s failed", task["id"])
+                    sms_task_service.mark_send_failure(task, str(exc))
+                    metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": "transport"})
     except Exception:
         logger.exception("SMS worker %s terminated unexpectedly", worker_index + 1)
 
