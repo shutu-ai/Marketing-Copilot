@@ -22,6 +22,7 @@ playwright-report/
 .env
 *.env.local
 backend/db_config.json
+backend/data/
 backend/*.db
 backend/*.db-*
 backend/*.duckdb
