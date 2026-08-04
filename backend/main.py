@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
 from auth import auth_middleware
 from services import update_service
-from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router
+from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router, users as users_router
 
 from services.runtime_service import configure_logging, acquire_instance_lock, release_instance_lock
 configure_logging()
@@ -46,6 +46,7 @@ app.include_router(filesystem_router.router)
 app.include_router(logs_router.router)
 app.include_router(auth_router.router)
 app.include_router(update_router.router)
+app.include_router(users_router.router)
 
 
 @app.on_event("startup")
@@ -55,6 +56,8 @@ def startup():
     from database import get_database_file, set_database_file
     set_database_file(db_config_service.get_effective_db_path(get_database_file()))
     init_db()
+    from services import user_service
+    user_service.bootstrap_admin()
     update_service.record_pending_result()
     from services.settings_service import get_setting
     from services.runtime_service import set_log_level, set_detail_logging

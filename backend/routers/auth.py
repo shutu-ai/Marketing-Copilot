@@ -1,11 +1,8 @@
-import hmac
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from auth import (
     TOKEN_TTL_SECONDS,
-    admin_credentials,
     client_ip,
     create_token,
     get_current_user,
@@ -13,6 +10,7 @@ from auth import (
     record_audit,
     record_login_failure,
 )
+from services import user_service
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
@@ -28,16 +26,14 @@ def login(data: LoginRequest, request: Request):
     if login_limited(ip):
         record_audit(request, "login", detail={"result": "rate_limited", "ip": ip}, username=data.username or "unknown")
         raise HTTPException(status_code=429, detail="Too many login attempts, try again later")
-    expected_user, expected_pass = admin_credentials()
-    ok_user = hmac.compare_digest(data.username or "", expected_user)
-    ok_pass = hmac.compare_digest(data.password or "", expected_pass)
-    if not (ok_user and ok_pass):
+    user = user_service.authenticate((data.username or "").strip().lower(), data.password or "")
+    if not user:
         record_login_failure(ip)
         record_audit(request, "login", detail={"result": "failed", "ip": ip}, username=data.username or "unknown")
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    token = create_token(expected_user)
-    record_audit(request, "login", detail={"result": "success"}, username=expected_user)
-    return {"token": token, "username": expected_user, "role": "admin", "expires_in": TOKEN_TTL_SECONDS}
+    token = create_token(user["username"], role=user["role"])
+    record_audit(request, "login", detail={"result": "success", "role": user["role"]}, username=user["username"])
+    return {"token": token, "username": user["username"], "role": user["role"], "expires_in": TOKEN_TTL_SECONDS}
 
 
 @router.post("/logout")

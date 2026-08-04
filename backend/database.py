@@ -37,6 +37,7 @@ TABLE_SEQUENCES = {
     "failed_task_archive": "seq_failed_task_archive",
     "template_versions": "seq_template_versions",
     "update_history": "seq_update_history",
+    "users": "seq_users",
 }
 
 
@@ -451,6 +452,17 @@ def init_db():
             detail TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
+        """CREATE TABLE IF NOT EXISTS users (
+            id INTEGER DEFAULT nextval('seq_users') PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT 'operator',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_login_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
     ]
 
     for stmt in ddl:
@@ -571,6 +583,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_template_versions ON template_versions(template_id,version_no)",
         "CREATE INDEX IF NOT EXISTS idx_update_history_created ON update_history(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
     ]
     for idx in indexes:
         try:

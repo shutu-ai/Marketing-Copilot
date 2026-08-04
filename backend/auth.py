@@ -33,9 +33,49 @@ DEFAULT_PASSWORD = "Huawei@123"
 # by the update runner's post-restart health check.
 PUBLIC_API_PATHS = {"/api/ready", "/api/health", "/api/auth/login"}
 
+# Prefixes that only the admin role may use. `/api/users/me/*` (self password
+# change) is exempt and available to every authenticated role.
+ADMIN_ONLY_PREFIXES = ("/api/users", "/api/update", "/api/db-query")
+ROLES = ("admin", "operator", "viewer")
+
 _login_failures: dict = {}
 LOGIN_MAX_FAILURES = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
+PBKDF2_ITERATIONS = 120000
+
+
+def hash_password(password: str, iterations: int = PBKDF2_ITERATIONS) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, iterations, salt_hex, hash_hex = stored.split("$")
+        if scheme != "pbkdf2":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+        )
+        return hmac.compare_digest(digest.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+def role_allows(role: str, method: str, path: str) -> bool:
+    """Authorize a request by role. The middleware enforces this for /api routes."""
+    if role == "admin":
+        return True
+    if path.startswith("/api/users/me"):
+        return True
+    if any(path.startswith(prefix) for prefix in ADMIN_ONLY_PREFIXES):
+        return False
+    if role == "operator":
+        return True
+    if role == "viewer":
+        return method in ("GET", "HEAD", "OPTIONS") or path in ("/api/auth/login", "/api/auth/logout")
+    return False
 
 
 def auth_disabled() -> bool:
@@ -123,7 +163,26 @@ async def auth_middleware(request: Request, call_next):
         path = request.url.path
         if request.method != "OPTIONS" and path.startswith("/api") and path not in PUBLIC_API_PATHS:
             try:
-                request.state.user = get_current_user(request)
+                user = get_current_user(request)
+                request.state.user = user
+                # Admin-only endpoints re-check the role against the database so
+                # demoted users lose admin capability immediately, not only after
+                # their token expires.
+                if user.get("role") == "admin" and any(path.startswith(p) for p in ADMIN_ONLY_PREFIXES):
+                    try:
+                        from services import user_service
+
+                        db_role = user_service.get_role(user.get("username", ""))
+                        if db_role != "admin":
+                            from fastapi.responses import JSONResponse
+
+                            return JSONResponse(status_code=403, content={"detail": "Insufficient permissions"})
+                    except Exception:
+                        pass
+                if not role_allows(user.get("role", "viewer"), request.method, path):
+                    from fastapi.responses import JSONResponse
+
+                    return JSONResponse(status_code=403, content={"detail": "Insufficient permissions"})
             except HTTPException as exc:
                 from fastapi.responses import JSONResponse
 

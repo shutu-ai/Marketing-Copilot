@@ -8,7 +8,7 @@
     </div>
 
     <el-tabs v-model="activeTab" class="settings-tabs" @tab-change="handleTabChange">
-      <el-tab-pane :label="$t('settings.basicTab')" name="basic">
+      <el-tab-pane v-if="canSee.basic" :label="$t('settings.basicTab')" name="basic">
         <el-card shadow="never">
           <el-form :model="form" label-width="200px" size="small">
             <el-form-item :label="$t('settings.batchBaseDir')">
@@ -53,11 +53,11 @@
         </el-card>
       </el-tab-pane>
 
-      <el-tab-pane :label="$t('settings.smppTab')" name="smpp" lazy>
+      <el-tab-pane v-if="canSee.smpp" :label="$t('settings.smppTab')" name="smpp" lazy>
         <SmppConfig embedded />
       </el-tab-pane>
 
-      <el-tab-pane :label="$t('settings.databaseTab')" name="database" lazy>
+      <el-tab-pane v-if="canSee.database" :label="$t('settings.databaseTab')" name="database" lazy>
         <el-alert
           :title="$t('settings.databaseWarning')"
           type="warning"
@@ -68,19 +68,23 @@
         <DbConfig embedded />
       </el-tab-pane>
 
-      <el-tab-pane :label="$t('settings.logTab')" name="logs" lazy>
+      <el-tab-pane v-if="canSee.logs" :label="$t('settings.logTab')" name="logs" lazy>
         <LogViewer embedded />
       </el-tab-pane>
 
-      <el-tab-pane :label="$t('settings.updateTab')" name="update" lazy>
+      <el-tab-pane v-if="canSee.update" :label="$t('settings.updateTab')" name="update" lazy>
         <SystemUpdate embedded />
+      </el-tab-pane>
+
+      <el-tab-pane v-if="canSee.users" :label="$t('settings.usersTab')" name="users" lazy>
+        <UserManagement embedded />
       </el-tab-pane>
     </el-tabs>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, reactive, watch } from 'vue'
+import { ref, onMounted, reactive, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
@@ -89,19 +93,45 @@ import SmppConfig from '@/views/smpp/SmppConfig.vue'
 import DbConfig from '@/views/dbConfig/DbConfig.vue'
 import LogViewer from '@/views/logs/LogViewer.vue'
 import SystemUpdate from '@/views/update/SystemUpdate.vue'
+import UserManagement from '@/views/users/UserManagement.vue'
+import { useAuthStore } from '@/stores/auth'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const validTabs = ['basic', 'smpp', 'database', 'logs', 'update'] as const
+const authStore = useAuthStore()
+const validTabs = ['basic', 'smpp', 'database', 'logs', 'update', 'users'] as const
 
 type SettingsTab = typeof validTabs[number]
 
-function normalizeTab(value: unknown): SettingsTab {
-  return typeof value === 'string' && validTabs.includes(value as SettingsTab)
-    ? value as SettingsTab
-    : 'basic'
+function visibleTabs(): SettingsTab[] {
+  const role = authStore.role
+  const map: Record<string, SettingsTab[]> = {
+    admin: [...validTabs],
+    operator: ['basic', 'smpp', 'database', 'logs'],
+    viewer: ['logs'],
+  }
+  return map[role] || ['logs']
 }
+
+function normalizeTab(value: unknown): SettingsTab {
+  const tabs = visibleTabs()
+  return typeof value === 'string' && tabs.includes(value as SettingsTab)
+    ? value as SettingsTab
+    : tabs[0]
+}
+
+const canSee = computed(() => {
+  const role = authStore.role
+  return {
+    basic: role !== 'viewer',
+    smpp: role !== 'viewer',
+    database: role !== 'viewer',
+    logs: true,
+    update: role === 'admin',
+    users: role === 'admin',
+  }
+})
 
 const activeTab = ref<SettingsTab>(normalizeTab(route.query.tab))
 const saving = ref(false)
