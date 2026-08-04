@@ -4,6 +4,12 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     {
+      path: '/login',
+      name: 'Login',
+      meta: { titleKey: 'auth.loginTitle' },
+      component: () => import('@/views/auth/Login.vue'),
+    },
+    {
       path: '/',
       component: () => import('@/views/layout/MainLayout.vue'),
       redirect: '/dashboard',
@@ -105,6 +111,12 @@ const router = createRouter({
           component: () => import('@/views/logs/LogViewer.vue'),
         },
         {
+          path: 'update',
+          name: 'SystemUpdate',
+          meta: { titleKey: 'update.title' },
+          component: () => import('@/views/update/SystemUpdate.vue'),
+        },
+        {
           path: 'db-config',
           redirect: { path: '/settings', query: { tab: 'database' } },
         },
@@ -117,6 +129,17 @@ const router = createRouter({
       ],
     },
   ],
+})
+
+router.beforeEach((to) => {
+  const token = localStorage.getItem('mc_token')
+  if (to.path !== '/login' && !token) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  if (to.path === '/login' && token) {
+    return '/'
+  }
+  return true
 })
 
 export default router

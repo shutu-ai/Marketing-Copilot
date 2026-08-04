@@ -49,7 +49,7 @@ tar -C "$ROOT/backend" \
   --exclude='uploads' --exclude='monitor_dir' \
   -cf - . | tar -C "$STAGE/payload/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/payload/frontend/"
-cp "$ROOT/deploy/marketing-copilot.env.example" "$ROOT/deploy/marketing-copilot.service" "$ROOT/deploy/marketing-copilot-backup.service" "$ROOT/deploy/marketing-copilot-backup.timer" "$ROOT/deploy/marketing-copilot-smsc-simulator.service" "$STAGE/payload/deploy/"
+cp "$ROOT/deploy/marketing-copilot.env.example" "$ROOT/deploy/marketing-copilot.service" "$ROOT/deploy/marketing-copilot-backup.service" "$ROOT/deploy/marketing-copilot-backup.timer" "$ROOT/deploy/marketing-copilot-smsc-simulator.service" "$ROOT/deploy/polkit-marketing-copilot.rules" "$STAGE/payload/deploy/"
 
 # manylinux2014 uses glibc 2.17, compatible with SLES 12 SP5 glibc 2.22.
 # smpplib is pure Python and is built into a universal wheel here, so the target
@@ -60,6 +60,18 @@ python3 -m pip wheel --no-deps --wheel-dir "$STAGE/offline/wheels/app" smpplib==
 printf '%s\n' 'No third-party wheels: the SMSC simulator uses Python standard library only.' > "$STAGE/offline/wheels/smsc-simulator/README.txt"
 cp "$ROOT/deploy/requirements-smsc-simulator.txt" "$STAGE/offline/wheels/smsc-simulator/"
 cp "$ROOT/deploy/install-sles12sp5-offline.sh" "$STAGE/install.sh"; chmod 0755 "$STAGE/install.sh"
+# Version metadata for the online-update feature.
+GIT_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
+cat > "$STAGE/payload/backend/release.json" <<JSON
+{
+  "name": "Marketing Copilot",
+  "version": "$VERSION",
+  "build_time": "$(date -Is)",
+  "builder": "build-sles12sp5-offline.sh",
+  "git_sha": "$GIT_SHA"
+}
+JSON
+cp "$STAGE/payload/backend/release.json" "$STAGE/release.json"
 (cd "$STAGE" && find . -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > checksums.sha256)
 mkdir -p "$OUTPUT"
 tar -C "$WORK" -czf "$OUTPUT/marketing-copilot-sles12sp5-$VERSION.tar.gz" "$(basename "$STAGE")"

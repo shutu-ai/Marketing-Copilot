@@ -46,6 +46,10 @@
       <span>{{ $t('menu.logViewer') }}</span>
     </el-menu-item>
 
+    <el-menu-item index="/update">
+      <el-icon><RefreshRight /></el-icon>
+      <span>{{ $t('menu.update') }}</span>
+    </el-menu-item>
 
     <el-menu-item index="/settings">
       <el-icon><Tools /></el-icon>

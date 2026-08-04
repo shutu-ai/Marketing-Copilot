@@ -23,6 +23,7 @@ mkdir -p "$PREFIX"
 cp -a payload/backend payload/frontend "$PREFIX/"
 cp -a runtime/opt/marketing-copilot/python runtime/opt/marketing-copilot/python-deps "$PREFIX/"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 /var/lib/marketing-copilot /var/lib/marketing-copilot/backups /var/log/marketing-copilot /run/marketing-copilot
+chown "$SERVICE_USER:$SERVICE_USER" "$PREFIX"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$PREFIX/backend" "$PREFIX/frontend"
 
 PYTHON="$PREFIX/python/bin/python3.11"
@@ -40,6 +41,13 @@ install -m 0644 payload/deploy/marketing-copilot.service /etc/systemd/system/mar
 install -m 0644 payload/deploy/marketing-copilot-backup.service /etc/systemd/system/marketing-copilot-backup.service
 install -m 0644 payload/deploy/marketing-copilot-backup.timer /etc/systemd/system/marketing-copilot-backup.timer
 if [ "$WITH_SMSC" -eq 1 ]; then install -m 0644 payload/deploy/marketing-copilot-smsc-simulator.service /etc/systemd/system/marketing-copilot-smsc-simulator.service; fi
+# Best-effort polkit rule so the service account can manage its own unit for
+# self-update (start/stop between the directory swap). Harmless if absent: the
+# update runner then falls back to pid-based stop/start.
+if [ -d /etc/polkit-1/rules.d ]; then
+  install -m 0644 payload/deploy/polkit-marketing-copilot.rules /etc/polkit-1/rules.d/60-marketing-copilot.rules
+  echo "Installed polkit rule for self-update."
+fi
 systemctl daemon-reload
 systemctl enable marketing-copilot.service marketing-copilot-backup.timer
 echo "Installed. Review /etc/marketing-copilot.env, then run: systemctl start marketing-copilot.service"

@@ -20,6 +20,7 @@ def main():
             "MC_INSTANCE_LOCK": str(root / "instance.lock"),
             "MC_LOG_PATH": str(root / "e2e.log"),
             "MC_SYSTEM_MODE": "development",
+            "MC_AUTH_DISABLED": "1",
         })
         import uvicorn
         uvicorn.run("main:app", host="127.0.0.1", port=args.port, log_level="warning")

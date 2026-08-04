@@ -1,6 +1,11 @@
 import { expect, test } from '@playwright/test'
 
 test('sidebar navigation groups expand exclusively', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('mc_token', 'e2e-token')
+    localStorage.setItem('mc_user', 'admin')
+  })
+
   await page.route(/^https?:\/\/[^/]+\/api\/dashboard\/stats/, route =>
     route.fulfill({
       status: 200,

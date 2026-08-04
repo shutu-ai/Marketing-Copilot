@@ -43,6 +43,18 @@ cp "$ROOT/deploy/marketing-copilot.single-dir.env.example" "$STAGE/marketing-cop
 cp "$ROOT/deploy/run-system-python-manual.sh" "$STAGE/run.sh"
 cp "$ROOT/deploy/README-system-python-manual.md" "$STAGE/README.md"
 chmod 0755 "$STAGE/run.sh"
+# Version metadata for the online-update feature.
+GIT_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
+cat > "$STAGE/backend/release.json" <<JSON
+{
+  "name": "Marketing Copilot",
+  "version": "$VERSION",
+  "build_time": "$(date -Is)",
+  "builder": "build-sles12sp5-system-python-manual.sh",
+  "git_sha": "$GIT_SHA"
+}
+JSON
+cp "$STAGE/backend/release.json" "$STAGE/release.json"
 (cd "$STAGE" && find . -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > checksums.sha256)
 mkdir -p "$OUTPUT"
 tar -C "$WORK" -czf "$OUTPUT/$NAME.tar.gz" "$NAME"

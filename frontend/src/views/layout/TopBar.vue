@@ -10,6 +10,24 @@
       </el-breadcrumb>
     </div>
     <div class="top-bar-right">
+      <el-dropdown trigger="click" @command="onUserCommand">
+        <span class="user-chip">
+          <el-avatar :size="28" class="user-avatar">{{ userInitial }}</el-avatar>
+          <span class="user-name">{{ username || $t('layout.guest') }}</span>
+          <el-icon class="user-caret"><ArrowDown /></el-icon>
+        </span>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item disabled>
+              {{ $t('layout.loggedInAs') }}：{{ username }}
+            </el-dropdown-item>
+            <el-dropdown-item divided command="logout">
+              <el-icon><SwitchButton /></el-icon>
+              {{ $t('layout.logout') }}
+            </el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
       <el-select
         :aria-label="$t('layout.language')"
         :model-value="currentLocale"
@@ -26,20 +44,33 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 
 import { useElementPlusLocale } from '@/utils/locale'
+import { useAuthStore } from '@/stores/auth'
 
 const props = defineProps<{ title: string }>()
 const emit = defineEmits<{ toggle: [] }>()
 
 const { locale } = useI18n()
+const router = useRouter()
+const authStore = useAuthStore()
 const currentLocale = computed(() => locale.value)
+const username = computed(() => authStore.username)
+const userInitial = computed(() => (authStore.username || 'M').slice(0, 1).toUpperCase())
 
 function switchLocale(val: string) {
   locale.value = val
   localStorage.setItem('locale', val)
   useElementPlusLocale(val)
+}
+
+function onUserCommand(command: string) {
+  if (command === 'logout') {
+    authStore.signOut()
+    router.push('/login')
+  }
 }
 </script>
 
@@ -64,6 +95,33 @@ function switchLocale(val: string) {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 4px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.user-chip:hover {
+  background: var(--mc-surface-muted);
+}
+.user-avatar {
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  background: var(--mc-primary);
+}
+.user-name {
+  color: var(--mc-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.user-caret {
+  color: var(--mc-text-secondary);
+  font-size: 12px;
 }
 .nav-toggle {
   width: 36px;

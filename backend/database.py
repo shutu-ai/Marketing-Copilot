@@ -36,6 +36,7 @@ TABLE_SEQUENCES = {
     "task_events": "seq_task_events",
     "failed_task_archive": "seq_failed_task_archive",
     "template_versions": "seq_template_versions",
+    "update_history": "seq_update_history",
 }
 
 
@@ -439,6 +440,17 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             UNIQUE(template_id, version_no)
         )""",
+        """CREATE TABLE IF NOT EXISTS update_history (
+            id INTEGER DEFAULT nextval('seq_update_history') PRIMARY KEY,
+            run_id TEXT NOT NULL UNIQUE,
+            action TEXT NOT NULL DEFAULT 'apply',
+            version TEXT NOT NULL DEFAULT '',
+            previous_version TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            operator TEXT NOT NULL DEFAULT 'system',
+            detail TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
     ]
 
     for stmt in ddl:
@@ -558,6 +570,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_events_open ON system_events(resolved,severity,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_template_versions ON template_versions(template_id,version_no)",
+        "CREATE INDEX IF NOT EXISTS idx_update_history_created ON update_history(created_at)",
     ]
     for idx in indexes:
         try:

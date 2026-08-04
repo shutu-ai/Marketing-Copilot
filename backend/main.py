@@ -10,13 +10,15 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
-from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router
+from auth import auth_middleware
+from services import update_service
+from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router
 
 from services.runtime_service import configure_logging, acquire_instance_lock, release_instance_lock
 configure_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Marketing Copilot API", version="1.1.0")
+app = FastAPI(title="Marketing Copilot API", version=update_service.version_info().get("version", "1.2.0"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +27,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(auth_middleware)
 
 app.include_router(smpp.router)
 app.include_router(sms_content.router)
@@ -41,6 +44,8 @@ app.include_router(operations_router.router)
 app.include_router(metrics_router.router)
 app.include_router(filesystem_router.router)
 app.include_router(logs_router.router)
+app.include_router(auth_router.router)
+app.include_router(update_router.router)
 
 
 @app.on_event("startup")
@@ -50,6 +55,7 @@ def startup():
     from database import get_database_file, set_database_file
     set_database_file(db_config_service.get_effective_db_path(get_database_file()))
     init_db()
+    update_service.record_pending_result()
     from services.settings_service import get_setting
     from services.runtime_service import set_log_level, set_detail_logging
     try:
@@ -59,6 +65,7 @@ def startup():
     set_detail_logging(get_setting("detail_logging", "0") or "0")
     os.makedirs(os.path.join(os.path.dirname(__file__), "uploads"), exist_ok=True)
     os.makedirs(os.path.join(os.path.dirname(__file__), "monitor_dir"), exist_ok=True)
+    update_service.ensure_update_dir()
     from services.task_worker import start_worker
     from services.activity_scheduler import start_scheduler
     start_worker()
@@ -106,7 +113,7 @@ def ready():
         conn = get_connection(); conn.execute("SELECT 1"); conn.close()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
-    return {"status": "ready"}
+    return {"status": "ready", "version": update_service.version_info().get("version", "1.2.0")}
 
 
 DIST_DIR = os.path.abspath(os.environ.get("MC_FRONTEND_DIR", os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")))

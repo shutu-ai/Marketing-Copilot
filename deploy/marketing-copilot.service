@@ -16,6 +16,10 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=30
 KillSignal=SIGTERM
+# Only the main process is signalled on stop so the detached update runner
+# (spawned by the web process) can survive `systemctl stop` and finish the
+# directory swap before starting the new version.
+KillMode=process
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true

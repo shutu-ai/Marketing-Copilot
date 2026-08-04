@@ -76,6 +76,8 @@ sudo vi /etc/marketing-copilot.env
 | `MC_TASK_WORKERS` | 内部短信任务工作线程数。 |
 | `MC_ALERT_WEBHOOK_URL` | 可选告警 Webhook 地址；离线环境通常保持为空。 |
 | `MC_SYSTEM_MODE` | 系统运行模式，生产环境保持 `production`。 |
+| `MC_ADMIN_USERNAME` / `MC_ADMIN_PASSWORD` | 管理后台登录账号；默认 `admin / Huawei@123`，生产必须修改。 |
+| `MC_UPDATE_MODE` / `MC_STATE_DIR` / `MC_UPDATE_DIR` | 在线更新运行模式与状态目录，默认值可直接使用。 |
 
 服务默认监听 `0.0.0.0:8000`。如需限制网络访问，请在主机防火墙或反向代理中
 按实际安全策略配置；不要将管理服务直接暴露到不受信任网络。
@@ -90,6 +92,9 @@ curl --fail http://127.0.0.1:8000/api/ready
 curl --fail http://127.0.0.1:8000/api/health
 curl --fail http://127.0.0.1:8000/metrics
 ```
+
+管理界面默认启用登录认证：浏览器访问页面后先以管理员账号登录，再进入
+「系统更新」页完成在线升级。登录、上传、应用与回滚均写入审计日志。
 
 还可执行部署自检：
 
@@ -152,6 +157,31 @@ sudo -u marketing-copilot /opt/marketing-copilot/venv/bin/python -m tools.backup
 
 备份默认存放在 `/var/lib/marketing-copilot/backups`。升级前应先执行一次备份，
 保留原包与对应 SHA-256，并在维护窗口内停止服务后进行升级。
+
+### 7.1 在线更新（前端上传更新包）
+
+自 1.2.0 起，可直接在「系统更新」页面上传由
+`deploy/build-sles12sp5-offline.sh`（或 manual 构建脚本）生成的 tar.gz 完成
+应用层升级，系统会自动备份数据库、排空任务、切换目录并健康检查，失败自动
+回滚。详细说明见 `Docs/前端在线更新与认证.md`。
+
+**已部署服务器的首次启用（一次性）**：
+
+```bash
+# 1. 让 systemctl stop 不误杀更新执行器
+sudo sed -i '/^KillSignal=/a KillMode=process' /etc/systemd/system/marketing-copilot.service
+sudo systemctl daemon-reload
+
+# 2. 允许服务账户管理自己的单元（缺失时自动降级，建议安装）。
+#    新装机器由 install.sh 自动安装 polkit 规则；已部署服务器请参照
+#    Docs/前端在线更新与认证.md 第 2.1 节手工创建规则文件。
+
+# 3. 确认 /etc/marketing-copilot.env 已配置认证与更新项（示例已含默认值）
+sudo systemctl restart marketing-copilot.service
+```
+
+在线更新只覆盖应用层；Python/OpenSSL 运行时与 systemd 单元变更仍按本节手动
+升级流程执行。
 
 ## 8. 常见问题
 

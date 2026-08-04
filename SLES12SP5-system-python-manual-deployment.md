@@ -101,6 +101,19 @@ MC_FRONTEND_DIR=/opt/marketing-copilot-manual/frontend/dist
 按实际情况配置短信网关、数据库或告警地址。离线环境不需要也不应配置 pip/npm
 镜像或在线下载地址。
 
+认证与在线更新相关配置（默认值可直接使用）：
+
+| 配置项 | 说明 |
+| --- | --- |
+| `MC_ADMIN_USERNAME` / `MC_ADMIN_PASSWORD` | 管理后台登录账号；默认 `admin / Huawei@123`，生产必须修改 |
+| `MC_AUTH_DISABLED` | `1` 关闭登录校验，仅限开发/自动化测试 |
+| `MC_UPDATE_MODE` | 手动部署保持 `manual` |
+| `MC_STATE_DIR` / `MC_UPDATE_DIR` | 状态与更新目录，默认在 `$APP_HOME` 下 |
+
+启动后浏览器打开页面会先要求登录。可在「系统更新」页面上传构建脚本生成的
+tar.gz 完成应用层在线升级（自动备份、排空、切换、健康检查与失败回滚），详见
+`Docs/前端在线更新与认证.md`。
+
 ## 6. 离线创建虚拟环境并安装依赖
 
 以实际运行账户执行以下命令：
@@ -166,6 +179,41 @@ rm -f marketing-copilot.pid
 
 `nohup` 仅用于手工后台运行，不提供自动重启或开机启动；服务器重启后需要重新执行
 上述启动命令。
+
+### 7.1 转为 systemd 后台服务（推荐）
+
+后端提供一键创建 systemd 服务的脚本，可把手动部署转为受 systemd 托管的
+后台长期运行（自动重启、开机自启），并兼容前端在线更新：
+
+```bash
+cd /opt/marketing-copilot-manual
+sudo venv/bin/python -m tools.install_systemd_service
+```
+
+脚本会自动：
+
+1. 复用 `run.sh` 与 `marketing-copilot.env`（路径单一来源）；
+2. 生成 `/etc/systemd/system/marketing-copilot.service`，包含
+   `KillMode=process`（在线自更新必需）、`Restart=always`、开机自启；
+3. 安装 polkit 规则，允许服务账户启停自己的单元；
+4. 将环境文件中的 `MC_UPDATE_MODE` 改写为 `systemd`（原文件备份为
+   `marketing-copilot.env.bak`）；
+5. `systemctl daemon-reload` 并启动、启用服务。
+
+执行前可先预览单元内容（无需 root）：
+
+```bash
+cd /opt/marketing-copilot-manual
+venv/bin/python -m tools.install_systemd_service --dry-run
+```
+
+常用参数：`--user <运行账户>`（默认 `marketing-copilot`）、
+`--service-name <名称>.service`、`--no-start`、`--no-enable`、
+`--no-polkit`、`--force`、`--exec-start <命令>`。
+
+另外，`run.sh` 启动时会自动检查对应 systemd 单元：不存在且以 root 执行时，
+自动按应用目录属主创建单元（不启动、不启用）；需要跳过可设置
+`MC_SKIP_SYSTEMD_CHECK=1`。
 
 ## 8. 常见故障
 

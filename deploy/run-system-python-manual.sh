@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Manual foreground launcher; no systemd integration.
+# Manual foreground launcher. When run on a systemd host it optionally creates
+# the corresponding systemd unit (if missing) so the service can later run as
+# a managed background daemon; set MC_SKIP_SYSTEMD_CHECK=1 to skip this.
 set -euo pipefail
 APP_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ENV_FILE="${MC_ENV_FILE:-$APP_HOME/marketing-copilot.env}"
@@ -26,7 +28,34 @@ set -a
 . "$ENV_FILE"
 set +a
 
-mkdir -p "$APP_HOME/data" "$APP_HOME/logs" "$APP_HOME/run" "$APP_HOME/backups"
+mkdir -p "$APP_HOME/data" "$APP_HOME/logs" "$APP_HOME/run" "$APP_HOME/backups" "$APP_HOME/updates"
+export MC_STATE_DIR="${MC_STATE_DIR:-$APP_HOME/data}"
+export MC_UPDATE_DIR="${MC_UPDATE_DIR:-$APP_HOME/updates}"
+export MC_UPDATE_MODE="${MC_UPDATE_MODE:-manual}"
 export MC_FRONTEND_DIR="${MC_FRONTEND_DIR:-$APP_HOME/frontend/dist}"
+
+# Optional: create the systemd unit when it does not exist yet.
+if [ "${MC_SKIP_SYSTEMD_CHECK:-0}" != "1" ] && command -v systemctl >/dev/null 2>&1; then
+  MC_SERVICE_UNIT="${MC_SERVICE_UNIT:-marketing-copilot.service}"
+  if systemctl cat "$MC_SERVICE_UNIT" >/dev/null 2>&1; then
+    echo "systemd unit $MC_SERVICE_UNIT exists; for background running use: systemctl start $MC_SERVICE_UNIT"
+  else
+    echo "systemd unit $MC_SERVICE_UNIT not found; creating it (background daemon support)."
+    if [ "$(id -u)" -eq 0 ]; then
+      APP_OWNER=$(stat -c '%U' "$APP_HOME" 2>/dev/null || id -un)
+      "$VENV_DIR/bin/python" -m tools.install_systemd_service \
+        --service-name "$MC_SERVICE_UNIT" \
+        --env-file "$ENV_FILE" \
+        --user "$APP_OWNER" \
+        --update-mode "" \
+        --no-start --no-enable || \
+        echo "WARNING: failed to create the systemd unit; continuing in foreground."
+    else
+      echo "Not running as root. Create the unit manually with:"
+      echo "  sudo $VENV_DIR/bin/python -m tools.install_systemd_service --service-name $MC_SERVICE_UNIT --env-file $ENV_FILE --user $(stat -c '%U' "$APP_HOME" 2>/dev/null || id -un)"
+    fi
+  fi
+fi
+
 cd "$APP_HOME/backend"
 exec "$VENV_DIR/bin/python" -m uvicorn main:app --host "${MC_HOST:-0.0.0.0}" --port "${MC_PORT:-8000}" --workers 1

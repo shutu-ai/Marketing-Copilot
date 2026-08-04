@@ -24,6 +24,8 @@ def main():
         "log": os.environ.get("MC_LOG_PATH", ""),
         "instance lock": os.environ.get("MC_INSTANCE_LOCK", ""),
         "backup": os.environ.get("MC_BACKUP_DIR", ""),
+        "state": os.environ.get("MC_STATE_DIR", ""),
+        "update": os.environ.get("MC_UPDATE_DIR", ""),
     }
     for label, value in paths.items():
         if not value or not writable_parent(value): failures.append(f"{label} path is missing or not writable: {value}")

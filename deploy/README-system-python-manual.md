@@ -49,6 +49,14 @@ Logging is controlled by two settings:
 - `MC_DETAIL_LOGGING`: set to `1` to enable per-message detail logs (SMS body,
   RabbitMQ payload). Default `0` keeps these high-frequency logs off.
 
+The admin UI requires a login (default `admin / Huawei@123`, change it in
+production via `MC_ADMIN_PASSWORD`). The optional online-update feature lives
+in the "System Update" page: it accepts the same tar.gz package, verifies it,
+backs up the database, swaps the app directories and health-checks with
+automatic rollback. `run.sh` prepares `$APP_HOME/updates` and exports the
+`MC_UPDATE_MODE=manual` settings automatically. See
+`Docs/前端在线更新与认证.md` for details.
+
 ## 4. Run manually
 
 ```bash
@@ -71,3 +79,32 @@ curl --fail http://127.0.0.1:8000/api/health
 
 Stop it with `Ctrl+C`. For background execution, use the organization-approved
 process supervisor; this package intentionally does not create or enable one.
+
+## Run as a systemd background service
+
+The package ships with an installer tool that creates a systemd unit for this
+manual layout, so the service can run as a managed daemon with automatic
+restart and boot startup:
+
+```bash
+sudo /opt/marketing-copilot-manual/venv/bin/python -m tools.install_systemd_service
+```
+
+The tool detects the layout, reuses `run.sh` and `marketing-copilot.env`, sets
+`KillMode=process` (required for online self-updates), installs a polkit rule
+for the service account, flips `MC_UPDATE_MODE=systemd` (with a `.bak` backup),
+and starts/enables the unit. Review first with:
+
+```bash
+cd /opt/marketing-copilot-manual
+venv/bin/python -m tools.install_systemd_service --dry-run
+```
+
+Useful options: `--user <account>` (default `marketing-copilot`),
+`--service-name <name>.service`, `--no-start`, `--no-enable`, `--no-polkit`,
+`--force`, `--exec-start <command>`.
+
+`run.sh` also checks for the unit automatically: when it is missing and
+`run.sh` is executed as root, the unit is created (without starting it) using
+the owner of the app directory as the service account. Set
+`MC_SKIP_SYSTEMD_CHECK=1` to disable this check.
