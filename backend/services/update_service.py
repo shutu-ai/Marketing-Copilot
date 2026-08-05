@@ -655,11 +655,16 @@ def _latest_backup_dir() -> Path:
     return backups[-1] if backups else None
 
 
-def cleanup_staging(max_age_hours: int = 24, keep_backups: int = 3) -> None:
+def cleanup_staging(max_age_hours: int = 24) -> None:
+    keep_backups = max(1, int(os.environ.get("MC_UPDATE_KEEP_BACKUPS", "3")))
+    keep_uploads = max(1, int(os.environ.get("MC_UPDATE_KEEP_UPLOADS", "3")))
     root = ensure_update_dir()
     now = time.time()
+    state = load_state()
+    active_upload = state.get("upload_id") if state.get("status") in RUNNING_STATES else None
     uploads_root = root / "uploads"
     if uploads_root.is_dir():
+        completed = []
         for ud in uploads_root.glob("*"):
             if not ud.is_dir():
                 continue
@@ -669,16 +674,25 @@ def cleanup_staging(max_age_hours: int = 24, keep_backups: int = 3) -> None:
             except Exception:
                 meta = {}
             if meta.get("verified") or meta.get("complete"):
+                try:
+                    completed.append((ud.stat().st_mtime, ud, ud.name))
+                except OSError:
+                    pass
                 continue
             try:
                 if now - ud.stat().st_mtime > max_age_hours * 3600:
                     shutil.rmtree(ud, ignore_errors=True)
             except OSError:
                 pass
+        completed.sort(key=lambda item: item[0])
+        for _mtime, ud, uid in completed[:-keep_uploads]:
+            if uid == active_upload:
+                continue
+            shutil.rmtree(ud, ignore_errors=True)
     backups_root = root / "backups"
     if backups_root.is_dir():
         backups = sorted(backups_root.iterdir(), key=lambda p: p.name)
-        for old in backups[:-max(1, keep_backups)]:
+        for old in backups[:-keep_backups]:
             shutil.rmtree(old, ignore_errors=True)
 
 
