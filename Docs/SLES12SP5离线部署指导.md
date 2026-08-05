@@ -161,7 +161,7 @@ sudo -u marketing-copilot /opt/marketing-copilot/venv/bin/python -m tools.backup
 ### 7.1 在线更新（前端上传更新包）
 
 自 1.2.0 起，可直接在「系统设置」→「系统更新」Tab 上传由
-`deploy/build-sles12sp5-offline.sh`（或 manual 构建脚本）生成的 tar.gz 完成
+`deploy/build-sles12sp5-system-python-manual.sh` 生成的 tar.gz 完成
 应用层升级，系统会自动备份数据库、排空任务、切换目录并健康检查，失败自动
 回滚。详细说明见 `Docs/前端在线更新与认证.md`。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs a package produced by build-sles12sp5-offline.sh. No network is used.
+# Installs the delivered full offline package. No network is used.
 set -euo pipefail
 
 PREFIX=/opt/marketing-copilot

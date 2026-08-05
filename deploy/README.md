@@ -10,49 +10,30 @@ binary unusable on SLES 12. Node is used only to create `frontend/dist`; the
 generated archive contains static frontend files only, so the disconnected SLES
 target does not install or run Node.js/npm.
 
-The preferred no-target-compilation method is the official manylinux2014 build
-image. Docker/Podman is used **only on the build machine**; the SLES target has
-no container runtime. With the existing AlmaLinux 8 WSL and Podman:
-
-```bash
-bash deploy/build-sles12sp5-manylinux2014.sh --engine podman --output release
-```
-
-It compiles the bundled Python 3.11.5/OpenSSL runtime against glibc 2.17 inside
-the image, which is compatible with SLES 12 SP5 glibc 2.22.
+The project keeps a single packaging script for the manual (system Python)
+deployment package:
 
 ```bash
 cd /path/to/MarketingCopilot
-bash deploy/build-sles12sp5-offline.sh --output release
-
-# Copy the archive to the disconnected SLES 12 SP5 host, then:
-tar -xzf marketing-copilot-sles12sp5-*.tar.gz
-cd marketing-copilot-sles12sp5-*
-sudo bash install.sh
+bash deploy/build-sles12sp5-system-python-manual.sh --output release
 ```
 
-If only the Python dependency archive is needed now, it can be built in the
-existing AlmaLinux 8 WSL environment (no SLES-compatible compiler is required):
+It produces `marketing-copilot-sles12sp5-system-python-<ts>.tar.gz` containing
+backend source, frontend dist, the offline wheelhouse and `run.sh`, with
+`backend/release.json` version metadata for the online-update feature. The same
+tar.gz can be deployed manually on the target (see
+`SLES12SP5-system-python-manual-deployment.md`) or uploaded through
+「系统设置 → 系统更新」as the update package.
 
-```bash
-bash deploy/build-sles12sp5-wheelhouse.sh --output release
-```
+The build requires an existing offline wheelhouse archive
+(`marketing-copilot-sles12sp5-wheelhouse-*.tar.gz`) in `release/`. When Python
+dependencies change, regenerate it with the packaging skill helper
+(`sles12sp5-deploy-package/scripts/prepare_wheelhouse_wsl.ps1`), or recover the
+removed `deploy/build-sles12sp5-wheelhouse.sh` from git history.
 
-It creates `marketing-copilot-sles12sp5-wheelhouse-*.tar.gz`, including the
-application wheelhouse and an explicitly separate, empty-dependency SMSC
-simulator directory.
-
-The archive contains a precompiled CPython 3.11.5/OpenSSL 1.1.1w runtime and an
-offline `cp311` wheelhouse. The target only copies files and creates a virtual
-environment; it does not compile Python or require a compiler, development RPMs,
-Node.js, npm, or network access. Wheels are constrained to `manylinux2014_x86_64`
-(glibc 2.17), compatible with SLES 12 SP5 glibc 2.22. The installer checks
-SHA-256 before installation and never accesses the network.
-
-Use `sudo bash install.sh --with-smsc-simulator` to install the optional local
-SMSC simulator service. It is separate from application dependencies and uses
-only the bundled Python standard library. It remains disabled until explicitly
-enabled with `systemctl enable --now marketing-copilot-smsc-simulator.service`.
+The archive does **not** bundle a Python runtime; the target must provide
+system Python 3.11.5. Wheels are `manylinux2014_x86_64` (glibc 2.17),
+compatible with SLES 12 SP5 glibc 2.22.
 
 Use Python 3.11 or 3.12. The pinned `pandas==2.2.2` dependency is not suitable for a Python 3.13 installation without a local C/C++ build toolchain.
 
