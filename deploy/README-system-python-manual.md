@@ -87,6 +87,7 @@ manual layout, so the service can run as a managed daemon with automatic
 restart and boot startup:
 
 ```bash
+cd /opt/marketing-copilot-manual/backend
 sudo /opt/marketing-copilot-manual/venv/bin/python -m tools.install_systemd_service
 ```
 
@@ -96,8 +97,8 @@ for the service account, flips `MC_UPDATE_MODE=systemd` (with a `.bak` backup),
 and starts/enables the unit. Review first with:
 
 ```bash
-cd /opt/marketing-copilot-manual
-venv/bin/python -m tools.install_systemd_service --dry-run
+cd /opt/marketing-copilot-manual/backend
+/opt/marketing-copilot-manual/venv/bin/python -m tools.install_systemd_service --dry-run
 ```
 
 Useful options: `--user <account>` (default `marketing-copilot`),

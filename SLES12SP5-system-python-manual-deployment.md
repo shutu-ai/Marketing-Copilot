@@ -186,8 +186,8 @@ rm -f marketing-copilot.pid
 后台长期运行（自动重启、开机自启），并兼容前端在线更新：
 
 ```bash
-cd /opt/marketing-copilot-manual
-sudo venv/bin/python -m tools.install_systemd_service
+cd /opt/marketing-copilot-manual/backend
+sudo /opt/marketing-copilot-manual/venv/bin/python -m tools.install_systemd_service
 ```
 
 脚本会自动：
@@ -203,8 +203,8 @@ sudo venv/bin/python -m tools.install_systemd_service
 执行前可先预览单元内容（无需 root）：
 
 ```bash
-cd /opt/marketing-copilot-manual
-venv/bin/python -m tools.install_systemd_service --dry-run
+cd /opt/marketing-copilot-manual/backend
+/opt/marketing-copilot-manual/venv/bin/python -m tools.install_systemd_service --dry-run
 ```
 
 常用参数：`--user <运行账户>`（默认 `marketing-copilot`）、

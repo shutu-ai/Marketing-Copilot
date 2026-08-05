@@ -43,16 +43,16 @@ if [ "${MC_SKIP_SYSTEMD_CHECK:-0}" != "1" ] && command -v systemctl >/dev/null 2
     echo "systemd unit $MC_SERVICE_UNIT not found; creating it (background daemon support)."
     if [ "$(id -u)" -eq 0 ]; then
       APP_OWNER=$(stat -c '%U' "$APP_HOME" 2>/dev/null || id -un)
-      "$VENV_DIR/bin/python" -m tools.install_systemd_service \
+      (cd "$APP_HOME/backend" && "$VENV_DIR/bin/python" -m tools.install_systemd_service \
         --service-name "$MC_SERVICE_UNIT" \
         --env-file "$ENV_FILE" \
         --user "$APP_OWNER" \
         --update-mode "" \
-        --no-start --no-enable || \
+        --no-start --no-enable) || \
         echo "WARNING: failed to create the systemd unit; continuing in foreground."
     else
       echo "Not running as root. Create the unit manually with:"
-      echo "  sudo $VENV_DIR/bin/python -m tools.install_systemd_service --service-name $MC_SERVICE_UNIT --env-file $ENV_FILE --user $(stat -c '%U' "$APP_HOME" 2>/dev/null || id -un)"
+      echo "  cd $APP_HOME/backend && sudo $VENV_DIR/bin/python -m tools.install_systemd_service --service-name $MC_SERVICE_UNIT --env-file $ENV_FILE --user $(stat -c '%U' "$APP_HOME" 2>/dev/null || id -un)"
     fi
   fi
 fi
