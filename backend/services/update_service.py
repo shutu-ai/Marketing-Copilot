@@ -419,7 +419,7 @@ def active_business() -> dict:
              (SELECT COUNT(*) FROM realtime_campaigns WHERE status='in_progress') AS realtime_in_progress,
              (SELECT COUNT(*) FROM sms_tasks WHERE status='sending') AS sending_tasks,
              (SELECT COUNT(*) FROM sms_tasks WHERE status IN ('queued','retrying')
-                AND TRY_CAST(next_attempt_at AS TIMESTAMP) <= CURRENT_TIMESTAMP) AS pending_tasks"""
+                AND TRY_CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE) <= CURRENT_TIMESTAMP) AS pending_tasks"""
     ).fetchone()
     conn.close()
     return dict(row)

@@ -378,7 +378,7 @@ def claim_next_tasks(limit: int = 20) -> list:
         """UPDATE sms_tasks SET status='sending', attempts=attempts+1, claim_token=?,
             updated_at=CURRENT_TIMESTAMP
             WHERE id IN (SELECT id FROM sms_tasks WHERE status IN ('queued','retrying')
-            AND CAST(next_attempt_at AS TIMESTAMP)<=CURRENT_TIMESTAMP ORDER BY created_at,id LIMIT ?)
+            AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP ORDER BY created_at,id LIMIT ?)
             AND status IN ('queued','retrying') RETURNING *""", (token, limit)
     ).fetchall()
     tasks = [dict(r) for r in rows]
@@ -715,12 +715,12 @@ def recover_stale_tasks():
     conn.execute(
         """UPDATE sms_tasks SET status='retrying', error_msg='worker interrupted; recovered',
             next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-            WHERE status='sending' AND CAST(updated_at AS TIMESTAMP) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
+            WHERE status='sending' AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
     )
     conn.execute(
         """UPDATE sms_tasks SET status='expired', error_msg='delivery receipt timeout',
             updated_at=CURRENT_TIMESTAMP
-            WHERE status='submitted' AND CAST(submitted_at AS TIMESTAMP) < CURRENT_TIMESTAMP - INTERVAL '24 hours'"""
+            WHERE status='submitted' AND CAST(submitted_at AS TIMESTAMP WITH TIME ZONE) < CURRENT_TIMESTAMP - INTERVAL '24 hours'"""
     )
     conn.commit()
     conn.close()

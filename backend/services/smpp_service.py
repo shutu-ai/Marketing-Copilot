@@ -106,6 +106,111 @@ def delete_config(config_id: int) -> bool:
     return deleted
 
 
+def get_config_stats() -> dict:
+    """Per-SMSC processing statistics based on the sms_tasks table.
+
+    Queue attribution mirrors the gateway routing rules:
+      - tasks with an explicit smpp_config_id belong to that config;
+      - tasks without one are routed to the first enabled config
+        (ORDER BY priority,id), matching SmppGateway.send();
+      - when no enabled config exists, NULL-config tasks are counted
+        separately as "unassigned".
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT * FROM smpp_configs ORDER BY priority,id").fetchall()
+        configs = [dict(r) for r in rows]
+        enabled_ids = [c["id"] for c in configs if c.get("enabled")]
+        default_target_id = enabled_ids[0] if enabled_ids else None
+
+        def _where(cfg_id: int):
+            if cfg_id == default_target_id:
+                return "(smpp_config_id=? OR smpp_config_id IS NULL)", [cfg_id]
+            return "smpp_config_id=?", [cfg_id]
+
+        def _count(where: str, params: list, extra: str) -> int:
+            row = conn.execute(
+                f"SELECT COUNT(*) cnt FROM sms_tasks WHERE {where} AND {extra}", params,
+            ).fetchone()
+            return int(row["cnt"] or 0)
+
+        def _window_count(where: str, params: list, column: str, minutes: int) -> int:
+            return _count(
+                where, params,
+                f"CAST({column} AS TIMESTAMP WITH TIME ZONE) >= CURRENT_TIMESTAMP - INTERVAL '{minutes} minutes'",
+            )
+
+        stats = []
+        for cfg in configs:
+            cfg_id = cfg["id"]
+            where, params = _where(cfg_id)
+            submitted_1m = _window_count(where, params, "submitted_at", 1)
+            submitted_5m = _window_count(where, params, "submitted_at", 5)
+            submitted_60m = _window_count(where, params, "submitted_at", 60)
+            delivered_60m = _window_count(where, params, "delivered_at", 60)
+            failed_60m = _count(
+                where, params,
+                "status='failed' AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) >= CURRENT_TIMESTAMP - INTERVAL '60 minutes'",
+            )
+            terminal_60m = delivered_60m + failed_60m
+            stats.append({
+                "config_id": cfg_id,
+                "name": cfg.get("name", ""),
+                "host": cfg.get("host", ""),
+                "port": cfg.get("port", 0),
+                "enabled": cfg.get("enabled", 0),
+                "priority": cfg.get("priority", 100),
+                "tps": cfg.get("tps", 0),
+                "pool_size": cfg.get("pool_size", 1),
+                "queue_size": _count(where, params, "status IN ('queued','retrying')"),
+                "sending": _count(where, params, "status='sending'"),
+                "submitted": _count(where, params, "status='submitted'"),
+                "submitted_1m": submitted_1m,
+                "submitted_5m": submitted_5m,
+                "submitted_60m": submitted_60m,
+                "delivered_60m": delivered_60m,
+                "failed_60m": failed_60m,
+                "failure_rate_60m": round(failed_60m / terminal_60m, 4) if terminal_60m else 0.0,
+                "today_submitted": _count(
+                    where, params,
+                    "CAST(submitted_at AS TIMESTAMP WITH TIME ZONE) >= CAST(CAST(CURRENT_DATE AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE)",
+                ),
+                "today_delivered": _count(
+                    where, params,
+                    "CAST(delivered_at AS TIMESTAMP WITH TIME ZONE) >= CAST(CAST(CURRENT_DATE AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE)",
+                ),
+                "today_failed": _count(
+                    where, params,
+                    "status='failed' AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) >= CAST(CAST(CURRENT_DATE AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE)",
+                ),
+            })
+
+        unassigned = 0
+        if not default_target_id:
+            unassigned = _count(
+                "smpp_config_id IS NULL", [],
+                "status IN ('queued','retrying')",
+            )
+
+        summary = {
+            "queue_size": sum(item["queue_size"] for item in stats),
+            "sending": sum(item["sending"] for item in stats),
+            "submitted": sum(item["submitted"] for item in stats),
+            "submitted_1m": sum(item["submitted_1m"] for item in stats),
+            "submitted_5m": sum(item["submitted_5m"] for item in stats),
+            "submitted_60m": sum(item["submitted_60m"] for item in stats),
+            "delivered_60m": sum(item["delivered_60m"] for item in stats),
+            "failed_60m": sum(item["failed_60m"] for item in stats),
+            "today_submitted": sum(item["today_submitted"] for item in stats),
+            "today_delivered": sum(item["today_delivered"] for item in stats),
+            "today_failed": sum(item["today_failed"] for item in stats),
+            "unassigned": unassigned,
+        }
+        return {"summary": summary, "items": stats}
+    finally:
+        conn.close()
+
+
 def _run_smpp_bind_test(data: dict) -> dict:
     """Connect and perform a real SMPP bind so credentials are actually checked."""
     import smpplib.client

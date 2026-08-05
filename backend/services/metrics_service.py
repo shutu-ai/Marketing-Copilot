@@ -37,6 +37,27 @@ def observe_runtime_state(worker_count=0):
     set_gauge("marketing_copilot_queue_depth", counts.get("queued", 0) + counts.get("retrying", 0))
     set_gauge("marketing_copilot_workers", worker_count)
     set_gauge("marketing_copilot_uptime_seconds", time.time() - _started_at)
+    # Per-SMSC queue depth, using the same attribution as the gateway:
+    # NULL smpp_config_id tasks route to the first enabled config.
+    conn = get_connection()
+    config_rows = conn.execute(
+        "SELECT id FROM smpp_configs WHERE enabled=1 ORDER BY priority,id"
+    ).fetchall()
+    default_id = config_rows[0]["id"] if config_rows else None
+    by_config = defaultdict(int)
+    task_rows = conn.execute(
+        "SELECT smpp_config_id, status, COUNT(*) cnt FROM sms_tasks GROUP BY smpp_config_id, status"
+    ).fetchall()
+    for row in task_rows:
+        if row["status"] not in ("queued", "retrying"):
+            continue
+        cfg_id = row["smpp_config_id"] if row["smpp_config_id"] is not None else default_id
+        if cfg_id is None:
+            continue
+        by_config[cfg_id] += int(row["cnt"] or 0)
+    conn.close()
+    for cfg_id, depth in by_config.items():
+        set_gauge("marketing_copilot_smpp_queue_size", depth, {"config_id": cfg_id})
     return counts
 
 
