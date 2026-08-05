@@ -440,6 +440,10 @@ onBeforeUnmount(stopPolling)
   font-weight: 650;
   color: var(--mc-text);
 }
+.status-card,
+.tabs-card {
+  height: 100%;
+}
 .result-message {
   margin-left: 8px;
   color: var(--mc-text-secondary);
