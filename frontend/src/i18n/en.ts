@@ -420,6 +420,7 @@ export default {
     forceApplyTip: 'Force apply briefly interrupts sending; unfinished tasks are requeued automatically after restart.',
     apply: 'Apply Update',
     rollback: 'Rollback',
+    applyHint: 'Upload and verify a package in the "Upload Package" tab first; only verified packages can be applied.',
     uploadCard: 'Upload Package',
     dropHint: 'Drop the tar.gz package here, or click to select',
     uploadTip: 'Chunked upload is supported; package must contain backend, frontend/dist, offline/wheels and checksums.sha256',

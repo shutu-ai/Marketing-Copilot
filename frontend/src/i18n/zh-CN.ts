@@ -420,6 +420,7 @@ export default {
     forceApplyTip: '强制应用会短暂中断发送，未完成的任务将在重启后自动重新排队。',
     apply: '应用更新',
     rollback: '回滚',
+    applyHint: '请先在上方「上传更新包」Tab 完成上传与校验，校验通过后才能应用。',
     uploadCard: '上传更新包',
     dropHint: '将 tar.gz 更新包拖到此处，或点击选择文件',
     uploadTip: '支持分片上传；包内需包含 backend、frontend/dist、offline/wheels 与 checksums.sha256',

@@ -2,102 +2,45 @@
   <div class="update-page">
     <PageHeader v-if="!embedded" :title="$t('update.title')" :description="$t('update.description')" />
 
-    <el-row :gutter="18">
-      <el-col :xs="24" :lg="10">
-        <el-card class="status-card" shadow="never">
-          <template #header>
-            <div class="card-title">
-              <el-icon><Monitor /></el-icon>
-              <span>{{ $t('update.currentStatus') }}</span>
-            </div>
-          </template>
-          <el-descriptions :column="1" size="small">
-            <el-descriptions-item :label="$t('update.currentVersion')">
-              <b>{{ status?.version || '-' }}</b>
-            </el-descriptions-item>
-            <el-descriptions-item :label="$t('update.runMode')">
-              <el-tag size="small" :type="status?.mode === 'systemd' ? 'primary' : 'warning'">
-                {{ status?.mode === 'systemd' ? $t('update.modeSystemd') : $t('update.modeManual') }}
-              </el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item :label="$t('update.updateState')">
-              <el-tag size="small" :type="stateType">{{ $t(stateLabel) }}</el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item :label="$t('update.lastResult')">
-              <span v-if="lastResult">
-                <el-tag size="small" :type="lastResult.ok ? 'success' : 'danger'">
-                  {{ lastResult.ok ? $t('update.resultSuccess') : $t('update.resultFailed') }}
-                </el-tag>
-                <span class="result-message">{{ lastResult.message }}</span>
-              </span>
-              <span v-else>-</span>
-            </el-descriptions-item>
-            <el-descriptions-item :label="$t('update.backupAvailable')">
-              <el-tag size="small" :type="status?.has_backups ? 'success' : 'info'">
-                {{ status?.has_backups ? $t('common.yes') : $t('common.no') }}
-              </el-tag>
-            </el-descriptions-item>
-          </el-descriptions>
+    <el-card class="status-card" shadow="never">
+      <template #header>
+        <div class="card-title">
+          <el-icon><Monitor /></el-icon>
+          <span>{{ $t('update.currentStatus') }}</span>
+        </div>
+      </template>
+      <el-descriptions :column="3" size="small">
+        <el-descriptions-item :label="$t('update.currentVersion')">
+          <b>{{ status?.version || '-' }}</b>
+        </el-descriptions-item>
+        <el-descriptions-item :label="$t('update.runMode')">
+          <el-tag size="small" :type="status?.mode === 'systemd' ? 'primary' : 'warning'">
+            {{ status?.mode === 'systemd' ? $t('update.modeSystemd') : $t('update.modeManual') }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item :label="$t('update.updateState')">
+          <el-tag size="small" :type="stateType">{{ $t(stateLabel) }}</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item :label="$t('update.lastResult')">
+          <span v-if="lastResult">
+            <el-tag size="small" :type="lastResult.ok ? 'success' : 'danger'">
+              {{ lastResult.ok ? $t('update.resultSuccess') : $t('update.resultFailed') }}
+            </el-tag>
+            <span class="result-message">{{ lastResult.message }}</span>
+          </span>
+          <span v-else>-</span>
+        </el-descriptions-item>
+        <el-descriptions-item :label="$t('update.backupAvailable')">
+          <el-tag size="small" :type="status?.has_backups ? 'success' : 'info'">
+            {{ status?.has_backups ? $t('common.yes') : $t('common.no') }}
+          </el-tag>
+        </el-descriptions-item>
+      </el-descriptions>
+    </el-card>
 
-          <el-alert
-            v-if="hasActiveBusiness"
-            class="business-alert"
-            type="warning"
-            :closable="false"
-            show-icon
-            :title="$t('update.activeBusinessWarning')"
-          >
-            <template #default>
-              {{ $t('update.activeBusinessDetail', {
-                batch: status?.active_business?.batch_in_progress || 0,
-                realtime: status?.active_business?.realtime_in_progress || 0,
-              }) }}
-            </template>
-          </el-alert>
-        </el-card>
-
-        <el-card class="action-card" shadow="never">
-          <template #header>
-            <div class="card-title">
-              <el-icon><RefreshRight /></el-icon>
-              <span>{{ $t('update.applyCard') }}</span>
-            </div>
-          </template>
-          <el-checkbox v-model="forceApply" class="force-checkbox">
-            {{ $t('update.forceApply') }}
-          </el-checkbox>
-          <p class="force-tip">{{ $t('update.forceApplyTip') }}</p>
-          <div class="action-buttons">
-            <el-button
-              type="primary"
-              :disabled="!verifiedPackage || isRunning"
-              :loading="applying"
-              @click="confirmApply"
-            >
-              {{ $t('update.apply') }}
-            </el-button>
-            <el-button
-              type="danger"
-              plain
-              :disabled="!status?.has_backups || isRunning"
-              :loading="rollingBack"
-              @click="confirmRollback"
-            >
-              {{ $t('update.rollback') }}
-            </el-button>
-          </div>
-        </el-card>
-      </el-col>
-
-      <el-col :xs="24" :lg="14">
-        <el-card class="upload-card" shadow="never">
-          <template #header>
-            <div class="card-title">
-              <el-icon><UploadFilled /></el-icon>
-              <span>{{ $t('update.uploadCard') }}</span>
-            </div>
-          </template>
-
+    <el-card class="tabs-card" shadow="never">
+      <el-tabs v-model="activeSection">
+        <el-tab-pane name="upload" :label="$t('update.uploadCard')">
           <el-upload
             drag
             :auto-upload="false"
@@ -156,9 +99,58 @@
               <li v-for="err in precheck.errors" :key="err">{{ err }}</li>
             </ul>
           </template>
-        </el-card>
-      </el-col>
-    </el-row>
+        </el-tab-pane>
+
+        <el-tab-pane name="apply" :label="$t('update.applyCard')">
+          <el-alert
+            v-if="hasActiveBusiness"
+            class="business-alert"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="$t('update.activeBusinessWarning')"
+          >
+            <template #default>
+              {{ $t('update.activeBusinessDetail', {
+                batch: status?.active_business?.batch_in_progress || 0,
+                realtime: status?.active_business?.realtime_in_progress || 0,
+              }) }}
+            </template>
+          </el-alert>
+          <el-checkbox v-model="forceApply" class="force-checkbox">
+            {{ $t('update.forceApply') }}
+          </el-checkbox>
+          <p class="force-tip">{{ $t('update.forceApplyTip') }}</p>
+          <el-alert
+            v-if="!verifiedPackage"
+            class="apply-hint"
+            type="info"
+            :closable="false"
+            show-icon
+            :title="$t('update.applyHint')"
+          />
+          <div class="action-buttons">
+            <el-button
+              type="primary"
+              :disabled="!verifiedPackage || isRunning"
+              :loading="applying"
+              @click="confirmApply"
+            >
+              {{ $t('update.apply') }}
+            </el-button>
+            <el-button
+              type="danger"
+              plain
+              :disabled="!status?.has_backups || isRunning"
+              :loading="rollingBack"
+              @click="confirmRollback"
+            >
+              {{ $t('update.rollback') }}
+            </el-button>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
+    </el-card>
 
     <el-card class="history-card" shadow="never">
       <template #header>
@@ -225,6 +217,7 @@ const uploadId = ref('')
 const uploading = ref(false)
 const uploadProgress = ref(0)
 const precheck = ref<any>(null)
+const activeSection = ref('upload')
 const forceApply = ref(false)
 const applying = ref(false)
 const rollingBack = ref(false)
@@ -449,6 +442,9 @@ onBeforeUnmount(stopPolling)
 .business-alert,
 .precheck-alert {
   margin-top: 16px;
+}
+.apply-hint {
+  margin-bottom: 14px;
 }
 .force-checkbox {
   margin-bottom: 4px;
