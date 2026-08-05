@@ -2,14 +2,16 @@
   <div class="update-page">
     <PageHeader v-if="!embedded" :title="$t('update.title')" :description="$t('update.description')" />
 
-    <el-card class="status-card" shadow="never">
-      <template #header>
-        <div class="card-title">
-          <el-icon><Monitor /></el-icon>
-          <span>{{ $t('update.currentStatus') }}</span>
-        </div>
-      </template>
-      <el-descriptions :column="3" size="small">
+    <el-row :gutter="18">
+      <el-col :xs="24" :lg="10">
+        <el-card class="status-card" shadow="never">
+          <template #header>
+            <div class="card-title">
+              <el-icon><Monitor /></el-icon>
+              <span>{{ $t('update.currentStatus') }}</span>
+            </div>
+          </template>
+          <el-descriptions :column="1" size="small">
         <el-descriptions-item :label="$t('update.currentVersion')">
           <b>{{ status?.version || '-' }}</b>
         </el-descriptions-item>
@@ -35,11 +37,13 @@
             {{ status?.has_backups ? $t('common.yes') : $t('common.no') }}
           </el-tag>
         </el-descriptions-item>
-      </el-descriptions>
-    </el-card>
+          </el-descriptions>
+        </el-card>
+      </el-col>
 
-    <el-card class="tabs-card" shadow="never">
-      <el-tabs v-model="activeSection">
+      <el-col :xs="24" :lg="14">
+        <el-card class="tabs-card" shadow="never">
+          <el-tabs v-model="activeSection">
         <el-tab-pane name="upload" :label="$t('update.uploadCard')">
           <el-upload
             drag
@@ -149,8 +153,10 @@
             </el-button>
           </div>
         </el-tab-pane>
-      </el-tabs>
-    </el-card>
+          </el-tabs>
+        </el-card>
+      </el-col>
+    </el-row>
 
     <el-card class="history-card" shadow="never">
       <template #header>
