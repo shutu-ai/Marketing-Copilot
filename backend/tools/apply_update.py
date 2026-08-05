@@ -28,6 +28,13 @@ HEALTH_TRIES = int(os.environ.get("MC_UPDATE_HEALTH_TRIES", "30"))
 HEALTH_INTERVAL = float(os.environ.get("MC_UPDATE_HEALTH_INTERVAL", "2.0"))
 STOP_GRACE = float(os.environ.get("MC_UPDATE_STOP_GRACE", "30"))
 
+# Entries under the application directories that carry runtime configuration or
+# business data. They are preserved across updates (never cleared) and are not
+# copied back from the package (build scripts exclude them anyway).
+PROTECTED_ENTRIES = {
+    "db_config.json", "uploads", "monitor_dir", "data", "logs", "venv",
+}
+
 
 def log(message: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [apply_update] {message}", flush=True)
@@ -232,10 +239,22 @@ def health_ok() -> bool:
 # Swapping
 # ---------------------------------------------------------------------------
 
+def _is_protected(name: str) -> bool:
+    if name in PROTECTED_ENTRIES:
+        return True
+    lowered = name.lower()
+    return lowered.endswith(
+        (".duckdb", ".duckdb.wal", ".wal", ".db", ".log", ".pid", ".lock")
+    )
+
+
 def replace_tree(new_tree: Path, target: Path) -> None:
     log(f"replacing {target} with {new_tree}")
     target.mkdir(parents=True, exist_ok=True)
     for entry in target.iterdir():
+        if _is_protected(entry.name):
+            log(f"preserving {entry.name} during swap")
+            continue
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry, ignore_errors=True)
         else:
