@@ -77,7 +77,7 @@
       </el-tab-pane>
 
       <el-tab-pane v-if="canSee.users" :label="$t('settings.usersTab')" name="users" lazy>
-        <UserManagement embedded />
+        <UserManagement />
       </el-tab-pane>
     </el-tabs>
   </div>

@@ -1,6 +1,6 @@
 <template>
   <div class="user-management">
-    <div v-if="!embedded" class="page-header">
+    <div class="page-header">
       <div>
         <h2>{{ $t('users.title') }}</h2>
         <p>{{ $t('users.description') }}</p>
@@ -99,8 +99,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import { createUser, deleteUser, getUsers, updateUser, type UserRow } from '@/api/users'
-
-withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 
 const { t } = useI18n()
 const authStore = useAuthStore()
