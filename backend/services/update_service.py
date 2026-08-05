@@ -275,7 +275,9 @@ def _verify_manifest(root: Path) -> list:
             parts = line.split(" ", 1)
         if len(parts) < 2:
             continue
-        expected, rel = parts[0].strip().lower(), parts[1].strip()
+        expected = parts[0].strip().lower()
+        # `sha256sum -b` (binary mode) prefixes paths with `*`; strip it.
+        rel = parts[1].strip().lstrip("*")
         path = (root / rel).resolve()
         if not str(path).startswith(str(root.resolve()) + os.sep) or not path.is_file():
             bad.append(f"{rel}: missing")

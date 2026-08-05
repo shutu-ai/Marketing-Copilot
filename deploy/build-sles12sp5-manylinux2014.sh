@@ -68,7 +68,7 @@ tar -C "$ROOT/backend" \
   --exclude='__pycache__' --exclude='*.pyc' \
   --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
   --exclude='*.db*' --exclude='*.duckdb*' \
-  --exclude='uploads' --exclude='monitor_dir' \
+  --exclude='uploads' --exclude='monitor_dir' --exclude='data' \
   -cf - . | tar -C "$STAGE/payload/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/payload/frontend/"
 cp "$ROOT/deploy/marketing-copilot.env.example" "$ROOT/deploy/marketing-copilot.service" "$ROOT/deploy/marketing-copilot-backup.service" "$ROOT/deploy/marketing-copilot-backup.timer" "$ROOT/deploy/marketing-copilot-smsc-simulator.service" "$ROOT/deploy/polkit-marketing-copilot.rules" "$STAGE/payload/deploy/"

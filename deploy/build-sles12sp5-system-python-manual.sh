@@ -34,7 +34,7 @@ tar -C "$ROOT/backend" \
   --exclude='__pycache__' --exclude='*.pyc' \
   --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
   --exclude='*.db*' --exclude='*.duckdb*' \
-  --exclude='uploads' --exclude='monitor_dir' \
+  --exclude='uploads' --exclude='monitor_dir' --exclude='data' \
   -cf - . | tar -C "$STAGE/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/frontend/"
 cp -a "$SOURCE_WHEEL_DIR" "$STAGE/offline/wheels"
