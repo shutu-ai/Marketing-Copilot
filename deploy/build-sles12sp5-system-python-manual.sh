@@ -16,9 +16,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 if [ -z "$WHEELHOUSE" ]; then
-  WHEELHOUSE=$(find "$ROOT/release" -maxdepth 1 -name 'marketing-copilot-sles12sp5-wheelhouse-*.tar.gz' -print -quit)
+  WHEELHOUSE=$(find "$ROOT/cache/wheelhouse" -maxdepth 1 -name 'marketing-copilot-sles12sp5-wheelhouse-*.tar.gz' -print -quit 2>/dev/null || true)
 fi
-[ -n "$WHEELHOUSE" ] && [ -f "$WHEELHOUSE" ] || { echo 'Offline wheelhouse archive was not found. Build it first.' >&2; exit 1; }
+if [ -z "$WHEELHOUSE" ]; then
+  WHEELHOUSE=$(find "$ROOT/release" -maxdepth 1 -name 'marketing-copilot-sles12sp5-wheelhouse-*.tar.gz' -print -quit 2>/dev/null || true)
+fi
+[ -n "$WHEELHOUSE" ] && [ -f "$WHEELHOUSE" ] || {
+  echo 'Offline wheelhouse archive was not found. Put it in cache/wheelhouse/ or pass --wheelhouse.' >&2
+  exit 1
+}
 [ -f "$ROOT/frontend/dist/index.html" ] || { echo 'frontend/dist is missing. Build the frontend first.' >&2; exit 1; }
 
 WORK=$(mktemp -d)

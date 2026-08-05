@@ -36,6 +36,7 @@ old_script/*.csv
 
 # Local build and release snapshots
 release/
+cache/wheelhouse/
 MarketingCopilot-clean-source.zip
 
 # OS and tooling

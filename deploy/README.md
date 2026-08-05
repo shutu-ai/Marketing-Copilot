@@ -26,8 +26,11 @@ tar.gz can be deployed manually on the target (see
 「系统设置 → 系统更新」as the update package.
 
 The build requires an existing offline wheelhouse archive
-(`marketing-copilot-sles12sp5-wheelhouse-*.tar.gz`) in `release/`. When Python
-dependencies change, regenerate it with the packaging skill helper
+(`marketing-copilot-sles12sp5-wheelhouse-*.tar.gz`). It is looked up in this
+order: `--wheelhouse FILE` → `cache/wheelhouse/` (stable, git-ignored) →
+`release/`. Keep the archive in `cache/wheelhouse/` so builds do not depend on
+the scratch `release/` directory. When Python dependencies change, regenerate
+it with the packaging skill helper
 (`sles12sp5-deploy-package/scripts/prepare_wheelhouse_wsl.ps1`), or recover the
 removed `deploy/build-sles12sp5-wheelhouse.sh` from git history.
 
