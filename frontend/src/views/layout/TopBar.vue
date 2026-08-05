@@ -52,6 +52,7 @@
       :title="$t('layout.changePassword')"
       width="420px"
       destroy-on-close
+      append-to-body
     >
       <el-form :model="passwordForm" label-width="100px" size="small">
         <el-form-item :label="$t('layout.oldPassword')">
