@@ -34,8 +34,23 @@ export interface UpdateHistoryRow {
   created_at: string
 }
 
+export interface RecentUpload {
+  upload_id: string
+  filename: string
+  size: number
+  complete: boolean
+  verified: boolean
+  version: string
+  precheck: { ok: boolean; version: string; checks: any[]; errors: string[]; verified_at: string }
+  created_at: string
+}
+
 export function getUpdateStatus() {
   return api.get<UpdateStatus>('/update/status')
+}
+
+export function getRecentUploads(limit = 5) {
+  return api.get<RecentUpload[]>('/update/uploads', { params: { limit } })
 }
 
 export function startUpload(payload: UploadStartPayload) {

@@ -28,6 +28,11 @@ def status(request: Request):
     return update_service.status()
 
 
+@router.get("/uploads")
+def recent_uploads(limit: int = Query(5, ge=1, le=20)):
+    return update_service.recent_uploads(limit)
+
+
 @router.post("/upload/start")
 def upload_start(data: UploadStart, request: Request):
     try:

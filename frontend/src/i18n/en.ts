@@ -426,6 +426,7 @@ export default {
     uploadTip: 'Chunked upload is supported; package must contain backend, frontend/dist, offline/wheels and checksums.sha256',
     uploading: 'Uploading...',
     uploadAndVerify: 'Upload & Verify',
+    restoredHint: 'Restored the last verified package {filename}; you can apply it directly or upload a new one.',
     precheckPassed: 'Verification passed, ready to apply',
     precheckFailed: 'Verification failed, check the errors below',
     historyTitle: 'Update History',

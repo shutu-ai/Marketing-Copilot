@@ -426,6 +426,7 @@ export default {
     uploadTip: '支持分片上传；包内需包含 backend、frontend/dist、offline/wheels 与 checksums.sha256',
     uploading: '上传中...',
     uploadAndVerify: '上传并校验',
+    restoredHint: '已恢复上次校验通过的包 {filename}，可直接应用或重新上传覆盖。',
     precheckPassed: '校验通过，可以应用更新',
     precheckFailed: '校验未通过，请检查下方错误列表',
     historyTitle: '更新历史',

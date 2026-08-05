@@ -755,6 +755,37 @@ def list_history(limit: int = 50) -> list:
         return []
 
 
+def recent_uploads(limit: int = 5) -> list:
+    """Return recent staged uploads (newest first), including verified prechecks."""
+    root = ensure_update_dir() / "uploads"
+    if not root.is_dir():
+        return []
+    items = []
+    for ud in root.glob("*"):
+        if not ud.is_dir():
+            continue
+        meta_path = ud / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        except Exception:
+            continue
+        precheck = meta.get("precheck") or {}
+        items.append(
+            {
+                "upload_id": ud.name,
+                "filename": meta.get("filename", ""),
+                "size": meta.get("size", 0),
+                "complete": bool(meta.get("complete")),
+                "verified": bool(meta.get("verified")),
+                "version": precheck.get("version", ""),
+                "precheck": precheck,
+                "created_at": meta.get("created_at", ""),
+            }
+        )
+    items.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return items[:limit]
+
+
 def status() -> dict:
     ensure_update_dir()
     cleanup_staging()

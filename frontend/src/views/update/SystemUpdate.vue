@@ -69,6 +69,15 @@
             :status="uploadProgress === 100 ? 'success' : undefined"
           />
 
+          <el-alert
+            v-if="restoredName"
+            class="restored-alert"
+            type="info"
+            :closable="false"
+            show-icon
+            :title="$t('update.restoredHint', { filename: restoredName })"
+          />
+
           <div class="upload-actions">
             <el-button
               type="primary"
@@ -203,6 +212,7 @@ import {
   cancelUpload,
   getUpdateHistory,
   getUpdateStatus,
+  getRecentUploads,
   rollbackUpdate,
   startUpload,
   uploadChunk,
@@ -223,6 +233,7 @@ const uploadId = ref('')
 const uploading = ref(false)
 const uploadProgress = ref(0)
 const precheck = ref<any>(null)
+const restoredName = ref('')
 const activeSection = ref('upload')
 const forceApply = ref(false)
 const applying = ref(false)
@@ -285,6 +296,21 @@ async function refresh() {
   }
 }
 
+async function restoreVerifiedUpload() {
+  if (uploadId.value || precheck.value) return
+  try {
+    const res = await getRecentUploads()
+    const item = res.data.find(u => u.verified && u.precheck?.ok)
+    if (item) {
+      uploadId.value = item.upload_id
+      precheck.value = item.precheck
+      restoredName.value = item.filename
+    }
+  } catch {
+    // Restoring is best-effort; the user can re-upload if it fails.
+  }
+}
+
 function startPolling() {
   stopPolling()
   pollTimer = window.setInterval(refresh, 4000)
@@ -303,6 +329,7 @@ function onFileChange(file: UploadFile) {
   selectedFile.value = raw
   uploadId.value = ''
   precheck.value = null
+  restoredName.value = ''
   uploadProgress.value = 0
 }
 
@@ -310,6 +337,7 @@ function onFileRemove() {
   selectedFile.value = null
   uploadId.value = ''
   precheck.value = null
+  restoredName.value = ''
 }
 
 async function sha256File(file: File): Promise<string> {
@@ -366,6 +394,7 @@ async function cancelCurrent() {
     await cancelUpload(uploadId.value)
     uploadId.value = ''
     precheck.value = null
+    restoredName.value = ''
     fileList.value = []
     selectedFile.value = null
     ElMessage.success('已取消')
@@ -420,7 +449,7 @@ async function confirmRollback() {
 }
 
 onMounted(() => {
-  refresh()
+  refresh().then(restoreVerifiedUpload)
   startPolling()
 })
 
@@ -469,6 +498,9 @@ onBeforeUnmount(stopPolling)
   gap: 10px;
 }
 .upload-progress {
+  margin-top: 16px;
+}
+.restored-alert {
   margin-top: 16px;
 }
 .upload-actions {
