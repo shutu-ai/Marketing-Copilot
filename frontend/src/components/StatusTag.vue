@@ -28,6 +28,7 @@ const typeMap: Record<string, string> = {
   queued: 'warning',
   sending: 'primary',
   submitted: 'primary',
+  accepted: 'success',
   delivered: 'success',
   retrying: 'warning',
   expired: 'info',

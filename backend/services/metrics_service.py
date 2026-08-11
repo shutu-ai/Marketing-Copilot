@@ -32,7 +32,7 @@ def observe_runtime_state(worker_count=0):
     rows = conn.execute("SELECT status,COUNT(*) count FROM sms_tasks GROUP BY status").fetchall()
     conn.close()
     counts = {row["status"]: row["count"] for row in rows}
-    for status in ("queued", "retrying", "sending", "submitted", "delivered", "failed", "expired"):
+    for status in ("queued", "retrying", "sending", "submitted", "accepted", "delivered", "failed", "expired"):
         set_gauge("marketing_copilot_tasks", counts.get(status, 0), {"status": status})
     set_gauge("marketing_copilot_queue_depth", counts.get("queued", 0) + counts.get("retrying", 0))
     set_gauge("marketing_copilot_workers", worker_count)

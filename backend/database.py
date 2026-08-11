@@ -200,6 +200,7 @@ def init_db():
             tps INTEGER NOT NULL DEFAULT 20,
             priority INTEGER NOT NULL DEFAULT 100,
             reconnect_max_seconds INTEGER NOT NULL DEFAULT 60,
+            delivery_receipt_mode TEXT NOT NULL DEFAULT 'optional',
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
@@ -484,6 +485,7 @@ def init_db():
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS tps INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS priority INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS reconnect_max_seconds INTEGER",
+        "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS delivery_receipt_mode TEXT DEFAULT 'optional'",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS use_custom_directory BOOLEAN DEFAULT FALSE",
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS use_custom_directory BOOLEAN DEFAULT FALSE",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_dir TEXT DEFAULT ''",
@@ -551,6 +553,7 @@ def init_db():
         "UPDATE smpp_configs SET tps=20 WHERE tps IS NULL",
         "UPDATE smpp_configs SET priority=100 WHERE priority IS NULL",
         "UPDATE smpp_configs SET reconnect_max_seconds=60 WHERE reconnect_max_seconds IS NULL",
+        "UPDATE smpp_configs SET delivery_receipt_mode='optional' WHERE delivery_receipt_mode IS NULL OR delivery_receipt_mode=''",
         "UPDATE realtime_campaigns SET watch_filename_prefix='Android_4G_Switch_Somali_' WHERE watch_filename_prefix IS NULL OR watch_filename_prefix=''",
     ]:
         try:

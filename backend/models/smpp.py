@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Literal, Optional
 
 
 class SmppConfigCreate(BaseModel):
@@ -19,6 +19,7 @@ class SmppConfigCreate(BaseModel):
     tps: int = 20
     priority: int = 100
     reconnect_max_seconds: int = 60
+    delivery_receipt_mode: Literal['required', 'optional', 'disabled'] = 'optional'
     enabled: int = 1
 
 
@@ -39,6 +40,7 @@ class SmppConfigUpdate(BaseModel):
     tps: Optional[int] = None
     priority: Optional[int] = None
     reconnect_max_seconds: Optional[int] = None
+    delivery_receipt_mode: Optional[Literal['required', 'optional', 'disabled']] = None
     enabled: Optional[int] = None
 
 
@@ -56,6 +58,7 @@ class SmppConfigResponse(BaseModel):
     pool_size: int
     enquire_interval: int
     timeout: int
+    delivery_receipt_mode: Literal['required', 'optional', 'disabled']
     enabled: int
     created_at: str
     updated_at: str

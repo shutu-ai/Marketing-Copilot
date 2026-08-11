@@ -14,6 +14,7 @@ export interface SmppConfig {
   tps: number
   priority: number
   reconnect_max_seconds: number
+  delivery_receipt_mode: 'required' | 'optional' | 'disabled'
   enquire_interval: number
   timeout: number
   enabled: number
@@ -36,6 +37,7 @@ export interface SmppConfigForm {
   tps: number
   priority: number
   reconnect_max_seconds: number
+  delivery_receipt_mode: 'required' | 'optional' | 'disabled'
   enquire_interval: number
   timeout: number
 }

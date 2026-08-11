@@ -64,14 +64,30 @@ class _SmppConnection:
             message_id = self._text(getattr(pdu, "receipted_message_id", ""))
             state = self._text(getattr(pdu, "message_state", ""))
             raw = self._text(getattr(pdu, "short_message", ""))
-            if message_id:
+            detail_logger.info(
+                "SMPP delivery receipt config=%s slot=%s command=%s "
+                "sequence=%s message_id=%s state=%s",
+                self.config.get("id"), self.slot,
+                getattr(pdu, "command", ""), getattr(pdu, "sequence", ""),
+                message_id, state,
+            )
+            if not message_id:
+                logger.warning(
+                    "SMPP delivery receipt missing message_id config=%s slot=%s "
+                    "sequence=%s state=%s",
+                    self.config.get("id"), self.slot,
+                    getattr(pdu, "sequence", ""), state,
+                )
+            else:
                 sms_task_service.record_receipt(message_id, state, raw)
-                metrics_service.inc("marketing_copilot_dlr_total", labels={"state": state or "unknown"})
+                metrics_service.inc(
+                    "marketing_copilot_dlr_total",
+                    labels={"state": state or "unknown"},
+                )
             return smpplib.consts.SMPP_ESME_ROK
         except Exception:
             logger.exception("Failed to handle SMPP delivery receipt")
             return smpplib.consts.SMPP_ESME_RSYSERR
-
     def _listen(self, client):
         try:
             client.listen(auto_send_enquire_link=True)
@@ -164,7 +180,8 @@ class _SmppConnection:
                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
                        source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
                         dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
-                        short_message=part, data_coding=coding, esm_class=esm_class, registered_delivery=True)
+                        short_message=part, data_coding=coding, esm_class=esm_class,
+                        registered_delivery=(self.config.get('delivery_receipt_mode') or 'optional') != 'disabled')
                     submitted_any = True
                     sequence = pdu.sequence
                     self._sequence_tasks[sequence] = task["id"]
@@ -282,7 +299,8 @@ class SmppGateway:
                 raise RuntimeError(
                     f"Associated SMPP configuration {target_id} is missing or disabled")
             connection = self._connection_for(config)
-            self._active_config_id = config["id"]
+            task['_delivery_receipt_mode'] = config.get('delivery_receipt_mode') or 'optional'
+            self._active_config_id = config['id']
             return connection.send(task)
         previous_id = None
         errors = []
@@ -294,6 +312,7 @@ class SmppGateway:
                 if previous_id is not None and previous_id != config["id"]:
                     metrics_service.inc("marketing_copilot_smpp_failovers_total",
                                         labels={"from_config": previous_id, "to_config": config["id"]})
+                task['_delivery_receipt_mode'] = config.get('delivery_receipt_mode') or 'optional'
                 result = connection.send(task)
                 self._active_config_id = config["id"]
                 return result

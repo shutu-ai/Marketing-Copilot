@@ -47,12 +47,11 @@ def create_config(data: SmppConfigCreate) -> dict:
     cursor = conn.execute(
         """INSERT INTO smpp_configs (name,host,port,system_id,password,source_addr,
            bind_type,address_ton,address_npi,data_coding,pool_size,enquire_interval,timeout,
-           tps,priority,reconnect_max_seconds)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           tps,priority,reconnect_max_seconds,delivery_receipt_mode)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (data.name, data.host, data.port, data.system_id, data.password, data.source_addr,
          data.bind_type, data.address_ton, data.address_npi, data.data_coding,
-         data.pool_size, data.enquire_interval, data.timeout, data.tps, data.priority,
-         data.reconnect_max_seconds)
+         data.pool_size, data.enquire_interval, data.timeout, data.tps, data.priority, data.reconnect_max_seconds, data.delivery_receipt_mode)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone()
@@ -71,7 +70,7 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     for field in ["name", "host", "port", "system_id", "password", "source_addr",
                    "bind_type", "address_ton", "address_npi", "data_coding",
                    "pool_size", "enquire_interval", "timeout", "tps", "priority",
-                   "reconnect_max_seconds", "enabled"]:
+                   "reconnect_max_seconds", "delivery_receipt_mode", "enabled"]:
         val = getattr(data, field, None)
         if val is not None:
             # Empty or masked password means "keep the stored one" on edit.

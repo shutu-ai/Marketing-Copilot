@@ -112,6 +112,15 @@
         </el-row>
         <el-row :gutter="20">
           <el-col :span="12">
+            <el-form-item :label="$t('smpp.deliveryReceiptMode')">
+              <el-select v-model="form.delivery_receipt_mode" style="width: 100%">
+                <el-option :label="$t('smpp.deliveryReceiptRequired')" value="required" />
+                <el-option :label="$t('smpp.deliveryReceiptOptional')" value="optional" />
+                <el-option :label="$t('smpp.deliveryReceiptDisabled')" value="disabled" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
             <el-form-item :label="$t('smpp.addressTon')">
               <el-input-number v-model="form.address_ton" :min="0" :max="255" style="width: 100%" />
             </el-form-item>
@@ -184,7 +193,7 @@ const defaultForm: SmppConfigForm = {
   name: '', host: '', port: 2775, system_id: '', password: '',
   source_addr: '', bind_type: 'transceiver', address_ton: 0, address_npi: 0,
   data_coding: 0, pool_size: 1, enquire_interval: 30, timeout: 10,
-  tps: 10, priority: 100, reconnect_max_seconds: 60,
+  tps: 10, priority: 100, reconnect_max_seconds: 60, delivery_receipt_mode: 'optional',
 }
 const form = ref<SmppConfigForm>({ ...defaultForm })
 
@@ -201,6 +210,7 @@ function openDialog(row?: SmppConfig) {
       data_coding: row.data_coding, pool_size: row.pool_size,
       enquire_interval: row.enquire_interval, timeout: row.timeout,
       tps: row.tps, priority: row.priority, reconnect_max_seconds: row.reconnect_max_seconds,
+      delivery_receipt_mode: row.delivery_receipt_mode || 'optional',
     }
   } else {
     editingId.value = null

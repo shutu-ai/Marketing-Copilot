@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
 
 
-FINAL_STATES = {"delivered", "failed", "expired", "cancelled", "archived"}
+FINAL_STATES = {"delivered", "failed", "expired", "cancelled", "archived", "accepted"}
 
 DLR_STATE_MAP = {
     "DELIVRD": {"status": "delivered", "label": "Delivered", "retryable": False},
@@ -398,7 +398,7 @@ def claim_next_task() -> Optional[dict]:
     return tasks[0] if tasks else None
 
 
-def mark_submitted(task_id: int, message_ids: list[str]):
+def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: str = "optional"):
     conn = get_connection()
     row = conn.execute("SELECT smsc_message_ids FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
     existing_ids = []
@@ -408,21 +408,24 @@ def mark_submitted(task_id: int, message_ids: list[str]):
         except json.JSONDecodeError:
             existing_ids = []
     message_ids = list(dict.fromkeys(existing_ids + list(message_ids or [])))
+    mode = delivery_receipt_mode if delivery_receipt_mode in {"required", "optional", "disabled"} else "optional"
+    final_status = "submitted" if mode == "required" else "accepted"
     conn.execute(
-        """UPDATE sms_tasks SET status='submitted', smsc_message_ids=?, error_msg='',
+        f"""UPDATE sms_tasks SET status='{final_status}', smsc_message_ids=?, error_msg='',
             submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)), updated_at=CURRENT_TIMESTAMP
             WHERE id=? AND status IN ('sending','submitted')""",
         (json.dumps(message_ids), task_id),
     )
     if row:
         current = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
-        if current and current["status"] == "submitted":
-            _add_task_event(conn, task_id, "submitted", "sending", "submitted", "SMSC accepted task",
-                            {"message_ids": message_ids})
+        if current and current["status"] == final_status:
+            suffix = "delivery receipt required" if mode == "required" else ("delivery receipt disabled" if mode == "disabled" else "delivery receipt optional")
+            _add_task_event(conn, task_id, "submitted", "sending", final_status,
+                            f"SMSC accepted task; {suffix}",
+                            {"message_ids": message_ids, "delivery_receipt_mode": mode})
     _insert_message_mapping(conn, task_id, message_ids)
     conn.commit()
     conn.close()
-
 
 def append_message_id(task_id: int, message_id: str):
     conn = get_connection()
@@ -498,10 +501,10 @@ def record_receipt(message_id: str, state: str, raw: str):
             delivered_ids = {r["smsc_message_id"] for r in delivered_rows}
             delivered_ids.add(message_id)
             all_parts_delivered = bool(expected_ids) and expected_ids.issubset(delivered_ids)
-            status = "delivered" if all_parts_delivered else "submitted"
+            status = "delivered" if all_parts_delivered else ("accepted" if task.get("status") == "accepted" else "submitted")
             delivered_sql = ", delivered_at=CURRENT_TIMESTAMP" if all_parts_delivered else ""
         elif normalized_state in {"ACCEPTD", "ENROUTE", "SCHEDULED", "1", "6", "7"}:
-            status = "submitted"
+            status = "accepted" if task.get("status") == "accepted" else "submitted"
             delivered_sql = ""
         else:
             temporary_receipt = normalized_state in {"UNKNOWN", "UNDELIV", "EXPIRED"}
@@ -643,9 +646,9 @@ def mark_delivered(task_id: int) -> tuple[bool, str]:
     if task["status"] == "delivered":
         conn.close()
         return True, "Task already delivered"
-    if task["status"] != "submitted":
+    if task["status"] not in {"submitted", "accepted"}:
         conn.close()
-        return False, f"Only submitted tasks can be confirmed as delivered (current: {task['status']})"
+        return False, f"Only submitted or accepted tasks can be confirmed as delivered (current: {task['status']})"
     conn.execute(
         """UPDATE sms_tasks SET status='delivered', failure_class='', error_msg='',
             delivered_at=COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
