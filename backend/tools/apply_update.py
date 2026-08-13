@@ -23,7 +23,10 @@ import urllib.request
 from pathlib import Path
 
 SERVICE_UNIT = os.environ.get("MC_SERVICE_UNIT", "marketing-copilot.service")
-HEALTH_URL = os.environ.get("MC_PROBE_URL", "http://127.0.0.1:8000/api/ready")
+HEALTH_URL = os.environ.get(
+    "MC_PROBE_URL",
+    f"http://127.0.0.1:{os.environ.get('MC_PORT', '8000')}/api/ready",
+)
 HEALTH_TRIES = int(os.environ.get("MC_UPDATE_HEALTH_TRIES", "30"))
 HEALTH_INTERVAL = float(os.environ.get("MC_UPDATE_HEALTH_INTERVAL", "2.0"))
 STOP_GRACE = float(os.environ.get("MC_UPDATE_STOP_GRACE", "30"))

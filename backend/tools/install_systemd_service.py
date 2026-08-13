@@ -4,7 +4,7 @@
 Intended for the manual deployment layout (system Python + run.sh), where the
 service otherwise runs in the foreground or under nohup. The generated unit:
 
-* reuses ``run.sh`` (or starts uvicorn directly when run.sh is absent);
+* starts uvicorn directly; ``run.sh`` is only the bootstrap/fallback launcher;
 * reads the existing ``marketing-copilot.env`` so paths stay in one place;
 * uses ``KillMode=process`` so the online-update runner survives
   ``systemctl stop`` during a self-update;
@@ -39,6 +39,7 @@ WorkingDirectory={working_dir}
 EnvironmentFile={env_file}
 Environment=PYTHONUNBUFFERED=1
 Environment=MC_SERVICE_UNIT={unit_name}
+Environment=MC_RUN_UNDER_SYSTEMD=1
 ExecStart={exec_start}
 Restart=always
 RestartSec=5
@@ -91,6 +92,22 @@ def read_env_value(env_file: Path, key: str, default: str = "") -> str:
     return default
 
 
+def normalize_env_paths(env_file: Path, root: Path) -> None:
+    """Expand deployment-relative APP_HOME paths for direct systemd execution."""
+    if not env_file.is_file():
+        return
+    original = env_file.read_text(encoding="utf-8", errors="replace")
+    app_home = str(root)
+    normalized = original.replace("${APP_HOME}", app_home).replace("$APP_HOME", app_home)
+    if normalized == original:
+        return
+    backup = env_file.with_suffix(env_file.suffix + ".paths.bak")
+    if not backup.exists():
+        shutil.copy2(env_file, backup)
+    env_file.write_text(normalized, encoding="utf-8")
+    print(f"expanded APP_HOME paths in {env_file} (backup: {backup})")
+
+
 def find_python(root: Path) -> Path:
     for rel in (
         "venv/bin/python",
@@ -107,9 +124,6 @@ def find_python(root: Path) -> Path:
 def build_exec_start(args, root: Path) -> str:
     if args.exec_start:
         return args.exec_start
-    run_sh = root / "run.sh"
-    if run_sh.is_file() and os.access(run_sh, os.X_OK):
-        return str(run_sh)
     python = find_python(root)
     env_path = Path(args.env_file) if args.env_file else Path()
     host = args.host or read_env_value(env_path, "MC_HOST", "0.0.0.0")
@@ -219,6 +233,8 @@ def main() -> int:
     env_file = Path(args.env_file) if args.env_file else root / "marketing-copilot.env"
     args.env_file = str(env_file)
     unit_name = args.service_name if args.service_name.endswith(".service") else args.service_name + ".service"
+    if not args.dry_run:
+        normalize_env_paths(env_file, root)
     if not env_file.is_file():
         print(f"WARNING: environment file not found: {env_file}", file=sys.stderr)
 
