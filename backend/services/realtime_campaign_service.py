@@ -632,6 +632,56 @@ def _processed_file_record(campaign_id: int, filename: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _daily_window_ended(campaign: dict, now: Optional[datetime] = None) -> bool:
+    """Return whether the current local calendar day has passed its send window."""
+    now = now or datetime.now()
+    current = now.strftime("%H:%M")
+    start = (campaign.get("send_start_time") or "")[:5]
+    end = (campaign.get("send_end_time") or "")[:5]
+    if not end:
+        return False
+    if start and start > end:
+        return current > end and current < start
+    return current > end
+
+
+def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
+    """Close realtime work at a daily boundary and prevent cross-day carryover."""
+    now = now or datetime.now()
+    today = now.date().isoformat()
+    conn = get_connection()
+    # This is the hard cross-day guard. It also repairs tasks missed by the
+    # scheduler at midnight; task_date is independently enforced by the worker.
+    stale = conn.execute(
+        """UPDATE sms_tasks SET status='cancelled', error_msg='previous day task cancelled',
+           updated_at=CURRENT_TIMESTAMP
+           WHERE campaign_type='realtime' AND CAST(task_date AS DATE) < CAST(? AS DATE)
+             AND status IN ('queued','retrying','sending')""",
+        (today,),
+    ).rowcount or 0
+    campaigns = conn.execute(
+        "SELECT id,send_start_time,send_end_time FROM realtime_campaigns WHERE status='in_progress'"
+    ).fetchall()
+    cancelled = stale
+    for row in campaigns:
+        campaign = dict(row)
+        if not _daily_window_ended(campaign, now):
+            continue
+        result = conn.execute(
+            """UPDATE sms_tasks SET status='cancelled', error_msg='daily send window ended',
+               updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type='realtime' AND campaign_id=?
+                 AND CAST(task_date AS DATE)=CAST(? AS DATE)
+                 AND status IN ('queued','retrying','sending')""",
+            (campaign["id"], today),
+        )
+        cancelled += result.rowcount or 0
+    conn.commit()
+    conn.close()
+    if cancelled:
+        logger.info("Realtime daily tasks cancelled=%s", cancelled)
+    return cancelled
+
 def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
     conn = get_connection()
     if campaign_id:
@@ -651,6 +701,12 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
         campaign = dict(row)
         watch_dir = campaign.get("watch_dir", "")
         if not watch_dir or not os.path.isdir(watch_dir):
+            continue
+        # Keep the listener alive, but pause this campaign outside its
+        # current window. Filename time remains authoritative below.
+        active, reason = sms_task_service.campaign_is_active(campaign, now)
+        if not active:
+            logger.info("Watch intake paused campaign=%s reason=%s", campaign.get("id"), reason)
             continue
         campaign_dir = campaign.get("campaign_dir", "")
         if not campaign_dir:
@@ -733,6 +789,18 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
                 continue
             ext = os.path.splitext(fname)[1].lower()
             if ext not in (".csv", ".txt", ".xlsx", ".xls"):
+                continue
+            active, reason = sms_task_service.campaign_is_active(campaign, datetime.now())
+            file_time = _watch_file_timestamp(fname, campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_")
+            if (file_time and file_time.date() != datetime.now().date()) or (not active and reason in {"after daily send window", "campaign has ended", "campaign is not enabled"}):
+                try:
+                    target = operations_service.quarantine(src, campaign.get("campaign_dir", ""), fname)
+                    results["errors"].append({"filename": fname, "message": reason if not active else "file belongs to a previous day"})
+                    logger.info("Realtime inbox file archived campaign=%s file=%s reason=%s", campaign["id"], fname, reason if not active else "previous day")
+                except OSError as exc:
+                    results["errors"].append({"filename": fname, "message": str(exc)})
+                continue
+            if not active:
                 continue
             try:
                 result = receive_file(campaign["id"], src, fname)

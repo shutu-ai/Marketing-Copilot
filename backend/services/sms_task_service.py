@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime
@@ -61,7 +62,7 @@ def _bulk_insert_tasks(conn, task_rows) -> list:
     """Insert tasks in one multi-row statement, returning (id, dedupe_key) pairs."""
     columns = ("campaign_type", "campaign_id", "batch_id", "campaign_name", "msisdn", "language",
                "sms_template_id", "smpp_config_id", "content", "source_addr", "payload",
-               "source_file", "dedupe_key")
+               "source_file", "task_date", "dedupe_key")
     placeholders = ",".join("?" for _ in columns)
     values = ",".join(f"({placeholders})" for _ in task_rows)
     conn.execute(
@@ -285,6 +286,14 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
 
     conn = get_connection()
     try:
+        task_date = datetime.now().astimezone().date().isoformat()
+        if campaign_type == "realtime":
+            match = re.search(r"(\d{14})", os.path.basename(source_file or ""))
+            if match:
+                try:
+                    task_date = datetime.strptime(match.group(1), "%Y%m%d%H%M%S").date().isoformat()
+                except ValueError:
+                    pass
         exclusions = {
             normalize_msisdn(r["msisdn"])
             for r in conn.execute("SELECT msisdn FROM exclusion_users WHERE enabled=1").fetchall()
@@ -327,7 +336,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 campaign_type, campaign["id"], batch_id, campaign.get("name", ""), msisdn,
                 language, template["id"], campaign.get("smpp_config_id"), content,
                 template.get("source_addr") or "",
-                json.dumps(payload, ensure_ascii=False), source_file, dedupe_key,
+                json.dumps(payload, ensure_ascii=False), source_file, task_date, dedupe_key,
             ))
         if task_rows:
             try:
@@ -343,8 +352,8 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                         cursor = conn.execute(
                             """INSERT INTO sms_tasks
                                 (campaign_type,campaign_id,batch_id,campaign_name,msisdn,language,sms_template_id,smpp_config_id,content,
-                                source_addr,payload,source_file,dedupe_key)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                source_addr,payload,source_file,task_date,dedupe_key)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             row,
                         )
                         created.append((cursor.lastrowid, row[-1]))
@@ -378,7 +387,8 @@ def claim_next_tasks(limit: int = 20) -> list:
         """UPDATE sms_tasks SET status='sending', attempts=attempts+1, claim_token=?,
             updated_at=CURRENT_TIMESTAMP
             WHERE id IN (SELECT id FROM sms_tasks WHERE status IN ('queued','retrying')
-            AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP ORDER BY created_at,id LIMIT ?)
+            AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+            AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE) ORDER BY created_at,id LIMIT ?)
             AND status IN ('queued','retrying') RETURNING *""", (token, limit)
     ).fetchall()
     tasks = [dict(r) for r in rows]
@@ -687,6 +697,11 @@ def mark_delivered(task_id: int) -> tuple[bool, str]:
 
 
 def validate_task_schedule(task: dict) -> tuple[bool, str]:
+    task_date = task.get("task_date")
+    if task.get("campaign_type") == "realtime" and task_date is not None:
+        current_date = datetime.now().astimezone().date().isoformat()
+        if str(task_date)[:10] != current_date:
+            return False, "task belongs to a previous day"
     table = "batch_campaigns" if task["campaign_type"] == "batch" else "realtime_campaigns"
     conn = get_connection()
     row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (task["campaign_id"],)).fetchone()

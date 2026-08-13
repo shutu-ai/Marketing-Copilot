@@ -364,6 +364,7 @@ def init_db():
             source_addr TEXT NOT NULL DEFAULT '',
             payload TEXT NOT NULL DEFAULT '{}',
             source_file TEXT NOT NULL DEFAULT '',
+            task_date DATE NOT NULL DEFAULT CURRENT_DATE,
             dedupe_key TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'queued',
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -478,6 +479,7 @@ def init_db():
         logger.warning("[DB] Skipping sms_tasks.batch_id migration: %s", e)
     migrations = [
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS claim_token TEXT",
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS task_date DATE DEFAULT CURRENT_DATE",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS sms_template_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS last_smpp_status INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS failure_class TEXT",
@@ -548,6 +550,7 @@ def init_db():
         logger.warning("[DB] Skipping processed_files uniqueness migration: %s", e)
     for stmt in [
         "UPDATE sms_tasks SET claim_token='' WHERE claim_token IS NULL",
+        "UPDATE sms_tasks SET task_date=CAST(created_at AS DATE) WHERE task_date IS NULL",
         "UPDATE sms_tasks SET failure_class='' WHERE failure_class IS NULL",
         "UPDATE sms_tasks SET receipt_retry_count=0 WHERE receipt_retry_count IS NULL",
         "UPDATE smpp_configs SET tps=20 WHERE tps IS NULL",
@@ -570,6 +573,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_log_status ON sms_log(status)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_status ON sms_tasks(status, next_attempt_at)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_campaign ON sms_tasks(campaign_type, campaign_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_tasks_date ON sms_tasks(campaign_type, task_date, status, next_attempt_at)",
         "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(smsc_message_id)",
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
         "CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(campaign_type,campaign_id,file_hash)",

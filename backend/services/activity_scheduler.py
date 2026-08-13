@@ -52,6 +52,7 @@ def _run():
         try:
             ticks += 1
             _process_batches()
+            realtime_campaign_service.finalize_daily_tasks()
             realtime_campaign_service.sync_watch_dirs_to_inboxes()
             realtime_result = realtime_campaign_service.process_realtime_inboxes()
             for error in realtime_result.get("errors", []):

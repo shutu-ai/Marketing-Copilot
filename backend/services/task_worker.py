@@ -67,7 +67,7 @@ def _run(worker_index):
                     metrics_service.inc("marketing_copilot_tasks_claimed_total", labels={"worker": worker_index + 1})
                     active, reason = sms_task_service.validate_task_schedule(task)
                     if not active:
-                        expired = reason in {"campaign has ended", "campaign no longer exists", "campaign is not enabled"}
+                        expired = reason in {"campaign has ended", "campaign no longer exists", "campaign is not enabled", "task belongs to a previous day", "after daily send window"}
                         sms_task_service.defer_task(task["id"], reason, expired)
                         continue
                     if get_setting("system_mode", "production") == "development":

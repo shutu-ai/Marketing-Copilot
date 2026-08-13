@@ -17,13 +17,21 @@ def main():
     init_db()
     campaign_dir = root / "campaign"
     campaign_dir.mkdir()
+    watch_dir = campaign_dir / "watch"
+    watch_dir.mkdir()
     whitelist = campaign_dir / "whitelist.csv"
     whitelist.write_text("msisdn\n251900000001\n", encoding="utf-8")
     conn = get_connection()
+    conn.execute("""INSERT INTO smpp_configs
+        (name,host,port,system_id,password,enabled)
+        VALUES ('P1 SMPP','127.0.0.1',2775,'p1','p1',1)""")
+    smpp_id = conn.execute("SELECT id FROM smpp_configs WHERE name='P1 SMPP'").fetchone()["id"]
     conn.execute("""INSERT INTO realtime_campaigns
-        (name,status,start_time,end_time,customer_list_path,row_count,campaign_dir)
-        VALUES ('P1 realtime','in_progress','',?, ?,1,?)""",
-        ((datetime.now() + timedelta(days=1)).isoformat(), str(whitelist), str(campaign_dir)))
+        (name,status,start_time,end_time,customer_list_path,row_count,campaign_dir,
+         watch_dir,watch_filename_prefix,smpp_config_id)
+        VALUES ('P1 realtime','in_progress','',?, ?,1,?,?,?,?)""",
+        ((datetime.now() + timedelta(days=1)).isoformat(), str(whitelist), str(campaign_dir),
+         str(watch_dir), 'Android_4G_Switch_Somali_', smpp_id))
     realtime_id = conn.execute("SELECT id FROM realtime_campaigns WHERE name='P1 realtime'").fetchone()["id"]
     conn.execute("INSERT INTO campaigns(name,marketing_type,marketing_campaign_id) VALUES ('P1 templates','realtime',?)", (realtime_id,))
     content_campaign_id = conn.execute("SELECT id FROM campaigns WHERE name='P1 templates'").fetchone()["id"]
