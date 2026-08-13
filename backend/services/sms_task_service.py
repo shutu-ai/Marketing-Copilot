@@ -476,6 +476,24 @@ def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
     conn.close()
 
 
+def requeue_transport_failures() -> int:
+    """Put terminal transport failures back into the send queue after recovery."""
+    conn = get_connection()
+    count = conn.execute(
+        "SELECT COUNT(*) count FROM sms_tasks WHERE status='failed' AND failure_class='transport'"
+    ).fetchone()["count"]
+    if count:
+        conn.execute(
+            """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='',
+                claim_token='', last_smpp_status=NULL, next_attempt_at=CURRENT_TIMESTAMP,
+                updated_at=CURRENT_TIMESTAMP
+                WHERE status='failed' AND failure_class='transport'"""
+        )
+        conn.commit()
+    conn.close()
+    return int(count or 0)
+
+
 def record_receipt(message_id: str, state: str, raw: str):
     normalized_state = str(state or "").upper()
     conn = get_connection()

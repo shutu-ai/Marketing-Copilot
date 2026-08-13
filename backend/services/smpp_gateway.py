@@ -334,6 +334,22 @@ class SmppGateway:
             if config_id is None:
                 self._active_config_id = None
 
+    def recover(self, config_id=None):
+        """Immediately rebuild the live pool after an operator confirms recovery."""
+        configs = self._enabled_configs()
+        targets = [item for item in configs if config_id is None or item["id"] == config_id]
+        if config_id is not None and not targets:
+            raise RuntimeError(f"SMPP configuration {config_id} is missing or disabled")
+        for config in targets:
+            self._down_until.pop(config["id"], None)
+            self.disconnect(config["id"])
+            desired = max(1, min(20, int(config.get("pool_size") or 1)))
+            for _ in range(desired):
+                self._connection_for(config)
+            self._active_config_id = config["id"]
+        self._last_error = ""
+        return self.status()
+
     def status(self) -> dict:
         configs = self._enabled_configs()
         pools = []

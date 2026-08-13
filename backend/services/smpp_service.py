@@ -266,7 +266,17 @@ async def test_connection(data: dict) -> dict:
             "timeout": config.get("timeout") or data.get("timeout", 10),
         }
     try:
-        return await asyncio.to_thread(_run_smpp_bind_test, data)
+        result = await asyncio.to_thread(_run_smpp_bind_test, data)
+        if result.get("success") and config_id:
+            from services.smpp_gateway import gateway
+            try:
+                await asyncio.to_thread(gateway.recover, int(config_id))
+            except Exception as exc:
+                logger.exception("SMPP test succeeded but live gateway recovery failed")
+                result["gateway_recovery"] = {"success": False, "message": str(exc)}
+            else:
+                result["gateway_recovery"] = {"success": True}
+        return result
     except Exception as exc:
         logger.exception("SMPP connection test failed")
         return {"success": False, "message": str(exc)}

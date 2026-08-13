@@ -43,6 +43,7 @@ def worker_status():
 
 def _run(worker_index):
     reconnect_after, reconnect_delay, ticks = 0.0, 1.0, 0
+    last_connect_check, gateway_was_connected = 0.0, gateway.connected
     try:
         if worker_index == 0:
             sms_task_service.recover_stale_tasks()
@@ -51,6 +52,20 @@ def _run(worker_index):
             ticks += 1
             if worker_index == 0 and ticks % 60 == 0:
                 sms_task_service.recover_stale_tasks()
+            if (worker_index == 0 and get_setting("system_mode", "production") == "production"
+                    and time.monotonic() >= last_connect_check):
+                last_connect_check = time.monotonic() + 5.0
+                try:
+                    gateway.connect()
+                    reconnect_delay = 1.0
+                except Exception as exc:
+                    logger.warning("SMPP reconnect failed: %s", exc)
+                gateway_connected = gateway.connected
+                if gateway_connected and not gateway_was_connected:
+                    recovered = sms_task_service.requeue_transport_failures()
+                    if recovered:
+                        logger.warning("Requeued %s transport-failed SMS tasks after SMPP recovery", recovered)
+                gateway_was_connected = gateway_connected
             tasks = sms_task_service.claim_next_tasks(configured_claim_batch())
             if not tasks:
                 if (worker_index == 0 and get_setting("system_mode", "production") == "production"
