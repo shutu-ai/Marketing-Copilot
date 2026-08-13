@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import json
 import os
 import shutil
@@ -141,8 +141,9 @@ def audit(action: str, resource: str = "", resource_id="", detail=None,
 
 def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:
     errors = []
-    if not campaign.get("customer_list_path") or not os.path.isfile(campaign["customer_list_path"]):
-        errors.append("campaign whitelist is missing" if campaign_type == "realtime" else "campaign target file is missing")
+    if campaign_type != "realtime" or campaign.get("use_whitelist", True):
+        if not campaign.get("customer_list_path") or not os.path.isfile(campaign["customer_list_path"]):
+            errors.append("campaign whitelist is missing" if campaign_type == "realtime" else "campaign target file is missing")
     if not campaign.get("campaign_dir"):
         errors.append("campaign directory is missing")
     else:

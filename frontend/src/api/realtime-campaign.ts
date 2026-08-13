@@ -3,6 +3,7 @@ import api from './index'
 export interface RealtimeCampaign {
   id: number
   name: string
+  use_whitelist: boolean
   start_time: string
   end_time: string
   send_start_time: string
@@ -38,7 +39,7 @@ export function getRealtimeCampaign(id: number) {
 }
 
 export function createRealtimeCampaign(data: {
-  name: string; start_time?: string; end_time?: string;
+  name: string; use_whitelist?: boolean; start_time?: string; end_time?: string;
   send_start_time?: string; send_end_time?: string; send_days?: string[];
   campaign_dir?: string; use_custom_directory?: boolean;
   watch_dir?: string;

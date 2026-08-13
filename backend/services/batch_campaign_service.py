@@ -10,7 +10,7 @@ from typing import Optional
 import shutil
 import pandas as pd
 from services import settings_service
-from services import sms_task_service, operations_service
+from services import sms_task_service, operations_service, campaign_name_service
 
 logger = logging.getLogger(__name__)
 
@@ -150,12 +150,15 @@ def get_one(campaign_id: int) -> Optional[dict]:
 
 
 def create(data: BatchCampaignCreate) -> dict:
+    name = campaign_name_service.ensure_unique_name(data.name)
+    if not (data.phone_prefix or "").strip():
+        raise ValueError("\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00")
     conn = get_connection()
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
     cursor = conn.execute(
         "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, use_custom_directory, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (data.name, data.start_time or "", data.end_time or "",
+        (name, data.start_time or "", data.end_time or "",
           data.send_start_time or "", data.send_end_time or "",
           _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
           use_custom_directory, data.sms_template_id, data.smpp_config_id,
@@ -187,6 +190,8 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         conn.close()
         return None
     existing_dict = dict(existing)
+    if data.name is not None and data.name.strip() != (existing_dict.get("name") or "").strip():
+        data.name = campaign_name_service.ensure_unique_name(data.name, "batch", campaign_id)
     if data.use_custom_directory is not None and existing_dict.get("customer_list_path"):
         if data.use_custom_directory:
             new_dir = (data.campaign_dir or "").strip()

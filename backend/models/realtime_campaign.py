@@ -4,6 +4,7 @@ from typing import Optional
 
 class RealtimeCampaignCreate(BaseModel):
     name: str
+    use_whitelist: Optional[bool] = True
     start_time: Optional[str] = ""
     end_time: Optional[str] = ""
     send_start_time: Optional[str] = ""
@@ -20,6 +21,7 @@ class RealtimeCampaignCreate(BaseModel):
 
 class RealtimeCampaignUpdate(BaseModel):
     name: Optional[str] = None
+    use_whitelist: Optional[bool] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     status: Optional[str] = None

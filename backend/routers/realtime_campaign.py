@@ -47,8 +47,10 @@ def get_campaign(campaign_id: int):
 @router.post("")
 
 def create_campaign(data: RealtimeCampaignCreate):
-
-    return realtime_campaign_service.create(data)
+    try:
+        return realtime_campaign_service.create(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 

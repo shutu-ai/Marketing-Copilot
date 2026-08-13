@@ -119,7 +119,7 @@
               <template #dropdown>
                 <el-dropdown-menu>
                   <el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item>
-                  <el-dropdown-item command="upload">
+                  <el-dropdown-item command="upload" :disabled="row.use_whitelist === false">
                     {{ row.status === 'in_progress' ? '更新白名单' : $t('campaign.uploadWhitelist') }}
                   </el-dropdown-item>
                   <el-dropdown-item command="sms">
@@ -154,6 +154,9 @@
         <template v-if="!inProgressEdit">
         <el-form-item :label="$t('campaign.name')" required>
           <el-input v-model="editForm.name" />
+        </el-form-item>
+        <el-form-item label="是否需要白名单">
+          <el-switch v-model="editForm.use_whitelist" active-text="需要" inactive-text="不需要" />
         </el-form-item>
         <div v-if="editForm.status !== 'ended'" class="advanced-toggle">
           <el-switch v-model="customDirectory" :active-text="$t('campaign.customDirectory')" @change="handleCustomDirectoryChange" />
@@ -196,7 +199,7 @@
           <el-input v-model="editForm.watch_filename_prefix" placeholder="Android_4G_Switch_Somali_" :disabled="editForm.status === 'in_progress'" />
           <div class="form-tip">{{ $t('campaign.watchFilenamePrefixTip') }}</div>
         </el-form-item>
-        <el-form-item :label="$t('campaign.phonePrefix')">
+        <el-form-item :label="$t('campaign.phonePrefix')" required>
           <el-input v-model="editForm.phone_prefix" placeholder="251" :disabled="editForm.status === 'in_progress'" />
           <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
         </el-form-item>
@@ -307,6 +310,7 @@ const weekDays = [
 interface Campaign {
   id: number
   name: string
+  use_whitelist: boolean
   start_time: string
   end_time: string
   send_start_time: string
@@ -339,6 +343,7 @@ const enabledSmppOptions = computed(() => smppOptions.value.filter((item: any) =
 const editForm = ref<{
   id: number
   name: string
+  use_whitelist: boolean
   start_time: string
   end_time: string
   send_start_time: string
@@ -353,6 +358,7 @@ const editForm = ref<{
 }>({
   id: 0,
   name: '',
+  use_whitelist: true,
   start_time: '',
   end_time: '',
   send_start_time: '',
@@ -407,6 +413,7 @@ function showDialog(row: Campaign | null) {
     editForm.value = {
       id: row.id,
       name: row.name,
+      use_whitelist: row.use_whitelist !== false,
       start_time: row.start_time,
       end_time: row.end_time,
       send_start_time: row.send_start_time || '',
@@ -425,6 +432,7 @@ function showDialog(row: Campaign | null) {
     editForm.value = {
       id: 0,
       name: '',
+      use_whitelist: true,
       start_time: '',
       end_time: '',
       send_start_time: '',
@@ -445,7 +453,7 @@ function readinessItems(row: Campaign) {
   const scheduleReady = Boolean(row.start_time && row.end_time && row.send_start_time && row.send_end_time)
   const watchFilenamePrefix = row.watch_filename_prefix || 'Android_4G_Switch_Somali_'
   return [
-    { ok: row.row_count > 0, label: t(row.row_count > 0 ? 'campaign.whitelistReady' : 'campaign.whitelistMissing') },
+    { ok: row.use_whitelist === false || row.row_count > 0, label: row.use_whitelist === false ? '不需要白名单' : t(row.row_count > 0 ? 'campaign.whitelistReady' : 'campaign.whitelistMissing') },
     { ok: Boolean(row.sms_template_id), label: t(row.sms_template_id ? 'campaign.templateReady' : 'campaign.templateMissing') },
     { ok: Boolean(row.smpp_config_id), label: t(row.smpp_config_id ? 'campaign.smppReady' : 'campaign.smppMissing') },
     { ok: scheduleReady, label: t(scheduleReady ? 'campaign.scheduleReady' : 'campaign.scheduleMissing') },
@@ -485,10 +493,15 @@ async function handleSave() {
     ElMessage.warning('请输入活动名称')
     return
   }
+  if (!editForm.value.id && !editForm.value.phone_prefix.trim()) {
+    ElMessage.warning('\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00')
+    return
+  }
   saving.value = true
   try {
     let payload: any = {
       name: editForm.value.name,
+      use_whitelist: editForm.value.use_whitelist,
       start_time: editForm.value.start_time,
       end_time: editForm.value.end_time,
       send_start_time: editForm.value.send_start_time,
@@ -530,6 +543,7 @@ async function handleSave() {
 }
 
 function handleUpload(row: Campaign) {
+  if (row.use_whitelist === false) return
   uploadCampaignId.value = row.id
   selectedFile.value = null
   uploadKey.value++

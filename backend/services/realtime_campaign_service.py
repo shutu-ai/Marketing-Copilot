@@ -13,7 +13,7 @@ from database import get_connection
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
 from services import sms_task_service
-from services import operations_service
+from services import operations_service, campaign_name_service
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -117,12 +117,15 @@ def get_one(campaign_id: int) -> Optional[dict]:
 
 
 def create(data: RealtimeCampaignCreate) -> dict:
+    name = campaign_name_service.ensure_unique_name(data.name)
+    if not (data.phone_prefix or "").strip():
+        raise ValueError("\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00")
     conn = get_connection()
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
     cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_dir, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (data.name, data.start_time or "", data.end_time or "",
+        "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_dir, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, data.use_whitelist if data.use_whitelist is not None else True, data.start_time or "", data.end_time or "",
          data.send_start_time or "", data.send_end_time or "",
          _fmt_days(data.send_days), campaign_dir, use_custom_directory,
          data.watch_dir or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
@@ -154,12 +157,14 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         conn.close()
         return None
     existing_dict = dict(existing)
+    if data.name is not None and data.name.strip() != (existing_dict.get("name") or "").strip():
+        data.name = campaign_name_service.ensure_unique_name(data.name, "realtime", campaign_id)
     if data.status == "in_progress":
         validation_errors = operations_service.validate_campaign("realtime", {**existing_dict, "id": campaign_id})
         if validation_errors:
             conn.close()
             raise ValueError("; ".join(validation_errors))
-    if data.status == "in_progress" and not existing_dict.get("row_count", 0):
+    if data.status == "in_progress" and existing_dict.get("use_whitelist", True) and not existing_dict.get("row_count", 0):
         conn.close()
         raise ValueError("No whitelist uploaded — cannot start campaign")
     if existing_dict.get("status") != "not_started":
@@ -168,7 +173,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             conn.close()
             raise ValueError("Campaign has already started — cannot edit")
     fields = {}
-    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_dir", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
+    for field in ["name", "use_whitelist", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_dir", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
         val = getattr(data, field, None)
         if val is not None:
             fields[field] = val
@@ -218,11 +223,11 @@ def delete(campaign_id: int) -> bool:
             except Exception:
                 pass
     conn.execute("DELETE FROM realtime_campaign_files WHERE campaign_id=?", (campaign_id,))
-    cursor = conn.execute("DELETE FROM realtime_campaigns WHERE id=?", (campaign_id,))
-    deleted = cursor.rowcount > 0
+    conn.execute("DELETE FROM realtime_campaigns WHERE id=?", (campaign_id,))
     conn.commit()
     conn.close()
-    return deleted
+    # DuckDB rowcount is not reliable for DELETE; the initial lookup is authoritative.
+    return row is not None
 
 
 def copy(campaign_id: int) -> Optional[dict]:
@@ -234,8 +239,8 @@ def copy(campaign_id: int) -> Optional[dict]:
     orig = dict(row)
     new_name = orig["name"] + " (Copy)"
     cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (new_name, orig["start_time"], orig["end_time"],
+        "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (new_name, orig.get("use_whitelist", True), orig["start_time"], orig["end_time"],
          orig.get("send_start_time", ""), orig.get("send_end_time", ""),
          orig.get("send_days", "[]"), orig.get("sms_template_id"), orig.get("smpp_config_id"))
     )
@@ -357,7 +362,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         operations_service.finish_file(file_record_id, "failed", file_path, error=inactive_reason)
         return {"success": False, "message": inactive_reason}
     whitelist_path = campaign.get("customer_list_path", "")
-    if not whitelist_path or not os.path.isfile(whitelist_path):
+    if campaign.get("use_whitelist", True) and (not whitelist_path or not os.path.isfile(whitelist_path)):
         conn.close()
         operations_service.finish_file(file_record_id, "failed", file_path, error="No whitelist uploaded")
         return {"success": False, "message": "No whitelist uploaded for this campaign"}
@@ -376,9 +381,12 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         return {"success": False, "message": f"Cannot read file: {e}"}
 
     # Load whitelist MSISDNs and their preferred language (chunked for large CSV files)
-    wl_ext = os.path.splitext(whitelist_path)[1].lower()
+    wl_ext = os.path.splitext(whitelist_path)[1].lower() if campaign.get("use_whitelist", True) else ""
     try:
-        if wl_ext == ".csv":
+        if not campaign.get("use_whitelist", True):
+            whitelist_languages = {}
+            whitelist_set = set()
+        elif wl_ext == ".csv":
             whitelist_languages = {}
             for wl_chunk in _read_csv(whitelist_path, chunksize=CHUNK_SIZE):
                 wl_msisdn_col = "msisdn" if "msisdn" in wl_chunk.columns else wl_chunk.columns[0]
@@ -422,13 +430,13 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                 norm = chunk_normalized.iloc[idx]
                 if norm:
                     received_msisdns.add(norm)
-                    if norm in whitelist_set:
+                    if not campaign.get("use_whitelist", True) or norm in whitelist_set:
                         row_dict = chunk.iloc[idx].fillna("").to_dict()
                         row_dict["msisdn"] = norm
-                        row_dict["language"] = whitelist_languages[norm]
+                        row_dict["language"] = row_dict.get("language", "") if not campaign.get("use_whitelist", True) else whitelist_languages[norm]
                         matched_row_dicts.append(row_dict)
         total_msisdn = len(received_msisdns)
-        matched = received_msisdns & whitelist_set
+        matched = received_msisdns if not campaign.get("use_whitelist", True) else received_msisdns & whitelist_set
         matched_count = len(matched)
         task_result = sms_task_service.enqueue_rows(
             "realtime", campaign, matched_row_dicts, original_filename
@@ -439,14 +447,14 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         received_msisdns = {value for value in normalized_msisdns if value}
         total_msisdn = len(received_msisdns)
         total_rows = len(df)
-        matched = received_msisdns & whitelist_set
+        matched = received_msisdns if not campaign.get("use_whitelist", True) else received_msisdns & whitelist_set
         matched_count = len(matched)
         matched_rows = df[normalized_msisdns.isin(matched)].copy()
         matched_rows["msisdn"] = normalized_msisdns[normalized_msisdns.isin(matched)]
         matched_records = matched_rows.fillna("").to_dict("records")
         for record in matched_records:
             msisdn = record.get("msisdn")
-            record["language"] = whitelist_languages[msisdn]
+            record["language"] = record.get("language", "") if not campaign.get("use_whitelist", True) else whitelist_languages[msisdn]
         task_result = sms_task_service.enqueue_rows(
             "realtime", campaign, matched_records, original_filename
         )

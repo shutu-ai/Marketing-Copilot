@@ -196,7 +196,7 @@
             </el-checkbox>
           </el-checkbox-group>
         </el-form-item>
-        <el-form-item :label="$t('campaign.phonePrefix')">
+        <el-form-item :label="$t('campaign.phonePrefix')" required>
           <el-input v-model="editForm.phone_prefix" placeholder="251" />
           <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
         </el-form-item>
@@ -412,6 +412,10 @@ function startHint(row: Campaign) {
 async function handleSave() {
   if (!editForm.value.name) {
     ElMessage.warning('请输入活动名称')
+    return
+  }
+  if (!editForm.value.id && !editForm.value.phone_prefix.trim()) {
+    ElMessage.warning('\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00')
     return
   }
   saving.value = true

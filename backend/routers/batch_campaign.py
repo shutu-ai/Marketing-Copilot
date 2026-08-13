@@ -22,7 +22,10 @@ def get_campaign(campaign_id: int):
 
 @router.post("")
 def create_campaign(data: BatchCampaignCreate):
-    return batch_campaign_service.create(data)
+    try:
+        return batch_campaign_service.create(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.put("/{campaign_id}")
