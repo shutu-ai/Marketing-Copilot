@@ -16,8 +16,8 @@
         <el-table-column prop="system_id" :label="$t('smpp.systemId')" width="130" />
         <el-table-column prop="source_addr" :label="$t('smpp.sourceAddr')" width="130" />
         <el-table-column prop="bind_type" :label="$t('smpp.bindType')" width="120" />
-        <el-table-column prop="priority" label="优先级" width="90" />
-        <el-table-column prop="pool_size" label="连接池" width="80" />
+        <el-table-column prop="priority" :label="$t('legacy.xee8ecb9e')" width="90" />
+        <el-table-column prop="pool_size" :label="$t('remaining.x64cea34e')" width="80" />
         <el-table-column prop="tps" label="TPS" width="70" />
         <el-table-column :label="$t('common.status')" width="80">
           <template #default="{ row }">
@@ -150,19 +150,19 @@
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="优先级（越小越优先）">
+            <el-form-item :label="$t('legacy.x4d8329b8')">
               <el-input-number v-model="form.priority" :min="1" :max="10000" style="width: 100%" />
             </el-form-item>
           </el-col>
         </el-row>
         <el-row :gutter="20">
           <el-col :span="12">
-            <el-form-item label="每连接 TPS">
+            <el-form-item :label="$t('legacy.x7c8fbe80')">
               <el-input-number v-model="form.tps" :min="1" :max="10000" style="width: 100%" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="故障冷却秒数">
+            <el-form-item :label="$t('legacy.x62072bea')">
               <el-input-number v-model="form.reconnect_max_seconds" :min="1" :max="300" style="width: 100%" />
             </el-form-item>
           </el-col>
@@ -177,6 +177,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useSmppStore } from '@/stores/smpp'
@@ -221,9 +222,9 @@ function openDialog(row?: SmppConfig) {
 
 async function handleDelete(id: number) {
   try {
-    await ElMessageBox.confirm('确认删除？', '提示')
+    await ElMessageBox.confirm(i18n.global.t('legacy.xb28efaa0'), i18n.global.t('legacy.x02d9819d'))
     await store.removeConfig(id)
-    ElMessage.success('删除成功')
+    ElMessage.success(i18n.global.t('legacy.x0007d170'))
   } catch {}
 }
 
@@ -231,14 +232,14 @@ async function handleSave() {
   try {
     if (editingId.value) {
       await store.editConfig(editingId.value, form.value)
-      ElMessage.success('更新成功')
+      ElMessage.success(i18n.global.t('legacy.x55aa6366'))
     } else {
       await store.addConfig(form.value)
-      ElMessage.success('新增成功')
+      ElMessage.success(i18n.global.t('legacy.xa5bfd70d'))
     }
     dialogVisible.value = false
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '保存失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('common.saveFailed'))
   }
 }
 
@@ -251,12 +252,12 @@ async function testConfig(row: SmppConfig) {
       bind_type: row.bind_type,
     })
     if (result.success) {
-      ElMessage.success('连接测试成功')
+      ElMessage.success(i18n.global.t('dbConfig.testSuccess'))
     } else {
-      ElMessage.error('连接测试失败: ' + result.message)
+      ElMessage.error(i18n.global.t('dynamic.connectionTestFailed',{message:result.message}))
     }
   } catch (e: any) {
-    ElMessage.error('测试失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error(i18n.global.t('dynamic.testFailed',{message:e.response?.data?.detail || e.message}))
   }
 }
 </script>

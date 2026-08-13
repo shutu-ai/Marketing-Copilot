@@ -45,7 +45,7 @@
     <el-card shadow="never">
       <div class="tabs-with-refresh">
       <el-tabs v-model="activeTab">
-        <el-tab-pane label="实时接收数据" name="received">
+        <el-tab-pane :label="$t('legacy.x911b40e5')" name="received">
           <div class="summary-row">
             <div class="summary-card">
               <div class="summary-label">{{ $t('campaign.receivedFiles') }}</div>
@@ -83,15 +83,15 @@
             />
           </div>
         </el-tab-pane>
-        <el-tab-pane label="已发送记录" name="sent">
+        <el-tab-pane :label="$t('legacy.xe7502eb1')" name="sent">
           <el-table :data="sentRecords" stripe style="width: 100%" v-loading="sentRecordsLoading">
-            <el-table-column prop="date" label="日期" width="140" />
-            <el-table-column prop="filename" label="文件名" min-width="220" />
-            <el-table-column prop="user_count" label="用户数" width="100" />
-            <el-table-column label="下载发送记录" width="150" fixed="right">
+            <el-table-column prop="date" :label="$t('campaign.date')" width="140" />
+            <el-table-column prop="filename" :label="$t('legacy.x29139c2a')" min-width="220" />
+            <el-table-column prop="user_count" :label="$t('legacy.x71cb565f')" width="100" />
+            <el-table-column :label="$t('legacy.x82623f9e')" width="150" fixed="right">
               <template #default="{ row }">
                 <el-button text type="primary" size="small" @click="downloadSentRecord(row)">
-                  下载
+                  {{ $t('common.download') }}
                 </el-button>
               </template>
             </el-table-column>

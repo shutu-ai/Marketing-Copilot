@@ -204,6 +204,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
 import PageHeader from '@/components/PageHeader.vue'
@@ -373,16 +374,16 @@ async function uploadAndVerify() {
       await uploadChunk(uploadId.value, i, blob)
       uploadProgress.value = Math.round(((i + 1) / chunks) * 100)
     }
-    ElMessage.success('上传完成，开始校验')
+    ElMessage.success(i18n.global.t('legacy.xed76a30b'))
     const verified = await verifyUpload(uploadId.value)
     precheck.value = verified.data
     if (verified.data.ok) {
-      ElMessage.success('校验通过')
+      ElMessage.success(i18n.global.t('legacy.x9a9088c0'))
     } else {
-      ElMessage.error('校验未通过，请检查错误列表')
+      ElMessage.error(i18n.global.t('legacy.x396c13ee'))
     }
   } catch (error: any) {
-    ElMessage.error(error.response?.data?.detail || error.message || '上传失败')
+    ElMessage.error(error.response?.data?.detail || error.message || i18n.global.t('legacy.x54e5de42'))
   } finally {
     uploading.value = false
   }
@@ -397,18 +398,18 @@ async function cancelCurrent() {
     restoredName.value = ''
     fileList.value = []
     selectedFile.value = null
-    ElMessage.success('已取消')
+    ElMessage.success(i18n.global.t('campaign.status_cancelled'))
   } catch (error: any) {
-    ElMessage.error(error.response?.data?.detail || error.message || '取消失败')
+    ElMessage.error(error.response?.data?.detail || error.message || i18n.global.t('legacy.x482e8539'))
   }
 }
 
 async function confirmApply() {
   if (!uploadId.value) return
   try {
-    await ElMessageBox.confirm('确认应用该更新包？更新期间服务会短暂重启。', '应用更新', {
-      confirmButtonText: '应用',
-      cancelButtonText: '取消',
+    await ElMessageBox.confirm(i18n.global.t('legacy.x15ec5336'), i18n.global.t('update.apply'), {
+      confirmButtonText: i18n.global.t('legacy.x5b0520a9'),
+      cancelButtonText: i18n.global.t('common.cancel'),
       type: 'warning',
     })
   } catch {
@@ -417,10 +418,10 @@ async function confirmApply() {
   applying.value = true
   try {
     await applyUpdate(uploadId.value, forceApply.value)
-    ElMessage.success('已开始应用更新，系统将在重启后自动恢复')
+    ElMessage.success(i18n.global.t('legacy.xe2370d62'))
     await refresh()
   } catch (error: any) {
-    ElMessage.error(error.response?.data?.detail || error.message || '应用失败')
+    ElMessage.error(error.response?.data?.detail || error.message || i18n.global.t('legacy.xefafd9a3'))
   } finally {
     applying.value = false
   }
@@ -428,9 +429,9 @@ async function confirmApply() {
 
 async function confirmRollback() {
   try {
-    await ElMessageBox.confirm('确认回滚到上一次更新前的版本？', '回滚', {
-      confirmButtonText: '回滚',
-      cancelButtonText: '取消',
+    await ElMessageBox.confirm(i18n.global.t('legacy.xd5ff8c44'), i18n.global.t('update.rollback'), {
+      confirmButtonText: i18n.global.t('update.rollback'),
+      cancelButtonText: i18n.global.t('common.cancel'),
       type: 'warning',
     })
   } catch {
@@ -439,10 +440,10 @@ async function confirmRollback() {
   rollingBack.value = true
   try {
     await rollbackUpdate(forceApply.value)
-    ElMessage.success('已开始回滚')
+    ElMessage.success(i18n.global.t('legacy.xa0671e65'))
     await refresh()
   } catch (error: any) {
-    ElMessage.error(error.response?.data?.detail || error.message || '回滚失败')
+    ElMessage.error(error.response?.data?.detail || error.message || i18n.global.t('legacy.x22d7b738'))
   } finally {
     rollingBack.value = false
   }

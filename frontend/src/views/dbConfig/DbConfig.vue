@@ -43,6 +43,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getDbConfig, saveDbConfig, testDbConnection } from '@/api/dbConfig'
@@ -73,10 +74,10 @@ async function handleSave() {
   saving.value = true
   try {
     await saveDbConfig(form.value)
-    ElMessage.success('保存成功')
+    ElMessage.success(i18n.global.t('common.saveSuccess'))
     connected.value = true
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '保存失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('common.saveFailed'))
     connected.value = false
   } finally {
     saving.value = false
@@ -93,7 +94,7 @@ async function handleTest() {
       ElMessage.warning(res.data.message)
     }
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '测试失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x9710d9b9'))
   } finally {
     testing.value = false
   }

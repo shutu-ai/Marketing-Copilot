@@ -1,0 +1,67 @@
+export const dynamic = {
+  en: {
+    pollingUpdatedAt: "Updated at {time}",
+    dbLoadTablesFailed: "Failed to load database tables: {message}",
+    monitorScanResult: "Scan complete: copied {copied} files, processed {processed} files",
+    confirmCampaignAction: "Confirm {action} campaign ?{name}??",
+    bulkProcessedTasks: "Processed {count} tasks",
+    historicalErrors: "Historical errors: {errors}",
+    alertEvaluationComplete: "Alert evaluation complete: {count} active alerts",
+    connectionTestFailed: "Connection test failed: {message}",
+    testFailed: "Test failed: {message}",
+    publishFailed: "Publish failed: {message}",
+    restoreTemplateConfirm: "Restore language {language} to version {version}? Current content will be saved as a new history version."
+  },
+  'zh-CN': {
+    pollingUpdatedAt: "??? {time}",
+    dbLoadTablesFailed: "?????????{message}",
+    monitorScanResult: "??????? {copied} ?????? {processed} ???",
+    confirmCampaignAction: "??{action}???{name}??",
+    bulkProcessedTasks: "??? {count} ???",
+    historicalErrors: "?????{errors}",
+    alertEvaluationComplete: "???????{count} ?????",
+    connectionTestFailed: "???????{message}",
+    testFailed: "?????{message}",
+    publishFailed: "?????{message}",
+    restoreTemplateConfirm: "??????{language}?????? {version}??????????????????"
+  },
+  fr: {
+    pollingUpdatedAt: "Updated at {time}",
+    dbLoadTablesFailed: "Failed to load database tables: {message}",
+    monitorScanResult: "Scan complete: copied {copied} files, processed {processed} files",
+    confirmCampaignAction: "Confirm {action} campaign ?{name}??",
+    bulkProcessedTasks: "Processed {count} tasks",
+    historicalErrors: "Historical errors: {errors}",
+    alertEvaluationComplete: "Alert evaluation complete: {count} active alerts",
+    connectionTestFailed: "Connection test failed: {message}",
+    testFailed: "Test failed: {message}",
+    publishFailed: "Publish failed: {message}",
+    restoreTemplateConfirm: "Restore language {language} to version {version}? Current content will be saved as a new history version."
+  },
+  ar: {
+    pollingUpdatedAt: "Updated at {time}",
+    dbLoadTablesFailed: "Failed to load database tables: {message}",
+    monitorScanResult: "Scan complete: copied {copied} files, processed {processed} files",
+    confirmCampaignAction: "Confirm {action} campaign ?{name}??",
+    bulkProcessedTasks: "Processed {count} tasks",
+    historicalErrors: "Historical errors: {errors}",
+    alertEvaluationComplete: "Alert evaluation complete: {count} active alerts",
+    connectionTestFailed: "Connection test failed: {message}",
+    testFailed: "Test failed: {message}",
+    publishFailed: "Publish failed: {message}",
+    restoreTemplateConfirm: "Restore language {language} to version {version}? Current content will be saved as a new history version."
+  },
+  am: {
+    pollingUpdatedAt: "Updated at {time}",
+    dbLoadTablesFailed: "Failed to load database tables: {message}",
+    monitorScanResult: "Scan complete: copied {copied} files, processed {processed} files",
+    confirmCampaignAction: "Confirm {action} campaign ?{name}??",
+    bulkProcessedTasks: "Processed {count} tasks",
+    historicalErrors: "Historical errors: {errors}",
+    alertEvaluationComplete: "Alert evaluation complete: {count} active alerts",
+    connectionTestFailed: "Connection test failed: {message}",
+    testFailed: "Test failed: {message}",
+    publishFailed: "Publish failed: {message}",
+    restoreTemplateConfirm: "Restore language {language} to version {version}? Current content will be saved as a new history version."
+  },
+} as const

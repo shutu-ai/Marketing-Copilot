@@ -12,7 +12,7 @@
       <el-table-column prop="campaign_id" label="ID" width="70" />
       <el-table-column :label="$t('smsContent.marketingType')" width="100">
         <template #default="{ row }">
-          {{ row.marketing_type === 'realtime' ? '实时营销' : '批量营销' }}
+          {{ row.marketing_type === 'realtime' ? i18n.global.t('campaign.realtimeTitle') : i18n.global.t('campaign.batchTitle') }}
         </template>
       </el-table-column>
       <el-table-column prop="campaign_name" :label="$t('smsContent.campaignName')" min-width="160" />
@@ -32,7 +32,7 @@
               {{ $t('common.delete') }}
             </el-button>
           </span>
-          <el-button text type="primary" size="small" @click="openVersions(row)">版本</el-button>
+          <el-button text type="primary" size="small" @click="openVersions(row)">{{ $t('update.historyVersion') }}</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -45,18 +45,18 @@
       @current-change="changePage"
     />
 
-    <el-dialog v-model="versionVisible" title="模板版本历史" width="760px">
+    <el-dialog v-model="versionVisible" :title="$t('legacy.x569e45b8')" width="760px">
       <el-alert v-if="validation" :type="validation.valid ? 'success' : 'error'" :closable="false" show-icon>
-        <template #title>变量：{{ validation.variables?.join(', ') || '无' }}</template>
+        <template #title>{{ $t('legacy.x92069a3c') }}{{ validation.variables?.join(', ') || i18n.global.t('legacy.xd81bb206') }}</template>
         <div v-if="validation.warnings?.length">{{ validation.warnings.join('；') }}</div>
       </el-alert>
       <el-table :data="versions" style="margin-top:12px" max-height="420">
-        <el-table-column prop="version_no" label="版本" width="80" />
-        <el-table-column prop="language" label="语言" width="100" />
-        <el-table-column prop="content" label="内容" show-overflow-tooltip />
-        <el-table-column prop="change_note" label="变更说明" width="150" />
-        <el-table-column prop="created_at" label="时间" width="180" />
-        <el-table-column label="操作" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row)">恢复</el-button></template></el-table-column>
+        <el-table-column prop="version_no" :label="$t('update.historyVersion')" width="80" />
+        <el-table-column prop="language" :label="$t('common.language')" width="100" />
+        <el-table-column prop="content" :label="$t('legacy.x2d711b09')" show-overflow-tooltip />
+        <el-table-column prop="change_note" :label="$t('legacy.xa06b0305')" width="150" />
+        <el-table-column prop="created_at" :label="$t('logViewer.time')" width="180" />
+        <el-table-column :label="$t('common.action')" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row)">{{ $t('legacy.xc7db6d4f') }}</el-button></template></el-table-column>
       </el-table>
       <el-pagination
         v-model:current-page="versionPage"
@@ -71,6 +71,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/smsContent'
@@ -142,9 +143,9 @@ function changePage(nextPage: number) {
 async function handleDeleteCampaign(row: any) {
   if (!canDeleteCampaign(row)) return
   try {
-    await ElMessageBox.confirm('确认删除该短信配置及其所有语言模板？', '提示')
+    await ElMessageBox.confirm(i18n.global.t('legacy.x577c6ede'), i18n.global.t('legacy.x02d9819d'))
     await api.deleteCampaign(row.campaign_id)
-    ElMessage.success('删除成功')
+    ElMessage.success(i18n.global.t('legacy.x0007d170'))
     await fetchTable()
   } catch { /* ignore */ }
 }
@@ -154,8 +155,8 @@ function canDeleteCampaign(row: any) {
 }
 
 function deleteDisabledReason(row: any) {
-  if (Number(row.activity_reference_count || 0) > 0) return '短信内容已被营销活动引用，不能删除'
-  if (Number(row.task_reference_count || 0) > 0) return '短信内容已被短信任务引用，不能删除'
+  if (Number(row.activity_reference_count || 0) > 0) return i18n.global.t('legacy.x31f649e9')
+  if (Number(row.task_reference_count || 0) > 0) return i18n.global.t('legacy.xaa6ae74c')
   return ''
 }
 
@@ -189,9 +190,9 @@ function changeVersionPage(nextPage: number) {
 }
 
 async function restoreVersion(version: any) {
-  await ElMessageBox.confirm(`确认将语言「${version.language}」恢复到版本 ${version.version_no}？当前内容会自动保存为新的历史版本。`, '恢复模板')
+  await ElMessageBox.confirm(i18n.global.t('dynamic.restoreTemplateConfirm',{language:version.language,version:version.version_no}), i18n.global.t('legacy.x8bf6f6f4'))
   await api.restoreTemplateVersion(version.template_id, version.version_no)
-  ElMessage.success('模板版本已恢复')
+  ElMessage.success(i18n.global.t('legacy.x696384a9'))
   await fetchTable()
   const row = tableData.value.find(item => item.campaign_id === activeTemplate.value.campaign_id)
   if (row) await openVersions(row)

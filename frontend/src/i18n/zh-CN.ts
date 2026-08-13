@@ -66,6 +66,11 @@ export default {
     saveSuccess: '保存成功',
     saveFailed: '保存失败',
     back: '返回',
+    connectionFailed: '无法连接到服务',
+    loading: '正在加载…',
+    loadFailed: '数据加载失败',
+    retry: '重新加载',
+    noData: '暂无数据'
   },
   monitor: {
     title: '实时营销目录监控',

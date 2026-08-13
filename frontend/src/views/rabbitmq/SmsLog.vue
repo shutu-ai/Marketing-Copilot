@@ -15,7 +15,7 @@
         </el-form-item>
         <el-form-item :label="$t('common.status')">
           <el-select v-model="filters.status" clearable style="width: 130px" @change="fetchData">
-            <el-option label="全部" value="" />
+            <el-option :label="$t('common.all')" value="" />
             <el-option :label="$t('smsLog.status_sent')" value="sent" />
             <el-option :label="$t('smsLog.status_failed')" value="failed" />
             <el-option :label="$t('smsLog.status_pending')" value="pending" />

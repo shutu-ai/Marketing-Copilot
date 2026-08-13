@@ -1,16 +1,16 @@
 <template>
   <div class="db-query">
     <div class="page-header">
-      <h2>数据库 Schema</h2>
+      <h2>{{ $t('legacy.xf9493104') }}</h2>
       <div style="display:flex;gap:10px;align-items:center">
         <el-button type="primary" size="small" @click="showSqlPanel = true; scrollToSql()">
           <el-icon><Edit /></el-icon>
-          SQL 查询
+          {{ $t('legacy.x89f8857a') }}
         </el-button>
-        <el-input v-model="filterText" placeholder="搜索表名..." prefix-icon="Search" clearable style="width:220px" size="small" />
+        <el-input v-model="filterText" :placeholder="$t('legacy.xf5f09190')" prefix-icon="Search" clearable style="width:220px" size="small" />
         <el-button :loading="loadingTables" @click="fetchTables" size="small">
           <el-icon><Refresh /></el-icon>
-          刷新
+          {{ $t('common.refresh') }}
         </el-button>
       </div>
     </div>
@@ -19,9 +19,9 @@
     <el-card v-show="showSqlPanel" shadow="never" style="margin-bottom:16px">
       <template #header>
         <div style="display:flex;align-items:center;justify-content:space-between">
-          <span>SQL 查询</span>
+          <span>{{ $t('legacy.x89f8857a') }}</span>
           <div style="display:flex;gap:8px">
-            <span v-if="execTime !== null" style="font-size:12px;color:var(--mc-text-tertiary);margin-right:8px">耗时: {{ execTime }}ms</span>
+            <span v-if="execTime !== null" style="font-size:12px;color:var(--mc-text-tertiary);margin-right:8px">{{ $t('legacy.x3c724b57') }} {{ execTime }}ms</span>
             <el-button text @click="showSqlPanel = false"><el-icon><Close /></el-icon></el-button>
           </div>
         </div>
@@ -30,16 +30,16 @@
         v-model="sql"
         type="textarea"
         :rows="5"
-        placeholder="输入 SQL..."
+        :placeholder="$t('legacy.xa23a40b6')"
         style="font-family: 'Consolas', 'Courier New', monospace; font-size: 13px"
       />
       <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px">
-        <el-checkbox v-model="confirmWrite" style="margin-right:12px">确认写操作</el-checkbox>
+        <el-checkbox v-model="confirmWrite" style="margin-right:12px">{{ $t('legacy.xb8834692') }}</el-checkbox>
         <div style="display:flex;gap:8px">
-          <el-button @click="sql = ''; result = null">清空</el-button>
+          <el-button @click="sql = ''; result = null">{{ $t('legacy.x288f0c40') }}</el-button>
           <el-button type="primary" :loading="executing" @click="handleExecute" style="min-width:100px">
             <el-icon style="margin-right:4px"><CaretRight /></el-icon>
-            执行
+            {{ $t('legacy.x1a6aa24e') }}
           </el-button>
         </div>
       </div>
@@ -47,8 +47,8 @@
       <div v-if="result" style="margin-top:16px">
         <el-alert v-if="result.type === 'error'" :title="result.error" type="error" show-icon :closable="false" />
         <div v-else style="font-size:13px;margin-bottom:8px;color:var(--mc-text-secondary)">
-          <template v-if="result.type === 'select'">查询结果 — {{ result.row_count }} 行, {{ result.columns?.length }} 列</template>
-          <template v-else>成功 — 影响 {{ result.affected_rows }} 行</template>
+          <template v-if="result.type === 'select'">{{ $t('legacy.x844393f7') }} — {{ result.row_count }} {{ $t('legacy.x2d5aef4f') }}, {{ result.columns?.length }} {{ $t('legacy.xcb2f68c9') }}</template>
+          <template v-else>{{ $t('legacy.x330363df') }} — {{ $t('legacy.x28b42306') }} {{ result.affected_rows }} {{ $t('legacy.x2d5aef4f') }}</template>
         </div>
         <el-table
           v-if="result.type === 'select'"
@@ -56,7 +56,7 @@
           stripe border size="small" style="width:100%" max-height="400"
         >
           <el-table-column v-for="col in resultColumns" :key="col" :prop="col" :label="col" min-width="120" show-overflow-tooltip />
-          <template #empty><el-empty description="暂无数据" /></template>
+          <template #empty><el-empty :description="$t('common.noData')" /></template>
         </el-table>
         <el-pagination
           v-if="result.type === 'select'"
@@ -82,7 +82,7 @@
             <el-tag v-if="tbl.table_comment" size="small" type="info" style="margin-left:8px">{{ tbl.table_comment }}</el-tag>
           </div>
           <div class="schema-table-meta">
-            <span>{{ tbl.columns.length }} 列</span>
+            <span>{{ tbl.columns.length }} {{ $t('legacy.xcb2f68c9') }}</span>
             <el-icon style="margin-left:12px;font-size:12px;transition:transform .2s" :style="{ transform: expandedTables[tbl.table_name] ? 'rotate(180deg)' : '' }">
               <ArrowDown />
             </el-icon>
@@ -93,19 +93,19 @@
             <thead>
               <tr>
                 <th style="width:28px"></th>
-                <th style="width:200px">字段名</th>
-                <th style="width:110px">类型</th>
-                <th style="width:70px">可空</th>
-                <th style="width:60px">键</th>
-                <th style="width:180px">默认值</th>
-                <th>备注</th>
-                <th style="width:90px">操作</th>
+                <th style="width:200px">{{ $t('legacy.xd3145589') }}</th>
+                <th style="width:110px">{{ $t('legacy.x226b0912') }}</th>
+                <th style="width:70px">{{ $t('legacy.xd9b46407') }}</th>
+                <th style="width:60px">{{ $t('legacy.xf72c6ffa') }}</th>
+                <th style="width:180px">{{ $t('legacy.x225f3ed0') }}</th>
+                <th>{{ $t('legacy.x2432b575') }}</th>
+                <th style="width:90px">{{ $t('common.action') }}</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="col in tbl.columns" :key="col.column_name">
                 <td style="text-align:center">
-                  <el-icon v-if="col.is_pk" style="color:var(--mc-primary);font-size:16px" title="主键"><Key /></el-icon>
+                  <el-icon v-if="col.is_pk" style="color:var(--mc-primary);font-size:16px" :title="$t('legacy.x475cdfca')"><Key /></el-icon>
                 </td>
                 <td><span class="col-name">{{ col.column_name }}</span></td>
                 <td><el-tag size="small" :type="typeTag(col.data_type)">{{ col.data_type }}</el-tag></td>
@@ -120,14 +120,14 @@
                 <td><code v-if="col.column_default" class="default-val">{{ col.column_default }}</code></td>
                 <td><span class="col-comment">{{ col.column_comment || '-' }}</span></td>
                 <td>
-                  <el-button size="small" text type="primary" @click="insertColumn(tbl.table_name, col.column_name)">插入</el-button>
+                  <el-button size="small" text type="primary" @click="insertColumn(tbl.table_name, col.column_name)">{{ $t('legacy.x9bdb07e7') }}</el-button>
                 </td>
               </tr>
             </tbody>
           </table>
           <div class="schema-col-actions">
-            <el-button size="small" text type="primary" :icon="Search" @click.stop="quickQuery(tbl.table_name)">查询全部</el-button>
-            <el-button size="small" text type="primary" :icon="Edit" @click.stop="openSqlEditor(tbl)">自定义 SQL</el-button>
+            <el-button size="small" text type="primary" :icon="Search" @click.stop="quickQuery(tbl.table_name)">{{ $t('legacy.xb6a971fa') }}</el-button>
+            <el-button size="small" text type="primary" :icon="Edit" @click.stop="openSqlEditor(tbl)">{{ $t('legacy.x790605a4') }}</el-button>
           </div>
         </div>
       </div>
@@ -136,6 +136,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Search, Collection, Close, ArrowDown, Key, Edit, CaretRight } from '@element-plus/icons-vue'
@@ -202,8 +203,8 @@ async function fetchTables() {
     tables.value.forEach(t => { expandedTables.value[t.table_name] = true })
   } catch (e: any) {
     tables.value = []
-    const msg = e?.response?.data?.detail || e?.message || '加载失败'
-    ElMessage.error('加载数据库表失败: ' + msg)
+    const msg = e?.response?.data?.detail || e?.message || i18n.global.t('remaining.x866b795e')
+    ElMessage.error(i18n.global.t('dynamic.dbLoadTablesFailed',{message:msg}))
   } finally {
     loadingTables.value = false
   }
@@ -245,9 +246,9 @@ function insertColumn(table: string, column: string) {
 
 async function handleExecute() {
   const trimmed = sql.value.trim()
-  if (!trimmed) { ElMessage.warning('请输入 SQL'); return }
+  if (!trimmed) { ElMessage.warning(i18n.global.t('remaining.x5247e599')); return }
   const isWrite = !/^\s*(SELECT|WITH)\b/i.test(trimmed)
-  if (isWrite && !confirmWrite.value) { ElMessage.warning('执行写操作请勾选确认'); return }
+  if (isWrite && !confirmWrite.value) { ElMessage.warning(i18n.global.t('legacy.x6f33c867')); return }
 
   executing.value = true; execTime.value = null
   const start = performance.now()
@@ -259,7 +260,7 @@ async function handleExecute() {
     execTime.value = Math.round(performance.now() - start)
     if (res.data.type === 'error') ElMessage.error(res.data.error)
   } catch (e: any) {
-    const msg = e?.response?.data?.detail || e?.message || '执行失败'
+    const msg = e?.response?.data?.detail || e?.message || i18n.global.t('legacy.x1c83d797')
     result.value = { type: 'error', error: msg }
     ElMessage.error(msg)
   } finally { executing.value = false }

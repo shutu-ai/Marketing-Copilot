@@ -14,12 +14,12 @@
       <el-form :model="form" label-width="130px" size="small">
         <el-form-item :label="$t('smsContent.marketingType')" required>
           <template v-if="isEdit || isFromMarketing">
-            <el-input :model-value="form.marketing_type === 'realtime' ? '实时营销' : '批量营销'" disabled />
+            <el-input :model-value="form.marketing_type === 'realtime' ? i18n.global.t('campaign.realtimeTitle') : i18n.global.t('campaign.batchTitle')" disabled />
           </template>
           <template v-else>
             <el-select v-model="form.marketing_type" style="width:100%" @change="onMarketingTypeChange">
-              <el-option label="批量营销" value="batch" />
-              <el-option label="实时营销" value="realtime" />
+              <el-option :label="$t('campaign.batchTitle')" value="batch" />
+              <el-option :label="$t('campaign.realtimeTitle')" value="realtime" />
             </el-select>
           </template>
         </el-form-item>
@@ -56,7 +56,7 @@
         </div>
         <el-form label-width="100px" size="small">
           <el-form-item :label="$t('common.language')" required>
-            <el-select v-model="row.language" style="width:100%" placeholder="请选择语言">
+            <el-select v-model="row.language" style="width:100%" :placeholder="$t('legacy.xd17b8085')">
               <el-option
                 v-for="language in availableLanguages(idx)"
                 :key="language"
@@ -77,6 +77,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -165,16 +166,16 @@ async function loadSmsContentCampaign(campaignId: number) {
 
 async function handleSave() {
   if (!form.marketing_campaign_id && !isEdit.value) {
-    ElMessage.warning('请选择营销活动')
+    ElMessage.warning(i18n.global.t('legacy.x48024920'))
     return
   }
   const validRows = rows.value.filter(row => row.language && row.content?.trim())
   if (validRows.length === 0) {
-    ElMessage.warning('请至少添加一条语言内容')
+    ElMessage.warning(i18n.global.t('legacy.xc0e037ac'))
     return
   }
   if (new Set(validRows.map(row => row.language)).size !== validRows.length) {
-    ElMessage.warning('同一种语言只能配置一次')
+    ElMessage.warning(i18n.global.t('legacy.x87b560b0'))
     return
   }
 
@@ -226,10 +227,10 @@ async function handleSave() {
       }
     }
 
-    ElMessage.success(editingCampaignId ? '更新成功' : '新增成功')
+    ElMessage.success(editingCampaignId ? i18n.global.t('legacy.x55aa6366') : i18n.global.t('legacy.xa5bfd70d'))
     goBack()
   } catch (e: any) {
-    const msg = e?.response?.data?.detail || e?.message || '保存失败'
+    const msg = e?.response?.data?.detail || e?.message || i18n.global.t('common.saveFailed')
     ElMessage.error(msg)
   } finally {
     saving.value = false

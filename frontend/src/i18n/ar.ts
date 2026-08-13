@@ -1,0 +1,1 @@
+export default { auth: { subtitle: 'Arabic marketing assistant', login: 'Login', username: 'Username', password: 'Password' }, layout: { language: 'Interface language' }, common: { save: 'Save', cancel: 'Cancel', search: 'Search' } }

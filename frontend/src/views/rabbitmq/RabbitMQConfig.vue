@@ -94,6 +94,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getRabbitMQConfig, saveRabbitMQConfig, updateRabbitMQConfig, getRabbitMQStatus, testPublish } from '@/api/rabbitmq'
@@ -136,9 +137,9 @@ async function handleSave() {
     } else {
       await saveRabbitMQConfig(form.value)
     }
-    ElMessage.success('保存成功')
+    ElMessage.success(i18n.global.t('common.saveSuccess'))
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '保存失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('common.saveFailed'))
   }
 }
 
@@ -161,12 +162,12 @@ async function handleTestPublish() {
     }
     const res = await testPublish(testForm.value.routing_key, msg)
     if (res.data.success) {
-      ElMessage.success('发布成功')
+      ElMessage.success(i18n.global.t('monitor.publishSuccess'))
     } else {
-      ElMessage.warning('发布失败: ' + res.data.message)
+      ElMessage.warning(i18n.global.t('dynamic.publishFailed',{message:res.data.message}))
     }
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '发布失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('monitor.publishFailed'))
   } finally {
     testing.value = false
   }

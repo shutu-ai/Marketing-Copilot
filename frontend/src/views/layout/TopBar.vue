@@ -40,10 +40,10 @@
         :model-value="currentLocale"
         @update:model-value="switchLocale"
         size="small"
-        style="width: 120px"
+        style="width: 138px"
       >
-        <el-option label="中文" value="zh-CN" />
-        <el-option label="English" value="en" />
+        <el-option v-for="item in supportedLocales" :key="item.value" :label="item.label" :value="item.value" />
+
       </el-select>
     </div>
 
@@ -81,7 +81,7 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 
-import { useElementPlusLocale } from '@/utils/locale'
+import { setDocumentLocale, supportedLocales } from '@/i18n'
 import { useAuthStore } from '@/stores/auth'
 import { changeMyPassword } from '@/api/users'
 
@@ -102,7 +102,7 @@ const passwordForm = reactive({ old: '', newPwd: '', confirm: '' })
 function switchLocale(val: string) {
   locale.value = val
   localStorage.setItem('locale', val)
-  useElementPlusLocale(val)
+  setDocumentLocale(val)
 }
 
 function onUserCommand(command: string) {

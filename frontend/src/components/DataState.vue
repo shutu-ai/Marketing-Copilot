@@ -5,7 +5,8 @@
   <slot v-else />
 </template>
 <script setup lang="ts">
-defineProps({loading:Boolean,hasData:Boolean,empty:Boolean,error:{type:String,default:''},loadingText:{type:String,default:'正在加载…'},errorTitle:{type:String,default:'数据加载失败'},retryText:{type:String,default:'重新加载'},emptyTitle:{type:String,default:'暂无数据'},emptyDescription:{type:String,default:''}})
+import i18n from '@/i18n'
+defineProps({loading:Boolean,hasData:Boolean,empty:Boolean,error:{type:String,default:''},loadingText:{type:String,default:i18n.global.t('common.loading')},errorTitle:{type:String,default:i18n.global.t('common.loadFailed')},retryText:{type:String,default:i18n.global.t('common.retry')},emptyTitle:{type:String,default:i18n.global.t('common.noData')},emptyDescription:{type:String,default:''}})
 defineEmits<{ retry: [] }>()
 </script>
 <style scoped>.data-state{min-height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:32px;text-align:center;color:var(--mc-text-secondary)}.data-state strong{color:var(--mc-text);font-size:15px}.data-state--error>.el-icon{color:var(--mc-danger)}</style>

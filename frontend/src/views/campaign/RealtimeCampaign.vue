@@ -3,7 +3,7 @@
     <PageHeader :title="$t('campaign.realtimeTitle')" :description="$t('campaign.realtimeDesc')">
       <template #actions>
         <el-button :loading="loading" @click="fetchList">
-          <el-icon><Refresh /></el-icon>刷新
+          <el-icon><Refresh /></el-icon>{{ $t('common.refresh') }}
         </el-button>
         <el-button type="primary" @click="showDialog(null)">
           <el-icon><Plus /></el-icon>{{ $t('campaign.addCampaign') }}
@@ -120,10 +120,10 @@
                 <el-dropdown-menu>
                   <el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item>
                   <el-dropdown-item command="upload" :disabled="row.use_whitelist === false">
-                    {{ row.status === 'in_progress' ? '更新白名单' : $t('campaign.uploadWhitelist') }}
+                    {{ row.status === 'in_progress' ? i18n.global.t('legacy.xecf4ee8a') : $t('campaign.uploadWhitelist') }}
                   </el-dropdown-item>
                   <el-dropdown-item command="sms">
-                    {{ row.status === 'in_progress' ? '更新短信' : $t('smsContent.configSms') }}
+                    {{ row.status === 'in_progress' ? i18n.global.t('legacy.x2c4cd0cb') : $t('smsContent.configSms') }}
                   </el-dropdown-item>
                   <el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item>
                   <el-dropdown-item v-if="row.status !== 'in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item>
@@ -155,8 +155,8 @@
         <el-form-item :label="$t('campaign.name')" required>
           <el-input v-model="editForm.name" />
         </el-form-item>
-        <el-form-item label="是否需要白名单">
-          <el-switch v-model="editForm.use_whitelist" active-text="需要" inactive-text="不需要" />
+        <el-form-item :label="$t('legacy.xb1b4be1b')">
+          <el-switch v-model="editForm.use_whitelist" :active-text="$t('legacy.xdf16ffce')" in:active-text="$t('legacy.x8755a53c')" />
         </el-form-item>
         <div v-if="editForm.status !== 'ended'" class="advanced-toggle">
           <el-switch v-model="customDirectory" :active-text="$t('campaign.customDirectory')" @change="handleCustomDirectoryChange" />
@@ -281,6 +281,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
@@ -453,7 +454,7 @@ function readinessItems(row: Campaign) {
   const scheduleReady = Boolean(row.start_time && row.end_time && row.send_start_time && row.send_end_time)
   const watchFilenamePrefix = row.watch_filename_prefix || 'Android_4G_Switch_Somali_'
   return [
-    { ok: row.use_whitelist === false || row.row_count > 0, label: row.use_whitelist === false ? '不需要白名单' : t(row.row_count > 0 ? 'campaign.whitelistReady' : 'campaign.whitelistMissing') },
+    { ok: row.use_whitelist === false || row.row_count > 0, label: row.use_whitelist === false ? i18n.global.t('legacy.xc9b0bc31') : t(row.row_count > 0 ? 'campaign.whitelistReady' : 'campaign.whitelistMissing') },
     { ok: Boolean(row.sms_template_id), label: t(row.sms_template_id ? 'campaign.templateReady' : 'campaign.templateMissing') },
     { ok: Boolean(row.smpp_config_id), label: t(row.smpp_config_id ? 'campaign.smppReady' : 'campaign.smppMissing') },
     { ok: scheduleReady, label: t(scheduleReady ? 'campaign.scheduleReady' : 'campaign.scheduleMissing') },
@@ -490,7 +491,7 @@ function startHint(row: Campaign) {
 
 async function handleSave() {
   if (!editForm.value.name) {
-    ElMessage.warning('请输入活动名称')
+    ElMessage.warning(i18n.global.t('legacy.x7528b32e'))
     return
   }
   if (!editForm.value.id && !editForm.value.phone_prefix.trim()) {
@@ -536,7 +537,7 @@ async function handleSave() {
     dialogVisible.value = false
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))
   } finally {
     saving.value = false
   }
@@ -564,11 +565,11 @@ async function handleUploadSubmit() {
       selectedFile.value,
       (percent) => { uploadPercent.value = percent },
     )
-    ElMessage.success('上传成功')
+    ElMessage.success(i18n.global.t('legacy.xa7699ba7'))
     uploadVisible.value = false
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '上传失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x54e5de42'))
   } finally {
     uploadPercent.value = 0
     uploading.value = false
@@ -578,26 +579,26 @@ async function handleUploadSubmit() {
 async function handleStart(row: Campaign) {
   try {
     await api.updateRealtimeCampaign(row.id, { status: 'in_progress' })
-    ElMessage.success(row.status === 'ended' ? '已重新启动' : '已开始')
+    ElMessage.success(row.status === 'ended' ? i18n.global.t('legacy.x5a684a25') : i18n.global.t('legacy.xde05b7cf'))
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))
   }
 }
 
 async function handleEnd(row: Campaign) {
   try {
     await api.updateRealtimeCampaign(row.id, { status: 'ended' })
-    ElMessage.success('已停止')
+    ElMessage.success(i18n.global.t('legacy.x82977854'))
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))
   }
 }
 
 async function handleDelete(id: number) {
   try {
-    await ElMessageBox.confirm('确认删除该活动？', '提示')
+    await ElMessageBox.confirm(i18n.global.t('smsContent.confirmDeleteCampaign'), i18n.global.t('legacy.x02d9819d'))
   } catch {
     return
   }
@@ -605,9 +606,9 @@ async function handleDelete(id: number) {
   try {
     await api.deleteRealtimeCampaign(id)
     campaigns.value = campaigns.value.filter(item => item.id !== id)
-    ElMessage.success('删除成功')
+    ElMessage.success(i18n.global.t('legacy.x0007d170'))
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '删除失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.xacf0664a'))
     await fetchList()
   }
 }
@@ -615,10 +616,10 @@ async function handleDelete(id: number) {
 async function handleCopy(row: Campaign) {
   try {
     await api.copyRealtimeCampaign(row.id)
-    ElMessage.success('复制成功')
+    ElMessage.success(i18n.global.t('legacy.x20a49536'))
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '复制失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5154ae17'))
   }
 }
 
@@ -667,7 +668,7 @@ async function openSmsConfig(row: Campaign) {
       },
     })
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '加载短信配置失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x93347d5b'))
   }
 }
 

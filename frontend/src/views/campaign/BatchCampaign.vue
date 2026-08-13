@@ -112,7 +112,7 @@
               {{ $t('campaign.end') }}
             </el-button>
           </template>
-          <el-dropdown trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ row.status === 'in_progress' ? '更新目标清单' : $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+          <el-dropdown trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ row.status === 'in_progress' ? i18n.global.t('legacy.x780a6b21') : $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
           </div>
         </template>
       </el-table-column>
@@ -256,6 +256,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -411,7 +412,7 @@ function startHint(row: Campaign) {
 
 async function handleSave() {
   if (!editForm.value.name) {
-    ElMessage.warning('请输入活动名称')
+    ElMessage.warning(i18n.global.t('legacy.x7528b32e'))
     return
   }
   if (!editForm.value.id && !editForm.value.phone_prefix.trim()) {
@@ -453,7 +454,7 @@ async function handleSave() {
     dialogVisible.value = false
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))
   } finally {
     saving.value = false
   }
@@ -487,11 +488,11 @@ async function handleUploadSubmit() {
   uploading.value = true
   try {
     await api.uploadCustomerList(uploadCampaignId.value, selectedFile.value)
-    ElMessage.success('上传成功')
+    ElMessage.success(i18n.global.t('legacy.xa7699ba7'))
     uploadVisible.value = false
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '上传失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x54e5de42'))
   } finally {
     uploading.value = false
   }
@@ -500,36 +501,36 @@ async function handleUploadSubmit() {
 async function handleStart(row: Campaign) {
   try {
     await api.updateCampaign(row.id, { status: 'in_progress' })
-    ElMessage.success('已开始')
+    ElMessage.success(i18n.global.t('legacy.xde05b7cf'))
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))
   }
 }
 
 async function handleEnd(row: Campaign) {
   try {
     await api.updateCampaign(row.id, { status: 'ended' })
-    ElMessage.success('已结束')
+    ElMessage.success(i18n.global.t('campaign.status_ended'))
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '操作失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))
   }
 }
 
 async function handleCopy(id: number) {
   try {
     await api.copyCampaign(id)
-    ElMessage.success('复制成功')
+    ElMessage.success(i18n.global.t('legacy.x20a49536'))
     await fetchList()
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '复制失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5154ae17'))
   }
 }
 
 async function handleDelete(id: number) {
   try {
-    await ElMessageBox.confirm('确认删除该活动？', '提示')
+    await ElMessageBox.confirm(i18n.global.t('smsContent.confirmDeleteCampaign'), i18n.global.t('legacy.x02d9819d'))
   } catch {
     return
   }
@@ -537,9 +538,9 @@ async function handleDelete(id: number) {
   try {
     await api.deleteCampaign(id)
     campaigns.value = campaigns.value.filter(item => item.id !== id)
-    ElMessage.success('删除成功')
+    ElMessage.success(i18n.global.t('legacy.x0007d170'))
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '删除失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.xacf0664a'))
     // Reconcile with the server even when an older backend deleted the row but
     // incorrectly returned an error response.
     await fetchList()
@@ -564,7 +565,7 @@ async function openSmsConfig(row: Campaign) {
       },
     })
   } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || '加载短信配置失败')
+    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x93347d5b'))
   }
 }
 

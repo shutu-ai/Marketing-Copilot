@@ -44,21 +44,26 @@
           {{ $t('auth.login') }}
         </el-button>
       </el-form>
+      <el-select v-model="currentLocale" class="login-language" :aria-label="$t('layout.language')" size="small">
+        <el-option v-for="item in supportedLocales" :key="item.value" :label="item.label" :value="item.value" />
+      </el-select>
     </el-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
+import { setDocumentLocale, supportedLocales } from '@/i18n'
 
 const authStore = useAuthStore()
 const router = useRouter()
 const route = useRoute()
-const { t } = useI18n()
+const { t, locale } = useI18n()
+const currentLocale = computed({ get: () => locale.value, set: (value: string) => { locale.value = value; localStorage.setItem('locale', value); setDocumentLocale(value) } })
 
 const username = ref('')
 const password = ref('')
@@ -144,4 +149,5 @@ async function submit() {
   margin-top: 6px;
   border-radius: 10px;
 }
+.login-language { display: block; width: 120px; margin-top: 14px; margin-right: auto; }
 </style>

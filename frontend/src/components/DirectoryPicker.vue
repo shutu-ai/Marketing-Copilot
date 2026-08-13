@@ -19,6 +19,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Folder } from '@element-plus/icons-vue'
@@ -44,7 +45,7 @@ async function load(path = '') {
       await load('')
       return
     }
-    ElMessage.error(error.response?.data?.detail || '无法读取目录')
+    ElMessage.error(error.response?.data?.detail || i18n.global.t('legacy.xd058ce75'))
   } finally {
     loading.value = false
   }

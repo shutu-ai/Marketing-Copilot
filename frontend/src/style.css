@@ -70,6 +70,7 @@ body,
 body {
   overflow: hidden;
 }
+html[dir='rtl'] { direction: rtl; }
 
 ::selection {
   color: var(--mc-text);

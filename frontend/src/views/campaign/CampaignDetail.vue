@@ -31,8 +31,8 @@
                 <span style="white-space:pre-wrap">{{ tpl.content }}</span>
               </div>
             </template>
-            <span v-else-if="campaign.sms_template_id" style="color:#999">已关联模板 #{{ campaign.sms_template_id }}</span>
-            <span v-else style="color:#ccc">未配置</span>
+            <span v-else-if="campaign.sms_template_id" style="color:#999">{{ $t('legacy.xe2172505') }} #{{ campaign.sms_template_id }}</span>
+            <span v-else style="color:#ccc">{{ $t('legacy.x71dc8feb') }}</span>
           </el-descriptions-item>
           <el-descriptions-item :label="$t('campaign.sendDays')">
             <template v-if="campaign.send_days?.length">
@@ -54,21 +54,21 @@
         <el-tab-pane :label="$t('campaign.customerList')" name="prospects">
           <template v-if="campaign?.customer_list_path">
             <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-              <el-select v-model="filterField" clearable placeholder="字段" size="small" style="width:100px" @change="filterValue = ''">
+              <el-select v-model="filterField" clearable :placeholder="$t('legacy.x9caecd93')" size="small" style="width:100px" @change="filterValue = ''">
                 <el-option v-for="h in prospectHeaders" :key="h" :label="h" :value="h" />
               </el-select>
-              <el-input v-if="filterField" v-model="filterValue" placeholder="筛选值" size="small" style="width:130px" clearable @input="handleFilter" />
-              <el-input v-model="searchText" placeholder="全局搜索" size="small" style="width:180px" clearable @input="handleFilter">
+              <el-input v-if="filterField" v-model="filterValue" :placeholder="$t('legacy.xe125986c')" size="small" style="width:130px" clearable @input="handleFilter" />
+              <el-input v-model="searchText" :placeholder="$t('legacy.x681c0f39')" size="small" style="width:180px" clearable @input="handleFilter">
                 <template #prefix><el-icon><Search /></el-icon></template>
               </el-input>
             </div>
-            <el-empty v-if="!prospectLoading && prospectTotal === 0" :description="searchText || filterField ? '无匹配数据' : '暂无数据'" />
+            <el-empty v-if="!prospectLoading && prospectTotal === 0" :description="searchText || filterField ? i18n.global.t('legacy.xa32c4660') : i18n.global.t('common.noData')" />
             <template v-else>
               <el-table ref="prospectTableRef" :data="prospectRows" stripe border size="small" max-height="500" v-loading="prospectLoading">
                 <el-table-column v-for="h in prospectHeaders" :key="h" :prop="h" :label="h" min-width="120" />
               </el-table>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
-                <span style="font-size:13px;color:#909399">共 {{ prospectTotal }} 条</span>
+                <span style="font-size:13px;color:#909399">{{ $t('legacy.xfbd2b1fb') }} {{ prospectTotal }}</span>
                 <el-pagination
                   v-model:current-page="prospectPage"
                   :page-size="prospectPageSize"
@@ -80,16 +80,16 @@
               </div>
             </template>
           </template>
-          <el-empty v-else description="暂无潜客名单" />
+          <el-empty v-else :description="$t('legacy.xbebe25ea')" />
         </el-tab-pane>
-        <el-tab-pane label="已发送记录" name="sent">
+        <el-tab-pane :label="$t('legacy.xe7502eb1')" name="sent">
           <el-table ref="sentTableRef" v-if="(campaign.daily_stats || []).length" :data="pagedStats" stripe border size="small">
-            <el-table-column prop="stats_date" label="日期" width="140" />
-            <el-table-column prop="total_prospects" label="名单总数" width="120" />
-            <el-table-column prop="sent_count" label="已发送" width="120" />
+            <el-table-column prop="stats_date" :label="$t('campaign.date')" width="140" />
+            <el-table-column prop="total_prospects" :label="$t('remaining.x35240e82')" width="120" />
+            <el-table-column prop="sent_count" :label="$t('smsLog.status_sent')" width="120" />
             <el-table-column prop="smpp_label" label="SMPP" min-width="180" />
           </el-table>
-          <el-empty v-else description="暂无发送记录" />
+          <el-empty v-else :description="$t('legacy.x4c105d20')" />
           <div v-if="(campaign.daily_stats || []).length" style="display:flex;justify-content:flex-end;margin-top:12px">
             <el-pagination
               v-model:current-page="sentPage"
@@ -106,6 +106,7 @@
 </template>
 
 <script setup lang="ts">
+import i18n from '@/i18n'
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import StatusTag from '@/components/StatusTag.vue'
