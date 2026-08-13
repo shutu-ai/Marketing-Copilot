@@ -18,11 +18,11 @@ import { localizedSafe } from './localizedSafe'
 import { rebuildLocale, rebuiltAr, rebuiltAm } from './rebuild'
 import { monitorStatus } from './monitorStatus'
 export const supportedLocales = [
-  { value: 'zh-CN', label: 'Chinese', direction: 'ltr' },
+  { value: 'zh-CN', label: '\u4e2d\u6587', direction: 'ltr' },
   { value: 'en', label: 'English', direction: 'ltr' },
-  { value: 'fr', label: 'French', direction: 'ltr' },
-  { value: 'ar', label: 'Arabic', direction: 'rtl' },
-  { value: 'am', label: 'Amharic', direction: 'ltr' },
+  { value: 'fr', label: 'Fran\u00e7ais', direction: 'ltr' },
+  { value: 'ar', label: '\u0627\u0644\u0639\u0631\u0628\u064a\u0629', direction: 'rtl' },
+  { value: 'am', label: '\u12a0\u121b\u122d\u129b', direction: 'ltr' },
 ] as const
 const storedLocale = localStorage.getItem('locale') || 'zh-CN'
 export const initialLocale = supportedLocales.some(item => item.value === storedLocale) ? storedLocale : 'zh-CN'
