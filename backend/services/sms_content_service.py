@@ -2,7 +2,7 @@ from database import get_connection
 from models.sms_content import CampaignCreate, CampaignUpdate, SmsTemplateCreate, SmsTemplateUpdate
 from typing import Optional, List
 import re
-from services import operations_service
+from services import operations_service, sms_task_service
 
 
 VARIABLE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -341,6 +341,7 @@ def create_template(data: SmsTemplateCreate) -> dict:
     _save_version(conn, result, "Initial version")
     conn.commit()
     conn.close()
+    sms_task_service.invalidate_template_cache()
     operations_service.audit("template.create", "sms_template", result["id"], {"variables": validation["variables"]})
     return result
 
@@ -385,6 +386,7 @@ def update_template(template_id: int, data: SmsTemplateUpdate) -> Optional[dict]
     conn.commit()
     conn.close()
     if fields:
+        sms_task_service.invalidate_template_cache()
         operations_service.audit("template.update", "sms_template", template_id, {"fields": sorted(fields)})
     return result
 
@@ -433,6 +435,7 @@ def restore_template_version(template_id: int, version_no: int) -> Optional[dict
     restored = dict(conn.execute("SELECT * FROM sms_templates WHERE id=?", (template_id,)).fetchone())
     _save_version(conn, restored, f"Restored from version {version_no}")
     conn.commit(); conn.close()
+    sms_task_service.invalidate_template_cache()
     operations_service.audit("template.restore", "sms_template", template_id, {"version_no": version_no})
     return restored
 
@@ -452,6 +455,7 @@ def delete_template(template_id: int) -> bool:
     conn.execute("DELETE FROM sms_templates WHERE id=?", (template_id,))
     conn.commit()
     conn.close()
+    sms_task_service.invalidate_template_cache()
     return True
 
 

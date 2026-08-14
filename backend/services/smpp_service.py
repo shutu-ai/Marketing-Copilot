@@ -6,6 +6,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _invalidate_gateway_config_cache() -> None:
+    try:
+        from services.smpp_gateway import gateway
+        gateway.invalidate_config_cache()
+    except Exception:
+        logger.debug("Unable to invalidate SMPP gateway config cache", exc_info=True)
+
 _BIND_STATUS_MESSAGES = {
     0x00000003: "命令无效 (ESME_RINVCMDID)",
     0x0000000E: "密码错误 (ESME_RINVPASWD)",
@@ -56,6 +64,7 @@ def create_config(data: SmppConfigCreate) -> dict:
     conn.commit()
     row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone()
     conn.close()
+    _invalidate_gateway_config_cache()
     return _masked(row)
 
 
@@ -93,6 +102,7 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     conn.commit()
     row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
     conn.close()
+    _invalidate_gateway_config_cache()
     return _masked(row)
 
 
@@ -102,6 +112,7 @@ def delete_config(config_id: int) -> bool:
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    _invalidate_gateway_config_cache()
     return deleted
 
 

@@ -23,6 +23,16 @@ _TASK_COUNT_CACHE = {}
 _EXCLUSION_COUNT_CACHE = None
 _EXCLUSION_COUNT_CACHE_AT = 0.0
 _EXCLUSION_COUNT_LOCK = threading.Lock()
+_CACHE_LOCK = threading.RLock()
+_CAMPAIGN_CACHE = {}
+_TEMPLATE_CACHE = {}
+_CAMPAIGN_CACHE_TTL = 30.0
+_CAMPAIGN_CACHE_GENERATION = 0
+_TEMPLATE_CACHE_GENERATION = 0
+
+# Keep SQL statements bounded. 2000 rows is inside the requested 1000-5000
+# range while leaving room for the task/event columns in DuckDB statements.
+DB_INSERT_BATCH_SIZE = 2000
 
 
 FINAL_STATES = {"delivered", "failed", "expired", "cancelled", "archived", "accepted"}
@@ -60,6 +70,54 @@ def normalize_language_key(value) -> str:
     return LANGUAGE_ALIASES.get(key, key)
 
 
+def invalidate_campaign_cache(campaign_type: str = "", campaign_id: Optional[int] = None) -> None:
+    """Invalidate versioned runtime snapshots after campaign/config changes."""
+    global _CAMPAIGN_CACHE_GENERATION, _TEMPLATE_CACHE_GENERATION
+    with _CACHE_LOCK:
+        _CAMPAIGN_CACHE_GENERATION += 1
+        _TEMPLATE_CACHE_GENERATION += 1
+        if campaign_type and campaign_id is not None:
+            key = (campaign_type, int(campaign_id))
+            _CAMPAIGN_CACHE.pop(key, None)
+            _TEMPLATE_CACHE.pop(key, None)
+        else:
+            _CAMPAIGN_CACHE.clear()
+            _TEMPLATE_CACHE.clear()
+
+
+def invalidate_template_cache() -> None:
+    global _TEMPLATE_CACHE_GENERATION
+    with _CACHE_LOCK:
+        _TEMPLATE_CACHE_GENERATION += 1
+        _TEMPLATE_CACHE.clear()
+
+
+def _cached_campaign(conn, campaign_type: str, campaign_id: int) -> Optional[dict]:
+    key = (campaign_type, int(campaign_id))
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        cached = _CAMPAIGN_CACHE.get(key)
+        if cached and now - cached[0] < _CAMPAIGN_CACHE_TTL:
+            return dict(cached[1])
+        generation = _CAMPAIGN_CACHE_GENERATION
+    table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(campaign_type)
+    if not table:
+        return None
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (campaign_id,)).fetchone()
+    if owns_conn:
+        conn.close()
+    if not row:
+        return None
+    campaign = dict(row)
+    with _CACHE_LOCK:
+        if generation == _CAMPAIGN_CACHE_GENERATION:
+            _CAMPAIGN_CACHE[key] = (time.monotonic(), campaign)
+    return dict(campaign)
+
+
 def _add_task_event(conn, task_id: int, event_type: str, from_status: str = "", to_status: str = "",
                     message: str = "", detail=None):
     conn.execute(
@@ -71,17 +129,24 @@ def _add_task_event(conn, task_id: int, event_type: str, from_status: str = "", 
 
 
 def _bulk_insert_tasks(conn, task_rows) -> list:
-    """Insert tasks in one multi-row statement, returning (id, dedupe_key) pairs."""
+    """Insert tasks in bounded multi-row statements, returning inserted pairs."""
+    if not task_rows:
+        return []
     columns = ("campaign_type", "campaign_id", "batch_id", "campaign_name", "msisdn", "language",
                "sms_template_id", "smpp_config_id", "content", "source_addr", "payload",
                "source_file", "task_date", "dedupe_key")
     placeholders = ",".join("?" for _ in columns)
-    values = ",".join(f"({placeholders})" for _ in task_rows)
-    conn.execute(
-        f"INSERT INTO sms_tasks ({','.join(columns)}) VALUES {values} RETURNING id, dedupe_key",
-        [value for row in task_rows for value in row],
-    )
-    return [(r["id"], r["dedupe_key"]) for r in conn.fetchall()]
+    inserted = []
+    for start in range(0, len(task_rows), DB_INSERT_BATCH_SIZE):
+        rows = task_rows[start:start + DB_INSERT_BATCH_SIZE]
+        values = ",".join(f"({placeholders})" for _ in rows)
+        conn.execute(
+            f"INSERT INTO sms_tasks ({','.join(columns)}) VALUES {values} "
+            "ON CONFLICT (dedupe_key) DO NOTHING RETURNING id, dedupe_key",
+            [value for row in rows for value in row],
+        )
+        inserted.extend((r["id"], r["dedupe_key"]) for r in conn.fetchall())
+    return inserted
 
 
 def _bulk_insert_events(conn, event_rows) -> None:
@@ -89,11 +154,13 @@ def _bulk_insert_events(conn, event_rows) -> None:
         return
     columns = ("task_id", "event_type", "from_status", "to_status", "message", "detail")
     placeholders = ",".join("?" for _ in columns)
-    values = ",".join(f"({placeholders})" for _ in event_rows)
-    conn.execute(
-        f"INSERT INTO task_events ({','.join(columns)}) VALUES {values}",
-        [value for row in event_rows for value in row],
-    )
+    for start in range(0, len(event_rows), DB_INSERT_BATCH_SIZE):
+        rows = event_rows[start:start + DB_INSERT_BATCH_SIZE]
+        values = ",".join(f"({placeholders})" for _ in rows)
+        conn.execute(
+            f"INSERT INTO task_events ({','.join(columns)}) VALUES {values}",
+            [value for row in rows for value in row],
+        )
 
 
 def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
@@ -143,7 +210,21 @@ def _insert_message_mapping(conn, task_id: int, message_ids) -> None:
 
 
 def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: dict) -> dict:
-    """Resolve the campaign's language->template mapping once per enqueue call."""
+    """Resolve and cache the campaign's language->template mapping."""
+    cache_key = (campaign_type, int(campaign_id))
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        cached = _TEMPLATE_CACHE.get(cache_key)
+        if cached and now - cached[0] < _CAMPAIGN_CACHE_TTL:
+            return cached[1]
+        generation = _TEMPLATE_CACHE_GENERATION
+
+    def cache(value: dict) -> dict:
+        with _CACHE_LOCK:
+            if generation == _TEMPLATE_CACHE_GENERATION:
+                _TEMPLATE_CACHE[cache_key] = (time.monotonic(), value)
+        return value
+
     rows = conn.execute(
         """SELECT t.* FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
             WHERE c.marketing_type=? AND c.marketing_campaign_id=?
@@ -161,7 +242,7 @@ def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: 
             if key in by_lang:
                 fallback = by_lang[key]
                 break
-        return {"by_lang": by_lang, "fallback": fallback, "default": templates[0], "direct": None}
+        return cache({"by_lang": by_lang, "fallback": fallback, "default": templates[0], "direct": None})
     selected_template_id = campaign.get("sms_template_id")
     direct = None
     if selected_template_id:
@@ -182,7 +263,7 @@ def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: 
             ).fetchone()
             if fallback_template:
                 direct = dict(fallback_template)
-    return {"by_lang": {}, "fallback": None, "default": None, "direct": direct}
+    return cache({"by_lang": {}, "fallback": None, "default": None, "direct": direct})
 
 
 def _select_template(template_map: dict, language: str) -> Optional[dict]:
@@ -347,7 +428,8 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 except ValueError:
                     pass
         result = {"success": True, "created": 0, "duplicate": 0,
-                  "excluded": 0, "invalid": 0, "no_template": 0}
+                  "excluded": 0, "invalid": 0, "no_template": 0,
+                  "created_msisdns": []}
         seen = set()
         phone_prefix = (campaign.get("phone_prefix") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
         template_map = _resolve_template_map(conn, campaign_type, campaign["id"], campaign)
@@ -382,7 +464,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             for key, value in payload.items():
                 content = content.replace("{" + key + "}", value)
             dedupe_key = hashlib.sha256(
-                f"{campaign_type}:{campaign['id']}:{msisdn}:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:{source_file}".encode("utf-8")
+                f"{campaign_type}:{campaign['id']}:{msisdn}:{task_date}:{source_file}".encode("utf-8")
             ).hexdigest()
             task_rows.append((
                 campaign_type, campaign["id"], batch_id, campaign.get("name", ""), msisdn,
@@ -391,30 +473,13 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 json.dumps(payload, ensure_ascii=False), source_file, task_date, dedupe_key,
             ))
         if task_rows:
-            try:
-                created = _bulk_insert_tasks(conn, task_rows)
-            except Exception as exc:
-                if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
-                    raise
-                # Rare same-second/same-file collision: fall back to row-by-row so
-                # individual duplicates are counted instead of aborting the batch.
-                created = []
-                for row in task_rows:
-                    try:
-                        cursor = conn.execute(
-                            """INSERT INTO sms_tasks
-                                (campaign_type,campaign_id,batch_id,campaign_name,msisdn,language,sms_template_id,smpp_config_id,content,
-                                source_addr,payload,source_file,task_date,dedupe_key)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            row,
-                        )
-                        created.append((cursor.lastrowid, row[-1]))
-                    except Exception as single_exc:
-                        if "duplicate" in str(single_exc).lower() or "unique" in str(single_exc).lower():
-                            result["duplicate"] += 1
-                        else:
-                            raise
+            created = _bulk_insert_tasks(conn, task_rows)
+            result["duplicate"] += len(task_rows) - len(created)
             result["created"] += len(created)
+            created_keys = {dedupe for _task_id, dedupe in created}
+            result["created_msisdns"].extend(
+                row[4] for row in task_rows if row[-1] in created_keys
+            )
             event_rows = [
                 (task_id, "created", "", "queued", "task created from file",
                  json.dumps({"source_file": source_file}, ensure_ascii=False))
@@ -486,8 +551,27 @@ def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: 
                             f"SMSC accepted task; {suffix}",
                             {"message_ids": message_ids, "delivery_receipt_mode": mode})
     _insert_message_mapping(conn, task_id, message_ids)
+    pending_receipts = conn.execute(
+        """SELECT smsc_message_id, message_state, raw_receipt
+           FROM delivery_receipts
+           WHERE task_id IS NULL AND smsc_message_id IN
+             (SELECT UNNEST(from_json(?, '[\"VARCHAR\"]')))""",
+        (json.dumps(message_ids),),
+    ).fetchall()
+    if pending_receipts:
+        conn.execute(
+            """UPDATE delivery_receipts SET task_id=?
+               WHERE task_id IS NULL AND smsc_message_id IN
+                 (SELECT UNNEST(from_json(?, '[\"VARCHAR\"]')))""",
+            (task_id, json.dumps(message_ids)),
+        )
     conn.commit()
     conn.close()
+    for receipt in pending_receipts:
+        record_receipt(
+            receipt["smsc_message_id"], receipt["message_state"], receipt["raw_receipt"],
+            _task_id=task_id, _skip_insert=True,
+        )
 
 def append_message_id(task_id: int, message_id: str):
     conn = get_connection()
@@ -546,26 +630,33 @@ def requeue_transport_failures() -> int:
     return int(count or 0)
 
 
-def record_receipt(message_id: str, state: str, raw: str):
+def record_receipt(message_id: str, state: str, raw: str,
+                   _task_id: Optional[int] = None, _skip_insert: bool = False):
     normalized_state = str(state or "").upper()
     conn = get_connection()
-    task = _find_task_by_message_id(conn, message_id)
-    task_id = task["id"] if task else None
-    try:
-        conn.execute(
-            "INSERT INTO delivery_receipts (task_id,smsc_message_id,message_state,raw_receipt) VALUES (?,?,?,?)",
-            (task_id, message_id, normalized_state, raw[:4000]),
-        )
-    except Exception as exc:
-        if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
+    if _task_id is None:
+        task = _find_task_by_message_id(conn, message_id)
+        task_id = task["id"] if task else None
+    else:
+        task_id = _task_id
+        row = conn.execute("SELECT * FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
+        task = dict(row) if row else None
+    if not _skip_insert:
+        try:
+            conn.execute(
+                "INSERT INTO delivery_receipts (task_id,smsc_message_id,message_state,raw_receipt) VALUES (?,?,?,?)",
+                (task_id, message_id, normalized_state, raw[:4000]),
+            )
+        except Exception as exc:
+            if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
+                conn.close()
+                raise
+            # Duplicate receipt for the same (task_id, message_id, state): the
+            # first receipt already updated the task, so this is an idempotent
+            # no-op. Returning early also avoids leaving the DuckDB connection in
+            # a broken state after the constraint error.
             conn.close()
-            raise
-        # Duplicate receipt for the same (task_id, message_id, state): the
-        # first receipt already updated the task, so this is an idempotent
-        # no-op. Returning early also avoids leaving the DuckDB connection in
-        # a broken state after the constraint error.
-        conn.close()
-        return
+            return
     if task_id:
         was_delivered = task.get("status") == "delivered"
         if normalized_state in {"DELIVRD", "DELIVERED", "2"}:
@@ -631,18 +722,14 @@ def record_receipt(message_id: str, state: str, raw: str):
 
 
 def _find_task_by_message_id(conn, message_id: str) -> Optional[dict]:
-    """Find the task that currently owns an SMSC message id.
-
-    The task's own ``smsc_message_ids`` column is the authoritative source
-    (exact quoted JSON value), because the id-index table may contain stale
-    mappings for ids that have been reused. The newest task wins, so a receipt
-    for a reused id is applied to the task that most recently submitted it.
-    """
-    rows = conn.execute(
-        "SELECT * FROM sms_tasks WHERE smsc_message_ids LIKE ? ORDER BY id DESC LIMIT 1",
-        (f'%"{message_id}"%',),
-    ).fetchall()
-    return dict(rows[0]) if rows else None
+    """Find the task through the indexed SMSC message-id mapping."""
+    row = conn.execute(
+        """SELECT t.* FROM sms_task_message_ids m
+           JOIN sms_tasks t ON t.id=m.task_id
+           WHERE m.smsc_message_id=? LIMIT 1""",
+        (str(message_id),),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def cleanup_task_retention() -> int:
@@ -851,13 +938,10 @@ def validate_task_schedule(task: dict) -> tuple[bool, str]:
         current_date = datetime.now().astimezone().date().isoformat()
         if str(task_date)[:10] != current_date:
             return False, "task belongs to a previous day"
-    table = "batch_campaigns" if task["campaign_type"] == "batch" else "realtime_campaigns"
-    conn = get_connection()
-    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (task["campaign_id"],)).fetchone()
-    conn.close()
-    if not row:
+    campaign = _cached_campaign(None, task["campaign_type"], task["campaign_id"])
+    if not campaign:
         return False, "campaign no longer exists"
-    return campaign_is_active(dict(row))
+    return campaign_is_active(campaign)
 
 
 def defer_task(task_id: int, reason: str, expired: bool = False):

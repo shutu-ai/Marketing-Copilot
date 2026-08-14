@@ -9,6 +9,8 @@ from typing import Optional
 import pandas as pd
 import csv
 import time
+import sqlite3
+import tempfile
 from database import get_connection
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
@@ -18,7 +20,7 @@ from services import operations_service, campaign_name_service
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
 
-CHUNK_SIZE = 100000  # rows per chunk for large CSV files
+CHUNK_SIZE = 5000  # bounded working set for large CSV files
 
 
 def _clean_text(value) -> str:
@@ -209,6 +211,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
 
     row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
+    sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
     return _enrich(dict(row))
 
 
@@ -226,6 +229,7 @@ def delete(campaign_id: int) -> bool:
     conn.execute("DELETE FROM realtime_campaigns WHERE id=?", (campaign_id,))
     conn.commit()
     conn.close()
+    sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
     # DuckDB rowcount is not reliable for DELETE; the initial lookup is authoritative.
     return row is not None
 
@@ -305,6 +309,7 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
     conn.commit()
     row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
+    sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
     return dict(row) if row else None
 
 
@@ -333,6 +338,40 @@ def get_detail(campaign_id: int) -> Optional[dict]:
         return None
     campaign["reached_users"] = _count_output_rows(campaign.get("campaign_dir", ""))
     return campaign
+
+
+def _append_realtime_output(campaign_dir: str, rows: list[dict]) -> None:
+    """Append only the current matched chunk to today's output file."""
+    if not campaign_dir or not rows:
+        return
+    output_dir = os.path.join(campaign_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{datetime.now():%Y%m%d}.csv")
+    pd.DataFrame(rows, columns=["msisdn", "send_time"]).to_csv(
+        output_path, index=False, mode="a",
+        header=not os.path.isfile(output_path), encoding="utf-8-sig",
+    )
+
+
+def _task_msisdn_for_campaign(value, campaign: dict) -> str:
+    normalized = sms_task_service.normalize_msisdn(value)
+    prefix = (campaign.get("phone_prefix") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+    return prefix + normalized if prefix and not normalized.startswith(prefix) else normalized
+
+
+def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
+    """Load only the current input chunk's whitelist matches into memory."""
+    values = list({value for value in msisdns if value})
+    result = {}
+    for start in range(0, len(values), query_size):
+        current = values[start:start + query_size]
+        placeholders = ",".join("?" for _ in current)
+        rows = conn.execute(
+            f"SELECT msisdn, language FROM whitelist_msisdns WHERE msisdn IN ({placeholders})",
+            current,
+        ).fetchall()
+        result.update({row["msisdn"]: row["language"] for row in rows})
+    return result
 
 
 def receive_file(campaign_id: int, file_path: str, original_filename: str) -> dict:
@@ -382,22 +421,40 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
 
     # Load whitelist MSISDNs and their preferred language (chunked for large CSV files)
     wl_ext = os.path.splitext(whitelist_path)[1].lower() if campaign.get("use_whitelist", True) else ""
+    whitelist_temp_dir = None
+    whitelist_conn = None
     try:
         if not campaign.get("use_whitelist", True):
             whitelist_languages = {}
             whitelist_set = set()
         elif wl_ext == ".csv":
-            whitelist_languages = {}
+            # Keep the whitelist on disk. Only the current input chunk is
+            # materialized into a Python mapping during matching.
+            whitelist_temp_dir = tempfile.TemporaryDirectory(prefix="mc-whitelist-")
+            whitelist_conn = sqlite3.connect(os.path.join(whitelist_temp_dir.name, "whitelist.sqlite3"))
+            whitelist_conn.row_factory = sqlite3.Row
+            whitelist_conn.execute(
+                "CREATE TABLE whitelist_msisdns (msisdn TEXT PRIMARY KEY, language TEXT NOT NULL)"
+            )
             for wl_chunk in _read_csv(whitelist_path, chunksize=CHUNK_SIZE):
                 wl_msisdn_col = "msisdn" if "msisdn" in wl_chunk.columns else wl_chunk.columns[0]
                 has_language = "language" in wl_chunk.columns
-                for idx in range(len(wl_chunk)):
-                    norm = sms_task_service.normalize_msisdn(wl_chunk[wl_msisdn_col].iloc[idx])
-                    if not norm or norm in whitelist_languages:
+                whitelist_rows = []
+                for idx, value in enumerate(wl_chunk[wl_msisdn_col]):
+                    norm = sms_task_service.normalize_msisdn(value)
+                    if not norm:
                         continue
                     language = _clean_text(wl_chunk["language"].iloc[idx]) if has_language else ""
-                    whitelist_languages[norm] = language
-            whitelist_set = set(whitelist_languages)
+                    whitelist_rows.append((norm, language))
+                if whitelist_rows:
+                    whitelist_conn.executemany(
+                        "INSERT OR IGNORE INTO whitelist_msisdns(msisdn, language) VALUES (?,?)",
+                        whitelist_rows,
+                    )
+                del whitelist_rows, wl_chunk
+            whitelist_conn.commit()
+            whitelist_languages = None
+            whitelist_set = None
         else:
             wl_df = pd.read_excel(whitelist_path, dtype=str)
             wl_msisdn_col = "msisdn" if "msisdn" in wl_df.columns else wl_df.columns[0]
@@ -411,53 +468,129 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                 whitelist_languages[norm] = language
             whitelist_set = set(whitelist_languages)
     except Exception as e:
+        if whitelist_conn:
+            whitelist_conn.close()
+        if whitelist_temp_dir:
+            whitelist_temp_dir.cleanup()
         conn.close()
         operations_service.finish_file(file_record_id, "failed", file_path, error=f"Cannot read whitelist: {e}")
         return {"success": False, "message": f"Cannot read whitelist: {e}"}
 
-    # Match input MSISDNs against whitelist (chunked for CSV, full load for Excel)
+    # Match input MSISDNs against whitelist. CSV chunks are fully matched,
+    # enqueued and written before the next chunk is read. A disk-backed unique
+    # table preserves cross-chunk de-duplication without retaining the file in
+    # Python memory.
     if ext in (".csv", ".txt"):
-        received_msisdns = set()
-        matched_row_dicts = []
         total_rows = 0
         msisdn_col = None
-        for chunk in reader:
-            total_rows += len(chunk)
-            if msisdn_col is None:
-                msisdn_col = "msisdn" if "msisdn" in chunk.columns else chunk.columns[0]
-            chunk_normalized = chunk[msisdn_col].map(sms_task_service.normalize_msisdn)
-            for idx in range(len(chunk)):
-                norm = chunk_normalized.iloc[idx]
-                if norm:
-                    received_msisdns.add(norm)
-                    if not campaign.get("use_whitelist", True) or norm in whitelist_set:
-                        row_dict = chunk.iloc[idx].fillna("").to_dict()
-                        row_dict["msisdn"] = norm
-                        row_dict["language"] = row_dict.get("language", "") if not campaign.get("use_whitelist", True) else whitelist_languages[norm]
-                        matched_row_dicts.append(row_dict)
-        total_msisdn = len(received_msisdns)
-        matched = received_msisdns if not campaign.get("use_whitelist", True) else received_msisdns & whitelist_set
-        matched_count = len(matched)
-        task_result = sms_task_service.enqueue_rows(
-            "realtime", campaign, matched_row_dicts, original_filename
-        )
+        task_result = {"success": True, "created": 0, "duplicate": 0,
+                       "excluded": 0, "invalid": 0, "no_template": 0}
+        unique_dir = tempfile.TemporaryDirectory(prefix="mc-realtime-")
+        unique_conn = sqlite3.connect(os.path.join(unique_dir.name, "unique.sqlite3"))
+        try:
+            unique_conn.execute("CREATE TABLE seen_msisdns (msisdn TEXT PRIMARY KEY, matched INTEGER NOT NULL)")
+            for chunk in reader:
+                total_rows += len(chunk)
+                if msisdn_col is None:
+                    msisdn_col = "msisdn" if "msisdn" in chunk.columns else chunk.columns[0]
+                chunk_normalized = chunk[msisdn_col].map(sms_task_service.normalize_msisdn)
+                chunk_whitelist_languages = (
+                    _lookup_whitelist_languages(whitelist_conn, chunk_normalized)
+                    if whitelist_conn is not None else whitelist_languages
+                )
+                matched_records = []
+                for idx, norm in enumerate(chunk_normalized):
+                    if not norm:
+                        task_result["invalid"] += 1
+                        continue
+                    is_matched = not campaign.get("use_whitelist", True) or norm in chunk_whitelist_languages
+                    inserted = unique_conn.execute(
+                        "INSERT OR IGNORE INTO seen_msisdns(msisdn, matched) VALUES (?,?)",
+                        (norm, 1 if is_matched else 0),
+                    ).rowcount
+                    if not inserted or not is_matched:
+                        continue
+                    row_dict = chunk.iloc[idx].fillna("").to_dict()
+                    row_dict["msisdn"] = norm
+                    row_dict["language"] = row_dict.get("language", "") if not campaign.get("use_whitelist", True) else chunk_whitelist_languages[norm]
+                    matched_records.append(row_dict)
+                unique_conn.commit()
+                if matched_records:
+                    chunk_result = sms_task_service.enqueue_rows(
+                        "realtime", campaign, matched_records, original_filename
+                    )
+                    for key in ("created", "duplicate", "excluded", "invalid", "no_template"):
+                        task_result[key] += chunk_result.get(key, 0)
+                    if not chunk_result.get("success"):
+                        raise RuntimeError(chunk_result.get("message", "Unable to enqueue realtime chunk"))
+                    created_msisdns = set(chunk_result.get("created_msisdns", []))
+                    _append_realtime_output(campaign.get("campaign_dir", ""), [
+                        {"msisdn": row["msisdn"], "send_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")}
+                        for row in matched_records
+                        if _task_msisdn_for_campaign(row["msisdn"], campaign) in created_msisdns
+                    ])
+                    del created_msisdns
+                del matched_records, chunk_normalized, chunk_whitelist_languages, chunk
+            counts = unique_conn.execute(
+                "SELECT COUNT(*) AS total, SUM(matched) AS matched FROM seen_msisdns"
+            ).fetchone()
+            total_msisdn = int(counts[0] or 0)
+            matched_count = int(counts[1] or 0)
+        except Exception:
+            conn.close()
+            raise
+        finally:
+            unique_conn.close()
+            unique_dir.cleanup()
+            if whitelist_conn:
+                whitelist_conn.close()
+            if whitelist_temp_dir:
+                whitelist_temp_dir.cleanup()
     else:
-        msisdn_col = "msisdn" if "msisdn" in df.columns else df.columns[0]
-        normalized_msisdns = df[msisdn_col].map(sms_task_service.normalize_msisdn)
-        received_msisdns = {value for value in normalized_msisdns if value}
-        total_msisdn = len(received_msisdns)
-        total_rows = len(df)
-        matched = received_msisdns if not campaign.get("use_whitelist", True) else received_msisdns & whitelist_set
-        matched_count = len(matched)
-        matched_rows = df[normalized_msisdns.isin(matched)].copy()
-        matched_rows["msisdn"] = normalized_msisdns[normalized_msisdns.isin(matched)]
-        matched_records = matched_rows.fillna("").to_dict("records")
-        for record in matched_records:
-            msisdn = record.get("msisdn")
-            record["language"] = record.get("language", "") if not campaign.get("use_whitelist", True) else whitelist_languages[msisdn]
-        task_result = sms_task_service.enqueue_rows(
-            "realtime", campaign, matched_records, original_filename
-        )
+        try:
+            msisdn_col = "msisdn" if "msisdn" in df.columns else df.columns[0]
+            normalized_msisdns = df[msisdn_col].map(sms_task_service.normalize_msisdn)
+            received_msisdns = {value for value in normalized_msisdns if value}
+            total_msisdn = len(received_msisdns)
+            total_rows = len(df)
+            if whitelist_conn is not None:
+                chunk_whitelist_languages = _lookup_whitelist_languages(
+                    whitelist_conn, normalized_msisdns
+                )
+                matched = received_msisdns & set(chunk_whitelist_languages)
+            else:
+                chunk_whitelist_languages = whitelist_languages
+                matched = (
+                    received_msisdns
+                    if not campaign.get("use_whitelist", True)
+                    else received_msisdns & whitelist_set
+                )
+            matched_count = len(matched)
+            matched_rows = df[normalized_msisdns.isin(matched)].copy()
+            matched_rows["msisdn"] = normalized_msisdns[normalized_msisdns.isin(matched)]
+            matched_records = matched_rows.fillna("").to_dict("records")
+            for record in matched_records:
+                msisdn = record.get("msisdn")
+                record["language"] = (
+                    record.get("language", "")
+                    if not campaign.get("use_whitelist", True)
+                    else chunk_whitelist_languages[msisdn]
+                )
+            task_result = sms_task_service.enqueue_rows(
+                "realtime", campaign, matched_records, original_filename
+            )
+            created_msisdns = set(task_result.get("created_msisdns", []))
+            _append_realtime_output(campaign.get("campaign_dir", ""), [
+                {"msisdn": record["msisdn"], "send_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")}
+                for record in matched_records
+                if _task_msisdn_for_campaign(record["msisdn"], campaign) in created_msisdns
+            ])
+            del created_msisdns
+        finally:
+            if whitelist_conn:
+                whitelist_conn.close()
+            if whitelist_temp_dir:
+                whitelist_temp_dir.cleanup()
 
     campaign_dir = campaign.get("campaign_dir", "")
     received_dir = os.path.join(campaign_dir, "received")
@@ -468,18 +601,6 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         os.utime(dest, None)
     except OSError:
         pass
-
-    # Write matched users to output CSV
-    if matched_count > 0 and campaign_dir:
-        output_dir = os.path.join(campaign_dir, "output")
-        os.makedirs(output_dir, exist_ok=True)
-        out_date = datetime.now().strftime("%Y%m%d")
-        output_path = os.path.join(output_dir, f"{out_date}.csv")
-        matched_df = pd.DataFrame({"msisdn": list(matched)})
-        now_ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
-        matched_df["send_time"] = now_ts
-        matched_df.to_csv(output_path, index=False, mode="a",
-                          header=not os.path.isfile(output_path), encoding="utf-8-sig")
 
     conn.execute(
         "INSERT INTO realtime_campaign_files (campaign_id, filename, file_path, total_msisdn, matched_count) VALUES (?,?,?,?,?)",

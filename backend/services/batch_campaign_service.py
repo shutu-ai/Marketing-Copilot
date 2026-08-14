@@ -9,6 +9,7 @@ from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
 from typing import Optional
 import shutil
 import pandas as pd
+import time
 from services import settings_service
 from services import sms_task_service, operations_service, campaign_name_service
 
@@ -16,6 +17,40 @@ logger = logging.getLogger(__name__)
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads", "campaigns")
 ALLOWED_LANGUAGES = {"amharic", "tigrigna", "somali", "english", "oromign", "en"}
+INGEST_QUEUE_HIGH_WATERMARK = max(1000, int(os.getenv("MC_BATCH_INGEST_HIGH_WATERMARK", "50000")))
+INGEST_QUEUE_LOW_WATERMARK = max(0, min(
+    INGEST_QUEUE_HIGH_WATERMARK,
+    int(os.getenv("MC_BATCH_INGEST_LOW_WATERMARK", "20000")),
+))
+
+
+def _queued_task_count() -> int:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) AS count FROM sms_tasks
+               WHERE status IN ('queued', 'retrying', 'sending')"""
+        ).fetchone()
+        return int(row["count"] if row else 0)
+    finally:
+        conn.close()
+
+
+def _wait_for_ingest_capacity(stop_event=None) -> bool:
+    """Pause the ingestion worker while pending SMS work is above the high mark."""
+    queued = _queued_task_count()
+    if queued < INGEST_QUEUE_HIGH_WATERMARK:
+        return stop_event is None or not stop_event.is_set()
+
+    # Once the high watermark is reached, remain paused until the queue drains
+    # to the low watermark. This hysteresis prevents ingestion from repeatedly
+    # stopping and restarting around the high-water threshold.
+    while queued > INGEST_QUEUE_LOW_WATERMARK:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(0.25)
+        queued = _queued_task_count()
+    return stop_event is None or not stop_event.is_set()
 
 
 def _detect_csv_delimiter(path: str) -> str:
@@ -265,6 +300,7 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         conn.commit()
     row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
+    sms_task_service.invalidate_campaign_cache("batch", campaign_id)
     updated_campaign = _enrich(dict(row))
     if data.use_custom_directory is not None:
         os.makedirs(os.path.join(updated_campaign["campaign_dir"], "whitelist"), exist_ok=True)
@@ -272,7 +308,9 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
 
     # Auto: generate batches on start (no auto-send)
     if data.status == "in_progress":
-        batch_size = existing_dict.get("batch_size") or 500
+        # Use the committed value. A single update may change batch_size and
+        # start the campaign, so existing_dict may contain the obsolete size.
+        batch_size = updated_campaign.get("batch_size") or 500
         generate_batches(campaign_id, batch_size)
 
     return updated_campaign
@@ -331,6 +369,7 @@ def delete(campaign_id: int) -> bool:
     conn.execute("DELETE FROM batch_campaigns WHERE id=?", (campaign_id,))
     conn.commit()
     conn.close()
+    sms_task_service.invalidate_campaign_cache("batch", campaign_id)
     # DuckDB does not provide a reliable DB-API rowcount for DELETE and may
     # return -1 even when the row was removed. The lookup above is the source
     # of truth for whether this campaign existed.
@@ -501,7 +540,7 @@ def cancel_overdue_daily_tasks() -> int:
 
 
 def generate_batches(campaign_id: int, batch_size: int = 500) -> dict:
-    """Split customer list file into batches."""
+    """Split customer list file into batches using one sequential CSV iterator."""
     campaign = get_one(campaign_id)
     if not campaign:
         return {"success": False, "message": "Campaign not found"}
@@ -511,25 +550,44 @@ def generate_batches(campaign_id: int, batch_size: int = 500) -> dict:
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".csv":
-            df = pd.read_csv(path, dtype=str, sep=_detect_csv_delimiter(path))
+            source = pd.read_csv(
+                path, dtype=str, sep=_detect_csv_delimiter(path),
+                chunksize=max(1, int(batch_size or 500)),
+            )
+            total = 0
         else:
             df = pd.read_excel(path, dtype=str)
+            total = len(df)
     except Exception as e:
         return {"success": False, "message": f"Cannot read file: {e}"}
-    total = len(df)
     conn = get_connection()
     conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,))
     created = []
-    for i in range(0, total, batch_size):
-        end = min(i + batch_size, total)
-        cursor = conn.execute(
-            "INSERT INTO batch_campaign_batches (campaign_id, batch_index, start_row, end_row, total_count) VALUES (?,?,?,?,?)",
-            (campaign_id, len(created), i, end, end - i)
-        )
-        created.append({
-            "id": cursor.lastrowid, "batch_index": len(created) - 1,
-            "start_row": i, "end_row": end, "count": end - i, "status": "pending"
-        })
+    if ext == ".csv":
+        for chunk in source:
+            count = len(chunk)
+            start = total
+            total += count
+            end = total
+            cursor = conn.execute(
+                "INSERT INTO batch_campaign_batches (campaign_id, batch_index, start_row, end_row, total_count) VALUES (?,?,?,?,?)",
+                (campaign_id, len(created), start, end, count)
+            )
+            created.append({
+                "id": cursor.lastrowid, "batch_index": len(created),
+                "start_row": start, "end_row": end, "count": count, "status": "pending"
+            })
+    else:
+        for i in range(0, total, max(1, int(batch_size or 500))):
+            end = min(i + max(1, int(batch_size or 500)), total)
+            cursor = conn.execute(
+                "INSERT INTO batch_campaign_batches (campaign_id, batch_index, start_row, end_row, total_count) VALUES (?,?,?,?,?)",
+                (campaign_id, len(created), i, end, end - i)
+            )
+            created.append({
+                "id": cursor.lastrowid, "batch_index": len(created),
+                "start_row": i, "end_row": end, "count": end - i, "status": "pending"
+            })
     conn.commit()
     conn.close()
     return {"success": True, "batches": created, "total_batches": len(created), "total_rows": total}
@@ -560,7 +618,7 @@ def _get_today_sent_msisdns(campaign_dir: str) -> set:
     return set()
 
 
-def process_batch(batch_id: int) -> dict:
+def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[dict] = None) -> dict:
     conn = get_connection()
     row = conn.execute("SELECT * FROM batch_campaign_batches WHERE id=?", (batch_id,)).fetchone()
     if not row:
@@ -573,29 +631,26 @@ def process_batch(batch_id: int) -> dict:
         conn.close()
         return {"success": False, "message": "Batch is already processing or queued"}
 
+    if batch_rows is None:
+        campaign_probe = get_one(campaign_id)
+        if campaign_probe and os.path.splitext(campaign_probe.get("customer_list_path", ""))[1].lower() == ".csv":
+            conn.close()
+            return process_pending_batches(campaign_id, batch_id)
+
     conn.execute(
         "UPDATE batch_campaign_batches SET status='processing', updated_at=datetime('now','localtime') WHERE id=?",
         (batch_id,)
     )
     conn.commit()
     try:
-        campaign = get_one(campaign_id)
+        campaign = campaign_override or get_one(campaign_id)
         path = campaign.get("customer_list_path", "") if campaign else ""
         if not path or not os.path.isfile(path):
             raise Exception("Customer list file not found")
         ext = os.path.splitext(path)[1].lower()
-        if ext == ".csv":
-            # Read only this batch's row slice instead of re-reading the whole file,
-            # so per-batch cost is O(batch_size) rather than O(total rows).
-            start = int(batch["start_row"] or 0)
-            end = int(batch["end_row"] or start)
-            df = pd.read_csv(
-                path, dtype=str, sep=_detect_csv_delimiter(path),
-                skiprows=range(1, start + 1), nrows=max(0, end - start), header=0,
-            )
-        else:
+        if batch_rows is None:
             df = pd.read_excel(path, dtype=str)
-        batch_rows = df.iloc[batch["start_row"]:batch["end_row"]]
+            batch_rows = df.iloc[batch["start_row"]:batch["end_row"]]
 
         msisdn_col = "msisdn" if "msisdn" in batch_rows.columns else batch_rows.columns[0]
         if msisdn_col != "msisdn":
@@ -641,6 +696,76 @@ def process_batch(batch_id: int) -> dict:
         conn.commit()
         conn.close()
         return {"success": False, "message": str(e)}
+
+
+def process_pending_batches(campaign_id: Optional[int] = None, target_batch_id: Optional[int] = None,
+                            stop_event=None) -> dict:
+    """Process one campaign's batches with a single sequential CSV read.
+
+    Batch metadata remains addressable for the API, but the scheduler no longer
+    opens the same CSV once per batch and seeks from row zero each time.
+    """
+    conn = get_connection()
+    if campaign_id is None:
+        row = conn.execute(
+            """SELECT c.id FROM batch_campaigns c
+               JOIN batch_campaign_batches b ON b.campaign_id=c.id
+               WHERE c.status='in_progress' AND b.status='pending'
+               ORDER BY b.created_at LIMIT 1"""
+        ).fetchone()
+        campaign_id = row["id"] if row else None
+    if campaign_id is None:
+        conn.close()
+        return {"success": True, "processed": 0}
+    campaign_row = conn.execute(
+        "SELECT * FROM batch_campaigns WHERE id=? AND status='in_progress'", (campaign_id,)
+    ).fetchone()
+    batches = conn.execute(
+        "SELECT * FROM batch_campaign_batches WHERE campaign_id=? ORDER BY batch_index", (campaign_id,)
+    ).fetchall()
+    conn.close()
+    campaign = _enrich(dict(campaign_row)) if campaign_row else None
+    if not campaign or not batches:
+        return {"success": False, "message": "Campaign or batches not found", "processed": 0}
+    active, reason = sms_task_service.campaign_is_active(campaign)
+    if not active:
+        return {"success": False, "message": reason, "processed": 0}
+    path = campaign.get("customer_list_path", "")
+    if not path or not os.path.isfile(path):
+        return {"success": False, "message": "Customer list file not found", "processed": 0}
+
+    processed = 0
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".csv":
+            source = pd.read_csv(
+                path, dtype=str, sep=_detect_csv_delimiter(path),
+                chunksize=max(1, int(campaign.get("batch_size") or 500)),
+            )
+            for batch, frame in zip(batches, source):
+                if not _wait_for_ingest_capacity(stop_event):
+                    return {"success": False, "message": "batch ingestion worker stopping", "processed": processed}
+                if target_batch_id is not None:
+                    if batch["id"] != target_batch_id:
+                        continue
+                elif batch["status"] != "pending":
+                    continue
+                result = process_batch(batch["id"], batch_rows=frame, campaign_override=campaign)
+                if result.get("success"):
+                    processed += 1
+        else:
+            # Excel has no pandas chunk iterator; keep the existing API path.
+            for batch in batches:
+                if (target_batch_id is None and batch["status"] == "pending") or batch["id"] == target_batch_id:
+                    if not _wait_for_ingest_capacity(stop_event):
+                        return {"success": False, "message": "batch ingestion worker stopping", "processed": processed}
+                    result = process_batch(batch["id"], campaign_override=campaign)
+                    if result.get("success"):
+                        processed += 1
+    except Exception as exc:
+        logger.exception("Sequential batch read failed campaign=%s", campaign_id)
+        return {"success": False, "message": str(exc), "processed": processed}
+    return {"success": True, "processed": processed}
 
 
 def _count_reached_users(campaign_dir: str) -> int:
@@ -752,6 +877,7 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
     conn.commit()
     row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
+    sms_task_service.invalidate_campaign_cache("batch", campaign_id)
 
     # If campaign is in progress, regenerate batches from new list (no auto-send)
     if campaign.get("status") == "in_progress" and row_count > 0:

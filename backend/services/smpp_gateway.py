@@ -233,12 +233,27 @@ class SmppGateway:
         self._down_until = {}
         self._last_error = ""
         self._active_config_id = None
+        self._config_cache = None
+        self._config_cache_version = 0
+
+    def invalidate_config_cache(self):
+        with self._lock:
+            self._config_cache = None
+            self._config_cache_version += 1
 
     def _enabled_configs(self):
+        with self._lock:
+            if self._config_cache is not None:
+                return [dict(config) for config in self._config_cache]
+            generation = self._config_cache_version
         conn = get_connection()
         rows = conn.execute("SELECT * FROM smpp_configs WHERE enabled=1 ORDER BY priority,id").fetchall()
         conn.close()
-        return [dict(row) for row in rows]
+        configs = [dict(row) for row in rows]
+        with self._lock:
+            if generation == self._config_cache_version:
+                self._config_cache = configs
+        return [dict(config) for config in configs]
 
     @property
     def connected(self):

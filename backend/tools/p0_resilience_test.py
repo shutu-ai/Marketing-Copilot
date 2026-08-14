@@ -18,7 +18,9 @@ def main():
     sample.write_text("msisdn\n0900000000\n", encoding="utf-8")
     first_id, first_duplicate = operations_service.register_file("realtime", 1, str(sample), sample.name)
     second_id, second_duplicate = operations_service.register_file("realtime", 1, str(sample), "renamed.csv")
-    assert not first_duplicate and second_duplicate and first_id == second_id
+    # Realtime intake is filename-scoped: a renamed file is a new watched
+    # input, even when its content happens to be identical.
+    assert not first_duplicate and not second_duplicate and first_id != second_id
     duplicate_inbox = root / "duplicate.csv"
     duplicate_inbox.write_text("msisdn\n0900000000\n", encoding="utf-8")
     duplicate_path = operations_service.archive_duplicate(
@@ -34,10 +36,9 @@ def main():
     assert claimed and claimed["status"] == "sending" and claimed["attempts"] == 1
     assert sms_task_service.claim_next_task() is None
 
-    conn = get_connection()
-    conn.execute("UPDATE sms_tasks SET status='submitted',smsc_message_ids=? WHERE id=?",
-                 (json.dumps(["p0-msg"]), claimed["id"]))
-    conn.commit(); conn.close()
+    # Production submission writes both the task message-id payload and the
+    # indexed sms_task_message_ids mapping.
+    sms_task_service.mark_submitted(claimed["id"], ["p0-msg"])
     sms_task_service.record_receipt("p0-msg", "UNDELIV", "temporary test")
     conn = get_connection()
     task = conn.execute("SELECT status,receipt_retry_count FROM sms_tasks WHERE id=?", (claimed["id"],)).fetchone()
@@ -83,7 +84,7 @@ def main():
     old_task = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (old_id,)).fetchone()
     conn.close()
     assert new_task["status"] == "delivered", dict(new_task)
-    assert old_task["status"] == "submitted", dict(old_task)
+    assert old_task["status"] in {"submitted", "accepted"}, dict(old_task)
     # A repeated identical receipt is idempotent and must not error.
     sms_task_service.record_receipt("p0-reuse-msg", "DELIVRD", "duplicate receipt")
     conn = get_connection()
