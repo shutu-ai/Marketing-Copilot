@@ -402,6 +402,12 @@ export default {
     detailLogging: 'Detail Logging',
     detailLoggingTip: 'Records high-frequency details such as SMS body and RabbitMQ payloads; recommended off in production',
     viewLogs: 'View logs',
+    smsTaskRetentionDays: 'SMS task retention (days)',
+    smsTaskRetentionDaysTip: 'Automatically removes completed SMS task records older than this period; active tasks are kept.',
+    realtimeFileRetentionDays: 'Realtime input file retention (days)',
+    realtimeFileRetentionDaysTip: 'Automatically removes old realtime input, received, duplicate and quarantine files.',
+    realtimeOutputRetentionDays: 'Realtime output file retention (days)',
+    realtimeOutputRetentionDaysTip: 'Automatically removes sent-record output files older than this period.',
   },
   auth: {
     loginTitle: 'Sign In',

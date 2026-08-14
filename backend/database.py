@@ -578,6 +578,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_date ON sms_tasks(campaign_type, task_date, status, next_attempt_at)",
         "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(smsc_message_id)",
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_tasks_created ON sms_tasks(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(campaign_type,campaign_id,file_hash)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_name_unique ON processed_files(campaign_type,campaign_id,filename)",
         # Receipt dedup is per-task: SMSC message ids may be reused across
@@ -620,6 +621,9 @@ def init_db():
         ("system_mode", "production"),
         ("log_level", "INFO"),
         ("detail_logging", normalize_detail_logging(os.environ.get("MC_DETAIL_LOGGING", "0"))),
+        ("sms_task_retention_days", "3"),
+        ("realtime_file_retention_days", "1"),
+        ("realtime_output_retention_days", "30"),
     ]
     for k, v in defaults:
         try:

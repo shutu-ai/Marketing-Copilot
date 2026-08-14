@@ -1,5 +1,11 @@
 from database import get_connection
 
+RETENTION_SETTING_DEFAULTS = {
+    "sms_task_retention_days": "3",
+    "realtime_file_retention_days": "1",
+    "realtime_output_retention_days": "30",
+}
+
 
 def get_setting(key: str, default: str = "") -> str:
     conn = get_connection()

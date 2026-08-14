@@ -832,8 +832,8 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
 
 
 def cleanup_realtime_retention():
-    input_retention_days = max(1, int(os.environ.get("MC_REALTIME_FILE_RETENTION_DAYS", "1")))
-    output_retention_days = max(1, int(os.environ.get("MC_REALTIME_OUTPUT_RETENTION_DAYS", "30")))
+    input_retention_days = max(1, int(settings_service.get_setting("realtime_file_retention_days", os.environ.get("MC_REALTIME_FILE_RETENTION_DAYS", "1"))))
+    output_retention_days = max(1, int(settings_service.get_setting("realtime_output_retention_days", os.environ.get("MC_REALTIME_OUTPUT_RETENTION_DAYS", "30"))))
     input_cutoff_ts = (datetime.now() - timedelta(days=input_retention_days)).timestamp()
     output_cutoff_ts = (datetime.now() - timedelta(days=output_retention_days)).timestamp()
     conn = get_connection()

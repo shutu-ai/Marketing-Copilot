@@ -407,6 +407,12 @@ export default {
     detailLogging: '明细日志',
     detailLoggingTip: '记录短信正文、RabbitMQ 消息等高频明细日志，生产环境建议关闭',
     viewLogs: '查看日志',
+    smsTaskRetentionDays: '\u77ed\u4fe1\u4efb\u52a1\u4fdd\u7559\u5929\u6570',
+    smsTaskRetentionDaysTip: '\u81ea\u52a8\u6e05\u7406\u8d85\u8fc7\u671f\u9650\u7684\u5df2\u5b8c\u6210\u77ed\u4fe1\u4efb\u52a1\uff0c\u6b63\u5728\u5904\u7406\u7684\u4efb\u52a1\u4f1a\u4fdd\u7559\u3002',
+    realtimeFileRetentionDays: '\u5b9e\u65f6\u8f93\u5165\u6587\u4ef6\u4fdd\u7559\u5929\u6570',
+    realtimeFileRetentionDaysTip: '\u81ea\u52a8\u6e05\u7406\u8d85\u8fc7\u671f\u9650\u7684\u5b9e\u65f6\u8f93\u5165\u6587\u4ef6\u3002',
+    realtimeOutputRetentionDays: '\u5b9e\u65f6\u8f93\u51fa\u6587\u4ef6\u4fdd\u7559\u5929\u6570',
+    realtimeOutputRetentionDaysTip: '\u81ea\u52a8\u6e05\u7406\u8d85\u8fc7\u671f\u9650\u7684\u5b9e\u65f6\u8f93\u51fa\u6587\u4ef6。',
   },
   auth: {
     loginTitle: '登录',

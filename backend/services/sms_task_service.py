@@ -3,14 +3,26 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
+import time
 from datetime import datetime
 from typing import Iterable, Optional
 
 from database import get_connection
+from services import settings_service
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
+
+_TASK_STATS_CACHE = None
+_TASK_STATS_CACHE_AT = 0.0
+_TASK_STATS_CACHE_TTL = 30.0
+_TASK_STATS_LOCK = threading.Lock()
+_TASK_COUNT_CACHE = {}
+_EXCLUSION_COUNT_CACHE = None
+_EXCLUSION_COUNT_CACHE_AT = 0.0
+_EXCLUSION_COUNT_LOCK = threading.Lock()
 
 
 FINAL_STATES = {"delivered", "failed", "expired", "cancelled", "archived", "accepted"}
@@ -174,6 +186,20 @@ def normalize_msisdn(value: object) -> str:
     return number
 
 
+def _find_excluded_msisdns(conn, msisdns, chunk_size: int = 1000) -> set[str]:
+    """Return only exclusions relevant to the current enqueue batch."""
+    values = list(msisdns)
+    excluded = set()
+    for start in range(0, len(values), chunk_size):
+        chunk = values[start:start + chunk_size]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT msisdn FROM exclusion_users WHERE enabled=1 AND msisdn IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        excluded.update(row["msisdn"] for row in rows)
+    return excluded
+
 def campaign_is_active(campaign: dict, now: Optional[datetime] = None) -> tuple[bool, str]:
     now = now or datetime.now().astimezone()
     if campaign.get("status") != "in_progress":
@@ -294,16 +320,12 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                     task_date = datetime.strptime(match.group(1), "%Y%m%d%H%M%S").date().isoformat()
                 except ValueError:
                     pass
-        exclusions = {
-            normalize_msisdn(r["msisdn"])
-            for r in conn.execute("SELECT msisdn FROM exclusion_users WHERE enabled=1").fetchall()
-        }
         result = {"success": True, "created": 0, "duplicate": 0,
                   "excluded": 0, "invalid": 0, "no_template": 0}
         seen = set()
         phone_prefix = (campaign.get("phone_prefix") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
         template_map = _resolve_template_map(conn, campaign_type, campaign["id"], campaign)
-        task_rows = []
+        prepared_rows = []
         for raw in rows:
             payload = {str(k): "" if v is None else str(v) for k, v in dict(raw).items()}
             msisdn = normalize_msisdn(payload.get("msisdn"))
@@ -317,10 +339,14 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 result["duplicate"] += 1
                 continue
             seen.add(msisdn)
+            prepared_rows.append((payload, msisdn))
+
+        exclusions = _find_excluded_msisdns(conn, (item[1] for item in prepared_rows))
+        task_rows = []
+        for payload, msisdn in prepared_rows:
             if msisdn in exclusions:
                 result["excluded"] += 1
                 continue
-
             language = payload.get("language", "")
             template = _select_template(template_map, language)
             if not template:
@@ -593,6 +619,49 @@ def _find_task_by_message_id(conn, message_id: str) -> Optional[dict]:
     return dict(rows[0]) if rows else None
 
 
+def cleanup_task_retention() -> int:
+    retention_days = max(1, int(settings_service.get_setting("sms_task_retention_days", "3")))
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    active = "('queued','sending','retrying','submitted','accepted')"
+    rows = conn.execute(f"SELECT id FROM sms_tasks WHERE created_at < ? AND status NOT IN {active}", (cutoff,)).fetchall()
+    ids = [row["id"] for row in rows]
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(f"DELETE FROM sms_task_message_ids WHERE task_id IN ({placeholders})", ids)
+        conn.execute(f"DELETE FROM delivery_receipts WHERE task_id IN ({placeholders})", ids)
+        conn.execute(f"DELETE FROM task_events WHERE task_id IN ({placeholders})", ids)
+        conn.execute(f"DELETE FROM sms_tasks WHERE id IN ({placeholders})", ids)
+        conn.commit()
+    conn.close()
+    if ids:
+        logger.info("SMS task retention cleanup deleted=%s retention_days=%s", len(ids), retention_days)
+    return len(ids)
+
+def _cached_task_count(conn, where: str, params: list) -> int:
+    now = time.monotonic()
+    key = (where, tuple(params))
+    cached = _TASK_COUNT_CACHE.get(key)
+    if cached and now - cached[0] < _TASK_STATS_CACHE_TTL:
+        return cached[1]
+    with _TASK_STATS_LOCK:
+        cached = _TASK_COUNT_CACHE.get(key)
+        if cached and now - cached[0] < _TASK_STATS_CACHE_TTL:
+            return cached[1]
+        total = conn.execute(
+            f"SELECT COUNT(*) cnt FROM sms_tasks {where}", params
+        ).fetchone()["cnt"]
+        _TASK_COUNT_CACHE[key] = (now, total)
+        if len(_TASK_COUNT_CACHE) > 128:
+            expired = [
+                cache_key for cache_key, value in _TASK_COUNT_CACHE.items()
+                if now - value[0] >= _TASK_STATS_CACHE_TTL
+            ]
+            for cache_key in expired:
+                _TASK_COUNT_CACHE.pop(cache_key, None)
+        return total
+
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
                smpp_config_id: int = -1) -> dict:
     conn = get_connection()
@@ -610,21 +679,43 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
             conditions.append("smpp_config_id=?")
             params.append(smpp_config_id)
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    total = conn.execute(f"SELECT COUNT(*) cnt FROM sms_tasks {where}", params).fetchone()["cnt"]
+    total = task_stats()["total"] if not conditions else _cached_task_count(conn, where, params)
     offset = max(0, page - 1) * page_size
     rows = conn.execute(
-        f"SELECT * FROM sms_tasks {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        f"""SELECT id,campaign_type,campaign_id,campaign_name,smpp_config_id,
+                   msisdn,language,content,status,attempts,error_msg,updated_at
+            FROM sms_tasks {where} ORDER BY id DESC LIMIT ? OFFSET ?""",
         params + [page_size, offset],
     ).fetchall()
     conn.close()
     return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
 
 
+def _cached_exclusion_count(conn) -> int:
+    global _EXCLUSION_COUNT_CACHE, _EXCLUSION_COUNT_CACHE_AT
+    now = time.monotonic()
+    if (
+        _EXCLUSION_COUNT_CACHE is not None
+        and now - _EXCLUSION_COUNT_CACHE_AT < _TASK_STATS_CACHE_TTL
+    ):
+        return _EXCLUSION_COUNT_CACHE
+    with _EXCLUSION_COUNT_LOCK:
+        now = time.monotonic()
+        if (
+            _EXCLUSION_COUNT_CACHE is not None
+            and now - _EXCLUSION_COUNT_CACHE_AT < _TASK_STATS_CACHE_TTL
+        ):
+            return _EXCLUSION_COUNT_CACHE
+        total = conn.execute("SELECT COUNT(*) cnt FROM exclusion_users").fetchone()["cnt"]
+        _EXCLUSION_COUNT_CACHE = total
+        _EXCLUSION_COUNT_CACHE_AT = now
+        return total
+
 def list_exclusions(page: int = 1, page_size: int = 50) -> dict:
     conn = get_connection()
-    total = conn.execute("SELECT COUNT(*) cnt FROM exclusion_users").fetchone()["cnt"]
+    total = _cached_exclusion_count(conn)
     rows = conn.execute(
-        "SELECT * FROM exclusion_users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        "SELECT id,msisdn,reason,enabled,created_at FROM exclusion_users ORDER BY id DESC LIMIT ? OFFSET ?",
         (page_size, max(0, page - 1) * page_size),
     ).fetchall()
     conn.close()
@@ -632,13 +723,27 @@ def list_exclusions(page: int = 1, page_size: int = 50) -> dict:
 
 
 def task_stats() -> dict:
-    conn = get_connection()
-    rows = conn.execute("SELECT status, COUNT(*) count FROM sms_tasks GROUP BY status").fetchall()
-    result = {r["status"]: r["count"] for r in rows}
-    result["total"] = sum(result.values())
-    conn.close()
-    return result
+    global _TASK_STATS_CACHE, _TASK_STATS_CACHE_AT
+    now = time.monotonic()
+    if _TASK_STATS_CACHE is not None and now - _TASK_STATS_CACHE_AT < _TASK_STATS_CACHE_TTL:
+        return dict(_TASK_STATS_CACHE)
 
+    with _TASK_STATS_LOCK:
+        now = time.monotonic()
+        if _TASK_STATS_CACHE is not None and now - _TASK_STATS_CACHE_AT < _TASK_STATS_CACHE_TTL:
+            return dict(_TASK_STATS_CACHE)
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) count FROM sms_tasks GROUP BY status"
+            ).fetchall()
+            result = {r["status"]: r["count"] for r in rows}
+            result["total"] = sum(result.values())
+        finally:
+            conn.close()
+        _TASK_STATS_CACHE = result
+        _TASK_STATS_CACHE_AT = now
+        return dict(result)
 
 def retry_task(task_id: int) -> bool:
     conn = get_connection()

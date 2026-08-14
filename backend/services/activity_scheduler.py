@@ -59,6 +59,7 @@ def _run():
                 logger.error("Realtime inbox file failed %s: %s", error.get("filename"), error.get("message"))
             if ticks % 20 == 0:
                 realtime_campaign_service.cleanup_realtime_retention()
+                sms_task_service.cleanup_task_retention()
                 p1_service.auto_complete_campaigns()
                 from services import metrics_service, task_worker
                 from services.smpp_gateway import gateway

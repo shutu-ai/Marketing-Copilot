@@ -37,7 +37,18 @@
               </div>
               <div class="form-tip">{{ $t('settings.logLevelTip') }}</div>
             </el-form-item>
-            <el-form-item :label="$t('settings.detailLogging')">
+                        <el-form-item :label="$t('settings.smsTaskRetentionDays')">
+              <el-input-number v-model="form.sms_task_retention_days" :min="1" :precision="0" controls-position="right" />
+              <div class="form-tip">{{ $t('settings.smsTaskRetentionDaysTip') }}</div>
+            </el-form-item>
+            <el-form-item :label="$t('settings.realtimeFileRetentionDays')">
+              <el-input-number v-model="form.realtime_file_retention_days" :min="1" :precision="0" controls-position="right" />
+              <div class="form-tip">{{ $t('settings.realtimeFileRetentionDaysTip') }}</div>
+            </el-form-item>
+            <el-form-item :label="$t('settings.realtimeOutputRetentionDays')">
+              <el-input-number v-model="form.realtime_output_retention_days" :min="1" :precision="0" controls-position="right" />
+              <div class="form-tip">{{ $t('settings.realtimeOutputRetentionDaysTip') }}</div>
+            </el-form-item><el-form-item :label="$t('settings.detailLogging')">
               <div>
                 <el-switch v-model="form.detail_logging" active-value="1" inactive-value="0" />
                 <div class="form-tip">{{ $t('settings.detailLoggingTip') }}</div>
@@ -141,6 +152,9 @@ const form = reactive({
   system_mode: 'production',
   log_level: 'INFO',
   detail_logging: '0',
+  sms_task_retention_days: 3,
+  realtime_file_retention_days: 1,
+  realtime_output_retention_days: 30,
 })
 const logLevels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
@@ -173,6 +187,12 @@ onMounted(async () => {
         form.log_level = s.value
       } else if (s.key === 'detail_logging') {
         form.detail_logging = s.value
+      } else if (s.key === 'sms_task_retention_days') {
+        form.sms_task_retention_days = Number(s.value) || 3
+      } else if (s.key === 'realtime_file_retention_days') {
+        form.realtime_file_retention_days = Number(s.value) || 1
+      } else if (s.key === 'realtime_output_retention_days') {
+        form.realtime_output_retention_days = Number(s.value) || 30
       }
     }
   } catch {
@@ -188,6 +208,9 @@ async function handleSave() {
     await updateSetting('system_mode', form.system_mode)
     await updateSetting('log_level', form.log_level)
     await updateSetting('detail_logging', form.detail_logging)
+    await updateSetting('sms_task_retention_days', String(form.sms_task_retention_days))
+    await updateSetting('realtime_file_retention_days', String(form.realtime_file_retention_days))
+    await updateSetting('realtime_output_retention_days', String(form.realtime_output_retention_days))
     ElMessage.success(t('common.saveSuccess'))
   } catch (e: any) {
     ElMessage.error(e.response?.data?.detail || t('common.saveFailed'))
