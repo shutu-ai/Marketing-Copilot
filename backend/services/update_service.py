@@ -702,6 +702,26 @@ def cleanup_staging(max_age_hours: int = 24) -> None:
 # History
 # ---------------------------------------------------------------------------
 
+HISTORY_RETENTION_DAYS = 365
+
+
+def prune_history() -> None:
+    """Remove update-history rows older than the one-year retention window."""
+    try:
+        from database import get_connection
+
+        conn = get_connection()
+        conn.execute(
+            f"""DELETE FROM update_history
+               WHERE try_cast(created_at AS TIMESTAMP)
+                     < CURRENT_TIMESTAMP - INTERVAL '{HISTORY_RETENTION_DAYS} days'"""
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("failed to prune update history")
+
+
 def record_pending_result() -> None:
     """Persist the last runner result into ``update_history`` exactly once."""
     state = load_state()
@@ -743,6 +763,7 @@ def record_pending_result() -> None:
 
 def list_history(limit: int = 50) -> list:
     try:
+        prune_history()
         from database import get_connection
 
         conn = get_connection()
@@ -790,6 +811,7 @@ def status() -> dict:
     ensure_update_dir()
     cleanup_staging()
     record_pending_result()
+    prune_history()
     recover_if_runner_dead()
     current = version_info()
     state = load_state()
