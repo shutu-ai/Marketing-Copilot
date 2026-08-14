@@ -96,6 +96,32 @@ def _bulk_insert_events(conn, event_rows) -> None:
     )
 
 
+def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
+                                  message: str = "campaign cancelled") -> int:
+    """Mark not-yet-submitted campaign tasks terminal so workers cannot claim them."""
+    rows = conn.execute(
+        """SELECT id, status FROM sms_tasks
+           WHERE campaign_type=? AND campaign_id=?
+             AND status IN ('queued','retrying','sending')""",
+        (campaign_type, campaign_id),
+    ).fetchall()
+    if not rows:
+        return 0
+    conn.execute(
+        """UPDATE sms_tasks SET status='cancelled', error_msg=?, claim_token='',
+               updated_at=CURRENT_TIMESTAMP
+           WHERE campaign_type=? AND campaign_id=?
+             AND status IN ('queued','retrying','sending')""",
+        (message, campaign_type, campaign_id),
+    )
+    _bulk_insert_events(conn, [
+        (row["id"], "campaign_cancelled", row["status"], "cancelled", message,
+         json.dumps({"campaign_type": campaign_type, "campaign_id": campaign_id}, ensure_ascii=False))
+        for row in rows
+    ])
+    return len(rows)
+
+
 def _insert_message_mapping(conn, task_id: int, message_ids) -> None:
     """Record the latest task that used each SMSC message id.
 

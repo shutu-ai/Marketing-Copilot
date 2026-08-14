@@ -6,7 +6,7 @@ from typing import Optional
 from database import get_connection, get_database_file
 from models.batch_campaign import BatchCampaignUpdate
 from models.realtime_campaign import RealtimeCampaignUpdate
-from services import batch_campaign_service, operations_service, realtime_campaign_service
+from services import batch_campaign_service, operations_service, realtime_campaign_service, sms_task_service
 
 
 CAMPAIGN_TRANSITIONS = {
@@ -35,12 +35,10 @@ def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic
         raise ValueError(f"cannot {action} campaign from {current}")
     updated = service.update(campaign_id, update_model(status=target))
     conn = get_connection()
+    cancelled_task_count = 0
     if target == "cancelled":
-        conn.execute(
-            """UPDATE sms_tasks SET status='cancelled', error_msg='campaign cancelled',
-               updated_at=CURRENT_TIMESTAMP WHERE campaign_type=? AND campaign_id=?
-               AND status IN ('queued','retrying','sending')""",
-            (campaign_type, campaign_id),
+        cancelled_task_count = sms_task_service.cancel_pending_campaign_tasks(
+            conn, campaign_type, campaign_id,
         )
     elif target == "completed":
         conn.execute(
@@ -59,8 +57,10 @@ def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic
     operations_service.audit(
         "campaign.auto_complete" if automatic else f"campaign.{action}",
         f"{campaign_type}_campaign", campaign_id,
-        {"from_status": current, "to_status": target},
+        {"from_status": current, "to_status": target, "cancelled_task_count": cancelled_task_count},
     )
+    if target == "cancelled":
+        updated["cancelled_task_count"] = cancelled_task_count
     return updated
 
 

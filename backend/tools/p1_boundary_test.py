@@ -17,15 +17,22 @@ def main():
     realtime_id = conn.execute("SELECT id FROM realtime_campaigns WHERE name='Cancel me'").fetchone()["id"]
     conn.execute("""INSERT INTO sms_tasks(campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
         VALUES ('realtime',?,'Cancel me','251900000001','x','cancel-boundary','queued')""", (realtime_id,))
+    for status in ("retrying", "sending"):
+        conn.execute("""INSERT INTO sms_tasks(campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+            VALUES ('realtime',?,'Cancel me','251900000001','x',?,?)""", (realtime_id, f"cancel-boundary-{status}", status))
+    conn.execute("""INSERT INTO sms_tasks(campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+        VALUES ('realtime',?,'Cancel me','251900000001','x','cancel-boundary-accepted','accepted')""", (realtime_id,))
     conn.execute("INSERT INTO batch_campaigns(name,status,campaign_dir) VALUES ('Batch boundary','in_progress',?)", (str(root),))
     batch_id = conn.execute("SELECT id FROM batch_campaigns WHERE name='Batch boundary'").fetchone()["id"]
     conn.commit(); conn.close()
 
     assert p1_service.campaign_action("batch", batch_id, "pause")["status"] == "paused"
     assert p1_service.campaign_action("batch", batch_id, "cancel")["status"] == "cancelled"
-    assert p1_service.campaign_action("realtime", realtime_id, "cancel")["status"] == "cancelled"
+    assert p1_service.campaign_action("realtime", realtime_id, "cancel")["cancelled_task_count"] == 3
     conn = get_connection()
     assert conn.execute("SELECT status FROM sms_tasks WHERE dedupe_key='cancel-boundary'").fetchone()["status"] == "cancelled"
+    assert conn.execute("SELECT COUNT(*) count FROM sms_tasks WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')", (realtime_id,)).fetchone()["count"] == 0
+    assert conn.execute("SELECT status FROM sms_tasks WHERE dedupe_key='cancel-boundary-accepted'").fetchone()["status"] == "accepted"
     conn.close()
     try:
         p1_service.campaign_action("realtime", realtime_id, "resume")
