@@ -16,6 +16,28 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
+# systemd EnvironmentFile entries are not evaluated by a shell, so values such
+# as DUCKDB_PATH=$APP_HOME/data/... would otherwise reach the application with
+# a literal "$APP_HOME" when an existing unit starts uvicorn directly. Expand
+# those deployment-relative paths in the file before either sourcing it here or
+# handing it to systemd. Keep a one-time backup for recovery/auditing.
+"$VENV_DIR/bin/python" - "$ENV_FILE" "$APP_HOME" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+env_file = Path(sys.argv[1])
+app_home = sys.argv[2]
+original = env_file.read_text(encoding="utf-8", errors="replace")
+normalized = original.replace("${APP_HOME}", app_home).replace("$APP_HOME", app_home)
+if normalized != original:
+    backup = env_file.with_suffix(env_file.suffix + ".paths.bak")
+    if not backup.exists():
+        shutil.copy2(env_file, backup)
+    env_file.write_text(normalized, encoding="utf-8")
+    print(f"Expanded APP_HOME paths in {env_file} (backup: {backup})")
+PY
+
 if ! "$VENV_DIR/bin/python" - <<'PY' >/dev/null 2>&1
 import duckdb, fastapi, pandas, smpplib, uvicorn
 PY

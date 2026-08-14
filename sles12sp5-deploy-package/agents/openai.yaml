@@ -1,0 +1,4 @@
+interface:
+  display_name: "SLES12SP5 部署包生成"
+  short_description: "生成 SLES12SP5 离线部署包和依赖包，自动准备本机 WSL 环境"
+  default_prompt: "使用 $sles12sp5-deploy-package 自动准备 WSL 环境并生成或更新 SLES 12 SP5 离线部署包。"
