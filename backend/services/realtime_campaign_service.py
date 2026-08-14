@@ -162,6 +162,14 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
     existing_dict = dict(existing)
     if data.name is not None and data.name.strip() != (existing_dict.get("name") or "").strip():
         data.name = campaign_name_service.ensure_unique_name(data.name, "realtime", campaign_id)
+    auto_campaign_dir = ""
+    if data.status == "in_progress" and not (existing_dict.get("campaign_dir") or "").strip() \
+            and not bool(existing_dict.get("use_custom_directory")):
+        # Older campaigns may predate automatic campaign directory creation.
+        # Materialize the default directory before validation so they can be
+        # started after an upgrade without manual database repair.
+        auto_campaign_dir = _ensure_campaign_dir(existing_dict)
+        existing_dict["campaign_dir"] = auto_campaign_dir
     if data.status == "in_progress":
         validation_errors = operations_service.validate_campaign("realtime", {**existing_dict, "id": campaign_id})
         if validation_errors:
@@ -180,6 +188,8 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         val = getattr(data, field, None)
         if val is not None:
             fields[field] = val
+    if auto_campaign_dir:
+        fields["campaign_dir"] = auto_campaign_dir
     if data.send_days is not None:
         fields["send_days"] = _fmt_days(data.send_days)
 
