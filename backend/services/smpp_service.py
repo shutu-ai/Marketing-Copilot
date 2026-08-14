@@ -54,12 +54,12 @@ def create_config(data: SmppConfigCreate) -> dict:
     conn = get_connection()
     cursor = conn.execute(
         """INSERT INTO smpp_configs (name,host,port,system_id,password,source_addr,
-           bind_type,address_ton,address_npi,data_coding,pool_size,enquire_interval,timeout,
+           bind_type,address_ton,address_npi,data_coding,pool_size,window_size,enquire_interval,timeout,
            tps,priority,reconnect_max_seconds,delivery_receipt_mode)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (data.name, data.host, data.port, data.system_id, data.password, data.source_addr,
          data.bind_type, data.address_ton, data.address_npi, data.data_coding,
-         data.pool_size, data.enquire_interval, data.timeout, data.tps, data.priority, data.reconnect_max_seconds, data.delivery_receipt_mode)
+         data.pool_size, data.window_size, data.enquire_interval, data.timeout, data.tps, data.priority, data.reconnect_max_seconds, data.delivery_receipt_mode)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone()
@@ -78,7 +78,7 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     fields = {}
     for field in ["name", "host", "port", "system_id", "password", "source_addr",
                    "bind_type", "address_ton", "address_npi", "data_coding",
-                   "pool_size", "enquire_interval", "timeout", "tps", "priority",
+                   "pool_size", "window_size", "enquire_interval", "timeout", "tps", "priority",
                    "reconnect_max_seconds", "delivery_receipt_mode", "enabled"]:
         val = getattr(data, field, None)
         if val is not None:
@@ -172,6 +172,7 @@ def get_config_stats() -> dict:
                 "priority": cfg.get("priority", 100),
                 "tps": cfg.get("tps", 0),
                 "pool_size": cfg.get("pool_size", 1),
+                "window_size": cfg.get("window_size", 10),
                 "queue_size": _count(where, params, "status IN ('queued','retrying')"),
                 "sending": _count(where, params, "status='sending'"),
                 "submitted": _count(where, params, "status='submitted'"),

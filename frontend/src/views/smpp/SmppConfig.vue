@@ -18,6 +18,7 @@
         <el-table-column prop="bind_type" :label="$t('smpp.bindType')" width="120" />
         <el-table-column prop="priority" :label="$t('legacy.xee8ecb9e')" width="90" />
         <el-table-column prop="pool_size" :label="$t('remaining.x64cea34e')" width="80" />
+        <el-table-column prop="window_size" :label="$t('smpp.windowSize')" width="100" />
         <el-table-column prop="tps" label="TPS" width="70" />
         <el-table-column :label="$t('common.status')" width="80">
           <template #default="{ row }">
@@ -132,12 +133,17 @@
           </el-col>
         </el-row>
         <el-row :gutter="20">
-          <el-col :span="12">
+          <el-col :span="8">
             <el-form-item :label="$t('smpp.poolSize')">
               <el-input-number v-model="form.pool_size" :min="1" :max="20" style="width: 100%" />
             </el-form-item>
           </el-col>
-          <el-col :span="12">
+          <el-col :span="8">
+            <el-form-item :label="$t('smpp.windowSize')">
+              <el-input-number v-model="form.window_size" :min="1" :max="100" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
             <el-form-item :label="$t('smpp.enquireInterval')">
               <el-input-number v-model="form.enquire_interval" :min="5" :max="300" style="width: 100%" />
             </el-form-item>
@@ -193,7 +199,7 @@ const editingId = ref<number | null>(null)
 const defaultForm: SmppConfigForm = {
   name: '', host: '', port: 2775, system_id: '', password: '',
   source_addr: '', bind_type: 'transceiver', address_ton: 0, address_npi: 0,
-  data_coding: 0, pool_size: 1, enquire_interval: 30, timeout: 10,
+  data_coding: 0, pool_size: 1, window_size: 10, enquire_interval: 30, timeout: 10,
   tps: 10, priority: 100, reconnect_max_seconds: 60, delivery_receipt_mode: 'optional',
 }
 const form = ref<SmppConfigForm>({ ...defaultForm })
@@ -208,7 +214,7 @@ function openDialog(row?: SmppConfig) {
       system_id: row.system_id, password: '',
       source_addr: row.source_addr, bind_type: row.bind_type,
       address_ton: row.address_ton, address_npi: row.address_npi,
-      data_coding: row.data_coding, pool_size: row.pool_size,
+      data_coding: row.data_coding, pool_size: row.pool_size, window_size: row.window_size || 10,
       enquire_interval: row.enquire_interval, timeout: row.timeout,
       tps: row.tps, priority: row.priority, reconnect_max_seconds: row.reconnect_max_seconds,
       delivery_receipt_mode: row.delivery_receipt_mode || 'optional',

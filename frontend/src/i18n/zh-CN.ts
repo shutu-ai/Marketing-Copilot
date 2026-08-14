@@ -241,6 +241,7 @@ export default {
     addressNpi: '地址NPI',
     dataCoding: '编码格式',
     poolSize: '连接池大小',
+    windowSize: '并发窗口大小',
     enquireInterval: '心跳间隔(秒)',
     timeout: '超时(秒)',
     deliveryReceiptMode: 'DLR策略',

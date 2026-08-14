@@ -107,6 +107,7 @@ def status() -> dict[str, Any]:
         "running": bool(thread and thread.is_alive()),
         "queue_depth": sum(queue_depths.values()),
         "queue_depths": queue_depths,
+        "queue_capacity": QUEUE_CAPACITY,
         "batch_size": MAX_BATCH_SIZE,
         "flush_interval_ms": round(FLUSH_INTERVAL * 1000),
     }

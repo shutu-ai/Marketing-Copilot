@@ -11,6 +11,7 @@ export interface SmppConfig {
   address_npi: number
   data_coding: number
   pool_size: number
+  window_size: number
   tps: number
   priority: number
   reconnect_max_seconds: number
@@ -34,6 +35,7 @@ export interface SmppConfigForm {
   address_npi: number
   data_coding: number
   pool_size: number
+  window_size: number
   tps: number
   priority: number
   reconnect_max_seconds: number

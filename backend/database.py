@@ -39,6 +39,9 @@ TABLE_SEQUENCES = {
     "template_versions": "seq_template_versions",
     "update_history": "seq_update_history",
     "users": "seq_users",
+    "ingestion_files": "seq_ingestion_files",
+    "ingestion_chunks": "seq_ingestion_chunks",
+    "task_archive_manifests": "seq_task_archive_manifests",
 }
 
 
@@ -97,6 +100,13 @@ class WrappedConnection:
                 self.conn.execute(sql, params)
             else:
                 self.conn.execute(sql)
+        return self
+
+    def executemany(self, sql, rows):
+        sql = sql.replace("datetime('now','localtime')", "CURRENT_TIMESTAMP")
+        self._last_sql = sql
+        with _lock:
+            self.conn.executemany(sql, rows)
         return self
 
     def fetchone(self):
@@ -196,6 +206,7 @@ def init_db():
             address_npi INTEGER NOT NULL DEFAULT 0,
             data_coding INTEGER NOT NULL DEFAULT 0,
             pool_size INTEGER NOT NULL DEFAULT 1,
+            window_size INTEGER NOT NULL DEFAULT 10,
             enquire_interval INTEGER NOT NULL DEFAULT 30,
             timeout INTEGER NOT NULL DEFAULT 10,
             tps INTEGER NOT NULL DEFAULT 20,
@@ -409,6 +420,60 @@ def init_db():
             detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
             UNIQUE(campaign_type, campaign_id, filename)
         )""",
+        """CREATE TABLE IF NOT EXISTS ingestion_files (
+            id INTEGER DEFAULT nextval('seq_ingestion_files') PRIMARY KEY,
+            campaign_type TEXT NOT NULL,
+            campaign_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            file_path TEXT NOT NULL DEFAULT '',
+            file_size BIGINT NOT NULL DEFAULT 0,
+            total_rows BIGINT NOT NULL DEFAULT 0,
+            chunk_size INTEGER NOT NULL DEFAULT 5000,
+            total_chunks INTEGER NOT NULL DEFAULT 0,
+            completed_chunks INTEGER NOT NULL DEFAULT 0,
+            created_tasks BIGINT NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error_detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            completed_at TEXT,
+            UNIQUE(campaign_type, campaign_id, filename)
+        )""",
+        """CREATE TABLE IF NOT EXISTS ingestion_chunks (
+            id INTEGER DEFAULT nextval('seq_ingestion_chunks') PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            source_batch_id INTEGER,
+            chunk_index INTEGER NOT NULL,
+            start_row BIGINT NOT NULL DEFAULT 0,
+            end_row BIGINT NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT NOT NULL DEFAULT '',
+            lease_expires_at TEXT,
+            created_tasks INTEGER NOT NULL DEFAULT 0,
+            duplicate_rows INTEGER NOT NULL DEFAULT 0,
+            excluded_rows INTEGER NOT NULL DEFAULT 0,
+            invalid_rows INTEGER NOT NULL DEFAULT 0,
+            no_template_rows INTEGER NOT NULL DEFAULT 0,
+            error_detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            completed_at TEXT,
+            UNIQUE(file_id, chunk_index)
+        )""",
+        """CREATE TABLE IF NOT EXISTS task_archive_manifests (
+            id INTEGER DEFAULT nextval('seq_task_archive_manifests') PRIMARY KEY,
+            archive_key TEXT NOT NULL UNIQUE,
+            task_date DATE NOT NULL,
+            campaign_type TEXT NOT NULL,
+            campaign_id INTEGER NOT NULL,
+            first_task_id BIGINT NOT NULL,
+            last_task_id BIGINT NOT NULL,
+            task_count INTEGER NOT NULL,
+            root_path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'completed',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
         """CREATE TABLE IF NOT EXISTS system_events (
             id INTEGER DEFAULT nextval('seq_system_events') PRIMARY KEY,
             category TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'error',
@@ -516,6 +581,7 @@ def init_db():
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+        "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS window_size INTEGER DEFAULT 10",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS task_count INTEGER DEFAULT 0",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS delivered_count INTEGER DEFAULT 0",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS failed_count INTEGER DEFAULT 0",
@@ -627,6 +693,9 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_task_msg_task ON sms_task_message_ids(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_task_event_batches_campaign ON task_event_batches(campaign_type,campaign_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ingestion_chunks_status ON ingestion_chunks(status,lease_expires_at,id)",
+        "CREATE INDEX IF NOT EXISTS idx_ingestion_chunks_batch ON ingestion_chunks(source_batch_id)",
+        "CREATE INDEX IF NOT EXISTS idx_archive_partition ON task_archive_manifests(task_date,campaign_type,campaign_id,first_task_id)",
         "CREATE INDEX IF NOT EXISTS idx_events_open ON system_events(resolved,severity,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_template_versions ON template_versions(template_id,version_no)",

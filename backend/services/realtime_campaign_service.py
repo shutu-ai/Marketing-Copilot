@@ -9,13 +9,14 @@ from typing import Optional
 import pandas as pd
 import csv
 import time
-import sqlite3
+import duckdb
 import tempfile
 from database import get_connection
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
 from services import sms_task_service
-from services import operations_service, campaign_name_service
+from services import (operations_service, campaign_name_service, ingestion_job_service,
+                      backpressure_service)
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -365,12 +366,14 @@ def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
     result = {}
     for start in range(0, len(values), query_size):
         current = values[start:start + query_size]
-        placeholders = ",".join("?" for _ in current)
+        values_sql = ",".join("(?)" for _ in current)
         rows = conn.execute(
-            f"SELECT msisdn, language FROM whitelist_msisdns WHERE msisdn IN ({placeholders})",
+            f"""WITH current_chunk(msisdn) AS (VALUES {values_sql})
+                SELECT w.msisdn,w.language FROM whitelist_msisdns w
+                JOIN current_chunk c ON c.msisdn=w.msisdn""",
             current,
         ).fetchall()
-        result.update({row["msisdn"]: row["language"] for row in rows})
+        result.update({row[0]: row[1] for row in rows})
     return result
 
 
@@ -383,6 +386,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         conn.close()
         return {"success": False, "message": "Campaign not found"}
     campaign = dict(campaign)
+    # Do not retain a long-lived DuckDB snapshot while chunk state and tasks are
+    # committed through their own short transactions.
+    conn.close()
     try:
         file_record_id, duplicate_file = operations_service.register_file(
             "realtime", campaign_id, file_path, original_filename)
@@ -395,6 +401,10 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
             file_path, campaign.get("campaign_dir", ""), original_filename)
         return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
                 "message": "file already processed"}
+    ingestion_file_id, _ = ingestion_job_service.register_file(
+        "realtime", campaign_id, original_filename, file_path,
+        chunk_size=CHUNK_SIZE, reset=False,
+    )
     active, inactive_reason = sms_task_service.campaign_is_active(campaign)
     if not active:
         conn.close()
@@ -431,8 +441,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
             # Keep the whitelist on disk. Only the current input chunk is
             # materialized into a Python mapping during matching.
             whitelist_temp_dir = tempfile.TemporaryDirectory(prefix="mc-whitelist-")
-            whitelist_conn = sqlite3.connect(os.path.join(whitelist_temp_dir.name, "whitelist.sqlite3"))
-            whitelist_conn.row_factory = sqlite3.Row
+            whitelist_conn = duckdb.connect(os.path.join(whitelist_temp_dir.name, "whitelist.duckdb"))
             whitelist_conn.execute(
                 "CREATE TABLE whitelist_msisdns (msisdn TEXT PRIMARY KEY, language TEXT NOT NULL)"
             )
@@ -448,7 +457,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     whitelist_rows.append((norm, language))
                 if whitelist_rows:
                     whitelist_conn.executemany(
-                        "INSERT OR IGNORE INTO whitelist_msisdns(msisdn, language) VALUES (?,?)",
+                        "INSERT INTO whitelist_msisdns(msisdn, language) VALUES (?,?) ON CONFLICT DO NOTHING",
                         whitelist_rows,
                     )
                 del whitelist_rows, wl_chunk
@@ -486,11 +495,25 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         task_result = {"success": True, "created": 0, "duplicate": 0,
                        "excluded": 0, "invalid": 0, "no_template": 0}
         unique_dir = tempfile.TemporaryDirectory(prefix="mc-realtime-")
-        unique_conn = sqlite3.connect(os.path.join(unique_dir.name, "unique.sqlite3"))
+        unique_conn = duckdb.connect(os.path.join(unique_dir.name, "unique.duckdb"))
+        current_job = None
         try:
             unique_conn.execute("CREATE TABLE seen_msisdns (msisdn TEXT PRIMARY KEY, matched INTEGER NOT NULL)")
-            for chunk in reader:
+            for chunk_index, chunk in enumerate(reader):
+                pressure, _ = backpressure_service.reasons()
+                if pressure:
+                    raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
+                chunk_start = total_rows
                 total_rows += len(chunk)
+                ingestion_job_service.ensure_chunk(
+                    ingestion_file_id, chunk_index, chunk_start, total_rows
+                )
+                current_job = ingestion_job_service.claim_chunk(
+                    file_id=ingestion_file_id, chunk_index=chunk_index
+                )
+                if current_job is None:
+                    raise RuntimeError(f"realtime chunk {chunk_index} lease is held by another worker")
+                chunk_completed = current_job.get("status") == "completed"
                 if msisdn_col is None:
                     msisdn_col = "msisdn" if "msisdn" in chunk.columns else chunk.columns[0]
                 chunk_normalized = chunk[msisdn_col].map(sms_task_service.normalize_msisdn)
@@ -499,15 +522,17 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     if whitelist_conn is not None else whitelist_languages
                 )
                 matched_records = []
+                chunk_result = {}
                 for idx, norm in enumerate(chunk_normalized):
                     if not norm:
                         task_result["invalid"] += 1
                         continue
                     is_matched = not campaign.get("use_whitelist", True) or norm in chunk_whitelist_languages
                     inserted = unique_conn.execute(
-                        "INSERT OR IGNORE INTO seen_msisdns(msisdn, matched) VALUES (?,?)",
+                        """INSERT INTO seen_msisdns(msisdn, matched) VALUES (?,?)
+                           ON CONFLICT DO NOTHING RETURNING msisdn""",
                         (norm, 1 if is_matched else 0),
-                    ).rowcount
+                    ).fetchone()
                     if not inserted or not is_matched:
                         continue
                     row_dict = chunk.iloc[idx].fillna("").to_dict()
@@ -515,7 +540,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     row_dict["language"] = row_dict.get("language", "") if not campaign.get("use_whitelist", True) else chunk_whitelist_languages[norm]
                     matched_records.append(row_dict)
                 unique_conn.commit()
-                if matched_records:
+                if matched_records and not chunk_completed:
                     chunk_result = sms_task_service.enqueue_rows(
                         "realtime", campaign, matched_records, original_filename
                     )
@@ -530,14 +555,27 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                         if _task_msisdn_for_campaign(row["msisdn"], campaign) in created_msisdns
                     ])
                     del created_msisdns
+                elif chunk_completed:
+                    for key, column in (
+                        ("created", "created_tasks"), ("duplicate", "duplicate_rows"),
+                        ("excluded", "excluded_rows"), ("no_template", "no_template_rows"),
+                    ):
+                        task_result[key] += int(current_job.get(column, 0) or 0)
+                if not chunk_completed:
+                    ingestion_job_service.complete_chunk(
+                        current_job["id"], chunk_result if matched_records else {}
+                    )
+                current_job = None
                 del matched_records, chunk_normalized, chunk_whitelist_languages, chunk
             counts = unique_conn.execute(
                 "SELECT COUNT(*) AS total, SUM(matched) AS matched FROM seen_msisdns"
             ).fetchone()
             total_msisdn = int(counts[0] or 0)
             matched_count = int(counts[1] or 0)
-        except Exception:
+        except Exception as exc:
             conn.close()
+            if current_job and current_job.get("status") != "completed":
+                ingestion_job_service.fail_chunk(current_job["id"], exc)
             raise
         finally:
             unique_conn.close()
@@ -547,6 +585,17 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
             if whitelist_temp_dir:
                 whitelist_temp_dir.cleanup()
     else:
+        pressure, _ = backpressure_service.reasons()
+        if pressure:
+            conn.close()
+            raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
+        ingestion_job_service.ensure_chunk(ingestion_file_id, 0, 0, len(df))
+        excel_job = ingestion_job_service.claim_chunk(
+            file_id=ingestion_file_id, chunk_index=0
+        )
+        if excel_job is None:
+            conn.close()
+            raise RuntimeError("realtime Excel chunk lease is held by another worker")
         try:
             msisdn_col = "msisdn" if "msisdn" in df.columns else df.columns[0]
             normalized_msisdns = df[msisdn_col].map(sms_task_service.normalize_msisdn)
@@ -576,9 +625,20 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     if not campaign.get("use_whitelist", True)
                     else chunk_whitelist_languages[msisdn]
                 )
-            task_result = sms_task_service.enqueue_rows(
-                "realtime", campaign, matched_records, original_filename
-            )
+            if excel_job.get("status") == "completed":
+                task_result = {
+                    "success": True,
+                    "created": int(excel_job.get("created_tasks", 0) or 0),
+                    "duplicate": int(excel_job.get("duplicate_rows", 0) or 0),
+                    "excluded": int(excel_job.get("excluded_rows", 0) or 0),
+                    "invalid": int(excel_job.get("invalid_rows", 0) or 0),
+                    "no_template": int(excel_job.get("no_template_rows", 0) or 0),
+                    "created_msisdns": [],
+                }
+            else:
+                task_result = sms_task_service.enqueue_rows(
+                    "realtime", campaign, matched_records, original_filename
+                )
             created_msisdns = set(task_result.get("created_msisdns", []))
             _append_realtime_output(campaign.get("campaign_dir", ""), [
                 {"msisdn": record["msisdn"], "send_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")}
@@ -586,6 +646,13 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                 if _task_msisdn_for_campaign(record["msisdn"], campaign) in created_msisdns
             ])
             del created_msisdns
+            if excel_job.get("status") != "completed":
+                ingestion_job_service.complete_chunk(excel_job["id"], task_result)
+        except Exception as exc:
+            conn.close()
+            if excel_job.get("status") != "completed":
+                ingestion_job_service.fail_chunk(excel_job["id"], exc)
+            raise
         finally:
             if whitelist_conn:
                 whitelist_conn.close()
@@ -602,6 +669,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
     except OSError:
         pass
 
+    conn = get_connection()
     conn.execute(
         "INSERT INTO realtime_campaign_files (campaign_id, filename, file_path, total_msisdn, matched_count) VALUES (?,?,?,?,?)",
         (campaign_id, original_filename, dest, total_msisdn, matched_count)
@@ -609,6 +677,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
     conn.commit()
     conn.close()
     operations_service.finish_file(file_record_id, "completed", dest, total_rows, task_result.get("created", 0))
+    ingestion_job_service.finish_file(ingestion_file_id)
     logger.info(
         "Realtime file processed campaign=%s file=%s rows=%s unique_msisdn=%s matched=%s tasks_created=%s dest=%s",
         campaign_id, original_filename, total_rows, total_msisdn, matched_count, task_result.get("created", 0), dest,

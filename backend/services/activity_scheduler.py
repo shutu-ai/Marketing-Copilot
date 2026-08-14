@@ -5,7 +5,8 @@ import threading
 import time
 
 from database import get_connection
-from services import batch_campaign_service, realtime_campaign_service, sms_task_service, p1_service
+from services import (batch_campaign_service, realtime_campaign_service, sms_task_service,
+                      p1_service, ingestion_job_service)
 
 logger = logging.getLogger(__name__)
 _stop = threading.Event()
@@ -105,6 +106,7 @@ def _run():
             for error in realtime_result.get("errors", []):
                 logger.error("Realtime inbox file failed %s: %s", error.get("filename"), error.get("message"))
             if ticks % 20 == 0:
+                ingestion_job_service.recover_expired_chunks()
                 realtime_campaign_service.cleanup_realtime_retention()
                 sms_task_service.cleanup_task_retention()
                 p1_service.auto_complete_campaigns()
@@ -128,6 +130,9 @@ def start_scheduler():
                 break
     _stop.clear()
     _batch_worker_stop.clear()
+    recovered = ingestion_job_service.recover_expired_chunks()
+    if recovered:
+        logger.warning("Recovered %s expired ingestion chunk leases", recovered)
     _batch_worker_thread = threading.Thread(
         target=_batch_worker, name="batch-ingestion-worker", daemon=True
     )

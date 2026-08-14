@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 
@@ -37,6 +38,10 @@ class _SmppConnection:
         self._early_outcomes = {}
         self._listener = None
         self._last_submit = 0.0
+        self.window_size = max(1, min(100, int(
+            self.config.get("window_size") or os.environ.get("MC_SMPP_WINDOW_SIZE", "10")
+        )))
+        self._window = threading.BoundedSemaphore(self.window_size)
 
     @staticmethod
     def _text(value) -> str:
@@ -155,6 +160,10 @@ class _SmppConnection:
         self._last_submit = time.monotonic()
 
     def send(self, task: dict) -> list[str]:
+        with self._window:
+            return self._send_windowed(task)
+
+    def _send_windowed(self, task: dict) -> list[str]:
         with self._condition:
             self.connect()
             import smpplib.consts
@@ -221,7 +230,8 @@ class _SmppConnection:
 
     def status(self):
         return {"slot": self.slot, "state": self.state, "connected": self.connected,
-                "last_error": self.last_error, "last_connected_at": self.last_connected_at}
+                "last_error": self.last_error, "last_connected_at": self.last_connected_at,
+                "window_size": self.window_size, "inflight": len(self._sequence_tasks)}
 
 
 class SmppGateway:

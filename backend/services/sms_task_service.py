@@ -326,6 +326,14 @@ def normalize_msisdn(value: object) -> str:
     return number
 
 
+def stable_task_dedupe_key(campaign_type: str, campaign_id: int, msisdn: str,
+                           task_date: str, source_file: str) -> str:
+    """Build a replay-stable business key without ingestion-time timestamps."""
+    source_identity = os.path.basename(str(source_file or "")).strip()
+    value = f"{campaign_type}:{int(campaign_id)}:{source_identity}:{task_date}:{msisdn}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _find_excluded_msisdns(conn, msisdns, chunk_size: int = 1000) -> set[str]:
     """Return only exclusions relevant to the current enqueue batch."""
     values = list(msisdns)
@@ -463,31 +471,75 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
         result = {"success": True, "created": 0, "duplicate": 0,
                   "excluded": 0, "invalid": 0, "no_template": 0,
                   "created_msisdns": []}
-        seen = set()
         phone_prefix = (campaign.get("phone_prefix") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
         template_map = _resolve_template_map(conn, campaign_type, campaign["id"], campaign)
-        prepared_rows = []
-        for raw in rows:
+        stage_rows = []
+        for ordinal, raw in enumerate(rows):
             payload = {str(k): "" if v is None else str(v) for k, v in dict(raw).items()}
-            msisdn = normalize_msisdn(payload.get("msisdn"))
-            if not msisdn:
-                result["invalid"] += 1
-                continue
-            if phone_prefix and not msisdn.startswith(phone_prefix):
-                msisdn = phone_prefix + msisdn
-            payload["msisdn"] = msisdn
-            if msisdn in seen:
-                result["duplicate"] += 1
-                continue
-            seen.add(msisdn)
-            prepared_rows.append((payload, msisdn))
-
-        exclusions = _find_excluded_msisdns(conn, (item[1] for item in prepared_rows))
+            stage_rows.append((ordinal, payload.get("msisdn", ""),
+                               json.dumps(payload, ensure_ascii=False)))
+        conn.execute(
+            """CREATE TEMP TABLE ingest_task_stage (
+               ordinal BIGINT,raw_msisdn TEXT,payload TEXT)"""
+        )
+        if stage_rows:
+            conn.executemany(
+                "INSERT INTO ingest_task_stage VALUES (?,?,?)", stage_rows
+            )
+        normalized_expression = (
+            "regexp_replace(regexp_replace(COALESCE(raw_msisdn,''),'[^0-9]','','g'),'^0','')"
+        )
+        prefix_sql = "? || normalized" if phone_prefix else "normalized"
+        stage_params = [phone_prefix, phone_prefix] + ([phone_prefix] if phone_prefix else [])
+        stats = conn.execute(
+            f"""WITH cleaned AS (
+                    SELECT ordinal,payload,{normalized_expression} normalized
+                    FROM ingest_task_stage
+                 ), prefixed AS (
+                    SELECT ordinal,payload,
+                           CASE WHEN normalized='' THEN ''
+                                WHEN ?<>'' AND NOT starts_with(normalized,?) THEN {prefix_sql}
+                                ELSE normalized END msisdn
+                    FROM cleaned
+                 ), ranked AS (
+                    SELECT *,ROW_NUMBER() OVER (PARTITION BY msisdn ORDER BY ordinal) rn
+                    FROM prefixed
+                 )
+                 SELECT SUM(CASE WHEN r.msisdn='' THEN 1 ELSE 0 END) invalid,
+                        SUM(CASE WHEN r.msisdn<>'' AND rn>1 THEN 1 ELSE 0 END) duplicate,
+                        SUM(CASE WHEN r.msisdn<>'' AND rn=1 AND e.msisdn IS NOT NULL THEN 1 ELSE 0 END) excluded
+                 FROM ranked r LEFT JOIN exclusion_users e
+                   ON e.msisdn=r.msisdn AND e.enabled=1""",
+            stage_params,
+        ).fetchone()
+        result["invalid"] = int(stats["invalid"] or 0)
+        result["duplicate"] = int(stats["duplicate"] or 0)
+        result["excluded"] = int(stats["excluded"] or 0)
+        prepared_rows = conn.execute(
+            f"""WITH cleaned AS (
+                    SELECT ordinal,payload,{normalized_expression} normalized
+                    FROM ingest_task_stage
+                 ), prefixed AS (
+                    SELECT ordinal,payload,
+                           CASE WHEN normalized='' THEN ''
+                                WHEN ?<>'' AND NOT starts_with(normalized,?) THEN {prefix_sql}
+                                ELSE normalized END msisdn
+                    FROM cleaned
+                 ), ranked AS (
+                    SELECT *,ROW_NUMBER() OVER (PARTITION BY msisdn ORDER BY ordinal) rn
+                    FROM prefixed
+                 )
+                 SELECT r.payload,r.msisdn FROM ranked r
+                 LEFT JOIN exclusion_users e ON e.msisdn=r.msisdn AND e.enabled=1
+                 WHERE r.msisdn<>'' AND r.rn=1 AND e.msisdn IS NULL
+                 ORDER BY r.ordinal""",
+            stage_params,
+        ).fetchall()
         task_rows = []
-        for payload, msisdn in prepared_rows:
-            if msisdn in exclusions:
-                result["excluded"] += 1
-                continue
+        for stage_row in prepared_rows:
+            payload = json.loads(stage_row["payload"])
+            msisdn = stage_row["msisdn"]
+            payload["msisdn"] = msisdn
             language = payload.get("language", "")
             template = _select_template(template_map, language)
             if not template:
@@ -496,9 +548,9 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             content = template["content"]
             for key, value in payload.items():
                 content = content.replace("{" + key + "}", value)
-            dedupe_key = hashlib.sha256(
-                f"{campaign_type}:{campaign['id']}:{msisdn}:{task_date}:{source_file}".encode("utf-8")
-            ).hexdigest()
+            dedupe_key = stable_task_dedupe_key(
+                campaign_type, campaign["id"], msisdn, task_date, source_file
+            )
             task_rows.append((
                 campaign_type, campaign["id"], batch_id, campaign.get("name", ""), msisdn,
                 language, template["id"], campaign.get("smpp_config_id"), content,
@@ -871,9 +923,14 @@ def cleanup_task_retention() -> int:
     cleanup_batch = max(1000, min(20000, int(os.environ.get("MC_TASK_CLEANUP_BATCH", "5000"))))
     from datetime import timedelta
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    archive_enabled = os.environ.get("MC_TASK_ARCHIVE_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+    archived_count = 0
+    if archive_enabled:
+        from services import task_archive_service
+        archived_count = task_archive_service.archive_terminal_tasks(cutoff, cleanup_batch)["archived"]
     conn = get_connection()
     active = "('queued','sending','retrying','submitted','accepted')"
-    rows = conn.execute(
+    rows = [] if archive_enabled else conn.execute(
         f"""SELECT id FROM sms_tasks
              WHERE created_at < ? AND status NOT IN {active}
              ORDER BY id LIMIT ?""",
@@ -902,7 +959,7 @@ def cleanup_task_retention() -> int:
     conn.close()
     if ids:
         logger.info("SMS task retention cleanup deleted=%s retention_days=%s", len(ids), retention_days)
-    return len(ids)
+    return archived_count if archive_enabled else len(ids)
 
 def _cached_task_count(conn, where: str, params: list) -> int:
     now = time.monotonic()

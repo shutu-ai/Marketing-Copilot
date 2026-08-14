@@ -14,6 +14,7 @@ class SmppConfigCreate(BaseModel):
     address_npi: int = 0
     data_coding: int = 0
     pool_size: int = 1
+    window_size: int = 10
     enquire_interval: int = 30
     timeout: int = 10
     tps: int = 20
@@ -35,6 +36,7 @@ class SmppConfigUpdate(BaseModel):
     address_npi: Optional[int] = None
     data_coding: Optional[int] = None
     pool_size: Optional[int] = None
+    window_size: Optional[int] = None
     enquire_interval: Optional[int] = None
     timeout: Optional[int] = None
     tps: Optional[int] = None
@@ -56,6 +58,7 @@ class SmppConfigResponse(BaseModel):
     address_npi: int
     data_coding: int
     pool_size: int
+    window_size: int
     enquire_interval: int
     timeout: int
     delivery_receipt_mode: Literal['required', 'optional', 'disabled']

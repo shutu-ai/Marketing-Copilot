@@ -236,6 +236,7 @@ export default {
     addressNpi: 'Address NPI',
     dataCoding: 'Data Coding',
     poolSize: 'Pool Size',
+    windowSize: 'Window Size',
     enquireInterval: 'Enquire Interval (s)',
     timeout: 'Timeout (s)',
     deliveryReceiptMode: 'DLR mode',

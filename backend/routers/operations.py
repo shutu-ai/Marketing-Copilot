@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from database import get_connection
 from services import p1_service
+from services import task_archive_service
 
 router = APIRouter(prefix="/api/operations", tags=["Operations"])
 
@@ -71,6 +72,22 @@ def failure_archive(page: int = 1, page_size: int = Query(50, le=200),
 def failed_tasks(page: int = 1, page_size: int = Query(50, le=200),
                  cursor: Optional[int] = Query(None, ge=1)):
     return p1_service.list_failed_tasks(page, page_size, cursor)
+
+
+@router.get("/tasks/parquet-archives")
+def parquet_archives(campaign_type: str = "", campaign_id: int = 0,
+                     cursor: Optional[int] = Query(None, ge=1),
+                     page_size: int = Query(50, le=200)):
+    return task_archive_service.list_archives(campaign_type, campaign_id, cursor, page_size)
+
+
+@router.get("/tasks/parquet-archives/items")
+def parquet_archive_items(campaign_type: str = "", campaign_id: int = 0,
+                          cursor: Optional[int] = Query(None, ge=1),
+                          page_size: int = Query(50, le=200)):
+    return task_archive_service.list_archived_tasks(
+        campaign_type, campaign_id, cursor, page_size
+    )
 
 
 @router.get("/tasks/{task_id}/timeline")

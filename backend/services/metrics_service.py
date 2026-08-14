@@ -41,6 +41,17 @@ def observe_runtime_state(worker_count=0):
         from services import sms_write_buffer
         buffered = sms_write_buffer.status()
         set_gauge("marketing_copilot_sms_write_queue_depth", buffered["queue_depth"])
+        for queue_name, depth in buffered.get("queue_depths", {}).items():
+            set_gauge("marketing_copilot_sms_write_queue_depth_by_kind", depth,
+                      {"queue": queue_name})
+    except Exception:
+        pass
+    try:
+        from services import backpressure_service
+        pressure = backpressure_service.snapshot(include_task_depth=False)
+        set_gauge("marketing_copilot_ingestion_chunk_backlog", pressure["chunk_depth"])
+        set_gauge("marketing_copilot_disk_used_percent", pressure["disk"]["used_pct"])
+        set_gauge("marketing_copilot_disk_free_bytes", pressure["disk"]["free_bytes"])
     except Exception:
         pass
     # Per-SMSC queue depth, using the same attribution as the gateway:

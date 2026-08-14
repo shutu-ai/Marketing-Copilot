@@ -88,7 +88,7 @@ MC_SYSTEM_MODE=production
 MC_TASK_WORKERS=4
 MC_AUTH_DISABLED=0
 MC_ADMIN_USERNAME=admin
-MC_ADMIN_PASSWORD=请替换为首次登录密码
+MC_ADMIN_PASSWORD=Huawei@123
 MC_UPDATE_MODE=manual
 MC_STATE_DIR=/opt/marketing-copilot/data
 MC_UPDATE_DIR=/opt/marketing-copilot/updates
@@ -101,7 +101,8 @@ MC_UPDATE_DIR=/opt/marketing-copilot/updates
 - 数据库、日志、锁和备份目录必须对运行账号可写。
 - `MC_FRONTEND_DIR` 要指向 `frontend/dist`，不是前端源码目录。
 - 生产环境 `MC_SYSTEM_MODE` 必须为 `production`。
-- 生产环境 `MC_AUTH_DISABLED` 必须为 `0`，管理员密码必须修改；默认密码为 `Huawei@123`。
+- 默认管理员账号为 `admin`，默认密码为 `Huawei@123`。首次登录后必须修改密码。
+- 生产环境 `MC_AUTH_DISABLED` 必须为 `0`，不能关闭登录认证。
 - 手工或 nohup 运行使用 `MC_UPDATE_MODE=manual`；改为 systemd 托管后使用 `systemd`。
 
 ### 3.3 启动应用
@@ -179,21 +180,9 @@ cd /opt/marketing-copilot/backend
 
 页面中填写 Host `127.0.0.1`、Port `2775`、System ID `test`、Password `test`、Bind Type `transceiver`，保存并测试连接。系统模式仍必须设置为生产模式，模拟器才会收到真实 SMPP 提交。模拟器只用于联调，不能用于生产。
 
-## 6. 配置短信内容
+## 6. 创建批量营销任务
 
-每个营销活动都必须有短信内容活动和至少一个匹配用户语言的模板。
-
-1. 进入“批量活动”或“实时活动”。
-2. 在活动行点击“更多”→“配置短信”。
-3. 新建短信内容活动。
-4. 为每种语言添加模板并保存。
-5. 可使用 `{msisdn}`、`{event_filter_id}`、`{cell_id}`、`{offer_code}` 等变量。
-
-变量名必须和上传文件的列名一致。发送前确认变量已替换，不能发送包含未替换 `{...}` 的内容。
-
-## 7. 创建批量营销任务
-
-### 7.1 准备目标清单
+### 6.1 准备目标清单
 
 最少需要 `msisdn` 列，推荐使用 UTF-8 CSV，并包含 `language` 和业务字段：
 
@@ -205,7 +194,7 @@ msisdn,event_filter_id,cell_id,customer_name,offer_code,language
 
 手机号应带国家码；`language` 必须与模板语言一致。
 
-### 7.2 创建、上传和配置
+### 6.2 创建、上传和配置
 
 1. 进入“批量活动”→“新增活动”。
 2. 填写活动名称、开始时间、结束时间、每日发送开始/结束时间。
@@ -214,10 +203,11 @@ msisdn,event_filter_id,cell_id,customer_name,offer_code,language
 5. 填写号码前缀，例如 `251`，并选择已测试成功的 SMPP 配置。
 6. 点击“保存”。
 7. 活动行点击“更多”→“上传目标清单”，选择 CSV 并确认，检查行数和详情。
-8. 点击“更多”→“配置短信”，为清单中的每种语言创建模板并保存。
-9. 确认活动“就绪度”包含：清单、模板、SMPP、发送计划全部完成。
+8. 点击“更多”→“配置短信”，新建短信内容活动。
+9. 为清单中出现的每种语言创建模板并保存。模板可以使用 `{msisdn}`、`{event_filter_id}`、`{cell_id}`、`{offer_code}` 等变量，变量名必须与 CSV 列名一致。
+10. 确认活动“就绪度”包含：清单、模板、SMPP、发送计划全部完成。发送前确认正文中没有未替换的 `{...}`。
 
-### 7.3 启动和查看
+### 6.3 启动和查看
 
 1. 确认系统模式为生产模式。
 2. 点击活动行“开始”。
@@ -227,9 +217,9 @@ msisdn,event_filter_id,cell_id,customer_name,offer_code,language
 
 第一次生产发送只使用少量测试号码，先确认 SMSC 已接受提交；如果启用了送达回执，再确认回执状态后扩大名单。
 
-## 8. 创建实时营销任务
+## 7. 创建实时营销任务
 
-### 8.1 准备活动白名单
+### 7.1 准备活动白名单
 
 白名单至少包含 `msisdn`，推荐包含 `region`、`language`：
 
@@ -240,37 +230,41 @@ msisdn,region,language
 251900001003,ET,Tigrigna
 ```
 
-### 8.2 创建并配置活动
+### 7.2 创建并配置活动
 
 1. 进入“实时活动”→“新增活动”。
 2. 填写名称、起止日期、每日发送时间和允许发送星期。
 3. 填写号码前缀并选择 SMPP 配置，保存。
 4. 活动行点击“更多”→“上传白名单”，选择 CSV 并确认行数。
-5. 点击“更多”→“配置短信”，为白名单语言创建模板并保存。
-6. 确认活动就绪度完成。
+5. 点击“更多”→“配置短信”，新建短信内容活动。
+6. 为白名单中的每种语言创建模板并保存。模板可以使用事件文件中的 `{event_filter_id}`、`{msisdn}`、`{cell_id}` 等变量，变量名必须与文件列名一致。
+7. 确认活动就绪度完成，且模板正文没有未替换的 `{...}`。
 
-### 8.3 投递事件文件并发送
+### 7.3 投递事件文件并发送
 
-事件 CSV/XLS/XLSX 推荐包含：
+按以下步骤投递事件文件：
 
-```csv
-msisdn,event_filter_id,cell_id,customer_name,offer_code
-251900001001,RT_EVT_001,CELL_R01,Alice,FLASH10
-251900001002,RT_EVT_002,CELL_R02,Berhanu,FLASH20
-```
+1. 点击实时活动“开始”，确认活动状态变为“进行中”。
+2. 打开活动详情，查看系统显示的监听目录 `watch_dir`、监听文件名前缀和 `inbox` 目录。
+3. 如果使用监听目录，将事件平台导出的文件完整复制到 `watch_dir`。导出的文件应包含 `msisdn` 列；常见格式如下：
 
-1. 点击实时活动“开始”。
-2. 点击“更多”→“上传目标文件”，选择事件文件；或将文件完整复制到活动详情显示的 `inbox` 目录。
-3. 打开活动详情，查看接收文件、事件用户和匹配用户数。
-4. 进入“短信任务”，活动类型选择“实时”。
-5. 确认只有白名单号码产生任务，且正文变量已替换。
-6. 如果 SMSC 提供送达回执，等待任务变为 `delivered`；如果未启用回执，以 `submitted` 作为 SMSC 已接受提交的结果，并结合短信中心侧记录确认发送情况。
+   ```text
+   eventType|event_filter_id|starttime|msisdn|imsi|imei|cell_id
+   8004|CEP_admin_20260717114709359|1785328439|975028665|636019965838629|356701088786390|636011BB0C02
+   ```
+
+   文件名默认应类似 `Android_4G_Switch_Somali_20260814123000.csv`：前缀以活动详情为准，后面为 `YYYYMMDDHHMMSS` 时间戳。文件扩展名可为 `.csv`、`.txt`、`.xlsx` 或 `.xls`，文件必须写完后再复制到目录。
+
+4. 打开活动详情，查看“接收文件”“事件用户”和“匹配用户”数量。
+5. 进入“短信任务”，活动类型选择“实时”。
+6. 确认只有白名单号码产生任务，且短信模板中的 `{event_filter_id}`、`{msisdn}` 等变量已正确替换。
+7. 如果 SMSC 提供送达回执，等待任务变为 `delivered`；如果未启用回执，以 `submitted` 作为 SMSC 已接受提交的结果，并结合短信中心侧记录确认发送情况。
 
 系统会按号码去重，并过滤不在实时白名单中的号码。重复投递同一文件不应产生重复短信。
 
-## 9. 监控、结束和故障处理
+## 8. 监控、结束和故障处理
 
-### 9.1 页面监控
+### 8.1 页面监控
 
 - “仪表盘”：总体统计。
 - “短信任务”：按类型、活动、状态筛选并查看单条短信。
@@ -280,7 +274,7 @@ msisdn,event_filter_id,cell_id,customer_name,offer_code
 
 活动结束时，在批量/实时活动列表点击“结束”；实时活动结束后不要继续向 inbox 放文件。
 
-### 9.2 常见故障
+### 8.2 常见故障
 
 **页面打不开：**
 
@@ -300,7 +294,7 @@ tail -n 100 /opt/marketing-copilot/logs/app.log
 
 **任务 failed/retrying：**在短信任务查看错误信息；修复原因后，只对确认不会造成重复触达的任务执行“重新入队”。
 
-## 10. 上线前检查清单
+## 9. 上线前检查清单
 
 - [ ] SLES 12 SP5 x86_64、Python 3.11.5、ssl/venv 均正常。
 - [ ] `marketing-copilot.env` 已创建，管理员密码已修改，认证未关闭。
@@ -311,7 +305,7 @@ tail -n 100 /opt/marketing-copilot/logs/app.log
 - [ ] 已用少量测试号码验证 SMSC 提交成功；如启用送达回执，再验证回执状态。
 - [ ] 已确认短信任务、日志、审计记录可查看。
 
-## 11. 命令速查
+## 10. 命令速查
 
 ```bash
 sudo systemctl status marketing-copilot.service
