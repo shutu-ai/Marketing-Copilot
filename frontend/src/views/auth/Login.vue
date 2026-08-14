@@ -4,7 +4,7 @@
       <div class="login-brand">
         <span class="login-mark" aria-hidden="true">M</span>
         <div class="login-titles">
-          <h1 class="login-name">Marketing Copilot</h1>
+          <h1 class="login-name">Marketing Copilot Plus</h1>
           <p class="login-sub">{{ $t('auth.subtitle') }}</p>
         </div>
       </div>

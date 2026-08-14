@@ -3,7 +3,7 @@
     <el-aside v-if="!isMobile" :width="collapse ? '76px' : '248px'" class="aside">
       <div class="logo">
         <span class="logo-mark" aria-hidden="true">M</span>
-        <span v-if="!collapse" class="logo-name">Marketing Copilot</span>
+        <span v-if="!collapse" class="logo-name">Marketing Copilot Plus</span>
       </div>
       <Sidebar :collapse="collapse" />
     </el-aside>
@@ -25,7 +25,7 @@
     size="280px"
     class="mobile-navigation"
   >
-    <div class="logo">Marketing Copilot</div>
+    <div class="logo">Marketing Copilot Plus</div>
     <Sidebar :collapse="false" @navigate="mobileOpen = false" />
   </el-drawer>
 </template>
