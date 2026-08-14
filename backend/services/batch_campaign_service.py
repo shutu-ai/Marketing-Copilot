@@ -459,7 +459,9 @@ def reset_batches_for_today(campaign_id: int) -> bool:
         conn.close()
         return False
     conn.execute(
-        "UPDATE batch_campaign_batches SET status='pending', updated_at=CURRENT_TIMESTAMP WHERE campaign_id=?",
+        """UPDATE batch_campaign_batches
+           SET status='pending',task_count=0,delivered_count=0,failed_count=0,
+               updated_at=CURRENT_TIMESTAMP WHERE campaign_id=?""",
         (campaign_id,),
     )
     conn.commit()
@@ -663,8 +665,10 @@ def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[di
         queued = enqueue_result["created"]
         batch_status = "queued" if queued > 0 else "skipped"
         conn.execute(
-            "UPDATE batch_campaign_batches SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
-            (batch_status, batch_id)
+            """UPDATE batch_campaign_batches
+               SET status=?,task_count=?,delivered_count=0,failed_count=0,
+                   updated_at=datetime('now','localtime') WHERE id=?""",
+            (batch_status, queued, batch_id)
         )
 
         # Update daily stats

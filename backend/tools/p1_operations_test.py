@@ -67,11 +67,12 @@ def main():
 
     conn = get_connection()
     conn.execute("""INSERT INTO sms_tasks
-        (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status,smsc_message_ids)
-        VALUES ('realtime',?,'P1 realtime','251900000002','x','p1-dlr','submitted',?)""",
-        (realtime_id, json.dumps(["p1-dlr-msg"])))
+        (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+        VALUES ('realtime',?,'P1 realtime','251900000002','x','p1-dlr','sending')""",
+        (realtime_id,))
     dlr_id = conn.execute("SELECT id FROM sms_tasks WHERE dedupe_key='p1-dlr'").fetchone()["id"]
     conn.commit(); conn.close()
+    sms_task_service.mark_submitted(dlr_id, ["p1-dlr-msg"])
     sms_task_service.record_receipt("p1-dlr-msg", "REJECTD", "rejected test")
     timeline = p1_service.task_timeline(dlr_id)
     assert timeline["events"][-1]["event_type"] == "delivery_receipt"

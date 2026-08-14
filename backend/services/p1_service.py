@@ -168,11 +168,21 @@ def bulk_failed_tasks(action: str, task_ids=None, campaign_type: str = "", campa
     conn = get_connection()
     rows = conn.execute("SELECT * FROM sms_tasks WHERE " + " AND ".join(conditions), params).fetchall()
     if action == "retry":
+        retry_by_batch = {}
         for row in rows:
             conn.execute(
                 """UPDATE sms_tasks SET status='queued',attempts=0,error_msg='',failure_class='',
                    next_attempt_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""", (row["id"],))
             _task_event(conn, row["id"], "bulk_retry", row["status"], "queued", "bulk retry requested")
+            if row["batch_id"]:
+                retry_by_batch[row["batch_id"]] = retry_by_batch.get(row["batch_id"], 0) + 1
+        for batch_id, count in retry_by_batch.items():
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET failed_count=GREATEST(COALESCE(failed_count,0)-?,0),
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (count, batch_id),
+            )
     elif action == "archive":
         for raw in rows:
             row = dict(raw)
@@ -202,28 +212,43 @@ def _task_event(conn, task_id: int, event_type: str, from_status: str, to_status
          json.dumps(detail or {}, ensure_ascii=False, default=str)))
 
 
-def list_failure_archive(page: int = 1, page_size: int = 50) -> dict:
+def list_failure_archive(page: int = 1, page_size: int = 50,
+                         cursor: Optional[int] = None) -> dict:
     conn = get_connection()
     total = conn.execute("SELECT COUNT(*) cnt FROM failed_task_archive").fetchone()["cnt"]
-    rows = conn.execute("SELECT * FROM failed_task_archive ORDER BY archived_at DESC LIMIT ? OFFSET ?",
-                        (page_size, max(0, page - 1) * page_size)).fetchall()
+    where, params = ("WHERE id<?", [cursor]) if cursor else ("", [])
+    rows = conn.execute(
+        f"SELECT * FROM failed_task_archive {where} ORDER BY id DESC LIMIT ?",
+        params + [page_size + 1],
+    ).fetchall()
     conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+    has_more = len(rows) > page_size
+    items = [dict(row) for row in rows[:page_size]]
+    return {"total": total, "page": page, "page_size": page_size, "items": items,
+            "next_cursor": items[-1]["id"] if has_more and items else None,
+            "has_more": has_more}
 
 
-def list_failed_tasks(page: int = 1, page_size: int = 50) -> dict:
+def list_failed_tasks(page: int = 1, page_size: int = 50,
+                      cursor: Optional[int] = None) -> dict:
     conn = get_connection()
     total = conn.execute(
         "SELECT COUNT(*) cnt FROM sms_tasks WHERE status IN ('failed','expired')"
     ).fetchone()["cnt"]
+    cursor_condition = " AND id<?" if cursor else ""
+    params = [cursor] if cursor else []
     rows = conn.execute(
-        """SELECT * FROM sms_tasks
-           WHERE status IN ('failed','expired')
-           ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        (page_size, max(0, page - 1) * page_size),
+        f"""SELECT * FROM sms_tasks
+            WHERE status IN ('failed','expired'){cursor_condition}
+            ORDER BY id DESC LIMIT ?""",
+        params + [page_size + 1],
     ).fetchall()
     conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+    has_more = len(rows) > page_size
+    items = [dict(row) for row in rows[:page_size]]
+    return {"total": total, "page": page, "page_size": page_size, "items": items,
+            "next_cursor": items[-1]["id"] if has_more and items else None,
+            "has_more": has_more}
 
 
 def task_timeline(task_id: int) -> dict:
@@ -233,9 +258,19 @@ def task_timeline(task_id: int) -> dict:
         conn.close()
         raise LookupError("task not found")
     events = conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY created_at,id", (task_id,)).fetchall()
+    batch_events = conn.execute(
+        """SELECT * FROM task_event_batches
+           WHERE campaign_type=? AND campaign_id=?
+             AND (batch_id IS NULL OR batch_id IS NOT DISTINCT FROM ?)
+             AND ? BETWEEN first_task_id AND last_task_id
+           ORDER BY created_at,id""",
+        (task["campaign_type"], task["campaign_id"], task["batch_id"], task_id),
+    ).fetchall()
     receipts = conn.execute("SELECT * FROM delivery_receipts WHERE task_id=? ORDER BY received_at,id", (task_id,)).fetchall()
     conn.close()
-    return {"task": dict(task), "events": [dict(r) for r in events], "receipts": [dict(r) for r in receipts]}
+    return {"task": dict(task), "events": [dict(r) for r in events],
+            "batch_events": [dict(r) for r in batch_events],
+            "receipts": [dict(r) for r in receipts]}
 
 
 def list_events(resolved: Optional[bool] = None, severity: str = "", page: int = 1, page_size: int = 50) -> dict:

@@ -1,6 +1,6 @@
 import api from './index'
 
-export function getSmsTasks(params: { page?: number; page_size?: number; status?: string; campaign_type?: string; smpp_config_id?: number }) {
+export function getSmsTasks(params: { page?: number; page_size?: number; cursor?: number; status?: string; campaign_type?: string; smpp_config_id?: number }) {
   return api.get<any>('/sms-tasks', { params })
 }
 

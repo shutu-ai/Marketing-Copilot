@@ -92,19 +92,19 @@ def _run(worker_index):
                             task["id"], task.get("campaign_type"), task.get("campaign_id"),
                             task.get("msisdn"), len(task.get("content") or ""), (task.get("content") or "")[:1000],
                         )
-                        sms_task_service.mark_submitted(task["id"], [message_id], task.get("_delivery_receipt_mode", "optional"))
-                        sms_task_service.record_receipt(message_id, "DELIVRD", "development simulation")
+                        sms_task_service.mark_submitted(task["id"], [message_id], task.get("_delivery_receipt_mode", "optional"), wait=False)
+                        sms_task_service.record_receipt(message_id, "DELIVRD", "development simulation", wait=False)
                     else:
-                        sms_task_service.mark_submitted(task["id"], gateway.send(task), task.get("_delivery_receipt_mode", "optional"))
+                        sms_task_service.mark_submitted(task["id"], gateway.send(task), task.get("_delivery_receipt_mode", "optional"), wait=False)
                     metrics_service.inc("marketing_copilot_tasks_submitted_total")
                 except SmppSubmitError as exc:
                     temporary = exc.status in {0x00000008, 0x00000014, 0x00000045, 0x00000058}
                     failure_class = "delivery_unknown" if exc.status == -1 else "submit_sm_resp"
-                    sms_task_service.mark_send_failure(task, str(exc), exc.status, temporary, failure_class)
+                    sms_task_service.mark_send_failure(task, str(exc), exc.status, temporary, failure_class, wait=False)
                     metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": failure_class})
                 except Exception as exc:
                     logger.exception("SMS task %s failed", task["id"])
-                    sms_task_service.mark_send_failure(task, str(exc))
+                    sms_task_service.mark_send_failure(task, str(exc), wait=False)
                     metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": "transport"})
     except Exception:
         logger.exception("SMS worker %s terminated unexpectedly", worker_index + 1)

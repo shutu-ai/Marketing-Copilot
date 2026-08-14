@@ -37,6 +37,12 @@ def observe_runtime_state(worker_count=0):
     set_gauge("marketing_copilot_queue_depth", counts.get("queued", 0) + counts.get("retrying", 0))
     set_gauge("marketing_copilot_workers", worker_count)
     set_gauge("marketing_copilot_uptime_seconds", time.time() - _started_at)
+    try:
+        from services import sms_write_buffer
+        buffered = sms_write_buffer.status()
+        set_gauge("marketing_copilot_sms_write_queue_depth", buffered["queue_depth"])
+    except Exception:
+        pass
     # Per-SMSC queue depth, using the same attribution as the gateway:
     # NULL smpp_config_id tasks route to the first enabled config.
     conn = get_connection()

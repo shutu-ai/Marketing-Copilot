@@ -62,13 +62,15 @@ def bulk_tasks(body: BulkTaskRequest):
 
 
 @router.get("/tasks/archive")
-def failure_archive(page: int = 1, page_size: int = Query(50, le=200)):
-    return p1_service.list_failure_archive(page, page_size)
+def failure_archive(page: int = 1, page_size: int = Query(50, le=200),
+                    cursor: Optional[int] = Query(None, ge=1)):
+    return p1_service.list_failure_archive(page, page_size, cursor)
 
 
 @router.get("/tasks/failures")
-def failed_tasks(page: int = 1, page_size: int = Query(50, le=200)):
-    return p1_service.list_failed_tasks(page, page_size)
+def failed_tasks(page: int = 1, page_size: int = Query(50, le=200),
+                 cursor: Optional[int] = Query(None, ge=1)):
+    return p1_service.list_failed_tasks(page, page_size, cursor)
 
 
 @router.get("/tasks/{task_id}/timeline")

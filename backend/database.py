@@ -34,6 +34,7 @@ TABLE_SEQUENCES = {
     "system_events": "seq_system_events",
     "audit_logs": "seq_audit_logs",
     "task_events": "seq_task_events",
+    "task_event_batches": "seq_task_event_batches",
     "failed_task_archive": "seq_failed_task_archive",
     "template_versions": "seq_template_versions",
     "update_history": "seq_update_history",
@@ -282,6 +283,9 @@ def init_db():
             start_row INTEGER NOT NULL DEFAULT 0,
             end_row INTEGER NOT NULL DEFAULT 0,
             total_count INTEGER NOT NULL DEFAULT 0,
+            task_count INTEGER NOT NULL DEFAULT 0,
+            delivered_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
@@ -426,6 +430,20 @@ def init_db():
             message TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
+        """CREATE TABLE IF NOT EXISTS task_event_batches (
+            id INTEGER DEFAULT nextval('seq_task_event_batches') PRIMARY KEY,
+            campaign_type TEXT NOT NULL DEFAULT '',
+            campaign_id INTEGER NOT NULL DEFAULT 0,
+            batch_id INTEGER,
+            event_type TEXT NOT NULL,
+            from_status TEXT NOT NULL DEFAULT '',
+            to_status TEXT NOT NULL DEFAULT '',
+            event_count INTEGER NOT NULL DEFAULT 0,
+            first_task_id INTEGER,
+            last_task_id INTEGER,
+            detail TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
         """CREATE TABLE IF NOT EXISTS failed_task_archive (
             id INTEGER DEFAULT nextval('seq_failed_task_archive') PRIMARY KEY,
             task_id INTEGER NOT NULL UNIQUE, campaign_type TEXT NOT NULL,
@@ -498,6 +516,9 @@ def init_db():
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+        "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS task_count INTEGER DEFAULT 0",
+        "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS delivered_count INTEGER DEFAULT 0",
+        "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS failed_count INTEGER DEFAULT 0",
    ]
     for stmt in migrations:
         try:
@@ -560,6 +581,20 @@ def init_db():
         "UPDATE smpp_configs SET reconnect_max_seconds=60 WHERE reconnect_max_seconds IS NULL",
         "UPDATE smpp_configs SET delivery_receipt_mode='optional' WHERE delivery_receipt_mode IS NULL OR delivery_receipt_mode=''",
         "UPDATE realtime_campaigns SET watch_filename_prefix='Android_4G_Switch_Somali_' WHERE watch_filename_prefix IS NULL OR watch_filename_prefix=''",
+        """UPDATE batch_campaign_batches b SET
+               task_count=s.task_count,
+               delivered_count=s.delivered_count,
+               failed_count=s.failed_count
+           FROM (
+               SELECT t.batch_id,COUNT(*) task_count,
+                      SUM(CASE WHEN t.status='delivered' THEN 1 ELSE 0 END) delivered_count,
+                      SUM(CASE WHEN t.status IN ('failed','expired','cancelled') THEN 1 ELSE 0 END) failed_count
+               FROM sms_tasks t
+               JOIN batch_campaign_batches pending ON pending.id=t.batch_id
+               WHERE COALESCE(pending.task_count,0)=0
+               GROUP BY t.batch_id
+           ) s
+           WHERE b.id=s.batch_id AND COALESCE(b.task_count,0)=0""",
     ]:
         try:
             conn.execute(stmt)
@@ -579,6 +614,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(smsc_message_id)",
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_created ON sms_tasks(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_tasks_keyset ON sms_tasks(id)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_tasks_batch_status ON sms_tasks(batch_id,status)",
         "CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(campaign_type,campaign_id,file_hash)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_name_unique ON processed_files(campaign_type,campaign_id,filename)",
         # Receipt dedup is per-task: SMSC message ids may be reused across
@@ -589,6 +626,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_receipt_task ON delivery_receipts(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_msg_task ON sms_task_message_ids(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_task_event_batches_campaign ON task_event_batches(campaign_type,campaign_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_events_open ON system_events(resolved,severity,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_template_versions ON template_versions(template_id,version_no)",

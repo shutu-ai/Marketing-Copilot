@@ -69,8 +69,10 @@ def startup():
     os.makedirs(os.path.join(os.path.dirname(__file__), "uploads"), exist_ok=True)
     os.makedirs(os.path.join(os.path.dirname(__file__), "monitor_dir"), exist_ok=True)
     update_service.ensure_update_dir()
+    from services.sms_write_buffer import start as start_sms_write_buffer
     from services.task_worker import start_worker
     from services.activity_scheduler import start_scheduler
+    start_sms_write_buffer()
     start_worker()
     start_scheduler()
 
@@ -89,8 +91,10 @@ def startup():
 def shutdown():
     from services.task_worker import stop_worker
     from services.activity_scheduler import stop_scheduler
+    from services.sms_write_buffer import stop as stop_sms_write_buffer
     stop_scheduler()
     stop_worker()
+    stop_sms_write_buffer()
     release_instance_lock()
 
 

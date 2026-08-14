@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+from typing import Optional
 
 from database import get_connection
 from services import sms_task_service
@@ -14,8 +15,11 @@ class ExclusionRequest(BaseModel):
 
 @router.get("")
 def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = "",
-               campaign_type: str = "", smpp_config_id: int = Query(-1)):
-    return sms_task_service.list_tasks(page, page_size, status, campaign_type, smpp_config_id)
+               campaign_type: str = "", smpp_config_id: int = Query(-1),
+               cursor: Optional[int] = Query(None, ge=1)):
+    return sms_task_service.list_tasks(
+        page, page_size, status, campaign_type, smpp_config_id, cursor
+    )
 
 
 @router.get("/stats")

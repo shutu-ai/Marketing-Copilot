@@ -163,16 +163,48 @@ def _bulk_insert_events(conn, event_rows) -> None:
         )
 
 
+def _add_task_event_batch(conn, campaign_type: str, campaign_id: int,
+                          batch_id: Optional[int], event_type: str,
+                          from_status: str, to_status: str, task_ids,
+                          detail=None) -> None:
+    ids = [int(task_id) for task_id in task_ids]
+    if not ids:
+        return
+    _add_task_event_batch_summary(
+        conn, campaign_type, campaign_id, batch_id, event_type,
+        from_status, to_status, len(ids), min(ids), max(ids), detail,
+    )
+
+
+def _add_task_event_batch_summary(conn, campaign_type: str, campaign_id: int,
+                                  batch_id: Optional[int], event_type: str,
+                                  from_status: str, to_status: str, event_count: int,
+                                  first_task_id: int, last_task_id: int,
+                                  detail=None) -> None:
+    if not event_count:
+        return
+    conn.execute(
+        """INSERT INTO task_event_batches
+           (campaign_type,campaign_id,batch_id,event_type,from_status,to_status,
+            event_count,first_task_id,last_task_id,detail)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (campaign_type, campaign_id, batch_id, event_type, from_status, to_status,
+         event_count, first_task_id, last_task_id,
+         json.dumps(detail or {}, ensure_ascii=False, default=str)),
+    )
+
+
 def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
                                   message: str = "campaign cancelled") -> int:
     """Mark not-yet-submitted campaign tasks terminal so workers cannot claim them."""
-    rows = conn.execute(
-        """SELECT id, status FROM sms_tasks
+    summary = conn.execute(
+        """SELECT COUNT(*) count,MIN(id) first_id,MAX(id) last_id FROM sms_tasks
            WHERE campaign_type=? AND campaign_id=?
              AND status IN ('queued','retrying','sending')""",
         (campaign_type, campaign_id),
-    ).fetchall()
-    if not rows:
+    ).fetchone()
+    count = int(summary["count"] or 0)
+    if not count:
         return 0
     conn.execute(
         """UPDATE sms_tasks SET status='cancelled', error_msg=?, claim_token='',
@@ -181,12 +213,13 @@ def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
              AND status IN ('queued','retrying','sending')""",
         (message, campaign_type, campaign_id),
     )
-    _bulk_insert_events(conn, [
-        (row["id"], "campaign_cancelled", row["status"], "cancelled", message,
-         json.dumps({"campaign_type": campaign_type, "campaign_id": campaign_id}, ensure_ascii=False))
-        for row in rows
-    ])
-    return len(rows)
+    _add_task_event_batch_summary(
+        conn, campaign_type, campaign_id, None,
+        "campaign_cancelled", "active", "cancelled", count,
+        summary["first_id"], summary["last_id"],
+        {"message": message},
+    )
+    return count
 
 
 def _insert_message_mapping(conn, task_id: int, message_ids) -> None:
@@ -480,12 +513,12 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             result["created_msisdns"].extend(
                 row[4] for row in task_rows if row[-1] in created_keys
             )
-            event_rows = [
-                (task_id, "created", "", "queued", "task created from file",
-                 json.dumps({"source_file": source_file}, ensure_ascii=False))
-                for task_id, _dedupe in created
-            ]
-            _bulk_insert_events(conn, event_rows)
+            _add_task_event_batch(
+                conn, campaign_type, campaign["id"], batch_id,
+                "created", "", "queued",
+                [task_id for task_id, _dedupe in created],
+                {"source_file": source_file},
+            )
         conn.commit()
         logger.info(
             "Tasks enqueued campaign=%s:%s file=%s result=%s",
@@ -510,11 +543,18 @@ def claim_next_tasks(limit: int = 20) -> list:
     ).fetchall()
     tasks = [dict(r) for r in rows]
     if tasks:
-        _bulk_insert_events(conn, [
-            (task["id"], "claimed", "queued", "sending", "worker claimed task",
-             json.dumps({"claim_token": token, "attempt": task["attempts"]}, ensure_ascii=False))
-            for task in tasks
-        ])
+        grouped = {}
+        for task in tasks:
+            key = (task["campaign_type"], task["campaign_id"], task.get("batch_id"))
+            grouped.setdefault(key, []).append(task)
+        for (campaign_type, campaign_id, batch_id), items in grouped.items():
+            _add_task_event_batch(
+                conn, campaign_type, campaign_id, batch_id,
+                "claimed", "queued", "sending",
+                [task["id"] for task in items],
+                {"claim_token": token, "attempt_min": min(task["attempts"] for task in items),
+                 "attempt_max": max(task["attempts"] for task in items)},
+            )
     conn.commit()
     conn.close()
     return tasks
@@ -525,8 +565,59 @@ def claim_next_task() -> Optional[dict]:
     return tasks[0] if tasks else None
 
 
-def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: str = "optional"):
-    conn = get_connection()
+def apply_buffered_writes(conn, items) -> None:
+    """Apply one buffered delivery batch inside a single database transaction."""
+    submitted_ids = []
+    for item in items:
+        payload = item.payload
+        if item.kind == "submitted":
+            _apply_submitted(conn, **payload)
+            submitted_ids.append(int(payload["task_id"]))
+        elif item.kind == "message_id":
+            _apply_message_id(conn, **payload)
+        elif item.kind == "send_failure":
+            _apply_send_failure(conn, **payload)
+        elif item.kind == "receipt":
+            _apply_receipt(conn, **payload)
+        else:
+            raise ValueError(f"unknown SMS buffered write kind: {item.kind}")
+    if submitted_ids:
+        placeholders = ",".join("?" for _ in submitted_ids)
+        rows = conn.execute(
+            f"""SELECT id,campaign_type,campaign_id,batch_id,status FROM sms_tasks
+                 WHERE id IN ({placeholders})""",
+            submitted_ids,
+        ).fetchall()
+        grouped = {}
+        for row in rows:
+            key = (row["campaign_type"], row["campaign_id"], row["batch_id"], row["status"])
+            grouped.setdefault(key, []).append(row["id"])
+        for (campaign_type, campaign_id, batch_id, status), task_ids in grouped.items():
+            _add_task_event_batch(
+                conn, campaign_type, campaign_id, batch_id,
+                "submitted", "sending", status, task_ids,
+                {"buffered": True},
+            )
+
+
+def flush_pending_writes(timeout: float = 10.0) -> None:
+    from services import sms_write_buffer
+    sms_write_buffer.flush(timeout)
+
+
+def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: str = "optional",
+                   wait: bool = True):
+    from services import sms_write_buffer
+    sms_write_buffer.submit(
+        "submitted",
+        {"task_id": task_id, "message_ids": list(message_ids or []),
+         "delivery_receipt_mode": delivery_receipt_mode},
+        wait=wait,
+    )
+
+
+def _apply_submitted(conn, task_id: int, message_ids: list[str],
+                     delivery_receipt_mode: str = "optional"):
     row = conn.execute("SELECT smsc_message_ids FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
     existing_ids = []
     if row:
@@ -543,13 +634,6 @@ def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: 
             WHERE id=? AND status IN ('sending','submitted')""",
         (json.dumps(message_ids), task_id),
     )
-    if row:
-        current = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
-        if current and current["status"] == final_status:
-            suffix = "delivery receipt required" if mode == "required" else ("delivery receipt disabled" if mode == "disabled" else "delivery receipt optional")
-            _add_task_event(conn, task_id, "submitted", "sending", final_status,
-                            f"SMSC accepted task; {suffix}",
-                            {"message_ids": message_ids, "delivery_receipt_mode": mode})
     _insert_message_mapping(conn, task_id, message_ids)
     pending_receipts = conn.execute(
         """SELECT smsc_message_id, message_state, raw_receipt
@@ -565,16 +649,21 @@ def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: 
                  (SELECT UNNEST(from_json(?, '[\"VARCHAR\"]')))""",
             (task_id, json.dumps(message_ids)),
         )
-    conn.commit()
-    conn.close()
     for receipt in pending_receipts:
-        record_receipt(
-            receipt["smsc_message_id"], receipt["message_state"], receipt["raw_receipt"],
-            _task_id=task_id, _skip_insert=True,
+        _apply_receipt(
+            conn, receipt["smsc_message_id"], receipt["message_state"],
+            receipt["raw_receipt"], task_id=task_id, skip_insert=True,
         )
 
-def append_message_id(task_id: int, message_id: str):
-    conn = get_connection()
+
+def append_message_id(task_id: int, message_id: str, wait: bool = True):
+    from services import sms_write_buffer
+    sms_write_buffer.submit(
+        "message_id", {"task_id": task_id, "message_id": message_id}, wait=wait
+    )
+
+
+def _apply_message_id(conn, task_id: int, message_id: str):
     row = conn.execute("SELECT smsc_message_ids FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
     if row:
         try:
@@ -588,28 +677,42 @@ def append_message_id(task_id: int, message_id: str):
             (json.dumps(values), task_id),
         )
         _insert_message_mapping(conn, task_id, [message_id])
-        conn.commit()
-    conn.close()
 
 
 def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
+                      retryable: bool = True, failure_class: str = "transport",
+                      wait: bool = True):
+    from services import sms_write_buffer
+    sms_write_buffer.submit(
+        "send_failure",
+        {"task": dict(task), "error": str(error), "status_code": status_code,
+         "retryable": retryable, "failure_class": failure_class},
+        wait=wait,
+    )
+
+
+def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int] = None,
                         retryable: bool = True, failure_class: str = "transport"):
     retry = retryable and task["attempts"] < task.get("max_attempts", 3)
     status = "retrying" if retry else "failed"
     delay_minutes = min(30, 2 ** max(0, task["attempts"] - 1))
-    conn = get_connection()
-    conn.execute(
+    updated = conn.execute(
         f"""UPDATE sms_tasks SET status=?, error_msg=?, last_smpp_status=?, failure_class=?,
             next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '{delay_minutes} minutes',
-            updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending'""",
+            updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending'
+            RETURNING id""",
         (status, str(error)[:2000], status_code, failure_class, task["id"]),
-    )
-    current = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (task["id"],)).fetchone()
-    if current and current["status"] == status:
+    ).fetchone()
+    if updated:
         _add_task_event(conn, task["id"], "send_failure", task.get("status", "sending"), status,
                         str(error)[:500], {"smpp_status": status_code, "failure_class": failure_class})
-    conn.commit()
-    conn.close()
+        if status == "failed" and task.get("batch_id"):
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET failed_count=COALESCE(failed_count,0)+1,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (task["batch_id"],),
+            )
 
 
 def requeue_transport_failures() -> int:
@@ -619,43 +722,58 @@ def requeue_transport_failures() -> int:
         "SELECT COUNT(*) count FROM sms_tasks WHERE status='failed' AND failure_class='transport'"
     ).fetchone()["count"]
     if count:
+        by_batch = conn.execute(
+            """SELECT batch_id,COUNT(*) count FROM sms_tasks
+               WHERE status='failed' AND failure_class='transport' AND batch_id IS NOT NULL
+               GROUP BY batch_id"""
+        ).fetchall()
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='',
                 claim_token='', last_smpp_status=NULL, next_attempt_at=CURRENT_TIMESTAMP,
                 updated_at=CURRENT_TIMESTAMP
                 WHERE status='failed' AND failure_class='transport'"""
         )
+        for row in by_batch:
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET failed_count=GREATEST(COALESCE(failed_count,0)-?,0),
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (row["count"], row["batch_id"]),
+            )
         conn.commit()
     conn.close()
     return int(count or 0)
 
 
 def record_receipt(message_id: str, state: str, raw: str,
-                   _task_id: Optional[int] = None, _skip_insert: bool = False):
+                   _task_id: Optional[int] = None, _skip_insert: bool = False,
+                   wait: bool = True):
+    from services import sms_write_buffer
+    sms_write_buffer.submit(
+        "receipt",
+        {"message_id": str(message_id), "state": str(state), "raw": str(raw),
+         "task_id": _task_id, "skip_insert": _skip_insert},
+        wait=wait,
+    )
+
+
+def _apply_receipt(conn, message_id: str, state: str, raw: str,
+                   task_id: Optional[int] = None, skip_insert: bool = False):
     normalized_state = str(state or "").upper()
-    conn = get_connection()
-    if _task_id is None:
+    if task_id is None:
         task = _find_task_by_message_id(conn, message_id)
         task_id = task["id"] if task else None
     else:
-        task_id = _task_id
         row = conn.execute("SELECT * FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
         task = dict(row) if row else None
-    if not _skip_insert:
-        try:
-            conn.execute(
-                "INSERT INTO delivery_receipts (task_id,smsc_message_id,message_state,raw_receipt) VALUES (?,?,?,?)",
-                (task_id, message_id, normalized_state, raw[:4000]),
-            )
-        except Exception as exc:
-            if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
-                conn.close()
-                raise
-            # Duplicate receipt for the same (task_id, message_id, state): the
-            # first receipt already updated the task, so this is an idempotent
-            # no-op. Returning early also avoids leaving the DuckDB connection in
-            # a broken state after the constraint error.
-            conn.close()
+    if not skip_insert:
+        inserted = conn.execute(
+            """INSERT INTO delivery_receipts
+               (task_id,smsc_message_id,message_state,raw_receipt)
+               VALUES (?,?,?,?) ON CONFLICT DO NOTHING RETURNING id""",
+            (task_id, message_id, normalized_state, raw[:4000]),
+        ).fetchone()
+        if task_id is not None and not inserted:
             return
     if task_id:
         was_delivered = task.get("status") == "delivered"
@@ -682,30 +800,48 @@ def record_receipt(message_id: str, state: str, raw: str,
             can_retry = temporary_receipt and int(task.get("receipt_retry_count") or 0) < 1
             status = "retrying" if can_retry else "failed"
             delivered_sql = ""
-        conn.execute(
+        updated = conn.execute(
             f"UPDATE sms_tasks SET status=?, failure_class=?, receipt_retry_count=COALESCE(receipt_retry_count,0)+?, "
             f"next_attempt_at=CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP + INTERVAL '5 minutes' AS VARCHAR) ELSE next_attempt_at END, "
-            f"updated_at=CURRENT_TIMESTAMP{delivered_sql} WHERE id=? AND (status<>'delivered' OR ?='delivered')",
+            f"updated_at=CURRENT_TIMESTAMP{delivered_sql} WHERE id=? AND (status<>'delivered' OR ?='delivered') "
+            f"RETURNING id",
             (status, "delivery_receipt" if status != "delivered" else "", 1 if status == "retrying" else 0,
             status == "retrying", task_id, status),
-        )
+        ).fetchone()
+        if not updated:
+            return
         mapping = DLR_STATE_MAP.get(normalized_state, {"label": "Unmapped DLR state", "retryable": False})
         _add_task_event(conn, task_id, "delivery_receipt", task.get("status", ""), status,
                         mapping["label"], {"message_id": message_id, "state": normalized_state,
                                             "retryable": mapping.get("retryable", False), "raw": raw[:1000]})
-        if status == "delivered" and task.get("batch_id"):
-            batch_counts = conn.execute(
-                """SELECT COUNT(*) total,
-                            SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) delivered
-                    FROM sms_tasks WHERE batch_id=?""",
+        if status == "delivered" and not was_delivered and task.get("batch_id"):
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET delivered_count=COALESCE(delivered_count,0)+1,
+                       failed_count=CASE WHEN ?='failed'
+                         THEN GREATEST(COALESCE(failed_count,0)-1,0)
+                         ELSE COALESCE(failed_count,0) END,
+                   status=CASE
+                     WHEN task_count>0 AND COALESCE(delivered_count,0)+1>=task_count
+                     THEN 'sent' ELSE status END,
+                   updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (task.get("status", ""), task["batch_id"]),
+            )
+        elif status == "failed" and task.get("status") != "failed" and task.get("batch_id"):
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET failed_count=COALESCE(failed_count,0)+1,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
                 (task["batch_id"],),
-            ).fetchone()
-            delivered_count = int(batch_counts["delivered"] or 0)
-            if batch_counts["total"] and delivered_count >= batch_counts["total"]:
-                conn.execute(
-                    "UPDATE batch_campaign_batches SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (task["batch_id"],),
-                )
+            )
+        elif task.get("status") == "failed" and status != "failed" and task.get("batch_id"):
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET failed_count=GREATEST(COALESCE(failed_count,0)-1,0),
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (task["batch_id"],),
+            )
         if status == "delivered" and not was_delivered and task.get("campaign_type") == "batch":
             stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
             existing = conn.execute(
@@ -717,8 +853,6 @@ def record_receipt(message_id: str, state: str, raw: str,
                     "UPDATE batch_campaign_daily_stats SET sent_count=sent_count+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (existing["id"],),
                 )
-    conn.commit()
-    conn.close()
 
 
 def _find_task_by_message_id(conn, message_id: str) -> Optional[dict]:
@@ -734,11 +868,17 @@ def _find_task_by_message_id(conn, message_id: str) -> Optional[dict]:
 
 def cleanup_task_retention() -> int:
     retention_days = max(1, int(settings_service.get_setting("sms_task_retention_days", "3")))
+    cleanup_batch = max(1000, min(20000, int(os.environ.get("MC_TASK_CLEANUP_BATCH", "5000"))))
     from datetime import timedelta
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
     active = "('queued','sending','retrying','submitted','accepted')"
-    rows = conn.execute(f"SELECT id FROM sms_tasks WHERE created_at < ? AND status NOT IN {active}", (cutoff,)).fetchall()
+    rows = conn.execute(
+        f"""SELECT id FROM sms_tasks
+             WHERE created_at < ? AND status NOT IN {active}
+             ORDER BY id LIMIT ?""",
+        (cutoff, cleanup_batch),
+    ).fetchall()
     ids = [row["id"] for row in rows]
     if ids:
         placeholders = ",".join("?" for _ in ids)
@@ -746,6 +886,18 @@ def cleanup_task_retention() -> int:
         conn.execute(f"DELETE FROM delivery_receipts WHERE task_id IN ({placeholders})", ids)
         conn.execute(f"DELETE FROM task_events WHERE task_id IN ({placeholders})", ids)
         conn.execute(f"DELETE FROM sms_tasks WHERE id IN ({placeholders})", ids)
+    old_event_rows = conn.execute(
+        "SELECT id FROM task_event_batches WHERE created_at < ? ORDER BY id LIMIT ?",
+        (cutoff, cleanup_batch),
+    ).fetchall()
+    old_event_ids = [row["id"] for row in old_event_rows]
+    if old_event_ids:
+        event_placeholders = ",".join("?" for _ in old_event_ids)
+        conn.execute(
+            f"DELETE FROM task_event_batches WHERE id IN ({event_placeholders})",
+            old_event_ids,
+        )
+    if ids or old_event_ids:
         conn.commit()
     conn.close()
     if ids:
@@ -776,7 +928,7 @@ def _cached_task_count(conn, where: str, params: list) -> int:
         return total
 
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
-               smpp_config_id: int = -1) -> dict:
+               smpp_config_id: int = -1, cursor: Optional[int] = None) -> dict:
     conn = get_connection()
     conditions, params = [], []
     if status:
@@ -791,17 +943,27 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
         else:
             conditions.append("smpp_config_id=?")
             params.append(smpp_config_id)
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    total = task_stats()["total"] if not conditions else _cached_task_count(conn, where, params)
-    offset = max(0, page - 1) * page_size
+    count_where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    total = task_stats()["total"] if not conditions else _cached_task_count(conn, count_where, params)
+    query_conditions = list(conditions)
+    query_params = list(params)
+    if cursor is not None and int(cursor) > 0:
+        query_conditions.append("id<?")
+        query_params.append(int(cursor))
+    where = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
     rows = conn.execute(
         f"""SELECT id,campaign_type,campaign_id,campaign_name,smpp_config_id,
                    msisdn,language,content,status,attempts,error_msg,updated_at
-            FROM sms_tasks {where} ORDER BY id DESC LIMIT ? OFFSET ?""",
-        params + [page_size, offset],
+            FROM sms_tasks {where} ORDER BY id DESC LIMIT ?""",
+        query_params + [page_size + 1],
     ).fetchall()
     conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
+    has_more = len(rows) > page_size
+    rows = rows[:page_size]
+    items = [dict(r) for r in rows]
+    next_cursor = items[-1]["id"] if has_more and items else None
+    return {"total": total, "page": page, "page_size": page_size, "items": items,
+            "next_cursor": next_cursor, "has_more": has_more}
 
 
 def _cached_exclusion_count(conn) -> int:
@@ -860,15 +1022,22 @@ def task_stats() -> dict:
 
 def retry_task(task_id: int) -> bool:
     conn = get_connection()
-    row = conn.execute("SELECT id FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
+    row = conn.execute("SELECT id,status,batch_id FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
     if row:
-        previous = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (task_id,)).fetchone()["status"]
+        previous = row["status"]
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='', claim_token='',
                 smsc_message_ids='[]', submitted_at=NULL, delivered_at=NULL,
                 next_attempt_at=CURRENT_TIMESTAMP WHERE id=?""",
             (task_id,),
         )
+        if previous in {"failed", "expired", "cancelled"} and row["batch_id"]:
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET failed_count=GREATEST(COALESCE(failed_count,0)-1,0),
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (row["batch_id"],),
+            )
         _add_task_event(conn, task_id, "manual_retry", previous, "queued", "manual retry requested")
         conn.commit()
     conn.close()
@@ -904,18 +1073,16 @@ def mark_delivered(task_id: int) -> tuple[bool, str]:
     _add_task_event(conn, task_id, "manual_delivered", task["status"], "delivered",
                     "manually confirmed as delivered")
     if task.get("batch_id"):
-        batch_counts = conn.execute(
-            """SELECT COUNT(*) total,
-                        SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) delivered
-                FROM sms_tasks WHERE batch_id=?""",
+        conn.execute(
+            """UPDATE batch_campaign_batches
+               SET delivered_count=COALESCE(delivered_count,0)+1,
+                   status=CASE
+                     WHEN task_count>0 AND COALESCE(delivered_count,0)+1>=task_count
+                     THEN 'sent' ELSE status END,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
             (task["batch_id"],),
-        ).fetchone()
-        delivered_count = int(batch_counts["delivered"] or 0)
-        if batch_counts["total"] and delivered_count >= batch_counts["total"]:
-            conn.execute(
-                "UPDATE batch_campaign_batches SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (task["batch_id"],),
-            )
+        )
     if task.get("campaign_type") == "batch":
         stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
         existing = conn.execute(

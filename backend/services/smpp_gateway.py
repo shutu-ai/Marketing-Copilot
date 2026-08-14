@@ -53,7 +53,7 @@ class _SmppConnection:
             target = self._outcomes if sequence in self._sequence_tasks else self._early_outcomes
             target[sequence] = outcome
             if ok and task_id and outcome["message_id"]:
-                sms_task_service.append_message_id(task_id, outcome["message_id"])
+                sms_task_service.append_message_id(task_id, outcome["message_id"], wait=False)
             self._condition.notify_all()
         detail_logger.info("SMPP response config=%s slot=%s sequence=%s task=%s status=%s message_id=%s",
                            self.config["id"], self.slot, sequence, task_id, outcome["status"], outcome["message_id"])
@@ -79,7 +79,7 @@ class _SmppConnection:
                     getattr(pdu, "sequence", ""), state,
                 )
             else:
-                sms_task_service.record_receipt(message_id, state, raw)
+                sms_task_service.record_receipt(message_id, state, raw, wait=False)
                 metrics_service.inc(
                     "marketing_copilot_dlr_total",
                     labels={"state": state or "unknown"},
@@ -189,7 +189,7 @@ class _SmppConnection:
                         outcome = self._early_outcomes.pop(sequence)
                         self._outcomes[sequence] = outcome
                         if outcome["ok"] and outcome["message_id"]:
-                            sms_task_service.append_message_id(task["id"], outcome["message_id"])
+                            sms_task_service.append_message_id(task["id"], outcome["message_id"], wait=False)
                     sequences.append(sequence)
                 deadline = time.monotonic() + int(self.config.get("timeout") or 10)
                 while any(seq not in self._outcomes for seq in sequences):
