@@ -116,5 +116,6 @@ cp "$STAGE/backend/release.json" "$STAGE/release.json"
 
 (cd "$STAGE" && find . -type f ! -name checksums.sha256 -print0 | sort -z | xargs -0 sha256sum > checksums.sha256)
 mkdir -p "$OUTPUT"
-tar -C "$WORK" -czf "$OUTPUT/$NAME.tar.gz" "$NAME"
+# 统一归档属主，避免把构建机无法解析的数字 UID/GID 带到 SLES。
+tar --owner=0 --group=0 --numeric-owner -C "$WORK" -czf "$OUTPUT/$NAME.tar.gz" "$NAME"
 echo "已生成 $OUTPUT/$NAME.tar.gz"
