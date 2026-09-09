@@ -132,18 +132,20 @@
             </el-form-item>
           </el-col>
         </el-row>
-        <el-row :gutter="20">
-          <el-col :span="8">
+        <el-row :gutter="20" class="smpp-throughput-row">
+          <el-col :span="12">
             <el-form-item :label="$t('smpp.poolSize')">
               <el-input-number v-model="form.pool_size" :min="1" :max="20" style="width: 100%" />
             </el-form-item>
           </el-col>
-          <el-col :span="8">
+          <el-col :span="12">
             <el-form-item :label="$t('smpp.windowSize')">
               <el-input-number v-model="form.window_size" :min="1" :max="100" style="width: 100%" />
             </el-form-item>
           </el-col>
-          <el-col :span="8">
+        </el-row>
+        <el-row :gutter="20" class="smpp-throughput-row">
+          <el-col :span="12">
             <el-form-item :label="$t('smpp.enquireInterval')">
               <el-input-number v-model="form.enquire_interval" :min="5" :max="300" style="width: 100%" />
             </el-form-item>
