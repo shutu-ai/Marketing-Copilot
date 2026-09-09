@@ -104,7 +104,12 @@ def campaign_progress(campaign_type: str, campaign_id: int) -> dict:
         (campaign_type, campaign_id)).fetchall()
     task_counts = {row["status"]: row["count"] for row in task_rows}
     task_total = sum(task_counts.values())
-    task_terminal = sum(task_counts.get(s, 0) for s in ("delivered", "failed", "expired", "cancelled", "archived"))
+    # ``accepted`` is the terminal business state when the SMPP configuration
+    # does not require a delivery receipt. Required-receipt tasks remain in
+    # ``submitted`` until a delivery receipt moves them to delivered/failed.
+    task_terminal = sum(task_counts.get(s, 0) for s in (
+        "delivered", "accepted", "failed", "expired", "cancelled", "archived"
+    ))
     files = conn.execute(
         """SELECT COUNT(*) total, SUM(CASE WHEN status IN ('completed','quarantined','failed') THEN 1 ELSE 0 END) finished,
            COALESCE(SUM(total_rows),0) row_count, COALESCE(SUM(created_tasks),0) task_count

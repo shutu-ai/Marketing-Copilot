@@ -32,6 +32,29 @@ def _insert_tasks(count: int, status: str = "sending", batch_id=None):
     return rows
 
 
+def test_campaign_progress_counts_accepted_as_terminal_when_present(isolated_db):
+    conn = database.get_connection()
+    campaign_id = conn.execute(
+        "INSERT INTO batch_campaigns(name,status) VALUES ('accepted-progress','in_progress') RETURNING id"
+    ).fetchone()["id"]
+    for index, status in enumerate(("accepted", "submitted", "failed", "queued")):
+        conn.execute(
+            """INSERT INTO sms_tasks
+               (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+               VALUES ('batch',?,?,?,'hello',?,?)""",
+            (campaign_id, "accepted-progress", f"251900{index:06d}",
+             f"accepted-progress-{index}", status),
+        )
+    conn.commit()
+    conn.close()
+
+    progress = p1_service.campaign_progress("batch", campaign_id)
+
+    assert progress["tasks"]["total"] == 4
+    assert progress["tasks"]["finished"] == 2
+    assert progress["tasks"]["by_status"]["accepted"] == 1
+
+
 def test_delivery_hot_path_is_committed_in_bounded_batches(isolated_db, monkeypatch):
     task_ids = _insert_tasks(300)
     commits = []
