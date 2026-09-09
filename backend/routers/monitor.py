@@ -23,6 +23,10 @@ class PublishFileReq(BaseModel):
     campaign_name: str = ""
 
 
+class FileIdsReq(BaseModel):
+    file_ids: list[int]
+
+
 @router.get("/realtime")
 def realtime_monitor(
     campaign_id: int = Query(None),
@@ -55,6 +59,26 @@ def scan_realtime_monitor(
         processed_page,
         processed_page_size,
     )
+
+
+@router.post("/realtime/files/{file_id}/retry")
+def retry_realtime_file(file_id: int):
+    result = monitor_service.retry_realtime_file(file_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="realtime ingestion file not found")
+    if not result.get("success", True):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/realtime/files/retry")
+def retry_realtime_files(body: FileIdsReq):
+    return monitor_service.retry_realtime_files(body.file_ids)
+
+
+@router.post("/realtime/files/archive")
+def archive_realtime_files(body: FileIdsReq):
+    return monitor_service.archive_realtime_files(body.file_ids)
 
 
 @router.get("/configs")

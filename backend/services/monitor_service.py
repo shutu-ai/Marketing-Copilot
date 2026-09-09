@@ -413,7 +413,22 @@ def get_realtime_monitor(
             ORDER BY detected_at DESC LIMIT ? OFFSET ?""",
         tuple(processed_params + [processed_page_size, processed_offset]),
     ).fetchall()
+    ingestion_where = "campaign_type='realtime'"
+    ingestion_params = []
+    if campaign_id:
+        ingestion_where += " AND campaign_id=?"
+        ingestion_params.append(campaign_id)
+    ingestion_rows = conn.execute(
+        f"""SELECT * FROM ingestion_files WHERE {ingestion_where}
+            ORDER BY updated_at DESC LIMIT 100""", tuple(ingestion_params),
+    ).fetchall()
     conn.close()
+    ingestion_by_key = {(int(item["campaign_id"]), item["filename"]): item["id"] for item in (dict(row) for row in ingestion_rows)}
+    processed_items = []
+    for row in processed_rows:
+        item = dict(row)
+        item["ingestion_file_id"] = ingestion_by_key.get((int(item["campaign_id"]), item["filename"]))
+        processed_items.append(item)
 
     selected_campaign = dict(campaign_rows[0]) if campaign_id and campaign_rows else None
     watch_dirs = {}
@@ -501,10 +516,11 @@ def get_realtime_monitor(
         "source_files_total": source_files_total,
         "source_files_page": source_page,
         "source_files_page_size": source_page_size,
-        "processed_files": [dict(row) for row in processed_rows],
+        "processed_files": processed_items,
         "processed_files_total": processed_total,
         "processed_files_page": processed_page,
         "processed_files_page_size": processed_page_size,
+        "ingestion_files": [dict(row) for row in ingestion_rows],
     }
 
 
@@ -528,4 +544,132 @@ def scan_realtime_watch_dir(
             processed_page,
             processed_page_size,
         ),
+    }
+
+
+def retry_realtime_file(file_id: int) -> Optional[dict]:
+    from services import ingestion_job_service
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM ingestion_files WHERE id=? AND campaign_type='realtime'", (file_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    job = dict(row)
+    if job["status"] not in ("failed", "quarantined", "retrying"):
+        return {"success": False, "message": "only failed or quarantined files can be retried"}
+    campaign = get_connection()
+    try:
+        campaign_row = campaign.execute("SELECT campaign_dir FROM realtime_campaigns WHERE id=?", (job["campaign_id"],)).fetchone()
+    finally:
+        campaign.close()
+    campaign_dir = campaign_row["campaign_dir"] if campaign_row else ""
+    inbox_path = os.path.join(campaign_dir, "inbox", job["filename"])
+    if not os.path.isfile(inbox_path):
+        quarantine_dir = os.path.join(campaign_dir, "quarantine")
+        quarantine_path = os.path.join(quarantine_dir, job["filename"])
+        if not os.path.isfile(quarantine_path) and os.path.isdir(quarantine_dir):
+            stem, ext = os.path.splitext(job["filename"])
+            matches = sorted(
+                name for name in os.listdir(quarantine_dir)
+                if name.startswith(stem + "_") and name.endswith(ext)
+            )
+            if matches:
+                quarantine_path = os.path.join(quarantine_dir, matches[-1])
+        if os.path.isfile(quarantine_path):
+            os.makedirs(os.path.dirname(inbox_path), exist_ok=True)
+            shutil.move(quarantine_path, inbox_path)
+    if not os.path.isfile(inbox_path):
+        return {"success": False, "message": "source file is no longer available"}
+    result = ingestion_job_service.requeue_file(file_id)
+    if not result:
+        return None
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE processed_files SET status='queued',processing_phase='queued',next_retry_at=NULL WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
+                     (job["campaign_id"], job["filename"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"success": True, "file": result}
+
+
+def retry_realtime_files(file_ids: list[int]) -> dict:
+    results = []
+    for file_id in list(dict.fromkeys(int(value) for value in file_ids)):
+        results.append({"file_id": file_id, **(retry_realtime_file(file_id) or {
+            "success": False, "message": "realtime ingestion file not found"
+        })})
+    return {
+        "success": all(item.get("success") for item in results) if results else True,
+        "requested": len(results),
+        "requeued": sum(1 for item in results if item.get("success")),
+        "items": results,
+    }
+
+
+def archive_realtime_file(file_id: int) -> Optional[dict]:
+    """Archive a terminal realtime file without deleting its audit metadata."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM ingestion_files WHERE id=? AND campaign_type='realtime'", (file_id,)
+        ).fetchone()
+        if not row:
+            return None
+        job = dict(row)
+        if job["status"] not in ("failed", "quarantined"):
+            return {"success": False, "message": "only failed or quarantined files can be archived"}
+        campaign = conn.execute(
+            "SELECT campaign_dir FROM realtime_campaigns WHERE id=?", (job["campaign_id"],)
+        ).fetchone()
+    finally:
+        conn.close()
+    campaign_dir = campaign["campaign_dir"] if campaign else ""
+    candidates = [job.get("file_path", ""),
+                  os.path.join(campaign_dir, "inbox", job["filename"]),
+                  os.path.join(campaign_dir, "quarantine", job["filename"])]
+    source = next((path for path in candidates if path and os.path.isfile(path)), "")
+    target = source
+    if source:
+        archive_dir = os.path.join(campaign_dir, "archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        target = os.path.join(archive_dir, os.path.basename(source))
+        if os.path.exists(target):
+            stem, ext = os.path.splitext(target)
+            target = f"{stem}_{file_id}{ext}"
+        shutil.move(source, target)
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE ingestion_files SET status='archived',processing_phase='archived',file_path=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (target, file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    processed = get_connection()
+    try:
+        processed.execute(
+            "UPDATE processed_files SET status='archived',processing_phase='archived',file_path=?,completed_at=COALESCE(completed_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)) WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
+            (target, job["campaign_id"], job["filename"]),
+        )
+        processed.commit()
+    finally:
+        processed.close()
+    return {"success": True, "file_id": file_id, "archive_path": target}
+
+
+def archive_realtime_files(file_ids: list[int]) -> dict:
+    results = []
+    for file_id in list(dict.fromkeys(int(value) for value in file_ids)):
+        results.append({"file_id": file_id, **(archive_realtime_file(file_id) or {
+            "success": False, "message": "realtime ingestion file not found"
+        })})
+    return {
+        "success": all(item.get("success") for item in results) if results else True,
+        "requested": len(results),
+        "archived": sum(1 for item in results if item.get("success")),
+        "items": results,
     }

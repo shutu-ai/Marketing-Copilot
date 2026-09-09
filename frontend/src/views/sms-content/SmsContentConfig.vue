@@ -2,7 +2,7 @@
   <div class="sms-content-config">
     <div class="page-header">
       <h2>{{ $t('smsContent.title') }}</h2>
-      <el-button type="primary" @click="$router.push('/sms-content/campaign/new')">
+      <el-button v-if="canManage" type="primary" @click="$router.push('/sms-content/campaign/new')">
         <el-icon><Plus /></el-icon>
         {{ $t('smsContent.addCampaign') }}
       </el-button>
@@ -24,11 +24,11 @@
       </el-table-column>
       <el-table-column :label="$t('common.action')" width="230" fixed="right">
         <template #default="{ row }">
-          <el-button text type="primary" size="small" @click="$router.push('/sms-content/campaign/' + row.campaign_id)">
+          <el-button v-if="canManage" text type="primary" size="small" @click="$router.push('/sms-content/campaign/' + row.campaign_id)">
             {{ $t('common.edit') }}
           </el-button>
           <span :title="deleteDisabledReason(row)">
-            <el-button text type="danger" size="small" :disabled="!canDeleteCampaign(row)" @click="handleDeleteCampaign(row)">
+            <el-button v-if="canManage" text type="danger" size="small" :disabled="!canDeleteCampaign(row)" @click="handleDeleteCampaign(row)">
               {{ $t('common.delete') }}
             </el-button>
           </span>
@@ -56,7 +56,7 @@
         <el-table-column prop="content" :label="$t('legacy.x2d711b09')" show-overflow-tooltip />
         <el-table-column prop="change_note" :label="$t('legacy.xa06b0305')" width="150" />
         <el-table-column prop="created_at" :label="$t('logViewer.time')" width="180" />
-        <el-table-column :label="$t('common.action')" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row)">{{ $t('legacy.xc7db6d4f') }}</el-button></template></el-table-column>
+        <el-table-column v-if="canManage" :label="$t('common.action')" width="90"><template #default="{ row }"><el-button link type="primary" @click="restoreVersion(row)">{{ $t('legacy.xc7db6d4f') }}</el-button></template></el-table-column>
       </el-table>
       <el-pagination
         v-model:current-page="versionPage"
@@ -72,9 +72,13 @@
 
 <script setup lang="ts">
 import i18n from '@/i18n'
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/smsContent'
+import { useAuthStore } from '@/stores/auth'
+
+const authStore = useAuthStore()
+const canManage = computed(() => ['admin', 'marketing'].includes(authStore.role))
 
 const loading = ref(false)
 const tableData = ref<any[]>([])

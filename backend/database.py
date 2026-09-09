@@ -41,6 +41,7 @@ TABLE_SEQUENCES = {
     "users": "seq_users",
     "ingestion_files": "seq_ingestion_files",
     "ingestion_chunks": "seq_ingestion_chunks",
+    "realtime_whitelist_versions": "seq_realtime_whitelist_versions",
     "task_archive_manifests": "seq_task_archive_manifests",
 }
 
@@ -323,6 +324,7 @@ def init_db():
             send_days TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'not_started',
             use_whitelist BOOLEAN NOT NULL DEFAULT TRUE,
+            active_whitelist_version_id INTEGER DEFAULT NULL,
             customer_list_filename TEXT DEFAULT '',
             customer_list_path TEXT DEFAULT '',
             row_count INTEGER DEFAULT 0,
@@ -416,8 +418,14 @@ def init_db():
             filename TEXT NOT NULL, file_hash TEXT NOT NULL,
             file_path TEXT NOT NULL DEFAULT '', file_size BIGINT NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'detected', total_rows INTEGER NOT NULL DEFAULT 0,
-            created_tasks INTEGER NOT NULL DEFAULT 0, error_detail TEXT NOT NULL DEFAULT '',
-            detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
+                     created_tasks INTEGER NOT NULL DEFAULT 0, error_detail TEXT NOT NULL DEFAULT '',
+                     whitelist_version_id INTEGER, processing_started_at TEXT, last_progress_at TEXT,
+                     processing_phase TEXT NOT NULL DEFAULT 'queued', processed_rows BIGINT NOT NULL DEFAULT 0,
+                     matched_rows BIGINT NOT NULL DEFAULT 0, current_chunk_index INTEGER NOT NULL DEFAULT 0,
+                     total_chunks INTEGER NOT NULL DEFAULT 0, worker_id TEXT NOT NULL DEFAULT '',
+                     retry_count INTEGER NOT NULL DEFAULT 0, last_error_class TEXT NOT NULL DEFAULT '',
+                     last_error_at TEXT, next_retry_at TEXT, max_retry_count INTEGER NOT NULL DEFAULT 4,
+             detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
             UNIQUE(campaign_type, campaign_id, filename)
         )""",
         """CREATE TABLE IF NOT EXISTS ingestion_files (
@@ -437,6 +445,14 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             completed_at TEXT,
+            whitelist_version_id INTEGER,
+            processing_started_at TEXT, last_progress_at TEXT,
+            processing_phase TEXT NOT NULL DEFAULT 'queued', processed_rows BIGINT NOT NULL DEFAULT 0,
+            matched_rows BIGINT NOT NULL DEFAULT 0, current_chunk_index INTEGER NOT NULL DEFAULT 0,
+            worker_id TEXT NOT NULL DEFAULT '', lease_token TEXT NOT NULL DEFAULT '',
+            lease_expires_at TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error_class TEXT NOT NULL DEFAULT '', last_error_at TEXT, next_retry_at TEXT,
+            max_retry_count INTEGER NOT NULL DEFAULT 4,
             UNIQUE(campaign_type, campaign_id, filename)
         )""",
         """CREATE TABLE IF NOT EXISTS ingestion_chunks (
@@ -460,6 +476,24 @@ def init_db():
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             completed_at TEXT,
             UNIQUE(file_id, chunk_index)
+        )""",
+        """CREATE TABLE IF NOT EXISTS realtime_whitelist_versions (
+            id INTEGER DEFAULT nextval('seq_realtime_whitelist_versions') PRIMARY KEY,
+            campaign_id INTEGER NOT NULL,
+            version_no INTEGER NOT NULL,
+            source_filename TEXT NOT NULL DEFAULT '',
+            source_path TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL,
+            row_count BIGINT NOT NULL DEFAULT 0,
+            normalized_count BIGINT NOT NULL DEFAULT 0,
+            index_path TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'building',
+            error_detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            ready_at TEXT,
+            retired_at TEXT,
+            UNIQUE(campaign_id, version_no),
+            UNIQUE(campaign_id, source_hash)
         )""",
         """CREATE TABLE IF NOT EXISTS task_archive_manifests (
             id INTEGER DEFAULT nextval('seq_task_archive_manifests') PRIMARY KEY,
@@ -543,7 +577,7 @@ def init_db():
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             display_name TEXT NOT NULL DEFAULT '',
-            role TEXT NOT NULL DEFAULT 'operator',
+            role TEXT NOT NULL DEFAULT 'marketing',
             enabled INTEGER NOT NULL DEFAULT 1,
             last_login_at TEXT,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
@@ -579,6 +613,36 @@ def init_db():
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_filename_prefix TEXT DEFAULT 'Android_4G_Switch_Somali_'",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS phone_prefix TEXT DEFAULT ''",
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS active_whitelist_version_id INTEGER",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS whitelist_version_id INTEGER",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS processing_started_at TEXT",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS last_progress_at TEXT",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS processing_phase TEXT DEFAULT 'queued'",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS processed_rows BIGINT DEFAULT 0",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS matched_rows BIGINT DEFAULT 0",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS current_chunk_index INTEGER DEFAULT 0",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS total_chunks INTEGER DEFAULT 0",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS worker_id TEXT DEFAULT ''",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS last_error_class TEXT DEFAULT ''",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS last_error_at TEXT",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS next_retry_at TEXT",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS max_retry_count INTEGER DEFAULT 4",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS whitelist_version_id INTEGER",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processing_started_at TEXT",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS last_progress_at TEXT",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processing_phase TEXT DEFAULT 'queued'",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processed_rows BIGINT DEFAULT 0",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS matched_rows BIGINT DEFAULT 0",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS current_chunk_index INTEGER DEFAULT 0",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS worker_id TEXT DEFAULT ''",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS lease_token TEXT DEFAULT ''",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS lease_expires_at TEXT",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS last_error_class TEXT DEFAULT ''",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS last_error_at TEXT",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS next_retry_at TEXT",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS max_retry_count INTEGER DEFAULT 4",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS window_size INTEGER DEFAULT 10",
@@ -616,7 +680,13 @@ def init_db():
                     filename TEXT NOT NULL, file_hash TEXT NOT NULL,
                     file_path TEXT NOT NULL DEFAULT '', file_size BIGINT NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'detected', total_rows INTEGER NOT NULL DEFAULT 0,
-                    created_tasks INTEGER NOT NULL DEFAULT 0, error_detail TEXT NOT NULL DEFAULT '',
+                     created_tasks INTEGER NOT NULL DEFAULT 0, error_detail TEXT NOT NULL DEFAULT '',
+                     whitelist_version_id INTEGER, processing_started_at TEXT, last_progress_at TEXT,
+                     processing_phase TEXT NOT NULL DEFAULT 'queued', processed_rows BIGINT NOT NULL DEFAULT 0,
+                     matched_rows BIGINT NOT NULL DEFAULT 0, current_chunk_index INTEGER NOT NULL DEFAULT 0,
+                     total_chunks INTEGER NOT NULL DEFAULT 0, worker_id TEXT NOT NULL DEFAULT '',
+                     retry_count INTEGER NOT NULL DEFAULT 0, last_error_class TEXT NOT NULL DEFAULT '',
+                     last_error_at TEXT, next_retry_at TEXT, max_retry_count INTEGER NOT NULL DEFAULT 4,
                     detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
                     UNIQUE(campaign_type, campaign_id, filename)
                 )"""
@@ -624,9 +694,13 @@ def init_db():
             conn.execute(
                 """INSERT INTO processed_files_new
                    (id,campaign_type,campaign_id,filename,file_hash,file_path,file_size,status,
-                    total_rows,created_tasks,error_detail,detected_at,completed_at)
+                     total_rows,created_tasks,error_detail,whitelist_version_id,processing_started_at,last_progress_at,
+                     processing_phase,processed_rows,matched_rows,current_chunk_index,total_chunks,worker_id,retry_count,
+                     last_error_class,last_error_at,next_retry_at,max_retry_count,detected_at,completed_at)
                    SELECT id,campaign_type,campaign_id,filename,file_hash,file_path,file_size,status,
-                          total_rows,created_tasks,error_detail,detected_at,completed_at
+                           total_rows,created_tasks,error_detail,whitelist_version_id,processing_started_at,last_progress_at,
+                           processing_phase,processed_rows,matched_rows,current_chunk_index,total_chunks,worker_id,retry_count,
+                           last_error_class,last_error_at,next_retry_at,max_retry_count,detected_at,completed_at
                    FROM processed_files
                    QUALIFY row_number() OVER (
                        PARTITION BY campaign_type,campaign_id,filename
@@ -638,6 +712,8 @@ def init_db():
     except Exception as e:
         logger.warning("[DB] Skipping processed_files uniqueness migration: %s", e)
     for stmt in [
+        "UPDATE users SET role='marketing' WHERE role='operator'",
+        "UPDATE users SET role='analyst' WHERE role='viewer'",
         "UPDATE sms_tasks SET claim_token='' WHERE claim_token IS NULL",
         "UPDATE sms_tasks SET task_date=CAST(created_at AS DATE) WHERE task_date IS NULL",
         "UPDATE sms_tasks SET failure_class='' WHERE failure_class IS NULL",
@@ -653,7 +729,7 @@ def init_db():
                failed_count=s.failed_count
            FROM (
                SELECT t.batch_id,COUNT(*) task_count,
-                      SUM(CASE WHEN t.status='delivered' THEN 1 ELSE 0 END) delivered_count,
+                      SUM(CASE WHEN t.status IN ('delivered','accepted') THEN 1 ELSE 0 END) delivered_count,
                       SUM(CASE WHEN t.status IN ('failed','expired','cancelled') THEN 1 ELSE 0 END) failed_count
                FROM sms_tasks t
                JOIN batch_campaign_batches pending ON pending.id=t.batch_id
@@ -695,6 +771,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_task_event_batches_campaign ON task_event_batches(campaign_type,campaign_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ingestion_chunks_status ON ingestion_chunks(status,lease_expires_at,id)",
         "CREATE INDEX IF NOT EXISTS idx_ingestion_chunks_batch ON ingestion_chunks(source_batch_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ingestion_files_queue ON ingestion_files(status,next_retry_at,updated_at,id)",
+        "CREATE INDEX IF NOT EXISTS idx_whitelist_versions_active ON realtime_whitelist_versions(campaign_id,status,version_no)",
         "CREATE INDEX IF NOT EXISTS idx_archive_partition ON task_archive_manifests(task_date,campaign_type,campaign_id,first_task_id)",
         "CREATE INDEX IF NOT EXISTS idx_events_open ON system_events(resolved,severity,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)",
@@ -731,6 +809,12 @@ def init_db():
         ("sms_task_retention_days", "3"),
         ("realtime_file_retention_days", "1"),
         ("realtime_output_retention_days", "30"),
+        ("realtime_match_chunk_size", os.environ.get("MC_REALTIME_MATCH_CHUNK_SIZE", "5000")),
+        ("realtime_whitelist_build_chunk_size", os.environ.get("MC_REALTIME_WHITELIST_BUILD_CHUNK", "10000")),
+        ("realtime_whitelist_build_memory_limit", os.environ.get("MC_REALTIME_WHITELIST_BUILD_MEMORY_LIMIT", "512MB")),
+        ("realtime_whitelist_build_threads", os.environ.get("MC_REALTIME_WHITELIST_BUILD_THREADS", "1")),
+        ("realtime_index_build_timeout", os.environ.get("MC_REALTIME_INDEX_BUILD_TIMEOUT", "7200")),
+        ("realtime_whitelist_retention_days", os.environ.get("MC_REALTIME_WHITELIST_RETENTION_DAYS", "7")),
     ]
     for k, v in defaults:
         try:

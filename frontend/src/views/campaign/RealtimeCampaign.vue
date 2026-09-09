@@ -5,7 +5,7 @@
         <el-button :loading="loading" @click="fetchList">
           <el-icon><Refresh /></el-icon>{{ $t('common.refresh') }}
         </el-button>
-        <el-button type="primary" @click="showDialog(null)">
+        <el-button v-if="canManage" type="primary" @click="showDialog(null)">
           <el-icon><Plus /></el-icon>{{ $t('campaign.addCampaign') }}
         </el-button>
       </template>
@@ -104,17 +104,17 @@
             </el-button>
             <template v-if="row.status === 'not_started' || row.status === 'ended'">
               <span :title="startHint(row)">
-                <el-button text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
+                <el-button v-if="canManage" text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
                   {{ row.status === 'ended' ? $t('campaign.restart') : $t('campaign.start') }}
                 </el-button>
               </span>
             </template>
             <template v-else-if="row.status === 'in_progress'">
-              <el-button text type="danger" size="small" @click="handleEnd(row)">
+              <el-button v-if="canManage" text type="danger" size="small" @click="handleEnd(row)">
                 {{ $t('campaign.stop') }}
               </el-button>
             </template>
-            <el-dropdown trigger="click" @command="handleMore($event, row)">
+            <el-dropdown v-if="canManage" trigger="click" @command="handleMore($event, row)">
               <el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button>
               <template #dropdown>
                 <el-dropdown-menu>
@@ -234,7 +234,7 @@
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
-        <el-button type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
+        <el-button v-if="canManage" type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
       </template>
     </el-dialog>
 
@@ -283,6 +283,7 @@
 <script setup lang="ts">
 import i18n from '@/i18n'
 import { ref, reactive, computed, onMounted } from 'vue'
+import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -297,6 +298,8 @@ import { useRouter } from 'vue-router'
 
 const { t } = useI18n()
 const router = useRouter()
+const authStore = useAuthStore()
+const canManage = computed(() => ['admin', 'marketing'].includes(authStore.role))
 
 const weekDays = [
   { value: '1' },

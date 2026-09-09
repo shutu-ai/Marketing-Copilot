@@ -2,11 +2,11 @@
   <div>
     <div v-if="!embedded" class="page-header">
       <div><h2>{{ $t('menu.capacity') }}</h2><p>{{ $t('legacy.x1d2afdea') }}</p></div>
-      <div class="header-actions"><PollingStatus :state="pollState" :updated-at="lastUpdated"/><el-button @click="evaluate">{{ $t('legacy.x5c6cbf3e') }}</el-button><el-button type="primary" :loading="loading" @click="load">{{ $t('common.refresh') }}</el-button></div>
+      <div class="header-actions"><PollingStatus :state="pollState" :updated-at="lastUpdated"/><el-button v-if="canEvaluate" @click="evaluate">{{ $t('legacy.x5c6cbf3e') }}</el-button><el-button type="primary" :loading="loading" @click="load">{{ $t('common.refresh') }}</el-button></div>
     </div>
     <div v-else class="embedded-header">
       <div><h3>{{ $t('menu.capacity') }}</h3><p>{{ $t('legacy.x1d2afdea') }}</p></div>
-      <div class="header-actions"><PollingStatus :state="pollState" :updated-at="lastUpdated"/><el-button @click="evaluate">{{ $t('legacy.x5c6cbf3e') }}</el-button><el-button type="primary" :loading="loading" @click="load">{{ $t('common.refresh') }}</el-button></div>
+      <div class="header-actions"><PollingStatus :state="pollState" :updated-at="lastUpdated"/><el-button v-if="canEvaluate" @click="evaluate">{{ $t('legacy.x5c6cbf3e') }}</el-button><el-button type="primary" :loading="loading" @click="load">{{ $t('common.refresh') }}</el-button></div>
     </div>
     <el-alert v-if="error" type="warning" :closable="false" show-icon :title="$t('legacy.x27f373e5')" class="state-alert" />
     <el-row :gutter="16" class="summary">
@@ -80,7 +80,10 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import PollingStatus from '@/components/PollingStatus.vue'
 import { evaluateCapacityAlerts, getCapacityStatus, getSmppStats } from '@/api/capacity'
+import { useAuthStore } from '@/stores/auth'
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
+const authStore = useAuthStore()
+const canEvaluate = computed(() => ['admin', 'marketing'].includes(authStore.role))
 const loading=ref(false),status=ref<any>({}),stats=ref<any>({ summary: {}, items: [] }),statsError=ref(''),error=ref(''),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale');let timer=0
 const metricRows = computed(() => [...(status.value.metrics?.gauges || []), ...(status.value.metrics?.counters || [])].map((m:any) => ({ ...m, labels: Object.entries(m.labels || {}).map(([k,v]) => `${k}=${v}`).join(', ') || '—' })))
 function pct(value:number|undefined){return value == null ? '—' : `${(value * 100).toFixed(1)}%`}

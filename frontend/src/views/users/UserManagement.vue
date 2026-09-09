@@ -108,12 +108,12 @@ const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref<UserRow | null>(null)
 const currentUsername = ref('')
-const roles = ['admin', 'operator', 'viewer']
+const roles = ['admin', 'marketing', 'analyst']
 
 const form = reactive({
   username: '',
   display_name: '',
-  role: 'operator',
+  role: 'marketing',
   enabled: '1',
   password: '',
 })
@@ -124,7 +124,7 @@ function roleLabel(role: string) {
 
 function roleType(role: string): 'danger' | 'primary' | 'info' {
   if (role === 'admin') return 'danger'
-  if (role === 'operator') return 'primary'
+  if (role === 'marketing') return 'primary'
   return 'info'
 }
 
@@ -142,7 +142,7 @@ async function refresh() {
 
 function openCreate() {
   editing.value = null
-  Object.assign(form, { username: '', display_name: '', role: 'operator', enabled: '1', password: '' })
+  Object.assign(form, { username: '', display_name: '', role: 'marketing', enabled: '1', password: '' })
   dialogVisible.value = true
 }
 

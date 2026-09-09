@@ -16,12 +16,30 @@ from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpd
 from services import settings_service
 from services import sms_task_service
 from services import (operations_service, campaign_name_service, ingestion_job_service,
-                      backpressure_service)
+                      backpressure_service, realtime_whitelist_service)
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
 
-CHUNK_SIZE = 5000  # bounded working set for large CSV files
+CHUNK_SIZE = 5000  # fallback; the effective value is read from app settings
+MAX_PENDING_FILES_PER_CAMPAIGN = max(1, int(os.environ.get("MC_REALTIME_MAX_PENDING_FILES_PER_CAMPAIGN", "100")))
+MAX_INBOX_FILES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_FILES", "1000")))
+MAX_INBOX_BYTES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_GB", "10")) * 1024 ** 3)
+
+
+def _realtime_chunk_size() -> int:
+    """Return the current bounded input chunk size without requiring a restart."""
+    # Keep the module fallback monkeypatchable for the existing streaming tests.
+    if CHUNK_SIZE != 5000:
+        return max(1, min(100000, int(CHUNK_SIZE)))
+    try:
+        configured = settings_service.get_setting(
+            "realtime_match_chunk_size",
+            os.environ.get("MC_REALTIME_MATCH_CHUNK_SIZE", str(CHUNK_SIZE)),
+        )
+        return max(500, min(100000, int(configured)))
+    except (TypeError, ValueError):
+        return CHUNK_SIZE
 
 
 def _clean_text(value) -> str:
@@ -40,7 +58,10 @@ def _read_csv(path: str, chunksize: int = 0):
     if "|" in first_line and first_line.count("|") >= 1:
         delimiter = "|"
     else:
-        delimiter = csv.Sniffer().sniff(sample, delimiters=",|;\t").delimiter
+        try:
+            delimiter = csv.Sniffer().sniff(sample, delimiters=",|;\t").delimiter
+        except csv.Error:
+            delimiter = ","
     if chunksize:
         return pd.read_csv(path, dtype=str, sep=delimiter, chunksize=chunksize)
     return pd.read_csv(path, dtype=str, sep=delimiter)
@@ -296,32 +317,61 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
         conn.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign_id))
         conn.commit()
         conn.close()
-    whitelist_dir = os.path.join(campaign_dir, "whitelist")
-    os.makedirs(whitelist_dir, exist_ok=True)
-    ext = os.path.splitext(original_filename)[1].lower()
-    dest = os.path.join(whitelist_dir, f"whitelist{ext}")
-    shutil.move(file_path, dest)
-    try:
-        if ext == ".csv":
-            row_count = sum(len(chunk) for chunk in _read_csv(dest, chunksize=CHUNK_SIZE))
-        else:
-            df = pd.read_excel(dest, dtype=str)
-            row_count = len(df)
-    except Exception as exc:
-        row_count = 0
-        logger.error("Whitelist upload failed campaign=%s file=%s error=%s", campaign_id, original_filename, exc)
-    else:
-        logger.info("Whitelist uploaded campaign=%s file=%s rows=%s dest=%s", campaign_id, original_filename, row_count, dest)
+    _ensure_realtime_dirs(campaign_dir)
+    result = realtime_whitelist_service.upload(campaign_id, file_path, original_filename)
+    if not result.get("success"):
+        return None
     conn = get_connection()
-    conn.execute(
-        "UPDATE realtime_campaigns SET customer_list_filename=?, customer_list_path=?, row_count=?, updated_at=datetime('now','localtime') WHERE id=?",
-        (original_filename, dest, row_count, campaign_id)
-    )
-    conn.commit()
     row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
     conn.close()
     sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
-    return dict(row) if row else None
+    return {**(dict(row) if row else {}),
+            "whitelist_version_id": result.get("whitelist_version_id"),
+            "whitelist_status": result.get("whitelist_status", "building"),
+            "row_count": result.get("row_count", (dict(row) if row else {}).get("row_count", 0)),
+            "customer_list_filename": result.get("customer_list_filename", (dict(row) if row else {}).get("customer_list_filename", "")),
+            "customer_list_path": result.get("customer_list_path", (dict(row) if row else {}).get("customer_list_path", "")),
+            }
+
+
+def queue_file(campaign_id: int, file_path: str, original_filename: str) -> dict:
+    """Persist an input file and enqueue it; processing is performed by the worker."""
+    campaign = get_one(campaign_id)
+    if not campaign:
+        return {"success": False, "message": "Campaign not found"}
+    active, reason = sms_task_service.campaign_is_active(campaign)
+    if not active:
+        return {"success": False, "message": reason}
+    campaign_dir = campaign.get("campaign_dir") or _ensure_campaign_dir(campaign)
+    if not campaign.get("campaign_dir"):
+        conn = get_connection()
+        conn.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign_id))
+        conn.commit()
+        conn.close()
+    _ensure_realtime_dirs(campaign_dir)
+    inbox_dir = os.path.join(campaign_dir, "inbox")
+    os.makedirs(inbox_dir, exist_ok=True)
+    safe_name = os.path.basename(original_filename)
+    dest = os.path.join(inbox_dir, safe_name)
+    if os.path.exists(dest):
+        return {"success": True, "queued": True, "duplicate_file": True, "filename": safe_name,
+                "message": "file is already queued"}
+    allowed, capacity_reason = _inbox_capacity_available(campaign_id, os.path.getsize(file_path))
+    if not allowed:
+        logger.warning("Realtime inbox backpressure campaign=%s file=%s reason=%s", campaign_id, safe_name, capacity_reason)
+        return {"success": False, "status": "backpressure", "retryable": True, "message": capacity_reason}
+    shutil.move(file_path, dest)
+    file_id, duplicate = ingestion_job_service.register_file(
+        "realtime", campaign_id, safe_name, dest, chunk_size=_realtime_chunk_size(),
+        whitelist_version_id=(realtime_whitelist_service.active_version(campaign_id) or {}).get("id"),
+    )
+    if duplicate:
+        duplicate_path = operations_service.archive_duplicate(dest, campaign_dir, safe_name)
+        return {"success": True, "queued": False, "duplicate_file": True,
+                "duplicate_path": duplicate_path, "filename": safe_name}
+    logger.info("Realtime file queued campaign=%s file=%s ingestion_file_id=%s", campaign_id, safe_name, file_id)
+    return {"success": True, "queued": True, "filename": safe_name,
+            "ingestion_file_id": file_id, "status": "queued", "processing_phase": "queued"}
 
 
 def _count_output_rows(campaign_dir: str, date_prefix: str = "") -> int:
@@ -370,10 +420,38 @@ def _task_msisdn_for_campaign(value, campaign: dict) -> str:
     return prefix + normalized if prefix and not normalized.startswith(prefix) else normalized
 
 
+def _inbox_capacity_available(campaign_id: int, file_size: int = 0) -> tuple[bool, str]:
+    conn = get_connection()
+    try:
+        campaign_count = conn.execute(
+            """SELECT COUNT(*) AS count FROM ingestion_files
+               WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('pending','processing','retrying')""",
+            (campaign_id,),
+        ).fetchone()["count"]
+        total_count = conn.execute(
+            """SELECT COUNT(*) AS count FROM ingestion_files
+               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')"""
+        ).fetchone()["count"]
+        total_bytes = conn.execute(
+            """SELECT COALESCE(SUM(file_size),0) AS bytes FROM ingestion_files
+               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')"""
+        ).fetchone()["bytes"]
+    finally:
+        conn.close()
+    if int(campaign_count or 0) >= MAX_PENDING_FILES_PER_CAMPAIGN:
+        return False, "campaign realtime inbox pending limit reached"
+    if int(total_count or 0) >= MAX_INBOX_FILES:
+        return False, "global realtime inbox pending limit reached"
+    if int(total_bytes or 0) + int(file_size or 0) > MAX_INBOX_BYTES:
+        return False, "global realtime inbox byte limit reached"
+    return True, ""
+
+
 def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
     """Load only the current input chunk's whitelist matches into memory."""
     values = list({value for value in msisdns if value})
     result = {}
+    query_size = max(100, min(1000, int(query_size)))
     for start in range(0, len(values), query_size):
         current = values[start:start + query_size]
         values_sql = ",".join("(?)" for _ in current)
@@ -387,7 +465,24 @@ def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
     return result
 
 
-def receive_file(campaign_id: int, file_path: str, original_filename: str) -> dict:
+def _open_whitelist_index(path: str):
+    """Open and minimally validate a persistent whitelist index."""
+    conn = duckdb.connect(path, read_only=True)
+    try:
+        # Connecting to a damaged DuckDB file can succeed before the first
+        # table access. Validate the schema once so a bad active version can
+        # be invalidated and rolled back before any input rows are consumed.
+        conn.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def receive_file(campaign_id: int, file_path: str, original_filename: str,
+                 ingestion_file_id: Optional[int] = None,
+                 whitelist_version_id: Optional[int] = None,
+                 worker_id: str = "") -> dict:
     conn = get_connection()
     campaign = conn.execute(
         "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
@@ -403,97 +498,157 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
         file_record_id, duplicate_file = operations_service.register_file(
             "realtime", campaign_id, file_path, original_filename)
     except Exception as exc:
-        conn.close()
-        return {"success": False, "message": str(exc)}
+        return {"success": False, "message": str(exc), "error_class": "INVALID_INPUT"}
     if duplicate_file:
-        conn.close()
         duplicate_path = operations_service.archive_duplicate(
             file_path, campaign.get("campaign_dir", ""), original_filename)
         return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
                 "message": "file already processed"}
-    ingestion_file_id, _ = ingestion_job_service.register_file(
-        "realtime", campaign_id, original_filename, file_path,
-        chunk_size=CHUNK_SIZE, reset=False,
-    )
+    chunk_size = _realtime_chunk_size()
+    if ingestion_file_id is None:
+        ingestion_file_id, _ = ingestion_job_service.register_file(
+            "realtime", campaign_id, original_filename, file_path,
+            chunk_size=chunk_size, reset=False, whitelist_version_id=whitelist_version_id,
+        )
+    if whitelist_version_id is None:
+        whitelist_version_id = (realtime_whitelist_service.active_version(campaign_id) or {}).get("id")
+    if whitelist_version_id:
+        conn = get_connection()
+        conn.execute("UPDATE processed_files SET whitelist_version_id=?,processing_phase='validating' WHERE id=?",
+                     (whitelist_version_id, file_record_id))
+        conn.commit()
+        conn.close()
+        ingestion_job_service.update_progress(ingestion_file_id, "validating", whitelist_version_id=whitelist_version_id)
+    def progress(phase: str, processed_rows: int = 0, matched_rows: int = 0,
+                 chunk_index: int = 0, total_chunks: int = 0):
+        operations_service.update_file_progress(
+            file_record_id, phase, processed_rows, matched_rows, chunk_index,
+            total_chunks, worker_id, whitelist_version_id,
+        )
+        ingestion_job_service.update_progress(
+            ingestion_file_id, phase, processed_rows, matched_rows, chunk_index,
+            total_chunks, worker_id, whitelist_version_id,
+        )
+        try:
+            from services import metrics_service
+            metrics_service.set_gauge("realtime_ingestion_worker_last_progress_timestamp", time.time())
+        except Exception:
+            pass
+        logger.info(
+            "Realtime file progress campaign=%s file=%s phase=%s rows=%s matched=%s chunk=%s total_chunks=%s whitelist_version=%s worker_id=%s",
+            campaign_id, original_filename, phase, int(processed_rows or 0), int(matched_rows or 0),
+            int(chunk_index or 0), int(total_chunks or 0), whitelist_version_id or "", worker_id or "",
+        )
     active, inactive_reason = sms_task_service.campaign_is_active(campaign)
     if not active:
-        conn.close()
         operations_service.finish_file(file_record_id, "failed", file_path, error=inactive_reason)
         return {"success": False, "message": inactive_reason}
+    whitelist_version = realtime_whitelist_service.get_version(whitelist_version_id) if whitelist_version_id else None
+    latest_whitelist_version = realtime_whitelist_service.latest_version(campaign_id)
     whitelist_path = campaign.get("customer_list_path", "")
-    if campaign.get("use_whitelist", True) and (not whitelist_path or not os.path.isfile(whitelist_path)):
-        conn.close()
+    if campaign.get("use_whitelist", True) and not whitelist_version and latest_whitelist_version \
+            and latest_whitelist_version.get("status") == "building":
+        ingestion_job_service.update_progress(ingestion_file_id, "waiting_for_whitelist")
+        return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
+                "message": "whitelist index is still building"}
+    if campaign.get("use_whitelist", True) and whitelist_version:
+        if whitelist_version.get("status") != "ready" or not os.path.isfile(whitelist_version.get("index_path", "")):
+            ingestion_job_service.update_progress(ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id)
+            return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
+                    "message": "whitelist index is still building"}
+        whitelist_path = whitelist_version["index_path"]
+    elif campaign.get("use_whitelist", True) and (not whitelist_path or not os.path.isfile(whitelist_path)):
         operations_service.finish_file(file_record_id, "failed", file_path, error="No whitelist uploaded")
-        return {"success": False, "message": "No whitelist uploaded for this campaign"}
+        return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
+                "message": "No ready whitelist for this campaign"}
 
     ext = os.path.splitext(file_path)[1].lower()
+    progress("reading_input")
     try:
         if ext in (".csv", ".txt"):
-            reader = _read_csv(file_path, chunksize=CHUNK_SIZE)
+            reader = _read_csv(file_path, chunksize=chunk_size)
         else:
             df = pd.read_excel(file_path, dtype=str)
     except Exception as e:
-        conn.close()
         target = operations_service.quarantine(file_path, campaign.get("campaign_dir", ""), original_filename)
         operations_service.finish_file(file_record_id, "quarantined", target, error=e)
         operations_service.event("file", "READ_FAILED", str(e), context={"campaign_id": campaign_id, "file": original_filename})
-        return {"success": False, "message": f"Cannot read file: {e}"}
+        return {"success": False, "status": "quarantined", "error_class": "INVALID_INPUT",
+                "quarantine_path": target, "message": f"Cannot read file: {e}"}
 
-    # Load whitelist MSISDNs and their preferred language (chunked for large CSV files)
-    wl_ext = os.path.splitext(whitelist_path)[1].lower() if campaign.get("use_whitelist", True) else ""
-    whitelist_temp_dir = None
+    # Load only the persistent versioned index. Legacy campaigns are migrated by
+    # the realtime worker before they are allowed to process new files.
     whitelist_conn = None
     try:
         if not campaign.get("use_whitelist", True):
             whitelist_languages = {}
             whitelist_set = set()
-        elif wl_ext == ".csv":
-            # Keep the whitelist on disk. Only the current input chunk is
-            # materialized into a Python mapping during matching.
-            whitelist_temp_dir = tempfile.TemporaryDirectory(prefix="mc-whitelist-")
-            whitelist_conn = duckdb.connect(os.path.join(whitelist_temp_dir.name, "whitelist.duckdb"))
-            whitelist_conn.execute(
-                "CREATE TABLE whitelist_msisdns (msisdn TEXT PRIMARY KEY, language TEXT NOT NULL)"
-            )
-            for wl_chunk in _read_csv(whitelist_path, chunksize=CHUNK_SIZE):
-                wl_msisdn_col = "msisdn" if "msisdn" in wl_chunk.columns else wl_chunk.columns[0]
-                has_language = "language" in wl_chunk.columns
-                whitelist_rows = []
-                for idx, value in enumerate(wl_chunk[wl_msisdn_col]):
-                    norm = sms_task_service.normalize_msisdn(value)
-                    if not norm:
-                        continue
-                    language = _clean_text(wl_chunk["language"].iloc[idx]) if has_language else ""
-                    whitelist_rows.append((norm, language))
-                if whitelist_rows:
-                    whitelist_conn.executemany(
-                        "INSERT INTO whitelist_msisdns(msisdn, language) VALUES (?,?) ON CONFLICT DO NOTHING",
-                        whitelist_rows,
-                    )
-                del whitelist_rows, wl_chunk
-            whitelist_conn.commit()
+        elif whitelist_version:
+            progress("loading_index")
+            whitelist_conn = _open_whitelist_index(whitelist_path)
             whitelist_languages = None
             whitelist_set = None
         else:
-            wl_df = pd.read_excel(whitelist_path, dtype=str)
-            wl_msisdn_col = "msisdn" if "msisdn" in wl_df.columns else wl_df.columns[0]
-            has_language = "language" in wl_df.columns
-            whitelist_languages = {}
-            for idx in range(len(wl_df)):
-                norm = sms_task_service.normalize_msisdn(wl_df[wl_msisdn_col].iloc[idx])
-                if not norm or norm in whitelist_languages:
-                    continue
-                language = _clean_text(wl_df["language"].iloc[idx]) if has_language else ""
-                whitelist_languages[norm] = language
-            whitelist_set = set(whitelist_languages)
+            ingestion_job_service.update_progress(
+                ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id
+            )
+            return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
+                    "message": "No ready whitelist index for this campaign"}
     except Exception as e:
         if whitelist_conn:
             whitelist_conn.close()
-        if whitelist_temp_dir:
-            whitelist_temp_dir.cleanup()
-        conn.close()
-        operations_service.finish_file(file_record_id, "failed", file_path, error=f"Cannot read whitelist: {e}")
-        return {"success": False, "message": f"Cannot read whitelist: {e}"}
+        fallback = None
+        if campaign.get("use_whitelist", True) and whitelist_version and whitelist_version_id:
+            failed_version_id = whitelist_version_id
+            fallback = realtime_whitelist_service.invalidate_version(
+                failed_version_id,
+                f"Cannot read whitelist index: {e}",
+            )
+            if fallback:
+                whitelist_version = fallback
+                whitelist_version_id = fallback["id"]
+                whitelist_path = fallback["index_path"]
+                conn = get_connection()
+                try:
+                    conn.execute(
+                        "UPDATE processed_files SET whitelist_version_id=?,processing_phase='validating' WHERE id=?",
+                        (whitelist_version_id, file_record_id),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                ingestion_job_service.update_progress(
+                    ingestion_file_id, "validating", whitelist_version_id=whitelist_version_id
+                )
+                try:
+                    progress("loading_index")
+                    whitelist_conn = _open_whitelist_index(whitelist_path)
+                    whitelist_languages = None
+                    whitelist_set = None
+                except Exception as fallback_error:
+                    e = RuntimeError(
+                        f"Cannot read whitelist index version {failed_version_id}; "
+                        f"fallback version {whitelist_version_id} also failed: {fallback_error}"
+                    )
+                    fallback = None
+        if fallback:
+            operations_service.event(
+                "realtime_ingestion", "WHITELIST_INDEX_ROLLBACK",
+                f"Whitelist index version {failed_version_id} was invalid; "
+                f"using version {whitelist_version_id}",
+                severity="warning",
+                context={"campaign_id": campaign_id, "failed_version_id": failed_version_id,
+                         "fallback_version_id": whitelist_version_id},
+            )
+        else:
+            operations_service.finish_file(file_record_id, "failed", file_path, error=f"Cannot read whitelist: {e}")
+            return {
+                "success": False,
+                "status": "failed",
+                "error_class": "WHITELIST_INDEX",
+                "retryable": False,
+                "message": f"Cannot read whitelist: {e}",
+            }
 
     # Match input MSISDNs against whitelist. CSV chunks are fully matched,
     # enqueued and written before the next chunk is read. A disk-backed unique
@@ -501,11 +656,14 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
     # Python memory.
     if ext in (".csv", ".txt"):
         total_rows = 0
+        matched_row_count = 0
         msisdn_col = None
         task_result = {"success": True, "created": 0, "duplicate": 0,
                        "excluded": 0, "invalid": 0, "no_template": 0}
-        unique_dir = tempfile.TemporaryDirectory(prefix="mc-realtime-")
-        unique_conn = duckdb.connect(os.path.join(unique_dir.name, "unique.duckdb"))
+        unique_fd, unique_path = tempfile.mkstemp(prefix="mc-realtime-", suffix=".duckdb")
+        os.close(unique_fd)
+        os.unlink(unique_path)
+        unique_conn = duckdb.connect(unique_path)
         current_job = None
         try:
             unique_conn.execute("CREATE TABLE seen_msisdns (msisdn TEXT PRIMARY KEY, matched INTEGER NOT NULL)")
@@ -515,6 +673,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
                 chunk_start = total_rows
                 total_rows += len(chunk)
+                progress("matching", total_rows, matched_row_count, chunk_index, chunk_index + 1)
                 ingestion_job_service.ensure_chunk(
                     ingestion_file_id, chunk_index, chunk_start, total_rows
                 )
@@ -533,11 +692,14 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                 )
                 matched_records = []
                 chunk_result = {}
+                chunk_matched_rows = 0
                 for idx, norm in enumerate(chunk_normalized):
                     if not norm:
                         task_result["invalid"] += 1
                         continue
                     is_matched = not campaign.get("use_whitelist", True) or norm in chunk_whitelist_languages
+                    if is_matched:
+                        chunk_matched_rows += 1
                     inserted = unique_conn.execute(
                         """INSERT INTO seen_msisdns(msisdn, matched) VALUES (?,?)
                            ON CONFLICT DO NOTHING RETURNING msisdn""",
@@ -550,6 +712,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     row_dict["language"] = row_dict.get("language", "") if not campaign.get("use_whitelist", True) else chunk_whitelist_languages[norm]
                     matched_records.append(row_dict)
                 unique_conn.commit()
+                matched_row_count += chunk_matched_rows
                 if matched_records and not chunk_completed:
                     chunk_result = sms_task_service.enqueue_rows(
                         "realtime", campaign, matched_records, original_filename
@@ -575,6 +738,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
                     ingestion_job_service.complete_chunk(
                         current_job["id"], chunk_result if matched_records else {}
                     )
+                    progress("enqueueing_tasks", total_rows, matched_row_count, chunk_index, chunk_index + 1)
                 current_job = None
                 del matched_records, chunk_normalized, chunk_whitelist_languages, chunk
             counts = unique_conn.execute(
@@ -583,30 +747,30 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
             total_msisdn = int(counts[0] or 0)
             matched_count = int(counts[1] or 0)
         except Exception as exc:
-            conn.close()
             if current_job and current_job.get("status") != "completed":
                 ingestion_job_service.fail_chunk(current_job["id"], exc)
             raise
         finally:
             unique_conn.close()
-            unique_dir.cleanup()
+            if os.path.exists(unique_path):
+                try:
+                    os.unlink(unique_path)
+                except OSError:
+                    pass
             if whitelist_conn:
                 whitelist_conn.close()
-            if whitelist_temp_dir:
-                whitelist_temp_dir.cleanup()
     else:
         pressure, _ = backpressure_service.reasons()
         if pressure:
-            conn.close()
             raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
         ingestion_job_service.ensure_chunk(ingestion_file_id, 0, 0, len(df))
         excel_job = ingestion_job_service.claim_chunk(
             file_id=ingestion_file_id, chunk_index=0
         )
         if excel_job is None:
-            conn.close()
             raise RuntimeError("realtime Excel chunk lease is held by another worker")
         try:
+            progress("matching", 0, 0, 0, 1)
             msisdn_col = "msisdn" if "msisdn" in df.columns else df.columns[0]
             normalized_msisdns = df[msisdn_col].map(sms_task_service.normalize_msisdn)
             received_msisdns = {value for value in normalized_msisdns if value}
@@ -659,17 +823,15 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str) -> di
             if excel_job.get("status") != "completed":
                 ingestion_job_service.complete_chunk(excel_job["id"], task_result)
         except Exception as exc:
-            conn.close()
             if excel_job.get("status") != "completed":
                 ingestion_job_service.fail_chunk(excel_job["id"], exc)
             raise
         finally:
             if whitelist_conn:
                 whitelist_conn.close()
-            if whitelist_temp_dir:
-                whitelist_temp_dir.cleanup()
 
     campaign_dir = campaign.get("campaign_dir", "")
+    progress("finalizing", total_rows, matched_count, 0, 0)
     received_dir = os.path.join(campaign_dir, "received")
     os.makedirs(received_dir, exist_ok=True)
     dest = os.path.join(received_dir, original_filename)
@@ -956,11 +1118,20 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
                 logger.info("Watch file skipped campaign=%s file=%s reason=already processed", campaign.get("id"), fname)
                 continue
             try:
+                allowed, capacity_reason = _inbox_capacity_available(campaign["id"], os.path.getsize(src))
+                if not allowed:
+                    logger.warning("Realtime inbox backpressure campaign=%s file=%s reason=%s", campaign["id"], fname, capacity_reason)
+                    continue
                 shutil.copy2(src, dest)
                 try:
                     os.utime(dest, None)
                 except OSError:
                     pass
+                whitelist_version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
+                ingestion_job_service.register_file(
+                    "realtime", campaign["id"], fname, dest,
+                    chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
+                )
                 total_moved += 1
                 logger.info("Watch file copied campaign=%s src=%s dest=%s", campaign.get("id"), src, dest)
             except OSError:
@@ -982,7 +1153,7 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
             "SELECT * FROM realtime_campaigns WHERE status='in_progress' AND campaign_dir<>''"
         ).fetchall()
     conn.close()
-    results = {"processed": 0, "errors": []}
+    results = {"processed": 0, "queued": 0, "errors": []}
     for row in rows:
         campaign = dict(row)
         campaign_dir = campaign.get("campaign_dir", "")
@@ -1011,23 +1182,29 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
             if not active:
                 continue
             try:
-                result = receive_file(campaign["id"], src, fname)
-                if result.get("success"):
-                    results["processed"] += 1
-                    logger.info(
-                        "Inbox file processed campaign=%s file=%s total_msisdn=%s matched=%s",
-                        campaign["id"], fname, result.get("total_msisdn", 0), result.get("matched_count", 0),
-                    )
-                else:
-                    results["errors"].append({"filename": fname, "message": result.get("message", "unknown")})
-                    logger.error(
-                        "Inbox file rejected campaign=%s file=%s reason=%s",
-                        campaign["id"], fname, result.get("message", "unknown"),
-                    )
+                existing = ingestion_job_service.get_file("realtime", campaign["id"], fname)
+                if existing:
+                    continue
+                version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
+                _file_id, duplicate = ingestion_job_service.register_file(
+                    "realtime", campaign["id"], fname, src, chunk_size=_realtime_chunk_size(),
+                    whitelist_version_id=version_id,
+                )
+                if not duplicate:
+                    results["queued"] += 1
+                    depth_conn = get_connection()
+                    try:
+                        depth = depth_conn.execute(
+                            "SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')"
+                        ).fetchone()["count"]
+                    finally:
+                        depth_conn.close()
+                    logger.info("Realtime file queued campaign=%s file=%s queue_depth=%s",
+                                campaign["id"], fname, int(depth or 0))
             except Exception as e:
                 results["errors"].append({"filename": fname, "message": str(e)})
-                logger.exception("Inbox file failed campaign=%s file=%s", campaign["id"], fname)
-    logger.info("Realtime inbox sweep processed=%s errors=%s", results["processed"], len(results["errors"]))
+                logger.exception("Realtime inbox file registration failed campaign=%s file=%s", campaign["id"], fname)
+    logger.info("Realtime inbox sweep queued=%s errors=%s", results["queued"], len(results["errors"]))
     return results
 
 
@@ -1040,6 +1217,14 @@ def cleanup_realtime_retention():
     rows = conn.execute(
         "SELECT id, campaign_dir FROM realtime_campaigns WHERE campaign_dir<>''"
     ).fetchall()
+    protected_paths = {
+        os.path.abspath(row["file_path"])
+        for row in conn.execute(
+            """SELECT file_path FROM ingestion_files
+               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')
+                 AND COALESCE(file_path,'')<>''"""
+        ).fetchall()
+    }
     deleted = 0
     for row in rows:
         campaign_dir = row["campaign_dir"]
@@ -1051,6 +1236,8 @@ def cleanup_realtime_retention():
             for fname in os.listdir(path):
                 file_path = os.path.join(path, fname)
                 if not os.path.isfile(file_path):
+                    continue
+                if os.path.abspath(file_path) in protected_paths:
                     continue
                 try:
                     if os.path.getmtime(file_path) < cutoff_ts:

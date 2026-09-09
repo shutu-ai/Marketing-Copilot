@@ -670,7 +670,10 @@ def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: 
 
 def _apply_submitted(conn, task_id: int, message_ids: list[str],
                      delivery_receipt_mode: str = "optional"):
-    row = conn.execute("SELECT smsc_message_ids FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT smsc_message_ids,batch_id,campaign_type,campaign_id,status FROM sms_tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
     existing_ids = []
     if row:
         try:
@@ -680,12 +683,35 @@ def _apply_submitted(conn, task_id: int, message_ids: list[str],
     message_ids = list(dict.fromkeys(existing_ids + list(message_ids or [])))
     mode = delivery_receipt_mode if delivery_receipt_mode in {"required", "optional", "disabled"} else "optional"
     final_status = "submitted" if mode == "required" else "accepted"
-    conn.execute(
-        f"""UPDATE sms_tasks SET status='{final_status}', smsc_message_ids=?, error_msg='',
-            submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)), updated_at=CURRENT_TIMESTAMP
-            WHERE id=? AND status IN ('sending','submitted')""",
-        (json.dumps(message_ids), task_id),
-    )
+    updated = conn.execute(
+        """UPDATE sms_tasks SET status=?, smsc_message_ids=?, error_msg='',
+            submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+            delivered_at=CASE WHEN ? <> 'required'
+                              THEN COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR))
+                              ELSE delivered_at END,
+            updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status IN ('sending','submitted')
+            RETURNING id""",
+        (final_status, json.dumps(message_ids), mode, task_id),
+    ).fetchone()
+    if updated and final_status == "accepted" and row and row["batch_id"]:
+        conn.execute(
+            """UPDATE batch_campaign_batches
+               SET delivered_count=COALESCE(delivered_count,0)+1,
+                   status=CASE
+                     WHEN task_count>0 AND COALESCE(delivered_count,0)+1>=task_count
+                     THEN 'sent' ELSE status END,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (row["batch_id"],),
+        )
+        stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+        conn.execute(
+            """UPDATE batch_campaign_daily_stats
+               SET sent_count=COALESCE(sent_count,0)+1, updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_id=? AND stats_date=?""",
+            (row["campaign_id"], stats_date),
+        )
     _insert_message_mapping(conn, task_id, message_ids)
     pending_receipts = conn.execute(
         """SELECT smsc_message_id, message_state, raw_receipt
@@ -828,7 +854,9 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
         if task_id is not None and not inserted:
             return
     if task_id:
-        was_delivered = task.get("status") == "delivered"
+        # accepted is a delivered-equivalent terminal state when the SMSC
+        # configuration does not require a delivery receipt.
+        was_delivered = task.get("status") in {"delivered", "accepted"}
         if normalized_state in {"DELIVRD", "DELIVERED", "2"}:
             try:
                 expected_ids = set(json.loads(task.get("smsc_message_ids") or "[]"))
@@ -880,6 +908,21 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
                    WHERE id=?""",
                 (task.get("status", ""), task["batch_id"]),
             )
+        elif status in {"retrying", "failed"} and was_delivered and task.get("batch_id"):
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET delivered_count=GREATEST(COALESCE(delivered_count,0)-1,0),
+                       failed_count=CASE WHEN ?='failed'
+                         THEN COALESCE(failed_count,0)+1
+                         ELSE COALESCE(failed_count,0) END,
+                       status=CASE
+                         WHEN status='sent' AND task_count>0
+                              AND GREATEST(COALESCE(delivered_count,0)-1,0)<task_count
+                         THEN 'in_progress' ELSE status END,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (status, task["batch_id"]),
+            )
         elif status == "failed" and task.get("status") != "failed" and task.get("batch_id"):
             conn.execute(
                 """UPDATE batch_campaign_batches
@@ -903,6 +946,17 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
             if existing:
                 conn.execute(
                     "UPDATE batch_campaign_daily_stats SET sent_count=sent_count+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (existing["id"],),
+                )
+        elif status in {"retrying", "failed"} and was_delivered and task.get("campaign_type") == "batch":
+            stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+            existing = conn.execute(
+                "SELECT id FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",
+                (task["campaign_id"], stats_date),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE batch_campaign_daily_stats SET sent_count=GREATEST(sent_count-1,0), updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (existing["id"],),
                 )
 
@@ -1069,8 +1123,10 @@ def task_stats() -> dict:
             rows = conn.execute(
                 "SELECT status, COUNT(*) count FROM sms_tasks GROUP BY status"
             ).fetchall()
-            result = {r["status"]: r["count"] for r in rows}
-            result["total"] = sum(result.values())
+            raw = {r["status"]: r["count"] for r in rows}
+            result = dict(raw)
+            result["delivered"] = raw.get("delivered", 0) + raw.get("accepted", 0)
+            result["total"] = sum(raw.values())
         finally:
             conn.close()
         _TASK_STATS_CACHE = result
@@ -1129,7 +1185,7 @@ def mark_delivered(task_id: int) -> tuple[bool, str]:
     )
     _add_task_event(conn, task_id, "manual_delivered", task["status"], "delivered",
                     "manually confirmed as delivered")
-    if task.get("batch_id"):
+    if task.get("batch_id") and task["status"] not in {"delivered", "accepted"}:
         conn.execute(
             """UPDATE batch_campaign_batches
                SET delivered_count=COALESCE(delivered_count,0)+1,
@@ -1140,7 +1196,7 @@ def mark_delivered(task_id: int) -> tuple[bool, str]:
                WHERE id=?""",
             (task["batch_id"],),
         )
-    if task.get("campaign_type") == "batch":
+    if task.get("campaign_type") == "batch" and task["status"] not in {"delivered", "accepted"}:
         stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
         existing = conn.execute(
             "SELECT id FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",

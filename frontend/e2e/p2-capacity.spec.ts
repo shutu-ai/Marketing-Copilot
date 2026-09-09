@@ -4,6 +4,7 @@ test('P2 capacity dashboard renders worker, pool and alert state', async ({ page
   await page.addInitScript(() => {
     localStorage.setItem('mc_token', 'e2e-token')
     localStorage.setItem('mc_user', 'admin')
+    localStorage.setItem('mc_role', 'admin')
   })
 
   const errors: string[] = []

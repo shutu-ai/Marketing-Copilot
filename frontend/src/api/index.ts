@@ -21,6 +21,7 @@ api.interceptors.response.use(
     if (status === 401 && !url.includes('/auth/login')) {
       localStorage.removeItem('mc_token')
       localStorage.removeItem('mc_user')
+      localStorage.removeItem('mc_role')
       if (window.location.pathname !== '/login') {
         window.location.href = '/login'
       }

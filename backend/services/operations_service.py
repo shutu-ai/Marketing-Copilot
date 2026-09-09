@@ -72,10 +72,49 @@ def finish_file(file_id: int, status: str, path: str = "", total_rows: int = 0,
     conn = get_connection()
     conn.execute(
         """UPDATE processed_files SET status=?,file_path=?,total_rows=?,created_tasks=?,error_detail=?,
-           completed_at=CURRENT_TIMESTAMP WHERE id=?""",
-        (status, path, total_rows, created_tasks, str(error)[:4000], file_id))
+           processing_phase=?,last_progress_at=CURRENT_TIMESTAMP,
+           completed_at=CASE WHEN ? IN ('completed','failed','quarantined') THEN CAST(CURRENT_TIMESTAMP AS VARCHAR) ELSE completed_at END
+           WHERE id=?""",
+        (status, path, total_rows, created_tasks, str(error)[:4000],
+         "completed" if status == "completed" else ("quarantined" if status == "quarantined" else "failed"),
+         status, file_id))
     conn.commit()
     conn.close()
+
+
+def update_file_progress(file_id: int, phase: str, processed_rows: int = 0,
+                         matched_rows: int = 0, chunk_index: int = 0,
+                         total_chunks: int = 0, worker_id: str = "",
+                         whitelist_version_id=None):
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE processed_files SET processing_phase=?,processed_rows=?,matched_rows=?,
+               current_chunk_index=?,total_chunks=?,worker_id=?,last_progress_at=CURRENT_TIMESTAMP,
+               processing_started_at=COALESCE(processing_started_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+               whitelist_version_id=COALESCE(?,whitelist_version_id) WHERE id=?""",
+            (phase, int(processed_rows or 0), int(matched_rows or 0), int(chunk_index or 0),
+             int(total_chunks or 0), worker_id or "", whitelist_version_id, file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_file_retry(file_id: int, error_class: str, error: str, next_retry_at=None):
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE processed_files SET status='retrying',retry_count=COALESCE(retry_count,0)+1,
+               last_error_class=?,last_error_at=CURRENT_TIMESTAMP,
+               next_retry_at=?,error_detail=?,processing_phase='queued',last_progress_at=CURRENT_TIMESTAMP,
+               completed_at=NULL
+               WHERE id=?""",
+            (error_class, next_retry_at, str(error)[:4000], file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def quarantine(path: str, campaign_dir: str, filename: str) -> str:

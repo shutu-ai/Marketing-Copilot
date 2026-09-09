@@ -4,7 +4,7 @@ export interface UserRow {
   id: number
   username: string
   display_name: string
-  role: 'admin' | 'operator' | 'viewer'
+  role: 'admin' | 'marketing' | 'analyst'
   enabled: number
   last_login_at: string | null
   created_at: string

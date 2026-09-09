@@ -16,6 +16,7 @@ export interface RealtimeMonitorState {
   processed_files_total: number
   processed_files_page: number
   processed_files_page_size: number
+  ingestion_files: any[]
 }
 
 export interface MonitorPageParams {
@@ -35,6 +36,18 @@ export function scanRealtimeMonitor(campaignId?: number, params: MonitorPagePara
   return api.post<{ sync: any; processing: any; monitor: RealtimeMonitorState }>('/monitor/realtime/scan', null, {
     params: { campaign_id: campaignId || undefined, ...params },
   })
+}
+
+export function retryRealtimeFile(fileId: number) {
+  return api.post(`/monitor/realtime/files/${fileId}/retry`)
+}
+
+export function retryRealtimeFiles(fileIds: number[]) {
+  return api.post('/monitor/realtime/files/retry', { file_ids: fileIds })
+}
+
+export function archiveRealtimeFiles(fileIds: number[]) {
+  return api.post('/monitor/realtime/files/archive', { file_ids: fileIds })
 }
 
 export function getMonitorConfigs() {

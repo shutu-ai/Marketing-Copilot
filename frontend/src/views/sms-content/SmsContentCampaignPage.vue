@@ -7,11 +7,11 @@
         </el-button>
         <h2>{{ pageTitle }}</h2>
       </div>
-      <el-button type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
+      <el-button v-if="canManage" type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
     </div>
 
     <el-card style="margin-bottom:16px">
-      <el-form :model="form" label-width="130px" size="small">
+      <el-form :model="form" label-width="130px" size="small" :disabled="!canManage">
         <el-form-item :label="$t('smsContent.marketingType')" required>
           <template v-if="isEdit || isFromMarketing">
             <el-input :model-value="form.marketing_type === 'realtime' ? i18n.global.t('campaign.realtimeTitle') : i18n.global.t('campaign.batchTitle')" disabled />
@@ -40,7 +40,7 @@
       <template #header>
         <div style="display:flex;align-items:center;justify-content:space-between">
           <span>{{ $t('smsContent.template') }}</span>
-          <el-button size="small" :disabled="rows.length >= languageOptions.length" @click="addRow">
+          <el-button v-if="canManage" size="small" :disabled="rows.length >= languageOptions.length" @click="addRow">
             <el-icon><Plus /></el-icon>
             {{ $t('common.add') }}
           </el-button>
@@ -50,11 +50,11 @@
       <div v-for="(row, idx) in rows" :key="idx" style="border:1px solid #e4e7ed;border-radius:6px;padding:16px;margin-bottom:12px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
           <strong style="font-size:14px">{{ $t('common.language') }} {{ idx + 1 }}</strong>
-          <el-button v-if="rows.length > 1" text type="danger" size="small" @click="rows.splice(idx, 1)">
+          <el-button v-if="canManage && rows.length > 1" text type="danger" size="small" @click="rows.splice(idx, 1)">
             <el-icon><Delete /></el-icon>
           </el-button>
         </div>
-        <el-form label-width="100px" size="small">
+        <el-form label-width="100px" size="small" :disabled="!canManage">
           <el-form-item :label="$t('common.language')" required>
             <el-select v-model="row.language" style="width:100%" :placeholder="$t('legacy.xd17b8085')">
               <el-option
@@ -86,11 +86,14 @@ import { useSmsContentStore } from '@/stores/smsContent'
 import * as api from '@/api/smsContent'
 import * as batchApi from '@/api/campaign'
 import * as realtimeApi from '@/api/realtime-campaign'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const store = useSmsContentStore()
 const { t } = useI18n()
+const authStore = useAuthStore()
+const canManage = computed(() => ['admin', 'marketing'].includes(authStore.role))
 
 const isEdit = computed(() => !!route.params.campaignId && route.params.campaignId !== 'new')
 const isFromMarketing = computed(() => !!route.query.from)

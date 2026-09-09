@@ -157,7 +157,12 @@ def get_config_stats() -> dict:
             submitted_1m = _window_count(where, params, "submitted_at", 1)
             submitted_5m = _window_count(where, params, "submitted_at", 5)
             submitted_60m = _window_count(where, params, "submitted_at", 60)
-            delivered_60m = _window_count(where, params, "delivered_at", 60)
+            delivered_60m = _count(
+                where, params,
+                "status IN ('delivered','accepted') AND "
+                "CAST(COALESCE(delivered_at, submitted_at, updated_at) AS TIMESTAMP WITH TIME ZONE) >= "
+                "CURRENT_TIMESTAMP - INTERVAL '60 minutes'",
+            )
             failed_60m = _count(
                 where, params,
                 "status='failed' AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) >= CURRENT_TIMESTAMP - INTERVAL '60 minutes'",
@@ -188,7 +193,9 @@ def get_config_stats() -> dict:
                 ),
                 "today_delivered": _count(
                     where, params,
-                    "CAST(delivered_at AS TIMESTAMP WITH TIME ZONE) >= CAST(CAST(CURRENT_DATE AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE)",
+                    "status IN ('delivered','accepted') AND "
+                    "CAST(COALESCE(delivered_at, submitted_at, updated_at) AS TIMESTAMP WITH TIME ZONE) >= "
+                    "CAST(CAST(CURRENT_DATE AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE)",
                 ),
                 "today_failed": _count(
                     where, params,

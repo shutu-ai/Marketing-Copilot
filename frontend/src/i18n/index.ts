@@ -69,11 +69,11 @@ const legacyEnglish = {
 const rebuiltLegacyAr = rebuildLocale(legacyEnglish, 'ar')
 const rebuiltLegacyAm = rebuildLocale(legacyEnglish, 'am')
 const messages: Record<string, any> = {
-  'zh-CN': mergeLocale(zhCN, monitorStatus['zh-CN'], { legacy: { ...legacy['zh-CN'], ...legacyExtra['zh-CN'], ...legacySms['zh-CN'], ...legacyFinal['zh-CN'], ...legacyFinal2['zh-CN'], ...legacyTail['zh-CN'], ...remaining['zh-CN'], ...dynamic['zh-CN'] } }),
-  'en': mergeLocale(en, monitorStatus.en, { legacy: { ...legacy.en, ...legacyExtra.en, ...legacySms.en, ...legacyFinal.en, ...legacyFinal2.en, ...legacyTail.en, ...remaining.en, ...dynamic.en } }),
-  fr: mergeLocale(en, monitorStatus.fr, fr, sanitizeLocalized(localized.fr, en), sanitizeLocalized(localizedExtra.fr, en), localizedSafe.fr, { legacy: { ...legacy.fr, ...legacyExtra.fr, ...legacySms.fr, ...legacyFinal.fr, ...legacyFinal2.fr, ...legacyTail.fr, ...remaining.fr, ...dynamic.fr } }),
-  ar: mergeLocale(en, monitorStatus.ar, rebuiltAr, localizedSafe.ar, { legacy: rebuiltLegacyAr }),
-  am: mergeLocale(en, monitorStatus.am, rebuiltAm, localizedSafe.am, { legacy: rebuiltLegacyAm }),
+  'zh-CN': mergeLocale(zhCN, monitorStatus['zh-CN'], { dynamic: dynamic['zh-CN'] }, { legacy: { ...legacy['zh-CN'], ...legacyExtra['zh-CN'], ...legacySms['zh-CN'], ...legacyFinal['zh-CN'], ...legacyFinal2['zh-CN'], ...legacyTail['zh-CN'], ...remaining['zh-CN'], ...dynamic['zh-CN'] } }),
+  'en': mergeLocale(en, monitorStatus.en, { dynamic: dynamic.en }, { legacy: { ...legacy.en, ...legacyExtra.en, ...legacySms.en, ...legacyFinal.en, ...legacyFinal2.en, ...legacyTail.en, ...remaining.en, ...dynamic.en } }),
+  fr: mergeLocale(en, monitorStatus.fr, fr, { dynamic: dynamic.fr }, sanitizeLocalized(localized.fr, en), sanitizeLocalized(localizedExtra.fr, en), localizedSafe.fr, { legacy: { ...legacy.fr, ...legacyExtra.fr, ...legacySms.fr, ...legacyFinal.fr, ...legacyFinal2.fr, ...legacyTail.fr, ...remaining.fr, ...dynamic.fr } }),
+  ar: mergeLocale(en, monitorStatus.ar, rebuiltAr, { dynamic: dynamic.ar }, localizedSafe.ar, { legacy: rebuiltLegacyAr }),
+  am: mergeLocale(en, monitorStatus.am, rebuiltAm, { dynamic: dynamic.am }, localizedSafe.am, { legacy: rebuiltLegacyAm }),
 }
 
 const i18n: any = (createI18n as any)({

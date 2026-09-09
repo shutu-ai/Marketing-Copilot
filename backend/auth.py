@@ -35,8 +35,17 @@ PUBLIC_API_PATHS = {"/api/ready", "/api/health", "/api/auth/login"}
 
 # Prefixes that only the admin role may use. `/api/users/me/*` (self password
 # change) is exempt and available to every authenticated role.
-ADMIN_ONLY_PREFIXES = ("/api/users", "/api/update", "/api/db-query")
-ROLES = ("admin", "operator", "viewer")
+ADMIN_ONLY_PREFIXES = (
+    "/api/users",
+    "/api/update",
+    "/api/db-query",
+    "/api/settings",
+    "/api/db-config",
+    "/api/operations/audits",
+    "/api/operations/export/audits",
+)
+CONFIG_WRITE_PREFIXES = ("/api/smpp",)
+ROLES = ("admin", "marketing", "analyst")
 
 _login_failures: dict = {}
 LOGIN_MAX_FAILURES = 5
@@ -65,15 +74,20 @@ def verify_password(password: str, stored: str) -> bool:
 
 def role_allows(role: str, method: str, path: str) -> bool:
     """Authorize a request by role. The middleware enforces this for /api routes."""
+    # Keep already-issued tokens usable while the database migration from the
+    # legacy role names takes effect; new logins only receive the new names.
+    role = {"operator": "marketing", "viewer": "analyst"}.get(role, role)
     if role == "admin":
         return True
     if path.startswith("/api/users/me"):
         return True
     if any(path.startswith(prefix) for prefix in ADMIN_ONLY_PREFIXES):
         return False
-    if role == "operator":
+    if any(path.startswith(prefix) for prefix in CONFIG_WRITE_PREFIXES) and method not in ("GET", "HEAD", "OPTIONS"):
+        return False
+    if role == "marketing":
         return True
-    if role == "viewer":
+    if role == "analyst":
         return method in ("GET", "HEAD", "OPTIONS") or path in ("/api/auth/login", "/api/auth/logout")
     return False
 
@@ -179,7 +193,7 @@ async def auth_middleware(request: Request, call_next):
                             return JSONResponse(status_code=403, content={"detail": "Insufficient permissions"})
                     except Exception:
                         pass
-                if not role_allows(user.get("role", "viewer"), request.method, path):
+                if not role_allows(user.get("role", "analyst"), request.method, path):
                     from fastapi.responses import JSONResponse
 
                     return JSONResponse(status_code=403, content={"detail": "Insufficient permissions"})

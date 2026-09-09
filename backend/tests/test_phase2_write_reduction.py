@@ -108,6 +108,44 @@ def test_delivery_receipts_increment_batch_progress_without_task_count_scan(isol
     assert batch["status"] == "sent"
 
 
+def test_accepted_submission_counts_as_delivered_without_double_counting_manual_confirmation(isolated_db):
+    conn = database.get_connection()
+    campaign_id = conn.execute(
+        "INSERT INTO batch_campaigns(name,status) VALUES ('accepted-progress','in_progress') RETURNING id"
+    ).fetchone()["id"]
+    batch_id = conn.execute(
+        """INSERT INTO batch_campaign_batches
+           (campaign_id,batch_index,start_row,end_row,total_count,task_count,status)
+           VALUES (?,0,0,1,1,1,'queued') RETURNING id""",
+        (campaign_id,),
+    ).fetchone()["id"]
+    stats_date = datetime.now().strftime("%Y-%m-%d")
+    conn.execute(
+        "INSERT INTO batch_campaign_daily_stats(campaign_id,stats_date,total_prospects,sent_count) VALUES (?,?,1,0)",
+        (campaign_id, stats_date),
+    )
+    conn.commit()
+    conn.close()
+    task_id = _insert_tasks(1, batch_id=batch_id)[0]
+
+    sms_task_service.mark_submitted(task_id, ["accepted-progress-message"], "optional", wait=False)
+    sms_task_service.flush_pending_writes()
+
+    conn = database.get_connection()
+    task = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
+    batch = conn.execute("SELECT delivered_count,status FROM batch_campaign_batches WHERE id=?", (batch_id,)).fetchone()
+    conn.close()
+    assert task["status"] == "accepted"
+    assert batch["delivered_count"] == 1
+    assert batch["status"] == "sent"
+
+    assert sms_task_service.mark_delivered(task_id)[0] is True
+    conn = database.get_connection()
+    batch = conn.execute("SELECT delivered_count FROM batch_campaign_batches WHERE id=?", (batch_id,)).fetchone()
+    conn.close()
+    assert batch["delivered_count"] == 1
+
+
 def test_late_failure_receipt_does_not_corrupt_completed_batch_counters(isolated_db):
     conn = database.get_connection()
     campaign_id = conn.execute(

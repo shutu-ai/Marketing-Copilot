@@ -10,7 +10,7 @@ router = APIRouter(prefix="/api/users", tags=["Users"], dependencies=[Depends(ge
 class UserCreate(BaseModel):
     username: str
     password: str
-    role: str = "operator"
+    role: str = "marketing"
     display_name: str = ""
     enabled: bool = True
 

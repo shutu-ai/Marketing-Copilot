@@ -856,7 +856,7 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     conn = get_connection()
     reached = conn.execute(
         """SELECT COUNT(DISTINCT msisdn) cnt FROM sms_tasks
-           WHERE campaign_type='batch' AND campaign_id=? AND status='delivered'""",
+           WHERE campaign_type='batch' AND campaign_id=? AND status IN ('delivered','accepted')""",
         (campaign_id,),
     ).fetchone()
     conn.close()

@@ -18,11 +18,13 @@
           <el-table-column :label="$t('legacy.xe683517f')" width="120"><template #default="{ row }">{{ row.batches ? `${row.batches.finished}/${row.batches.total}` : '—' }}</template></el-table-column>
           <el-table-column :label="$t('common.action')" width="270" fixed="right">
             <template #default="{ row }">
-              <el-button v-if="row.status === 'not_started'" link type="primary" @click="campaignAction(row, 'start')">{{ $t('legacy.x8e54ddfe') }}</el-button>
-              <el-button v-if="row.status === 'in_progress'" link @click="campaignAction(row, 'pause')">{{ $t('legacy.x8d63ef38') }}</el-button>
-              <el-button v-if="row.status === 'paused'" link type="primary" @click="campaignAction(row, 'resume')">{{ $t('legacy.xc7db6d4f') }}</el-button>
-              <el-button v-if="['in_progress','paused'].includes(row.status)" link type="success" @click="campaignAction(row, 'complete')">{{ $t('legacy.x769d88e4') }}</el-button>
-              <el-button v-if="!['completed','cancelled'].includes(row.status)" link type="danger" @click="campaignAction(row, 'cancel')">{{ $t('common.cancel') }}</el-button>
+              <template v-if="canOperate">
+                <el-button v-if="row.status === 'not_started'" link type="primary" @click="campaignAction(row, 'start')">{{ $t('legacy.x8e54ddfe') }}</el-button>
+                <el-button v-if="row.status === 'in_progress'" link @click="campaignAction(row, 'pause')">{{ $t('legacy.x8d63ef38') }}</el-button>
+                <el-button v-if="row.status === 'paused'" link type="primary" @click="campaignAction(row, 'resume')">{{ $t('legacy.xc7db6d4f') }}</el-button>
+                <el-button v-if="['in_progress','paused'].includes(row.status)" link type="success" @click="campaignAction(row, 'complete')">{{ $t('legacy.x769d88e4') }}</el-button>
+                <el-button v-if="!['completed','cancelled'].includes(row.status)" link type="danger" @click="campaignAction(row, 'cancel')">{{ $t('common.cancel') }}</el-button>
+              </template>
             </template>
           </el-table-column>
         </el-table>
@@ -42,8 +44,10 @@
 
       <el-tab-pane :label="$t('legacy.x01bdebc2')" name="failures">
         <div class="toolbar">
-          <el-button type="primary" :disabled="!selectedTasks.length" @click="bulkAction('retry')">{{ $t('legacy.xb2f87a97') }}</el-button>
-          <el-button type="warning" :disabled="!selectedTasks.length" @click="bulkAction('archive')">{{ $t('legacy.x3bd00c55') }}</el-button>
+          <template v-if="canOperate">
+            <el-button type="primary" :disabled="!selectedTasks.length" @click="bulkAction('retry')">{{ $t('legacy.xb2f87a97') }}</el-button>
+            <el-button type="warning" :disabled="!selectedTasks.length" @click="bulkAction('archive')">{{ $t('legacy.x3bd00c55') }}</el-button>
+          </template>
           <el-button @click="download('failures')">{{ $t('legacy.x0fd54dfd') }}</el-button>
         </div>
         <el-table v-loading="loading" :data="failedTasks" @selection-change="selectedTasks = $event">
@@ -85,7 +89,7 @@
       </el-tab-pane>
 
       <el-tab-pane :label="$t('legacy.xf0868962')" name="exceptions">
-        <div class="toolbar"><el-button type="primary" @click="runHealthCheck">{{ $t('legacy.x3b2222ed') }}</el-button></div>
+        <div class="toolbar"><el-button v-if="canOperate" type="primary" @click="runHealthCheck">{{ $t('legacy.x3b2222ed') }}</el-button></div>
         <el-row :gutter="12" class="health-grid">
           <el-col v-for="check in health" :key="check.code + check.message" :span="8">
             <el-alert :type="check.ok ? 'success' : check.severity" :title="check.code" :description="check.ok ? i18n.global.t('legacy.xfd6e80f1') : check.message" :closable="false" show-icon />
@@ -97,7 +101,7 @@
           <el-table-column prop="code" :label="$t('legacy.x06e004ef')" width="150" />
           <el-table-column prop="message" :label="$t('update.historyDetail')" />
           <el-table-column prop="created_at" :label="$t('logViewer.time')" width="180" />
-          <el-table-column :label="$t('common.action')" width="90"><template #default="{ row }"><el-button link type="primary" @click="resolve(row.id)">{{ $t('legacy.x4b86211f') }}</el-button></template></el-table-column>
+          <el-table-column :label="$t('common.action')" width="90"><template #default="{ row }"><el-button v-if="canOperate" link type="primary" @click="resolve(row.id)">{{ $t('legacy.x4b86211f') }}</el-button></template></el-table-column>
         </el-table>
         <el-pagination
           v-model:current-page="exceptionPage"
@@ -122,10 +126,10 @@
         </el-table>
       </el-tab-pane>
 
-      <el-tab-pane :label="$t('legacy.xa4231334')" name="audits">
+      <el-tab-pane v-if="isAdmin" :label="$t('legacy.xa4231334')" name="audits">
         <div class="toolbar">
           <el-input v-model="auditAction" :placeholder="$t('legacy.x1d85b707')" clearable style="width:220px" @change="handleAuditFilter" />
-          <el-button v-for="report in reports" :key="report.value" @click="download(report.value)">{{ $t('legacy.x55405ea6') }}{{ report.label }}</el-button>
+          <el-button v-for="report in reports.filter(item => item.value !== 'audits' || isAdmin)" :key="report.value" @click="download(report.value)">{{ $t('legacy.x55405ea6') }}{{ report.label }}</el-button>
         </div>
         <el-table v-loading="loading" :data="audits">
           <el-table-column prop="created_at" :label="$t('logViewer.time')" width="180" />
@@ -162,9 +166,13 @@ import StatusTag from '@/components/StatusTag.vue'
 import SmsTasks from '@/views/sms-tasks/SmsTasks.vue'
 import CapacityCenter from './CapacityCenter.vue'
 import * as ops from '@/api/operations'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
+const authStore = useAuthStore()
+const canOperate = computed(() => ['admin', 'marketing'].includes(authStore.role))
+const isAdmin = computed(() => authStore.role === 'admin')
 const validTabs = ['progress', 'sms-tasks', 'failures', 'exceptions', 'capacity', 'dlr', 'audits']
 const activeTab = ref(validTabs.includes(String(route.query.tab)) ? String(route.query.tab) : 'progress')
 const showGlobalRefresh = computed(() => !['sms-tasks', 'capacity'].includes(activeTab.value))

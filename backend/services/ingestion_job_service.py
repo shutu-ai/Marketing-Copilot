@@ -9,6 +9,7 @@ from database import get_connection
 
 
 DEFAULT_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_CHUNK_LEASE_SECONDS", "300")))
+FILE_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_FILE_LEASE_SECONDS", "600")))
 
 
 def get_file(campaign_type: str, campaign_id: int, filename: str) -> Optional[dict]:
@@ -26,7 +27,8 @@ def get_file(campaign_type: str, campaign_id: int, filename: str) -> Optional[di
 
 def register_file(campaign_type: str, campaign_id: int, filename: str, file_path: str,
                   total_rows: int = 0, chunk_size: int = 5000,
-                  chunks: Optional[Iterable[dict]] = None, reset: bool = False) -> tuple[int, bool]:
+                  chunks: Optional[Iterable[dict]] = None, reset: bool = False,
+                  whitelist_version_id: Optional[int] = None) -> tuple[int, bool]:
     """Register by stable business identity; a renamed file is a new manifest."""
     safe_filename = os.path.basename(filename)
     absolute_path = os.path.abspath(file_path) if file_path else ""
@@ -40,23 +42,30 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
         ).fetchone()
         if existing and existing["status"] == "completed" and not reset:
             return existing["id"], True
+        if existing and not reset and existing["file_path"] == absolute_path \
+                and int(existing.get("file_size", 0) or 0) == file_size:
+            return existing["id"], False
         if existing:
             file_id = existing["id"]
             conn.execute(
                 """UPDATE ingestion_files SET file_path=?,file_size=?,total_rows=?,chunk_size=?,
                    total_chunks=0,completed_chunks=0,created_tasks=0,status='pending',
-                   error_detail='',updated_at=CURRENT_TIMESTAMP,completed_at=NULL WHERE id=?""",
-                (absolute_path, file_size, int(total_rows or 0), max(1, int(chunk_size)), file_id),
+                   error_detail='',processing_phase='queued',processed_rows=0,matched_rows=0,
+                   current_chunk_index=0,worker_id='',lease_token='',lease_expires_at=NULL,
+                   retry_count=0,last_error_class='',last_error_at=NULL,next_retry_at=NULL,
+                   whitelist_version_id=COALESCE(?,whitelist_version_id),
+                   updated_at=CURRENT_TIMESTAMP,completed_at=NULL WHERE id=?""",
+                (absolute_path, file_size, int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id, file_id),
             )
             if reset:
                 conn.execute("DELETE FROM ingestion_chunks WHERE file_id=?", (file_id,))
         else:
             file_id = conn.execute(
                 """INSERT INTO ingestion_files
-                   (campaign_type,campaign_id,filename,file_path,file_size,total_rows,chunk_size)
-                   VALUES (?,?,?,?,?,?,?) RETURNING id""",
+                   (campaign_type,campaign_id,filename,file_path,file_size,total_rows,chunk_size,whitelist_version_id)
+                   VALUES (?,?,?,?,?,?,?,?) RETURNING id""",
                 (campaign_type, campaign_id, safe_filename, absolute_path, file_size,
-                 int(total_rows or 0), max(1, int(chunk_size))),
+                 int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id),
             ).fetchone()["id"]
         chunk_rows = list(chunks or [])
         for index, item in enumerate(chunk_rows):
@@ -74,6 +83,128 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
             )
         conn.commit()
         return file_id, False
+    finally:
+        conn.close()
+
+
+def claim_file(campaign_type: str = "realtime", worker_id: str = "",
+               lease_seconds: int = FILE_LEASE_SECONDS) -> Optional[dict]:
+    """Atomically lease one pending ingestion file for a single worker."""
+    token = uuid.uuid4().hex
+    worker_id = worker_id or f"realtime-ingestion-{os.getpid()}"
+    lease_until = (datetime.now() + timedelta(seconds=max(30, lease_seconds))).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT id FROM ingestion_files
+               WHERE campaign_type=? AND status IN ('pending','retrying')
+                 AND (next_retry_at IS NULL OR CAST(next_retry_at AS TIMESTAMP)<=CURRENT_TIMESTAMP)
+               ORDER BY created_at,id LIMIT 1""", (campaign_type,)
+        ).fetchone()
+        if not row:
+            return None
+        claimed = conn.execute(
+            """UPDATE ingestion_files SET status='processing',worker_id=?,lease_token=?,
+               lease_expires_at=?,processing_started_at=COALESCE(processing_started_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+               last_progress_at=CURRENT_TIMESTAMP,processing_phase='queued',updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND status IN ('pending','retrying')
+                 AND (next_retry_at IS NULL OR CAST(next_retry_at AS TIMESTAMP)<=CURRENT_TIMESTAMP)
+               RETURNING *""", (worker_id, token, lease_until, row["id"]),
+        ).fetchone()
+        if claimed:
+            conn.commit()
+            return dict(claimed)
+        return None
+    finally:
+        conn.close()
+
+
+def update_progress(file_id: int, phase: str, processed_rows: Optional[int] = None,
+                    matched_rows: Optional[int] = None, chunk_index: Optional[int] = None,
+                    total_chunks: Optional[int] = None, worker_id: Optional[str] = None,
+                    whitelist_version_id: Optional[int] = None) -> None:
+    fields = ["processing_phase=?", "last_progress_at=CURRENT_TIMESTAMP", "updated_at=CURRENT_TIMESTAMP"]
+    values = [phase]
+    for column, value in (("processed_rows", processed_rows), ("matched_rows", matched_rows),
+                          ("current_chunk_index", chunk_index), ("total_chunks", total_chunks),
+                          ("worker_id", worker_id), ("whitelist_version_id", whitelist_version_id)):
+        if value is not None:
+            fields.append(f"{column}=?")
+            values.append(value)
+    values.append(file_id)
+    conn = get_connection()
+    try:
+        conn.execute(f"UPDATE ingestion_files SET {','.join(fields)} WHERE id=?", values)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int) -> dict:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT retry_count,max_retry_count FROM ingestion_files WHERE id=?", (file_id,)).fetchone()
+        if not row:
+            return {"scheduled": False, "retry_count": 0, "max_retry_count": 0}
+        retry_count = int(row["retry_count"] or 0) + 1
+        max_retry_count = int(row["max_retry_count"] or 4)
+        if retry_count > max_retry_count:
+            return {"scheduled": False, "retry_count": retry_count, "max_retry_count": max_retry_count}
+        conn.execute(
+            """UPDATE ingestion_files SET status='retrying',retry_count=?,last_error_class=?,
+               last_error_at=CURRENT_TIMESTAMP,next_retry_at=CAST(CURRENT_TIMESTAMP + (? * INTERVAL '1 second') AS VARCHAR),
+               processing_phase='queued',lease_token='',lease_expires_at=NULL,worker_id='',
+               updated_at=CURRENT_TIMESTAMP,error_detail=? WHERE id=?""",
+            (retry_count, error_class, int(max(1, delay_seconds)), str(error)[:4000], file_id),
+        )
+        conn.commit()
+        return {"scheduled": True, "retry_count": retry_count, "max_retry_count": max_retry_count}
+    finally:
+        conn.close()
+
+
+def fail_file(file_id: int, error_class: str, error: str, status: str = "failed") -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE ingestion_files SET status=?,processing_phase=?,last_error_class=?,
+               last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,lease_token='',lease_expires_at=NULL,
+               worker_id='',error_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (status, "quarantined" if status == "quarantined" else "failed", error_class, str(error)[:4000], file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def complete_file(file_id: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE ingestion_files SET status='completed',processing_phase='completed',
+               next_retry_at=NULL,lease_token='',lease_expires_at=NULL,worker_id='',
+               completed_at=CURRENT_TIMESTAMP,last_progress_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""", (file_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def requeue_file(file_id: int) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM ingestion_files WHERE id=?", (file_id,)).fetchone()
+        if not row or row["status"] not in ("failed", "quarantined", "retrying"):
+            return dict(row) if row else None
+        updated = conn.execute(
+            """UPDATE ingestion_files SET status='pending',processing_phase='queued',retry_count=0,
+               last_error_class='',last_error_at=NULL,next_retry_at=NULL,error_detail='',
+               lease_token='',lease_expires_at=NULL,worker_id='',updated_at=CURRENT_TIMESTAMP
+               WHERE id=? RETURNING *""", (file_id,),
+        ).fetchone()
+        conn.commit()
+        return dict(updated) if updated else None
     finally:
         conn.close()
 
@@ -237,6 +368,23 @@ def recover_expired_chunks() -> int:
                 f"WHERE id IN ({placeholders}) AND status='processing'",
                 batch_ids,
             )
+        if rows:
+            conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def recover_expired_files() -> int:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """UPDATE ingestion_files SET status='pending',processing_phase='queued',
+               lease_token='',lease_expires_at=NULL,worker_id='',
+               error_detail='file lease expired; recovered after restart',updated_at=CURRENT_TIMESTAMP
+               WHERE status='processing' AND lease_expires_at IS NOT NULL
+                 AND CAST(lease_expires_at AS TIMESTAMP)<=CURRENT_TIMESTAMP RETURNING id"""
+        ).fetchall()
         if rows:
             conn.commit()
         return len(rows)

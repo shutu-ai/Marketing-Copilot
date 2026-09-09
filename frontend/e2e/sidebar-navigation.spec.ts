@@ -4,6 +4,7 @@ test('sidebar campaign group expands and shows current campaign routes', async (
   await page.addInitScript(() => {
     localStorage.setItem('mc_token', 'e2e-token')
     localStorage.setItem('mc_user', 'admin')
+    localStorage.setItem('mc_role', 'admin')
   })
 
   await page.route(/^https?:\/\/[^/]+\/api\/dashboard\/stats/, route =>

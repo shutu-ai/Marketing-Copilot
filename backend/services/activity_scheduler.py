@@ -99,15 +99,19 @@ def _run():
     while not _stop.wait(3):
         try:
             ticks += 1
+            from services import metrics_service
+            metrics_service.set_gauge("realtime_scheduler_last_tick_timestamp", time.time())
             _process_batches()
             realtime_campaign_service.finalize_daily_tasks()
             realtime_campaign_service.sync_watch_dirs_to_inboxes()
             realtime_result = realtime_campaign_service.process_realtime_inboxes()
-            for error in realtime_result.get("errors", []):
-                logger.error("Realtime inbox file failed %s: %s", error.get("filename"), error.get("message"))
+            if realtime_result.get("errors"):
+                logger.error("Realtime inbox registration errors=%s", len(realtime_result["errors"]))
             if ticks % 20 == 0:
                 ingestion_job_service.recover_expired_chunks()
                 realtime_campaign_service.cleanup_realtime_retention()
+                from services import realtime_whitelist_service
+                realtime_whitelist_service.cleanup_versions()
                 sms_task_service.cleanup_task_retention()
                 p1_service.auto_complete_campaigns()
                 from services import metrics_service, task_worker
@@ -137,6 +141,8 @@ def start_scheduler():
         target=_batch_worker, name="batch-ingestion-worker", daemon=True
     )
     _batch_worker_thread.start()
+    from services import realtime_ingestion_worker
+    realtime_ingestion_worker.start_worker()
     _thread = threading.Thread(target=_run, name="activity-scheduler", daemon=True)
     _thread.start()
     logger.info("Activity scheduler started")
@@ -148,3 +154,5 @@ def stop_scheduler():
     worker = _batch_worker_thread
     if worker and worker.is_alive():
         worker.join(timeout=2)
+    from services import realtime_ingestion_worker
+    realtime_ingestion_worker.stop_worker()

@@ -1,4 +1,5 @@
 import os
+import shutil
 
 import tempfile
 
@@ -148,11 +149,8 @@ def upload_customer_list(campaign_id: int, file: UploadFile = File(...)):
 
         try:
 
-            content = file.file.read()
-
             with open(tmp_path, "wb") as f:
-
-                f.write(content)
+                shutil.copyfileobj(file.file, f, length=1024 * 1024)
 
             result = realtime_campaign_service.upload_customer_list(campaign_id, tmp_path, file.filename or "file.csv")
 
@@ -194,13 +192,10 @@ def receive_file(campaign_id: int, file: UploadFile = File(...)):
 
     try:
 
-        content = file.file.read()
-
         with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f, length=1024 * 1024)
 
-            f.write(content)
-
-        result = realtime_campaign_service.receive_file(campaign_id, tmp_path, file.filename or "file.csv")
+        result = realtime_campaign_service.queue_file(campaign_id, tmp_path, file.filename or "file.csv")
 
     finally:
 

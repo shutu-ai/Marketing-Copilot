@@ -19,9 +19,9 @@ def get_stats() -> dict:
     today_str = datetime.now().strftime("%Y-%m-%d")
     today_sent = conn.execute(
         """SELECT COUNT(*) AS cnt FROM sms_tasks
-           WHERE status='delivered'
-             AND delivered_at IS NOT NULL AND delivered_at<>''
-             AND CAST(delivered_at AS DATE)=CAST(? AS DATE)""",
+           WHERE status IN ('delivered','accepted')
+             AND COALESCE(delivered_at, submitted_at, updated_at) IS NOT NULL
+             AND CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE)=CAST(? AS DATE)""",
         (today_str,)
     ).fetchone()
 
@@ -42,11 +42,11 @@ def get_stats() -> dict:
                   COUNT(*) AS sent_count,
                   0 AS conversion_count
            FROM sms_tasks
-           WHERE status='delivered'
-             AND delivered_at IS NOT NULL AND delivered_at<>''
-             AND CAST(delivered_at AS DATE)>=CAST(? AS DATE)
-           GROUP BY CAST(delivered_at AS DATE)
-           ORDER BY CAST(delivered_at AS DATE)""",
+           WHERE status IN ('delivered','accepted')
+             AND COALESCE(delivered_at, submitted_at, updated_at) IS NOT NULL
+             AND CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE)>=CAST(? AS DATE)
+           GROUP BY CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE)
+           ORDER BY CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE)""",
         (trend_start,),
     ).fetchall()
     trend_map = {row["stats_date"]: dict(row) for row in trend_rows}

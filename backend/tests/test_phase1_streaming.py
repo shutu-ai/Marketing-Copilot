@@ -10,7 +10,7 @@ import pytest
 import database
 from models.batch_campaign import BatchCampaignUpdate
 from models.realtime_campaign import RealtimeCampaignUpdate
-from services import batch_campaign_service, realtime_campaign_service, sms_task_service
+from services import batch_campaign_service, realtime_campaign_service, realtime_whitelist_service, sms_task_service
 from services.smpp_gateway import gateway
 
 
@@ -176,7 +176,7 @@ def test_realtime_failed_second_chunk_retry_does_not_duplicate_tasks_or_output(i
     assert output_rows["msisdn"].nunique() == 10
 
 
-def test_csv_whitelist_excel_input_releases_temp_resources(isolated_db, monkeypatch):
+def test_legacy_whitelist_is_migrated_before_excel_input(isolated_db, monkeypatch):
     whitelist = isolated_db / "excel-whitelist.csv"
     _write_csv(whitelist, 10)
     source = isolated_db / "realtime-input.xlsx"
@@ -206,6 +206,9 @@ def test_csv_whitelist_excel_input_releases_temp_resources(isolated_db, monkeypa
     conn.commit()
     conn.close()
 
+    assert realtime_whitelist_service.migrate_legacy_versions() == 1
+    assert realtime_whitelist_service.build_pending() == 1
+
     original_tempdir = realtime_campaign_service.tempfile.TemporaryDirectory
     tracked = []
 
@@ -230,7 +233,7 @@ def test_csv_whitelist_excel_input_releases_temp_resources(isolated_db, monkeypa
     assert result["success"] is True
     assert result["matched_count"] == 10
     assert len(_task_msisdns("realtime", campaign_id)) == 10
-    assert tracked and all(item.cleaned for item in tracked)
+    assert not tracked
 
 
 def test_cached_activity_snapshot_is_invalidated_when_campaign_stops(isolated_db):

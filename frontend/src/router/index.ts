@@ -101,7 +101,7 @@ const router = createRouter({
         {
           path: 'db-query',
           name: 'DbQuery',
-          meta: { titleKey: 'dbQuery.title' },
+          meta: { titleKey: 'dbQuery.title', roles: ['admin'] },
           component: () => import('@/views/dbQuery/DbQuery.vue'),
         },
         {
@@ -134,6 +134,12 @@ router.beforeEach((to) => {
   }
   if (to.path === '/login' && token) {
     return '/'
+  }
+  const requiredRoles = to.meta.roles as string[] | undefined
+  if (requiredRoles?.length) {
+    const roleAliases: Record<string, string> = { operator: 'marketing', viewer: 'analyst' }
+    const role = roleAliases[localStorage.getItem('mc_role') || ''] || localStorage.getItem('mc_role')
+    if (!role || !requiredRoles.includes(role)) return '/dashboard'
   }
   return true
 })

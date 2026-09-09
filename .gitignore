@@ -33,6 +33,10 @@ backend/server*.log
 backend/uploads/
 backend/monitor_dir/
 old_script/*.csv
+ET_SP_ter_merged.csv
+.pytest-*/
+截屏/
+Docs/报表交付/*.docx
 
 # Local build and release snapshots
 release/

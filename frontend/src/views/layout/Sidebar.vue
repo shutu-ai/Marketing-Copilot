@@ -33,13 +33,9 @@
       <el-icon><ChatDotSquare /></el-icon>
       <span>{{ $t('menu.smsContent') }}</span>
     </el-menu-item>
-    <el-menu-item v-if="role !== 'viewer'" index="/operations">
+    <el-menu-item index="/operations">
       <el-icon><Operation /></el-icon>
       <span>{{ $t('menu.operations') }}</span>
-    </el-menu-item>
-    <el-menu-item v-if="role === 'admin'" index="/db-query">
-      <el-icon><Search /></el-icon>
-      <span>{{ $t('menu.dbQuery') }}</span>
     </el-menu-item>
     <el-menu-item index="/settings">
       <el-icon><Tools /></el-icon>
@@ -50,14 +46,11 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router'
-import { useAuthStore } from '@/stores/auth'
 
 defineProps<{ collapse: boolean }>()
 const emit = defineEmits<{ navigate: [] }>()
 
 const route = useRoute()
-const authStore = useAuthStore()
-const role = authStore.role
 </script>
 
 <style scoped>

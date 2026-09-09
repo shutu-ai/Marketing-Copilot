@@ -2,7 +2,7 @@
   <div class="batch-campaign">
     <PageHeader :title="$t('campaign.batchTitle')" :description="$t('campaign.batchDesc')">
       <template #actions>
-        <el-button type="primary" @click="showDialog(null)">
+        <el-button v-if="canManage" type="primary" @click="showDialog(null)">
         <el-icon><Plus /></el-icon>{{ $t('campaign.addCampaign') }}
         </el-button>
       </template>
@@ -102,17 +102,17 @@
           </el-button>
           <template v-if="row.status === 'not_started' || row.status === 'ended' || row.status === 'completed'">
             <span :title="startHint(row)">
-              <el-button text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
+              <el-button v-if="canManage" text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
                 {{ row.status === 'ended' ? $t('campaign.restart') : $t('campaign.start') }}
               </el-button>
             </span>
           </template>
           <template v-else-if="row.status === 'in_progress'">
-            <el-button text type="danger" size="small" @click="handleEnd(row)">
+            <el-button v-if="canManage" text type="danger" size="small" @click="handleEnd(row)">
               {{ $t('campaign.end') }}
             </el-button>
           </template>
-          <el-dropdown trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ row.status === 'in_progress' ? i18n.global.t('legacy.x780a6b21') : $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+          <el-dropdown v-if="canManage" trigger="click" @command="handleMore($event, row)"><el-button text size="small">{{ $t('common.more') }}<el-icon><ArrowDown /></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="edit">{{ $t('common.edit') }}</el-dropdown-item><el-dropdown-item command="upload">{{ row.status === 'in_progress' ? i18n.global.t('legacy.x780a6b21') : $t('campaign.uploadTargetList') }}</el-dropdown-item><el-dropdown-item command="sms">{{ $t('smsContent.configSms') }}</el-dropdown-item><el-dropdown-item command="copy">{{ $t('campaign.copy') }}</el-dropdown-item><el-dropdown-item v-if="row.status!=='in_progress'" command="delete" divided>{{ $t('common.delete') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
           </div>
         </template>
       </el-table-column>
@@ -218,7 +218,7 @@
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
-        <el-button type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
+        <el-button v-if="canManage" type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
       </template>
     </el-dialog>
 
@@ -258,6 +258,7 @@
 <script setup lang="ts">
 import i18n from '@/i18n'
 import { ref, computed, onMounted } from 'vue'
+import { useAuthStore } from '@/stores/auth'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import StatusTag from '@/components/StatusTag.vue'
@@ -270,6 +271,8 @@ import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
 const router = useRouter()
+const authStore = useAuthStore()
+const canManage = computed(() => ['admin', 'marketing'].includes(authStore.role))
 
 const weekDays = [
   { value: '1', labelKey: 'day_mon' },

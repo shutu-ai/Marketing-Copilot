@@ -11,6 +11,7 @@ test('frontend works with the real backend', async ({ page, request }) => {
   await page.addInitScript(() => {
     localStorage.setItem('mc_token', 'e2e-token')
     localStorage.setItem('mc_user', 'admin')
+    localStorage.setItem('mc_role', 'admin')
   })
 
   const api = 'http://127.0.0.1:8017/api', name = `E2E ${Date.now()}`

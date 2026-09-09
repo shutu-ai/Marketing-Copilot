@@ -48,7 +48,24 @@
             <el-form-item :label="$t('settings.realtimeOutputRetentionDays')">
               <el-input-number v-model="form.realtime_output_retention_days" :min="1" :precision="0" controls-position="right" />
               <div class="form-tip">{{ $t('settings.realtimeOutputRetentionDaysTip') }}</div>
-            </el-form-item><el-form-item :label="$t('settings.detailLogging')">
+            </el-form-item>
+            <el-form-item label="Realtime match chunk size">
+              <el-input-number v-model="form.realtime_match_chunk_size" :min="500" :max="100000" :precision="0" controls-position="right" />
+              <div class="form-tip">Rows processed per input chunk.</div>
+            </el-form-item>
+            <el-form-item label="Whitelist build memory">
+              <el-input v-model="form.realtime_whitelist_build_memory_limit" placeholder="512MB" />
+            </el-form-item>
+            <el-form-item label="Whitelist build threads">
+              <el-input-number v-model="form.realtime_whitelist_build_threads" :min="1" :max="16" :precision="0" controls-position="right" />
+            </el-form-item>
+            <el-form-item label="Whitelist build timeout (seconds)">
+              <el-input-number v-model="form.realtime_index_build_timeout" :min="0" :max="86400" :precision="0" controls-position="right" />
+            </el-form-item>
+            <el-form-item label="Whitelist retention (days)">
+              <el-input-number v-model="form.realtime_whitelist_retention_days" :min="1" :max="3650" :precision="0" controls-position="right" />
+            </el-form-item>
+            <el-form-item :label="$t('settings.detailLogging')">
               <div>
                 <el-switch v-model="form.detail_logging" active-value="1" inactive-value="0" />
                 <div class="form-tip">{{ $t('settings.detailLoggingTip') }}</div>
@@ -119,8 +136,8 @@ function visibleTabs(): SettingsTab[] {
   const role = authStore.role
   const map: Record<string, SettingsTab[]> = {
     admin: [...validTabs],
-    operator: ['basic', 'smpp', 'database', 'logs'],
-    viewer: ['logs'],
+    marketing: ['logs'],
+    analyst: ['logs'],
   }
   return map[role] || ['logs']
 }
@@ -135,9 +152,9 @@ function normalizeTab(value: unknown): SettingsTab {
 const canSee = computed(() => {
   const role = authStore.role
   return {
-    basic: role !== 'viewer',
-    smpp: role !== 'viewer',
-    database: role !== 'viewer',
+    basic: role === 'admin',
+    smpp: role === 'admin',
+    database: role === 'admin',
     logs: true,
     update: role === 'admin',
     users: role === 'admin',
@@ -155,6 +172,11 @@ const form = reactive({
   sms_task_retention_days: 3,
   realtime_file_retention_days: 1,
   realtime_output_retention_days: 30,
+  realtime_match_chunk_size: 5000,
+  realtime_whitelist_build_memory_limit: '512MB',
+  realtime_whitelist_build_threads: 1,
+  realtime_index_build_timeout: 7200,
+  realtime_whitelist_retention_days: 7,
 })
 const logLevels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
@@ -193,6 +215,16 @@ onMounted(async () => {
         form.realtime_file_retention_days = Number(s.value) || 1
       } else if (s.key === 'realtime_output_retention_days') {
         form.realtime_output_retention_days = Number(s.value) || 30
+      } else if (s.key === 'realtime_match_chunk_size') {
+        form.realtime_match_chunk_size = Number(s.value) || 5000
+      } else if (s.key === 'realtime_whitelist_build_memory_limit') {
+        form.realtime_whitelist_build_memory_limit = s.value || '512MB'
+      } else if (s.key === 'realtime_whitelist_build_threads') {
+        form.realtime_whitelist_build_threads = Number(s.value) || 1
+      } else if (s.key === 'realtime_index_build_timeout') {
+        form.realtime_index_build_timeout = Number(s.value) || 7200
+      } else if (s.key === 'realtime_whitelist_retention_days') {
+        form.realtime_whitelist_retention_days = Number(s.value) || 7
       }
     }
   } catch {
@@ -211,6 +243,11 @@ async function handleSave() {
     await updateSetting('sms_task_retention_days', String(form.sms_task_retention_days))
     await updateSetting('realtime_file_retention_days', String(form.realtime_file_retention_days))
     await updateSetting('realtime_output_retention_days', String(form.realtime_output_retention_days))
+    await updateSetting('realtime_match_chunk_size', String(form.realtime_match_chunk_size))
+    await updateSetting('realtime_whitelist_build_memory_limit', form.realtime_whitelist_build_memory_limit)
+    await updateSetting('realtime_whitelist_build_threads', String(form.realtime_whitelist_build_threads))
+    await updateSetting('realtime_index_build_timeout', String(form.realtime_index_build_timeout))
+    await updateSetting('realtime_whitelist_retention_days', String(form.realtime_whitelist_retention_days))
     ElMessage.success(t('common.saveSuccess'))
   } catch (e: any) {
     ElMessage.error(e.response?.data?.detail || t('common.saveFailed'))

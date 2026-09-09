@@ -27,6 +27,15 @@ def set_gauge(name: str, value: float, labels=None):
         _gauges[_key(name, labels)] = float(value)
 
 
+def observe(name: str, value: float, labels=None):
+    """Record the latest value plus count/sum series for a runtime observation."""
+    value = float(value)
+    with _lock:
+        _gauges[_key(name, labels)] = value
+        _counters[_key(f"{name}_count", labels)] += 1
+        _counters[_key(f"{name}_sum", labels)] += value
+
+
 def observe_runtime_state(worker_count=0):
     conn = get_connection()
     rows = conn.execute("SELECT status,COUNT(*) count FROM sms_tasks GROUP BY status").fetchall()
@@ -52,6 +61,43 @@ def observe_runtime_state(worker_count=0):
         set_gauge("marketing_copilot_ingestion_chunk_backlog", pressure["chunk_depth"])
         set_gauge("marketing_copilot_disk_used_percent", pressure["disk"]["used_pct"])
         set_gauge("marketing_copilot_disk_free_bytes", pressure["disk"]["free_bytes"])
+    except Exception:
+        pass
+    try:
+        conn = get_connection()
+        file_rows = conn.execute(
+            "SELECT status,COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime' GROUP BY status"
+        ).fetchall()
+        phase_rows = conn.execute(
+            "SELECT processing_phase,COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime' GROUP BY processing_phase"
+        ).fetchall()
+        conn.close()
+        counts_by_status = {row["status"]: int(row["count"] or 0) for row in file_rows}
+        for status in ("pending", "processing", "retrying", "completed", "failed", "quarantined"):
+            set_gauge("realtime_inbox_files", counts_by_status.get(status, 0), {"status": status})
+        for phase in phase_rows:
+            set_gauge("realtime_inbox_phase_files", int(phase["count"] or 0), {"phase": phase["processing_phase"] or ""})
+        pending = counts_by_status.get("pending", 0) + counts_by_status.get("retrying", 0)
+        set_gauge("realtime_inbox_pending_files", pending)
+        set_gauge("realtime_inbox_processing_files", counts_by_status.get("processing", 0))
+        conn = get_connection()
+        ready_rows = conn.execute(
+            "SELECT COALESCE(SUM(normalized_count),0) rows FROM realtime_whitelist_versions WHERE status='ready'"
+        ).fetchone()["rows"]
+        set_gauge("realtime_whitelist_index_rows", int(ready_rows or 0))
+        progress_row = conn.execute(
+            """SELECT MAX(last_progress_at) last_progress_at FROM ingestion_files
+               WHERE campaign_type='realtime' AND status='processing'"""
+        ).fetchone()
+        conn.close()
+        if progress_row and progress_row["last_progress_at"]:
+            try:
+                set_gauge(
+                    "realtime_ingestion_worker_last_progress_timestamp",
+                    time.mktime(time.strptime(str(progress_row["last_progress_at"])[:19], "%Y-%m-%d %H:%M:%S")),
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
     except Exception:
         pass
     # Per-SMSC queue depth, using the same attribution as the gateway:
@@ -141,13 +187,37 @@ def evaluate_alerts(worker_count: int = 0, gateway_status=None) -> list:
     queue_limit = int(os.environ.get("MC_ALERT_QUEUE_DEPTH", "1000"))
     if queue_depth >= queue_limit:
         alerts.append(("QUEUE_DEPTH_HIGH", f"SMS queue depth is {queue_depth} (threshold {queue_limit})", {"queue_depth": queue_depth}))
-    terminal = counts.get("delivered", 0) + counts.get("failed", 0)
+    terminal = counts.get("delivered", 0) + counts.get("accepted", 0) + counts.get("failed", 0)
     failure_rate = counts.get("failed", 0) / terminal if terminal else 0
     rate_limit = float(os.environ.get("MC_ALERT_FAILURE_RATE", "0.2"))
     if terminal >= 20 and failure_rate >= rate_limit:
         alerts.append(("FAILURE_RATE_HIGH", f"SMS failure rate is {failure_rate:.1%} (threshold {rate_limit:.1%})", {"failure_rate": failure_rate}))
     if gateway_status and gateway_status.get("enabled_configs", 0) and not gateway_status.get("connected"):
         alerts.append(("ALL_SMSC_DOWN", "All enabled SMSC connections are unavailable", gateway_status))
+    try:
+        conn = get_connection()
+        realtime_pending = conn.execute(
+            """SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime'
+               AND status IN ('pending','retrying')"""
+        ).fetchone()["count"]
+        stale = conn.execute(
+            """SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime'
+               AND status='processing' AND last_progress_at IS NOT NULL
+               AND CAST(last_progress_at AS TIMESTAMP) < CURRENT_TIMESTAMP - (? * INTERVAL '1 second')""",
+            (max(60, int(os.environ.get("MC_REALTIME_NO_PROGRESS_SECONDS", "900"))),),
+        ).fetchone()["count"]
+        conn.close()
+        realtime_limit = max(1, int(os.environ.get("MC_ALERT_REALTIME_PENDING_FILES", "100")))
+        if int(realtime_pending or 0) >= realtime_limit:
+            alerts.append(("REALTIME_INBOX_BACKLOG_HIGH",
+                           f"Realtime inbox backlog is {realtime_pending} (threshold {realtime_limit})",
+                           {"pending_files": int(realtime_pending)}))
+        if int(stale or 0):
+            alerts.append(("REALTIME_INGESTION_STALLED",
+                           f"{stale} realtime file(s) have no progress within the configured interval",
+                           {"stalled_files": int(stale)}))
+    except Exception:
+        pass
     for code, message, context in alerts:
         _open_alert(code, message, "error" if code == "ALL_SMSC_DOWN" else "warning", context)
     conn = get_connection()
