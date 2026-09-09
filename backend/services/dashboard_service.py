@@ -38,7 +38,7 @@ def get_stats() -> dict:
 
     trend_start = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     trend_rows = conn.execute(
-        """SELECT strftime(CAST(delivered_at AS DATE), '%Y-%m-%d') AS stats_date,
+        """SELECT strftime(CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE), '%Y-%m-%d') AS stats_date,
                   COUNT(*) AS sent_count,
                   0 AS conversion_count
            FROM sms_tasks

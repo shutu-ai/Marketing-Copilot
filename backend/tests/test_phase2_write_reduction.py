@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 import database
-from services import p1_service, sms_task_service, sms_write_buffer
+from services import dashboard_service, p1_service, sms_task_service, sms_write_buffer
 
 
 @pytest.fixture()
@@ -53,6 +53,13 @@ def test_campaign_progress_counts_accepted_as_terminal_when_present(isolated_db)
     assert progress["tasks"]["total"] == 4
     assert progress["tasks"]["finished"] == 2
     assert progress["tasks"]["by_status"]["accepted"] == 1
+
+
+def test_dashboard_stats_builds_daily_trend_from_coalesced_task_date(isolated_db):
+    stats = dashboard_service.get_stats()
+
+    assert len(stats["daily_trend"]) == 7
+    assert all(point["sent_count"] == 0 for point in stats["daily_trend"])
 
 
 def test_delivery_hot_path_is_committed_in_bounded_batches(isolated_db, monkeypatch):
