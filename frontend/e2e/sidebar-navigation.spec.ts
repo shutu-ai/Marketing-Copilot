@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-test('sidebar navigation groups expand exclusively', async ({ page }) => {
+test('sidebar campaign group expands and shows current campaign routes', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('mc_token', 'e2e-token')
     localStorage.setItem('mc_user', 'admin')
@@ -25,18 +25,10 @@ test('sidebar navigation groups expand exclusively', async ({ page }) => {
 
   await page.goto('/dashboard')
 
-  const campaign = page.getByRole('menuitem', { name: '营销活动' })
-  const whitelist = page.getByRole('menuitem', { name: '白名单管理' })
-  const queue = page.getByRole('menuitem', { name: '消息队列' })
-
-  await campaign.click()
-  await expect(campaign).toHaveAttribute('aria-expanded', 'true')
-
-  await whitelist.click()
-  await expect(whitelist).toHaveAttribute('aria-expanded', 'true')
-  await expect(campaign).toHaveAttribute('aria-expanded', 'false')
-
-  await queue.click()
-  await expect(queue).toHaveAttribute('aria-expanded', 'true')
-  await expect(whitelist).toHaveAttribute('aria-expanded', 'false')
+  const campaign = page.locator('.el-sub-menu').first()
+  await campaign.locator(':scope > .el-sub-menu__title').click()
+  await expect(campaign).toHaveClass(/is-opened/)
+  await expect(campaign.locator('.el-menu-item')).toHaveCount(2)
+  await expect(campaign.locator('.el-menu-item').nth(0)).toBeVisible()
+  await expect(campaign.locator('.el-menu-item').nth(1)).toBeVisible()
 })

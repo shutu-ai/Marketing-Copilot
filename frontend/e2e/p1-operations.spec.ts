@@ -3,6 +3,11 @@ import os from 'node:os'
 import path from 'node:path'
 
 test('P1 operations center actions, failures, health and audits', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('mc_token', 'e2e-token')
+    localStorage.setItem('mc_user', 'admin')
+  })
+
   let status = 'in_progress'
   let failed = true
   let healthRecorded = false
