@@ -122,6 +122,11 @@ class _SmppConnection:
         self._early_outcomes = {}
         self._listener = None
         self._last_submit = 0.0
+        self._throttle_lock = threading.Lock()
+        # smpplib clients share one socket and sequence generator. Serialize
+        # only the short write operation; do not hold this lock while waiting
+        # for submit_sm_resp so the configured window can stay in flight.
+        self._send_lock = threading.Lock()
         self.window_size = max(1, min(100, int(
             self.config.get("window_size") or os.environ.get("MC_SMPP_WINDOW_SIZE", "10")
         )))
@@ -238,76 +243,83 @@ class _SmppConnection:
 
     def _throttle(self):
         interval = 1.0 / max(1, int(self.config.get("tps") or 1))
-        wait = interval - (time.monotonic() - self._last_submit)
-        if wait > 0:
-            time.sleep(wait)
-        self._last_submit = time.monotonic()
+        with self._throttle_lock:
+            now = time.monotonic()
+            wait = interval - (now - self._last_submit)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_submit = time.monotonic()
 
     def send(self, task: dict) -> list[str]:
         with self._window:
             return self._send_windowed(task)
 
     def _send_windowed(self, task: dict) -> list[str]:
-        with self._condition:
-            self.connect()
-            import smpplib.consts
-            parts, coding, esm_class = _make_parts(task["content"])
-            source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
-            content = task.get("content") or ""
-            detail_logger.info(
-                "[SMPP SEND] task=%s campaign=%s/%s name=%s msisdn=%s source_addr=%s "
-                "config=%s %s:%s slot=%s parts=%d content_len=%d content=%s",
-                task.get("id"), task.get("campaign_type"), task.get("campaign_id"),
-                task.get("campaign_name", ""), task.get("msisdn"), source_addr,
-                self.config.get("id"), self.config.get("host"), self.config.get("port"), self.slot,
-                len(parts), len(content), content[:1000],
-            )
-            sequences = []
-            submitted_any = False
-            try:
-                for part in parts:
-                    self._throttle()
+        self.connect()
+        import smpplib.consts
+        parts, coding, esm_class = _make_parts(task["content"])
+        source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
+        content = task.get("content") or ""
+        task_id = task.get("id")
+        detail_logger.info(
+            "[SMPP SEND] task=%s campaign=%s/%s name=%s msisdn=%s source_addr=%s "
+            "config=%s %s:%s slot=%s parts=%d content_len=%d content=%s",
+            task_id, task.get("campaign_type"), task.get("campaign_id"),
+            task.get("campaign_name", ""), task.get("msisdn"), source_addr,
+            self.config.get("id"), self.config.get("host"), self.config.get("port"), self.slot,
+            len(parts), len(content), content[:1000],
+        )
+        sequences = []
+        submitted_any = False
+        try:
+            for part in parts:
+                self._throttle()
+                with self._send_lock:
                     pdu = self.client.send_message(
-                       source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
-                       source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
-                       source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
+                        source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
+                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
+                        source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
                         dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
                         short_message=part, data_coding=coding, esm_class=esm_class,
                         registered_delivery=(self.config.get('delivery_receipt_mode') or 'optional') != 'disabled')
-                    submitted_any = True
-                    sequence = pdu.sequence
-                    self._sequence_tasks[sequence] = task["id"]
+                submitted_any = True
+                sequence = pdu.sequence
+                with self._condition:
+                    self._sequence_tasks[sequence] = task_id
                     if sequence in self._early_outcomes:
                         outcome = self._early_outcomes.pop(sequence)
                         self._outcomes[sequence] = outcome
-                        if outcome["ok"] and outcome["message_id"]:
-                            sms_task_service.append_message_id(task["id"], outcome["message_id"], wait=False)
+                        if outcome["ok"] and outcome["message_id"] and task_id:
+                            sms_task_service.append_message_id(task_id, outcome["message_id"], wait=False)
                     sequences.append(sequence)
-                deadline = time.monotonic() + int(self.config.get("timeout") or 10)
+            deadline = time.monotonic() + int(self.config.get("timeout") or 10)
+            with self._condition:
                 while any(seq not in self._outcomes for seq in sequences):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise SmppDeliveryUnknownError("submit_sm_resp timeout; delivery status unknown")
                     self._condition.wait(min(remaining, 0.25))
                 outcomes = [self._outcomes.pop(seq) for seq in sequences]
-                failed = next((item for item in outcomes if not item["ok"]), None)
-                if failed:
-                    raise SmppSubmitError(failed["status"])
-                detail_logger.info(
-                    "[SMPP SEND OK] task=%s sequences=%s message_ids=%s",
-                    task.get("id"), sequences,
-                    [item.get("message_id") for item in outcomes if item.get("message_id")],
-                )
-                metrics_service.inc("marketing_copilot_smpp_submitted_total",
-                                    labels={"config_id": self.config["id"]})
-                return [item["message_id"] for item in outcomes if item["message_id"]]
-            except (SmppSubmitError, SmppDeliveryUnknownError):
-                raise
-            except Exception as exc:
-                if submitted_any:
-                    raise SmppDeliveryUnknownError(f"connection lost after submit: {exc}") from exc
-                raise
-            finally:
+            failed = next((item for item in outcomes if not item["ok"]), None)
+            if failed:
+                raise SmppSubmitError(failed["status"])
+            task["_submit_sm_parts"] = len(parts)
+            detail_logger.info(
+                "[SMPP SEND OK] task=%s sequences=%s message_ids=%s",
+                task_id, sequences,
+                [item.get("message_id") for item in outcomes if item.get("message_id")],
+            )
+            metrics_service.inc("marketing_copilot_smpp_submitted_total",
+                                amount=len(parts), labels={"config_id": self.config["id"]})
+            return [item["message_id"] for item in outcomes if item["message_id"]]
+        except (SmppSubmitError, SmppDeliveryUnknownError):
+            raise
+        except Exception as exc:
+            if submitted_any:
+                raise SmppDeliveryUnknownError(f"connection lost after submit: {exc}") from exc
+            raise
+        finally:
+            with self._condition:
                 for seq in sequences:
                     self._sequence_tasks.pop(seq, None)
 
@@ -408,6 +420,7 @@ class SmppGateway:
                     f"Associated SMPP configuration {target_id} is missing or disabled")
             connection = self._connection_for(config)
             task['_delivery_receipt_mode'] = config.get('delivery_receipt_mode') or 'optional'
+            task['_transport_smpp_config_id'] = config['id']
             self._active_config_id = config['id']
             return connection.send(task)
         previous_id = None
@@ -421,6 +434,7 @@ class SmppGateway:
                     metrics_service.inc("marketing_copilot_smpp_failovers_total",
                                         labels={"from_config": previous_id, "to_config": config["id"]})
                 task['_delivery_receipt_mode'] = config.get('delivery_receipt_mode') or 'optional'
+                task['_transport_smpp_config_id'] = config['id']
                 result = connection.send(task)
                 self._active_config_id = config["id"]
                 return result

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 
 import database
-from services import dashboard_service, p1_service, sms_task_service, sms_write_buffer
+from services import dashboard_service, p1_service, smpp_service, sms_task_service, sms_write_buffer
 
 
 @pytest.fixture()
@@ -60,6 +60,66 @@ def test_dashboard_stats_builds_daily_trend_from_coalesced_task_date(isolated_db
 
     assert len(stats["daily_trend"]) == 7
     assert all(point["sent_count"] == 0 for point in stats["daily_trend"])
+
+
+def test_submitted_task_records_transport_config_and_submit_parts(isolated_db):
+    task_id = _insert_tasks(1)[0]
+
+    sms_task_service.mark_submitted(
+        task_id, ["transport-message"], "required",
+        transport_smpp_config_id=7, submit_sm_parts=3, wait=False,
+    )
+    sms_task_service.flush_pending_writes()
+
+    conn = database.get_connection()
+    row = conn.execute(
+        "SELECT transport_smpp_config_id,submit_sm_parts,status FROM sms_tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    conn.close()
+    assert row["transport_smpp_config_id"] == 7
+    assert row["submit_sm_parts"] == 3
+    assert row["status"] == "submitted"
+
+
+def test_smpp_stats_follow_actual_transport_config_and_count_parts(isolated_db):
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO smpp_configs(name,host,system_id,password,priority,tps,pool_size) "
+        "VALUES ('primary','primary', 'sys', 'pass', 1, 100, 1)"
+    )
+    conn.execute(
+        "INSERT INTO smpp_configs(name,host,system_id,password,priority,tps,pool_size) "
+        "VALUES ('backup','backup', 'sys', 'pass', 2, 100, 1)"
+    )
+    rows = []
+    for index in range(2):
+        row = conn.execute(
+            """INSERT INTO sms_tasks
+               (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status,smpp_config_id)
+               VALUES ('batch',1,'stats',?,'hello',?,'sending',1) RETURNING id""",
+            (f"251901{index:06d}", f"stats-{index}"),
+        ).fetchone()
+        rows.append(row["id"])
+    conn.commit()
+    conn.close()
+
+    sms_task_service.mark_submitted(
+        rows[0], ["stats-1", "stats-2"], "required",
+        transport_smpp_config_id=2, submit_sm_parts=2, wait=False,
+    )
+    sms_task_service.mark_submitted(
+        rows[1], ["stats-3", "stats-4", "stats-5"], "required",
+        transport_smpp_config_id=2, submit_sm_parts=3, wait=False,
+    )
+    sms_task_service.flush_pending_writes()
+
+    stats = smpp_service.get_config_stats()
+    by_id = {item["config_id"]: item for item in stats["items"]}
+    assert by_id[1]["submitted_1m"] == 0
+    assert by_id[2]["submitted_1m"] == 2
+    assert by_id[2]["submitted_parts_1m"] == 5
+    assert by_id[2]["submit_sm_tps_1m"] == round(5 / 60.0, 2)
 
 
 def test_delivery_hot_path_is_committed_in_bounded_batches(isolated_db, monkeypatch):

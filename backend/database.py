@@ -397,7 +397,9 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             submitted_at TEXT,
-            delivered_at TEXT
+            delivered_at TEXT,
+            transport_smpp_config_id INTEGER,
+            submit_sm_parts INTEGER NOT NULL DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS delivery_receipts (
             id INTEGER DEFAULT nextval('seq_delivery_receipts') PRIMARY KEY,
@@ -644,6 +646,8 @@ def init_db():
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS next_retry_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS max_retry_count INTEGER DEFAULT 4",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS transport_smpp_config_id INTEGER",
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS submit_sm_parts INTEGER DEFAULT 0",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS window_size INTEGER DEFAULT 10",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS task_count INTEGER DEFAULT 0",
@@ -758,6 +762,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_created ON sms_tasks(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_keyset ON sms_tasks(id)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_batch_status ON sms_tasks(batch_id,status)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_tasks_transport_smpp ON sms_tasks(transport_smpp_config_id)",
         "CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(campaign_type,campaign_id,file_hash)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_name_unique ON processed_files(campaign_type,campaign_id,filename)",
         # Receipt dedup is per-task: SMSC message ids may be reused across

@@ -657,19 +657,47 @@ def flush_pending_writes(timeout: float = 10.0) -> None:
     sms_write_buffer.flush(timeout)
 
 
+def create_external_task(campaign_id: int, campaign_name: str, msisdn: str,
+                         language: str, content: str, source_addr: str,
+                         payload: Optional[dict] = None) -> dict:
+    """Create a directly-consumed task so all SMS paths share task accounting."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """INSERT INTO sms_tasks
+               (campaign_type,campaign_id,campaign_name,msisdn,language,content,
+                source_addr,payload,source_file,dedupe_key,status,attempts,max_attempts)
+               VALUES ('rabbitmq',?,?,?,?,?,?,?,'rabbitmq',?,'sending',1,1)
+               RETURNING *""",
+            (int(campaign_id), campaign_name or "", msisdn or "", language or "",
+             content or "", source_addr or "", json.dumps(payload or {}, ensure_ascii=False),
+             f"rabbitmq:{uuid.uuid4().hex}"),
+        ).fetchone()
+        conn.commit()
+        return dict(row)
+    finally:
+        conn.close()
+
+
 def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: str = "optional",
-                   wait: bool = True):
+                   wait: bool = True,
+                   transport_smpp_config_id: Optional[int] = None,
+                   submit_sm_parts: Optional[int] = None):
     from services import sms_write_buffer
     sms_write_buffer.submit(
         "submitted",
         {"task_id": task_id, "message_ids": list(message_ids or []),
-         "delivery_receipt_mode": delivery_receipt_mode},
+         "delivery_receipt_mode": delivery_receipt_mode,
+         "transport_smpp_config_id": transport_smpp_config_id,
+         "submit_sm_parts": submit_sm_parts},
         wait=wait,
     )
 
 
 def _apply_submitted(conn, task_id: int, message_ids: list[str],
-                     delivery_receipt_mode: str = "optional"):
+                     delivery_receipt_mode: str = "optional",
+                     transport_smpp_config_id: Optional[int] = None,
+                     submit_sm_parts: Optional[int] = None):
     row = conn.execute(
         "SELECT smsc_message_ids,batch_id,campaign_type,campaign_id,status FROM sms_tasks WHERE id=?",
         (task_id,),
@@ -685,6 +713,8 @@ def _apply_submitted(conn, task_id: int, message_ids: list[str],
     final_status = "submitted" if mode == "required" else "accepted"
     updated = conn.execute(
         """UPDATE sms_tasks SET status=?, smsc_message_ids=?, error_msg='',
+            transport_smpp_config_id=COALESCE(?,transport_smpp_config_id),
+            submit_sm_parts=CASE WHEN ? IS NULL THEN submit_sm_parts ELSE GREATEST(1,?) END,
             submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
             delivered_at=CASE WHEN ? <> 'required'
                               THEN COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR))
@@ -692,7 +722,8 @@ def _apply_submitted(conn, task_id: int, message_ids: list[str],
             updated_at=CURRENT_TIMESTAMP
             WHERE id=? AND status IN ('sending','submitted')
             RETURNING id""",
-        (final_status, json.dumps(message_ids), mode, task_id),
+        (final_status, json.dumps(message_ids), transport_smpp_config_id,
+         submit_sm_parts, submit_sm_parts, mode, task_id),
     ).fetchone()
     if updated and final_status == "accepted" and row and row["batch_id"]:
         conn.execute(

@@ -92,10 +92,20 @@ def _run(worker_index):
                             task["id"], task.get("campaign_type"), task.get("campaign_id"),
                             task.get("msisdn"), len(task.get("content") or ""), (task.get("content") or "")[:1000],
                         )
-                        sms_task_service.mark_submitted(task["id"], [message_id], task.get("_delivery_receipt_mode", "optional"), wait=False)
+                        sms_task_service.mark_submitted(
+                            task["id"], [message_id], task.get("_delivery_receipt_mode", "optional"),
+                            submit_sm_parts=1, wait=False,
+                        )
                         sms_task_service.record_receipt(message_id, "DELIVRD", "development simulation", wait=False)
                     else:
-                        sms_task_service.mark_submitted(task["id"], gateway.send(task), task.get("_delivery_receipt_mode", "optional"), wait=False)
+                        message_ids = gateway.send(task)
+                        sms_task_service.mark_submitted(
+                            task["id"], message_ids,
+                            task.get("_delivery_receipt_mode", "optional"),
+                            transport_smpp_config_id=task.get("_transport_smpp_config_id"),
+                            submit_sm_parts=task.get("_submit_sm_parts"),
+                            wait=False,
+                        )
                     metrics_service.inc("marketing_copilot_tasks_submitted_total")
                 except SmppSubmitError as exc:
                     temporary = exc.status in {0x00000008, 0x00000014, 0x00000045, 0x00000058}

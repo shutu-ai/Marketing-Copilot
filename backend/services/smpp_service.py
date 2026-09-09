@@ -134,9 +134,11 @@ def get_config_stats() -> dict:
         default_target_id = enabled_ids[0] if enabled_ids else None
 
         def _where(cfg_id: int):
-            if cfg_id == default_target_id:
-                return "(smpp_config_id=? OR smpp_config_id IS NULL)", [cfg_id]
-            return "smpp_config_id=?", [cfg_id]
+            # The transport id is written only after submit_sm_resp succeeds.
+            # Pending tasks still fall back to their selected config, or to the
+            # first enabled config when no explicit selection was made.
+            target_expression = "COALESCE(transport_smpp_config_id, smpp_config_id, ?)"
+            return f"{target_expression}=?", [default_target_id, cfg_id]
 
         def _count(where: str, params: list, extra: str) -> int:
             row = conn.execute(
@@ -150,6 +152,16 @@ def get_config_stats() -> dict:
                 f"CAST({column} AS TIMESTAMP WITH TIME ZONE) >= CURRENT_TIMESTAMP - INTERVAL '{minutes} minutes'",
             )
 
+        def _window_parts(where: str, params: list, minutes: int) -> int:
+            row = conn.execute(
+                f"""SELECT COALESCE(SUM(GREATEST(1,COALESCE(submit_sm_parts,0))),0) parts
+                    FROM sms_tasks WHERE {where}
+                    AND CAST(submitted_at AS TIMESTAMP WITH TIME ZONE) >=
+                        CURRENT_TIMESTAMP - INTERVAL '{minutes} minutes'""",
+                params,
+            ).fetchone()
+            return int(row["parts"] or 0)
+
         stats = []
         for cfg in configs:
             cfg_id = cfg["id"]
@@ -157,6 +169,9 @@ def get_config_stats() -> dict:
             submitted_1m = _window_count(where, params, "submitted_at", 1)
             submitted_5m = _window_count(where, params, "submitted_at", 5)
             submitted_60m = _window_count(where, params, "submitted_at", 60)
+            submitted_parts_1m = _window_parts(where, params, 1)
+            submitted_parts_5m = _window_parts(where, params, 5)
+            submitted_parts_60m = _window_parts(where, params, 60)
             delivered_60m = _count(
                 where, params,
                 "status IN ('delivered','accepted') AND "
@@ -184,6 +199,10 @@ def get_config_stats() -> dict:
                 "submitted_1m": submitted_1m,
                 "submitted_5m": submitted_5m,
                 "submitted_60m": submitted_60m,
+                "submitted_parts_1m": submitted_parts_1m,
+                "submitted_parts_5m": submitted_parts_5m,
+                "submitted_parts_60m": submitted_parts_60m,
+                "submit_sm_tps_1m": round(submitted_parts_1m / 60.0, 2),
                 "delivered_60m": delivered_60m,
                 "failed_60m": failed_60m,
                 "failure_rate_60m": round(failed_60m / terminal_60m, 4) if terminal_60m else 0.0,
@@ -206,7 +225,7 @@ def get_config_stats() -> dict:
         unassigned = 0
         if not default_target_id:
             unassigned = _count(
-                "smpp_config_id IS NULL", [],
+                "transport_smpp_config_id IS NULL AND smpp_config_id IS NULL", [],
                 "status IN ('queued','retrying')",
             )
 
@@ -217,6 +236,10 @@ def get_config_stats() -> dict:
             "submitted_1m": sum(item["submitted_1m"] for item in stats),
             "submitted_5m": sum(item["submitted_5m"] for item in stats),
             "submitted_60m": sum(item["submitted_60m"] for item in stats),
+            "submitted_parts_1m": sum(item["submitted_parts_1m"] for item in stats),
+            "submitted_parts_5m": sum(item["submitted_parts_5m"] for item in stats),
+            "submitted_parts_60m": sum(item["submitted_parts_60m"] for item in stats),
+            "submit_sm_tps_1m": round(sum(item["submitted_parts_1m"] for item in stats) / 60.0, 2),
             "delivered_60m": sum(item["delivered_60m"] for item in stats),
             "failed_60m": sum(item["failed_60m"] for item in stats),
             "today_submitted": sum(item["today_submitted"] for item in stats),

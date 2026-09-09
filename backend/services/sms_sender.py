@@ -3,6 +3,8 @@ import logging
 from typing import Optional
 from database import get_connection
 from services.settings_service import get_setting
+from services import sms_task_service
+from services.smpp_gateway import SmppSubmitError, gateway
 from services.sms_task_service import normalize_language_key
 
 logger = logging.getLogger(__name__)
@@ -72,12 +74,21 @@ def process_message(routing_key: str, message: dict):
             content = content.replace(placeholder, str(val))
 
         source_addr = template.get("source_addr") or "Marketing"
+        task = sms_task_service.create_external_task(
+            campaign_id=campaign["id"], campaign_name=campaign_name,
+            msisdn=msisdn, language=language, content=content,
+            source_addr=source_addr, payload=message,
+        )
 
         is_dev = get_setting("system_mode", "production") == "development"
         if is_dev:
+            sms_task_service.mark_submitted(
+                task["id"], [f"DEV-{task['id']}"], "optional",
+                submit_sm_parts=1, wait=False,
+            )
             sms_success = True
         else:
-            sms_success = _send_sms_via_smpp(msisdn, content, source_addr)
+            sms_success = _send_sms_via_smpp(task)
 
         status = "sent" if sms_success else "failed"
         error = "" if sms_success else "SMPP send failed"
@@ -96,34 +107,30 @@ def process_message(routing_key: str, message: dict):
         conn.close()
 
 
-def _send_sms_via_smpp(msisdn: str, content: str, source_addr: str) -> bool:
-    """
-    Send SMS via the first enabled SMPP config.
-    For now this is a stub that logs the send request.
-    When python-smpplib is available, wire it up here.
-    """
-    conn = get_connection()
+def _send_sms_via_smpp(task: dict) -> bool:
+    """Send a legacy RabbitMQ message through the same SMPP gateway as tasks."""
     try:
-        smpp_config = conn.execute(
-            "SELECT * FROM smpp_configs WHERE enabled=1 ORDER BY id ASC LIMIT 1"
-        ).fetchone()
-        conn.close()
-
-        if smpp_config:
-            config = dict(smpp_config)
-            detail_logger.info(
-                "[SMPP SEND] via config=%s %s:%s msisdn=%s source_addr=%s content_len=%d content=%s",
-                config.get("id"), config.get("host"), config.get("port"), msisdn, source_addr,
-                len(content), content[:1000],
-            )
-        else:
-            detail_logger.info(
-                "[SMS STUB] No SMPP config, simulated send msisdn=%s source_addr=%s content_len=%d content=%s",
-                msisdn, source_addr, len(content), content[:1000],
-            )
-
+        message_ids = gateway.send(task)
+        sms_task_service.mark_submitted(
+            task["id"], message_ids,
+            task.get("_delivery_receipt_mode", "optional"),
+            transport_smpp_config_id=task.get("_transport_smpp_config_id"),
+            submit_sm_parts=task.get("_submit_sm_parts"),
+            wait=False,
+        )
         return True
+    except SmppSubmitError as exc:
+        sms_task_service.mark_send_failure(
+            task, str(exc), exc.status, retryable=False,
+            failure_class="delivery_unknown" if exc.status == -1 else "submit_sm_resp",
+            wait=False,
+        )
+        logger.error("RabbitMQ SMPP send failed for task %s: %s", task["id"], exc)
+        return False
     except Exception as e:
+        sms_task_service.mark_send_failure(
+            task, str(e), retryable=False, failure_class="transport", wait=False,
+        )
         logger.error(f"SMPP send error: {e}")
         return False
 

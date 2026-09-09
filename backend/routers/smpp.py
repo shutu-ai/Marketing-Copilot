@@ -65,6 +65,9 @@ def config_stats():
         item["last_error"] = "; ".join(
             str(conn.get("last_error") or "") for conn in connections if conn.get("last_error")
         )[:500]
-        item["configured_tps"] = (item.get("tps") or 0) * max(1, int(item.get("pool_size") or 1))
-        item["connected_tps"] = (item.get("tps") or 0) * max(1, connected_count)
+        item["configured_tps"] = (
+            (item.get("tps") or 0) * int(item.get("pool_size") or 1)
+            if item.get("enabled") else 0
+        )
+        item["connected_tps"] = (item.get("tps") or 0) * connected_count
     return result

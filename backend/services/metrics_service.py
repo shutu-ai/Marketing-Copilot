@@ -119,8 +119,10 @@ def observe_runtime_state(worker_count=0):
             continue
         by_config[cfg_id] += int(row["cnt"] or 0)
     conn.close()
-    for cfg_id, depth in by_config.items():
-        set_gauge("marketing_copilot_smpp_queue_size", depth, {"config_id": cfg_id})
+    for row in config_rows:
+        cfg_id = row["id"]
+        set_gauge("marketing_copilot_smpp_queue_size", by_config.get(cfg_id, 0),
+                  {"config_id": cfg_id})
     return counts
 
 

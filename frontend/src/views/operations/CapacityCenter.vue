@@ -62,7 +62,7 @@
           <template #default="{ row }">{{ pct(row.failure_rate_60m) }}</template>
         </el-table-column>
         <el-table-column :label="$t('legacy.xc7e8969c')" width="110">
-          <template #default="{ row }">{{ row.connected_tps || 0 }} / {{ row.configured_tps || 0 }}</template>
+          <template #default="{ row }">{{ row.submit_sm_tps_1m || 0 }} / {{ row.configured_tps || 0 }}</template>
         </el-table-column>
         <el-table-column :label="$t('legacy.xa2b83df0')" min-width="150">
           <template #default="{ row }">{{ errorText(row) }}</template>
