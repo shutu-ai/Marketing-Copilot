@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import threading
 import time
 
@@ -8,6 +9,89 @@ from services import metrics_service, sms_task_service
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
+
+
+def _encode_utf16be(text: str) -> bytes:
+    """Encode text as UTF-16BE without relying on Python's codec registry."""
+    return b"".join(_iter_utf16be_units(text))
+
+
+def _iter_utf16be_units(text: str):
+    """Yield complete UTF-16 code-unit sequences for each text character."""
+    index = 0
+    while index < len(text):
+        character = text[index]
+        code_point = ord(character)
+        if 0xD800 <= code_point <= 0xDBFF:
+            if index + 1 >= len(text) or not 0xDC00 <= ord(text[index + 1]) <= 0xDFFF:
+                raise UnicodeEncodeError(
+                    "utf-16-be", text, index, index + 1, "surrogates not allowed"
+                )
+            yield bytes((code_point >> 8, code_point & 0xFF,
+                         ord(text[index + 1]) >> 8, ord(text[index + 1]) & 0xFF))
+            index += 2
+            continue
+        if 0xDC00 <= code_point <= 0xDFFF:
+            raise UnicodeEncodeError(
+                "utf-16-be", text, index, index + 1, "surrogates not allowed"
+            )
+        if code_point <= 0xFFFF:
+            yield bytes((code_point >> 8, code_point & 0xFF))
+            index += 1
+            continue
+
+        code_point -= 0x10000
+        high_surrogate = 0xD800 + (code_point >> 10)
+        low_surrogate = 0xDC00 + (code_point & 0x3FF)
+        yield bytes((high_surrogate >> 8, high_surrogate & 0xFF,
+                     low_surrogate >> 8, low_surrogate & 0xFF))
+        index += 1
+
+
+def _make_ucs2_parts(text: str):
+    """Build SMPP UCS-2 parts without using the utf-16-be codec."""
+    import smpplib.consts
+    import smpplib.gsm
+
+    part_size = smpplib.consts.UCS2_PART_SIZE
+    encoded_parts = []
+    current_part = bytearray()
+    for encoded_character in _iter_utf16be_units(text):
+        if current_part and len(current_part) + len(encoded_character) > part_size:
+            encoded_parts.append(bytes(current_part))
+            current_part.clear()
+        current_part.extend(encoded_character)
+    if current_part or not encoded_parts:
+        encoded_parts.append(bytes(current_part))
+
+    if len(encoded_parts) > 255:
+        raise smpplib.gsm.exceptions.MessageTooLong()
+
+    if len(encoded_parts) == 1:
+        return (encoded_parts, smpplib.consts.SMPP_ENCODING_ISO10646,
+                smpplib.consts.SMPP_MSGTYPE_DEFAULT)
+
+    reference = random.randint(0, 255)
+    header = bytes((0x05, 0x00, 0x03, reference, len(encoded_parts)))
+    parts = [header + bytes((part_index,)) + part
+             for part_index, part in enumerate(encoded_parts, start=1)]
+    return (parts, smpplib.consts.SMPP_ENCODING_ISO10646,
+            smpplib.consts.SMPP_GSMFEAT_UDHI)
+
+
+def _make_parts(text: str):
+    """Use smpplib's normal splitter, with a narrow UCS-2 codec fallback."""
+    import smpplib.gsm
+
+    try:
+        return smpplib.gsm.make_parts(text)
+    except LookupError as exc:
+        if "utf-16-be" not in str(exc).lower():
+            raise
+        logger.warning(
+            "utf-16-be codec unavailable; using SMPP UCS-2 fallback"
+        )
+        return _make_ucs2_parts(text)
 
 
 class SmppSubmitError(RuntimeError):
@@ -167,8 +251,7 @@ class _SmppConnection:
         with self._condition:
             self.connect()
             import smpplib.consts
-            import smpplib.gsm
-            parts, coding, esm_class = smpplib.gsm.make_parts(task["content"])
+            parts, coding, esm_class = _make_parts(task["content"])
             source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
             content = task.get("content") or ""
             detail_logger.info(
