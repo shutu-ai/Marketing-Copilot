@@ -159,6 +159,8 @@ export default {
     cumulativeSent: '累计发送',
     reachedUsers: '已触达用户',
     receivedFiles: '接收文件数',
+    currentWatchFiles: '监听目录当前文件',
+    watchFileReason: '原因',
     matchedUsers: '匹配用户数',
     receiveFile: '接收文件',
     filename: '接收文件名',

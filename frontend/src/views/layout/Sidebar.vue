@@ -10,10 +10,6 @@
       <el-icon><DataBoard /></el-icon>
       <span>{{ $t('menu.dashboard') }}</span>
     </el-menu-item>
-    <el-menu-item index="/data-monitor">
-      <el-icon><Monitor /></el-icon>
-      <span>{{ $t('menu.dataMonitor') }}</span>
-    </el-menu-item>
     <el-sub-menu index="/campaign">
       <template #title>
         <el-icon><Promotion /></el-icon>

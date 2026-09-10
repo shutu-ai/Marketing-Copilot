@@ -885,6 +885,79 @@ def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> 
     }
 
 
+def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
+    """List the current CSV files in one realtime campaign's watch directory."""
+    campaign = get_one(campaign_id)
+    if not campaign:
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+    watch_dir = os.path.abspath(campaign.get("watch_dir") or "")
+    if not os.path.isdir(watch_dir):
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+    prefix = campaign.get("watch_filename_prefix") or ""
+    files = []
+    for name in sorted(os.listdir(watch_dir)):
+        path = os.path.join(watch_dir, name)
+        if not os.path.isfile(path) or os.path.splitext(name)[1].lower() != ".csv":
+            continue
+
+        match_prefix = bool(prefix and name.startswith(prefix))
+        match_schedule = _watch_file_matches_campaign(name, campaign)
+        processed_record = _processed_file_record(campaign_id, name)
+        if processed_record:
+            status = "processed"
+            status_label = "已处理过"
+            skip_reason = f"同名文件已处理: {processed_record.get('filename')}"
+        elif not match_prefix:
+            status = "ignored"
+            status_label = "前缀不匹配"
+            skip_reason = "文件名不符合当前活动前缀"
+        elif not match_schedule:
+            status = "ignored"
+            status_label = "发送规则不匹配"
+            skip_reason = "文件名时间不在当前活动发送日期或时间段内"
+        else:
+            try:
+                writing = datetime.now().timestamp() - os.path.getmtime(path) < 2
+            except OSError:
+                writing = True
+            status = "pending"
+            status_label = "写入中" if writing else "待处理"
+            skip_reason = "文件仍在写入稳定等待期内" if writing else ""
+
+        try:
+            row_count = len(pd.read_csv(path, dtype=str, encoding="utf-8-sig"))
+        except Exception:
+            row_count = 0
+        try:
+            file_size = os.path.getsize(path)
+        except OSError:
+            file_size = 0
+        files.append({
+            "filename": name,
+            "directory_path": watch_dir,
+            "file_size": file_size,
+            "row_count": row_count,
+            "match_prefix": match_prefix,
+            "match_schedule": match_schedule,
+            "status": status,
+            "status_label": status_label,
+            "skip_reason": skip_reason,
+            "created_at": "",
+            "updated_at": "",
+        })
+
+    total = len(files)
+    offset = max(0, page - 1) * page_size
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": files[offset:offset + page_size],
+    }
+
+
 def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
     campaign = get_one(campaign_id)
     if not campaign:

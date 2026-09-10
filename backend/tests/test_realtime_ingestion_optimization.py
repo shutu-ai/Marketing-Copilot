@@ -1,4 +1,5 @@
 import csv
+from datetime import datetime
 from pathlib import Path
 import sys
 
@@ -34,6 +35,34 @@ def _campaign(tmp_path):
     conn.commit()
     conn.close()
     return campaign_id, campaign_dir
+
+
+def test_realtime_watch_files_are_scoped_to_campaign_and_paginated(isolated_db):
+    campaign_id, _campaign_dir = _campaign(isolated_db)
+    watch_dir = isolated_db / "watch"
+    watch_dir.mkdir()
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE realtime_campaigns SET watch_dir=?,watch_filename_prefix=? WHERE id=?",
+        (str(watch_dir), "Android_", campaign_id),
+    )
+    conn.commit()
+    conn.close()
+
+    current_name = f"Android_{datetime.now():%Y%m%d%H%M%S}.csv"
+    (watch_dir / current_name).write_text("msisdn,language\n090001,en\n", encoding="utf-8")
+    (watch_dir / "other.csv").write_text("msisdn\n090002\n", encoding="utf-8")
+
+    result = realtime_campaign_service.get_realtime_watch_files(campaign_id, page=1, page_size=1)
+    assert result["total"] == 2
+    assert len(result["items"]) == 1
+    assert result["items"][0]["filename"] == current_name
+    assert result["items"][0]["status"] == "pending"
+    assert result["items"][0]["row_count"] == 1
+
+    second_page = realtime_campaign_service.get_realtime_watch_files(campaign_id, page=2, page_size=1)
+    assert second_page["items"][0]["filename"] == "other.csv"
+    assert second_page["items"][0]["status"] == "ignored"
 
 
 def test_whitelist_hash_is_built_once_and_reused(isolated_db):

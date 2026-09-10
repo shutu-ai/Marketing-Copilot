@@ -154,6 +154,8 @@ export default {
     cumulativeSent: 'Cumulative Sent',
     reachedUsers: 'Reached Users',
     receivedFiles: 'Files Received',
+    currentWatchFiles: 'Current Watch Files',
+    watchFileReason: 'Reason',
     matchedUsers: 'Users Matched',
     receiveFile: 'Receive File',
     filename: 'Received Filename',

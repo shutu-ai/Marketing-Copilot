@@ -226,6 +226,13 @@ def list_files(campaign_id: int, page: int = 1, page_size: int = Query(50, le=20
     return realtime_campaign_service.get_realtime_files(campaign_id, page, page_size)
 
 
+@router.get("/{campaign_id}/watch-files")
+
+def watch_files(campaign_id: int, page: int = 1, page_size: int = Query(50, le=200)):
+
+    return realtime_campaign_service.get_realtime_watch_files(campaign_id, page, page_size)
+
+
 @router.get("/{campaign_id}/sent-records")
 
 def sent_records(campaign_id: int, page: int = 1, page_size: int = Query(50, le=200)):

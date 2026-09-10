@@ -108,6 +108,32 @@
             />
           </div>
         </el-tab-pane>
+        <el-tab-pane :label="$t('campaign.currentWatchFiles')" name="watch-files">
+          <el-table :data="watchFiles" stripe style="width: 100%" v-loading="watchFilesLoading">
+            <el-table-column prop="filename" :label="$t('campaign.filename')" min-width="220" />
+            <el-table-column :label="$t('common.status')" width="130">
+              <template #default="{ row }">
+                <el-tag :type="watchStatusType(row.status)" size="small">{{ watchStatusLabel(row) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="skip_reason" :label="$t('campaign.watchFileReason')" min-width="260" show-overflow-tooltip />
+            <el-table-column :label="$t('monitor.fileSize')" width="120">
+              <template #default="{ row }">{{ formatFileSize(row.file_size || 0) }}</template>
+            </el-table-column>
+            <el-table-column prop="row_count" :label="$t('monitor.rowCount')" width="90" />
+          </el-table>
+          <div class="received-pagination">
+            <el-pagination
+              v-model:current-page="watchFilesPage"
+              :page-size="watchFilesPageSize"
+              :page-sizes="[10, 25, 50, 100]"
+              :total="watchFilesTotal"
+              layout="total, sizes, prev, pager, next"
+              @size-change="handleWatchFilesSizeChange"
+              @current-change="handleWatchFilesCurrentChange"
+            />
+          </div>
+        </el-tab-pane>
       </el-tabs>
       <el-button class="tabs-refresh" size="small" :loading="activeTab === 'sent' ? sentRecordsLoading : filesLoading" @click="refreshActiveTab">
         <el-icon><Refresh /></el-icon>
@@ -125,6 +151,8 @@ import StatusTag from '@/components/StatusTag.vue'
 import * as api from '@/api/realtime-campaign'
 import * as rtApi from '@/api/realtime'
 import * as smppApi from '@/api/smpp'
+import i18n from '@/i18n'
+import { formatFileSize } from '@/utils/format'
 
 const route = useRoute()
 const campaign = ref<any>(null)
@@ -134,6 +162,9 @@ const filesLoading = ref(false)
 const sentRecords = ref<any[]>([])
 const sentRecordsTotal = ref(0)
 const sentRecordsLoading = ref(false)
+const watchFiles = ref<any[]>([])
+const watchFilesTotal = ref(0)
+const watchFilesLoading = ref(false)
 const activeTab = ref('received')
 const stats = reactive({ file_count: 0, total_msisdn_sum: 0, total_matched: 0 })
 const smppOptions = ref<any[]>([])
@@ -167,6 +198,9 @@ const receivedPageSize = ref(Number(localStorage.getItem(RECEIVED_PAGE_SIZE_KEY)
 const SENT_RECORDS_PAGE_SIZE_KEY = 'mc.realtime-sent.page-size'
 const sentRecordsPage = ref(1)
 const sentRecordsPageSize = ref(Number(localStorage.getItem(SENT_RECORDS_PAGE_SIZE_KEY)) || 25)
+const WATCH_FILES_PAGE_SIZE_KEY = 'mc.realtime-watch-files.page-size'
+const watchFilesPage = ref(1)
+const watchFilesPageSize = ref(Number(localStorage.getItem(WATCH_FILES_PAGE_SIZE_KEY)) || 25)
 
 function handleReceivedSizeChange(size: number) {
   receivedPageSize.value = size
@@ -192,6 +226,18 @@ function handleSentRecordsCurrentChange(page: number) {
   void loadSentRecords(false)
 }
 
+function handleWatchFilesSizeChange(size: number) {
+  watchFilesPageSize.value = size
+  localStorage.setItem(WATCH_FILES_PAGE_SIZE_KEY, String(size))
+  watchFilesPage.value = 1
+  void loadWatchFiles(false)
+}
+
+function handleWatchFilesCurrentChange(page: number) {
+  watchFilesPage.value = page
+  void loadWatchFiles(false)
+}
+
 async function loadSentRecords(reset = true) {
   sentRecordsLoading.value = true
   try {
@@ -204,6 +250,34 @@ async function loadSentRecords(reset = true) {
     sentRecordsTotal.value = rr.data.total ?? sentRecords.value.length
   } catch { /* ignore */ }
   sentRecordsLoading.value = false
+}
+
+function watchStatusType(status: string) {
+  if (status === 'processed') return 'success' as const
+  if (status === 'ignored') return 'info' as const
+  return 'warning' as const
+}
+
+function watchStatusLabel(row: any) {
+  if (row.status === 'processed') return i18n.global.t('monitor.status_processed')
+  if (row.status === 'ignored' && row.match_prefix === false) return i18n.global.t('monitor.status_prefix_mismatch')
+  if (row.status === 'ignored') return i18n.global.t('monitor.status_schedule_mismatch')
+  if (row.status_label === '写入中') return i18n.global.t('monitor.status_writing')
+  return i18n.global.t('monitor.status_pending')
+}
+
+async function loadWatchFiles(reset = true) {
+  watchFilesLoading.value = true
+  try {
+    if (reset) watchFilesPage.value = 1
+    const wr = await rtApi.getRealtimeWatchFiles(Number(route.params.id), {
+      page: watchFilesPage.value,
+      page_size: watchFilesPageSize.value,
+    })
+    watchFiles.value = asArray(wr.data)
+    watchFilesTotal.value = wr.data.total ?? watchFiles.value.length
+  } catch { /* ignore */ }
+  watchFilesLoading.value = false
 }
 
 async function loadReceivedData(reset = true) {
@@ -227,6 +301,7 @@ async function loadReceivedData(reset = true) {
 
 function refreshActiveTab() {
   if (activeTab.value === 'sent') void loadSentRecords(true)
+  else if (activeTab.value === 'watch-files') void loadWatchFiles(true)
   else void loadReceivedData(true)
 }
 
@@ -241,6 +316,7 @@ async function loadDetail() {
   await loadSmppOptions()
   await loadReceivedData(true)
   await loadSentRecords(true)
+  await loadWatchFiles(true)
 }
 
 async function downloadSentRecord(row: any) {
@@ -257,6 +333,7 @@ async function downloadSentRecord(row: any) {
 onMounted(loadDetail)
 watch(activeTab, (tab) => {
   if (tab === 'sent') void loadSentRecords(true)
+  if (tab === 'watch-files') void loadWatchFiles(true)
 })
 </script>
 

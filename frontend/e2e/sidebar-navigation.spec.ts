@@ -26,6 +26,7 @@ test('sidebar campaign group expands and shows current campaign routes', async (
 
   await page.goto('/dashboard')
 
+  await expect(page.locator('.el-menu-item[index="/data-monitor"]')).toHaveCount(0)
   const campaign = page.locator('.el-sub-menu').first()
   await campaign.locator(':scope > .el-sub-menu__title').click()
   await expect(campaign).toHaveClass(/is-opened/)

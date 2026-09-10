@@ -21,12 +21,6 @@ const router = createRouter({
           component: () => import('@/views/dashboard/Dashboard.vue'),
         },
         {
-          path: 'data-monitor',
-          name: 'DataMonitor',
-          meta: { titleKey: 'monitor.title' },
-          component: () => import('@/views/monitor/FileMonitor.vue'),
-        },
-        {
           path: 'campaign/batch',
           name: 'BatchCampaign',
           meta: { titleKey: 'campaign.batchTitle' },
