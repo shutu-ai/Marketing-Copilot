@@ -139,12 +139,12 @@ cd /opt/marketing-copilot-manual
 ./run.sh
 ```
 
-默认监听 `0.0.0.0:8000`。在另一终端验证：
+默认监听 `0.0.0.0:19090`。在另一终端验证：
 
 ```bash
-curl --fail http://127.0.0.1:8000/api/ready
-curl --fail http://127.0.0.1:8000/api/health
-curl --fail http://127.0.0.1:8000/metrics
+curl --fail http://127.0.0.1:19090/api/ready
+curl --fail http://127.0.0.1:19090/api/health
+curl --fail http://127.0.0.1:19090/metrics
 ```
 
 停止服务时，在运行 `./run.sh` 的终端按 `Ctrl+C`。本包不创建 systemd 单元，也不
@@ -167,7 +167,7 @@ echo $! > marketing-copilot.pid
 ```bash
 ps -fp "$(cat marketing-copilot.pid)"
 tail -f logs/console.log
-curl --fail http://127.0.0.1:8000/api/ready
+curl --fail http://127.0.0.1:19090/api/ready
 ```
 
 停止后台进程：
@@ -237,5 +237,5 @@ cd /opt/marketing-copilot-manual/backend
 
 ### 外部浏览器无法访问
 
-若本机 `curl http://127.0.0.1:8000/api/ready` 正常，检查 SLES 防火墙、网络路由和
-安全组是否允许访问 TCP 8000。生产环境应按安全规范使用反向代理或访问控制。
+若本机 `curl http://127.0.0.1:19090/api/ready` 正常，检查 SLES 防火墙、网络路由和
+安全组是否允许访问 TCP 19090。生产环境应按安全规范使用反向代理或访问控制。

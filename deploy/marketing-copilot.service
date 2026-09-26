@@ -11,7 +11,7 @@ Environment=PYTHONUNBUFFERED=1
 StateDirectory=marketing-copilot
 LogsDirectory=marketing-copilot
 RuntimeDirectory=marketing-copilot
-ExecStart=/opt/marketing-copilot/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+ExecStart=/opt/marketing-copilot/venv/bin/uvicorn main:app --host 0.0.0.0 --port 19090 --workers 1
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

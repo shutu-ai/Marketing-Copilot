@@ -25,7 +25,7 @@ from pathlib import Path
 SERVICE_UNIT = os.environ.get("MC_SERVICE_UNIT", "marketing-copilot.service")
 HEALTH_URL = os.environ.get(
     "MC_PROBE_URL",
-    f"http://127.0.0.1:{os.environ.get('MC_PORT', '8000')}/api/ready",
+    f"http://127.0.0.1:{os.environ.get('MC_PORT', '19090')}/api/ready",
 )
 HEALTH_TRIES = int(os.environ.get("MC_UPDATE_HEALTH_TRIES", "30"))
 HEALTH_INTERVAL = float(os.environ.get("MC_UPDATE_HEALTH_INTERVAL", "2.0"))
@@ -196,7 +196,7 @@ def start_direct(state: dict) -> None:
                     "--host",
                     os.environ.get("MC_HOST", "0.0.0.0"),
                     "--port",
-                    os.environ.get("MC_PORT", "8000"),
+                    os.environ.get("MC_PORT", "19090"),
                     "--workers",
                     "1",
                 ],

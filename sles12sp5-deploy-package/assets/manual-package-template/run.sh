@@ -50,4 +50,4 @@ set +a
 mkdir -p "$APP_HOME/data" "$APP_HOME/logs" "$APP_HOME/run" "$APP_HOME/backups"
 export MC_FRONTEND_DIR="${MC_FRONTEND_DIR:-$APP_HOME/frontend/dist}"
 cd "$APP_HOME/backend"
-exec "$VENV_DIR/bin/python" -m uvicorn "$APP_MODULE" --host "${MC_HOST:-0.0.0.0}" --port "${MC_PORT:-8000}" --workers 1
+exec "$VENV_DIR/bin/python" -m uvicorn "$APP_MODULE" --host "${MC_HOST:-0.0.0.0}" --port "${MC_PORT:-19090}" --workers 1

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build a manual-run package for a target that already provides Python 3.11.5.
+# Build an application package for a target with the standalone SLES12SP5
+# Python 3.11.5 runtime installed at /opt/marketing-copilot/python.
 # No Python runtime, systemd unit, Docker/Podman artifact, or Node runtime is included.
 set -euo pipefail
 
@@ -41,23 +42,32 @@ tar -C "$ROOT/backend" \
   --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
   --exclude='*.db*' --exclude='*.duckdb*' \
   --exclude='uploads' --exclude='monitor_dir' --exclude='data' \
+  --exclude='.rt-smoke-*' --exclude='.tmp-*' \
   -cf - . | tar -C "$STAGE/backend" -xf -
 cp -a "$ROOT/frontend/dist" "$STAGE/frontend/"
 cp -a "$SOURCE_WHEEL_DIR" "$STAGE/offline/wheels"
 cp "$ROOT/backend/requirements.txt" "$STAGE/offline/requirements.txt"
-cp "$ROOT/deploy/marketing-copilot.single-dir.env.example" "$STAGE/marketing-copilot.env.example"
-cp "$ROOT/deploy/run-system-python-manual.sh" "$STAGE/run.sh"
-cp "$ROOT/deploy/README-system-python-manual.md" "$STAGE/README.md"
+# Deployment text files must use Unix line endings. The repository may be
+# checked out on Windows before the package is built in WSL/Linux.
+normalize_text() { tr -d '\r' < "$1" > "$2"; }
+normalize_text "$ROOT/deploy/marketing-copilot.single-dir.env.example" "$STAGE/marketing-copilot.env.example"
+normalize_text "$ROOT/deploy/run-system-python-manual.sh" "$STAGE/run.sh"
+normalize_text "$ROOT/deploy/README-system-python-manual.md" "$STAGE/README.md"
 chmod 0755 "$STAGE/run.sh"
 # Version metadata for the online-update feature.
 GIT_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+  GIT_SHA="${GIT_SHA}-dirty"
+fi
 cat > "$STAGE/backend/release.json" <<JSON
 {
   "name": "Marketing Copilot",
   "version": "$VERSION",
   "build_time": "$(date -Is)",
   "builder": "build-sles12sp5-system-python-manual.sh",
-  "git_sha": "$GIT_SHA"
+  "git_sha": "$GIT_SHA",
+  "python_runtime": "/opt/marketing-copilot/python/bin/python3.11",
+  "python_version": "3.11.5"
 }
 JSON
 cp "$STAGE/backend/release.json" "$STAGE/release.json"
@@ -66,4 +76,5 @@ mkdir -p "$OUTPUT"
 # Normalize archive ownership so a package built on a host with an unmapped
 # numeric UID/GID cannot carry that identity into a SLES deployment.
 tar --owner=0 --group=0 --numeric-owner -C "$WORK" -czf "$OUTPUT/$NAME.tar.gz" "$NAME"
+(cd "$OUTPUT" && sha256sum "$NAME.tar.gz") > "$OUTPUT/$NAME.tar.gz.sha256"
 echo "Created $OUTPUT/$NAME.tar.gz"

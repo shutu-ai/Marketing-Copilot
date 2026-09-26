@@ -251,7 +251,7 @@ python -m tools.smsc_simulator
 
 ```bash
 cd backend
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+python -m uvicorn main:app --host 0.0.0.0 --port 19090 --workers 1
 ```
 
 必须使用单Worker，避免重复启动活动调度器和短信发送Worker。

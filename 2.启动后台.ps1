@@ -8,5 +8,5 @@ if (-not (Test-Path $python)) {
 
 $env:PYTHONIOENCODING = 'utf-8'
 Set-Location (Join-Path $projectRoot 'backend')
-Write-Host 'Backend started: http://127.0.0.1:8000' -ForegroundColor Green
-& $python -m uvicorn main:app --host 0.0.0.0 --port 8000
+Write-Host 'Backend started: http://127.0.0.1:19090' -ForegroundColor Green
+& $python -m uvicorn main:app --host 0.0.0.0 --port 19090

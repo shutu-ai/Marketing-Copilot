@@ -5,15 +5,52 @@
 set -euo pipefail
 APP_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ENV_FILE="${MC_ENV_FILE:-$APP_HOME/marketing-copilot.env}"
-PYTHON_BIN="${PYTHON_BIN:-python3.11}"
-VENV_DIR="${MC_VENV_DIR:-$APP_HOME/venv}"
 [ -f "$ENV_FILE" ] || { echo "Environment file not found: $ENV_FILE" >&2; exit 1; }
 [ -d "$APP_HOME/offline/wheels" ] || { echo "Offline wheelhouse not found: $APP_HOME/offline/wheels" >&2; exit 1; }
 [ -f "$APP_HOME/offline/requirements.txt" ] || { echo "Requirements file not found: $APP_HOME/offline/requirements.txt" >&2; exit 1; }
 
+# Use the separately installed SLES12SP5 runtime before creating the project
+# venv. PYTHON_BIN remains supported for one-off overrides; MC_PYTHON_BIN is
+# the persistent deployment setting.
+set -a
+. "$ENV_FILE"
+set +a
+PYTHON_BIN="${MC_PYTHON_BIN:-${PYTHON_BIN:-/opt/marketing-copilot/python/bin/python3.11}}"
+VENV_DIR="${MC_VENV_DIR:-$APP_HOME/venv}"
+[ -x "$PYTHON_BIN" ] || {
+  echo "Python 3.11.5 runtime not found or not executable: $PYTHON_BIN" >&2
+  echo "Install the standalone SLES12SP5 Python package first, or set MC_PYTHON_BIN." >&2
+  exit 1
+}
+"$PYTHON_BIN" - <<'PY'
+import _ctypes
+import ctypes
+import ssl
+import sys
+import venv
+
+if sys.version_info[:3] != (3, 11, 5):
+    raise SystemExit(f"expected Python 3.11.5, got {sys.version}")
+print(f"Using Python {sys.version.split()[0]}: {sys.executable}")
+print(f"OpenSSL: {ssl.OPENSSL_VERSION}")
+print("ctypes: available")
+PY
+
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Virtual environment not found; creating $VENV_DIR"
   "$PYTHON_BIN" -m venv "$VENV_DIR"
+else
+  "$VENV_DIR/bin/python" - "$PYTHON_BIN" <<'PY'
+import os
+import sys
+
+if sys.version_info[:3] != (3, 11, 5):
+    raise SystemExit(f"existing venv is not Python 3.11.5: {sys.version}")
+expected = os.path.realpath(sys.argv[1])
+actual = os.path.realpath(getattr(sys, "_base_executable", ""))
+if actual != expected:
+    raise SystemExit(f"existing venv uses {actual or 'unknown base Python'}, expected {expected}")
+PY
 fi
 
 # systemd EnvironmentFile entries are not evaluated by a shell, so values such
@@ -45,10 +82,6 @@ then
   echo "Installing Python dependencies from offline wheelhouse"
   "$VENV_DIR/bin/python" -m pip install --no-index --find-links "$APP_HOME/offline/wheels" -r "$APP_HOME/offline/requirements.txt"
 fi
-
-set -a
-. "$ENV_FILE"
-set +a
 
 mkdir -p "$APP_HOME/data" "$APP_HOME/logs" "$APP_HOME/run" "$APP_HOME/backups" "$APP_HOME/updates"
 export MC_STATE_DIR="${MC_STATE_DIR:-$APP_HOME/data}"
@@ -90,4 +123,4 @@ elif [ "${MC_SKIP_SYSTEMD_CHECK:-0}" != "1" ] && command -v systemctl >/dev/null
 fi
 
 cd "$APP_HOME/backend"
-exec "$VENV_DIR/bin/python" -m uvicorn main:app --host "${MC_HOST:-0.0.0.0}" --port "${MC_PORT:-8000}" --workers 1
+exec "$VENV_DIR/bin/python" -m uvicorn main:app --host "${MC_HOST:-0.0.0.0}" --port "${MC_PORT:-19090}" --workers 1

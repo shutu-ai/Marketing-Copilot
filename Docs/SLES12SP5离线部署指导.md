@@ -79,7 +79,7 @@ sudo vi /etc/marketing-copilot.env
 | `MC_ADMIN_USERNAME` / `MC_ADMIN_PASSWORD` | 管理后台登录账号；默认 `admin / Huawei@123`，生产必须修改。 |
 | `MC_UPDATE_MODE` / `MC_STATE_DIR` / `MC_UPDATE_DIR` | 在线更新运行模式与状态目录，默认值可直接使用。 |
 
-服务默认监听 `0.0.0.0:8000`。如需限制网络访问，请在主机防火墙或反向代理中
+服务默认监听 `0.0.0.0:19090`。如需限制网络访问，请在主机防火墙或反向代理中
 按实际安全策略配置；不要将管理服务直接暴露到不受信任网络。
 
 ## 5. 启动与验证
@@ -88,9 +88,9 @@ sudo vi /etc/marketing-copilot.env
 sudo systemctl start marketing-copilot.service
 sudo systemctl status marketing-copilot.service --no-pager
 
-curl --fail http://127.0.0.1:8000/api/ready
-curl --fail http://127.0.0.1:8000/api/health
-curl --fail http://127.0.0.1:8000/metrics
+curl --fail http://127.0.0.1:19090/api/ready
+curl --fail http://127.0.0.1:19090/api/health
+curl --fail http://127.0.0.1:19090/metrics
 ```
 
 管理界面默认启用登录认证：浏览器访问页面后先以管理员账号登录，再进入
@@ -205,8 +205,8 @@ ls -ld /var/lib/marketing-copilot /var/log/marketing-copilot /run/marketing-copi
 
 ### 浏览器无法访问页面
 
-先在服务器本机检查 `curl http://127.0.0.1:8000/api/ready`。若本机正常，检查
-SLES 防火墙、路由、安全组和访问主机地址/端口；应用默认端口为 8000。
+先在服务器本机检查 `curl http://127.0.0.1:19090/api/ready`。若本机正常，检查
+SLES 防火墙、路由、安全组和访问主机地址/端口；应用默认端口为 19090。
 
 ### 目标机不能联网
 

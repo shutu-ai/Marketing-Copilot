@@ -18,8 +18,8 @@ queued → sending → submitted → delivered
 
 请先准备：
 
-1. SLES 12 SP5 x86_64 服务器、SSH 账号和可写目录。
-2. Python **3.11.5**。标准 CPython 通常已包含 `ssl` 和 `venv`，部署前检查其可用即可。
+1. SLES 12 SP5 或 EulerOS 2.0 x86_64 服务器、SSH 账号和可写目录。
+2. Python离线安装包。
 3. 应用离线安装包。
 4. SMSC 的 Host、Port、System ID、Password、Source Address。
 5. 服务器 IP、端口访问策略和少量测试号码。
@@ -29,20 +29,27 @@ queued → sending → submitted → delivered
 ```bash
 cat /etc/os-release
 uname -m
-python3.11 --version
-python3.11 - <<'PY'
-import ssl, sys
-assert sys.version_info[:3] == (3, 11, 5), sys.version
-assert ssl.OPENSSL_VERSION_INFO >= (1, 1, 1), ssl.OPENSSL_VERSION
-print(sys.version)
-print(ssl.OPENSSL_VERSION)
-PY
-python3.11 -m venv --help >/dev/null
+ldd --version | head -1
+systemctl --version | head -1
 ```
 
-以上检查必须全部成功。`ssl` 和 `venv` 一般随标准 CPython 提供，但精简安装或自行编译的 Python 可能缺少它们。不要用其他 Python 小版本替代 3.11.5。
+以上检查可以确认OS版本，并确认架构为 x86_64，且 glibc 不低于 2.17。
 
 ## 3. 安装应用
+### 3.0 安装独立 python 包
+假设安装包已复制到 `/home/paas`，本文统一使用 `/opt/marketing-copilot` 作为应用目录：
+```bash
+# 解压再安装独立 Python 包
+cd /home/paas
+tar -xzf sles12sp5-python-3.11.5-20260917-script.tar.gz 
+cd sles12sp5-python-3.11.5-20260917-script
+
+bash install.sh --prefix /opt/marketing-copilot --force
+
+# 安装后验证Python运行时
+/opt/marketing-copilot/python/bin/python3.11 -c \
+'import _ctypes, ctypes, ssl, venv; print("Python runtime OK")'
+```
 
 ### 3.1 解压应用包
 
@@ -51,18 +58,13 @@ python3.11 -m venv --help >/dev/null
 ```bash
 mkdir -p /opt/marketing-copilot
 cd /home/paas
-tar -xzf marketing-copilot-sles12sp5-system-python-*.tar.gz \
+tar -xzf marketing-copilot-sles12sp5-system-python-20260917105732.tar.gz \
   --strip-components=1 -C /opt/marketing-copilot
 cd /opt/marketing-copilot
 ```
 
 解压完成后，`/opt/marketing-copilot` 下应直接看到 `backend`、`frontend`、`offline`、`run.sh` 和 `marketing-copilot.env.example`。
 
-正常情况下，tar 会保留 `run.sh` 的执行权限。如果执行 `./run.sh` 时提示 `Permission denied`，再执行：
-
-```bash
-chmod 0755 /opt/marketing-copilot/run.sh
-```
 
 ### 3.2 第一次创建和配置 env 文件
 
@@ -71,39 +73,10 @@ chmod 0755 /opt/marketing-copilot/run.sh
 ```bash
 cd /opt/marketing-copilot
 cp marketing-copilot.env.example marketing-copilot.env
+
+# 修改端口号默认:MC_PORT=19090
 vi marketing-copilot.env
 ```
-
-至少确认以下内容：
-
-```dotenv
-DUCKDB_PATH=/opt/marketing-copilot/data/marketing_copilot.duckdb
-MC_FRONTEND_DIR=/opt/marketing-copilot/frontend/dist
-MC_HOST=0.0.0.0
-MC_PORT=8000
-MC_LOG_PATH=/opt/marketing-copilot/logs/app.log
-MC_INSTANCE_LOCK=/opt/marketing-copilot/run/instance.lock
-MC_BACKUP_DIR=/opt/marketing-copilot/backups
-MC_SYSTEM_MODE=production
-MC_TASK_WORKERS=4
-MC_AUTH_DISABLED=0
-MC_ADMIN_USERNAME=admin
-MC_ADMIN_PASSWORD=Huawei@123
-MC_UPDATE_MODE=manual
-MC_STATE_DIR=/opt/marketing-copilot/data
-MC_UPDATE_DIR=/opt/marketing-copilot/updates
-```
-
-`run.sh` 启动时会自动创建应用目录下的 `data`、`logs`、`run`、`backups` 和 `updates` 子目录。
-
-配置说明：
-
-- 数据库、日志、锁和备份目录必须对运行账号可写。
-- `MC_FRONTEND_DIR` 要指向 `frontend/dist`，不是前端源码目录。
-- 生产环境 `MC_SYSTEM_MODE` 必须为 `production`。
-- 默认管理员账号为 `admin`，默认密码为 `Huawei@123`。首次登录后必须修改密码。
-- 生产环境 `MC_AUTH_DISABLED` 必须为 `0`，不能关闭登录认证。
-- 手工或 nohup 运行使用 `MC_UPDATE_MODE=manual`；改为 systemd 托管后使用 `systemd`。
 
 ### 3.3 启动应用
 
@@ -113,15 +86,20 @@ MC_UPDATE_DIR=/opt/marketing-copilot/updates
 cd /opt/marketing-copilot
 ./run.sh
 ```
-
-另开终端检查：
+正常情况下，tar 会保留 `run.sh` 的执行权限。如果执行 `./run.sh` 时提示 `Permission denied`，再执行：
 
 ```bash
-curl --fail http://127.0.0.1:8000/api/ready
-curl --fail http://127.0.0.1:8000/api/health
+chmod 0755 /opt/marketing-copilot/run.sh
 ```
 
-应分别返回 ready 和健康/数据库已连接状态。浏览器打开 `http://服务器IP:8000`，用 env 中的管理员账号登录。首次登录后进入“系统设置”→“用户与权限”修改密码。
+检查：
+
+```bash
+curl --fail http://127.0.0.1:19090/api/ready
+curl --fail http://127.0.0.1:19090/api/health
+```
+
+应分别返回 ready 和健康/数据库已连接状态。浏览器打开 `http://服务器IP:19090`，用 env 中的管理员账号登录。首次登录后进入“系统设置”→“用户与权限”修改密码。
 
 ### 3.4 服务管理
 
@@ -135,6 +113,8 @@ tail -f /opt/marketing-copilot/logs/app.log
 ```
 
 ## 4. 首次登录后的基础设置
+默认登录账号：admin
+密码：Huawei@123
 
 1. 进入“系统设置”→“基础设置”，将系统模式设为“生产模式”，点击“保存”。开发模式不会连接 SMSC。
 2. 进入“系统设置”→“数据库配置”，点击“测试”，确认连接成功。不要随意修改数据库路径。
@@ -280,11 +260,11 @@ msisdn,region,language
 
 ```bash
 systemctl status marketing-copilot.service
-curl http://127.0.0.1:8000/api/ready
+curl http://127.0.0.1:19090/api/ready
 tail -n 100 /opt/marketing-copilot/logs/app.log
 ```
 
-本机正常而远程失败时，检查防火墙、路由和 TCP 8000 访问策略。
+本机正常而远程失败时，检查防火墙、路由和 TCP 19090 访问策略。
 
 **SMPP 连接失败：**检查 Host、Port、账号密码、服务器到 SMSC 的网络、配置是否启用、Bind Type 是否为 `transceiver`，以及系统模式是否为生产模式。
 
@@ -310,8 +290,8 @@ tail -n 100 /opt/marketing-copilot/logs/app.log
 ```bash
 sudo systemctl status marketing-copilot.service
 sudo systemctl restart marketing-copilot.service
-curl --fail http://127.0.0.1:8000/api/ready
-curl --fail http://127.0.0.1:8000/api/health
+curl --fail http://127.0.0.1:19090/api/ready
+curl --fail http://127.0.0.1:19090/api/health
 tail -f /opt/marketing-copilot/logs/app.log
 sudo systemctl stop marketing-copilot.service
 ```

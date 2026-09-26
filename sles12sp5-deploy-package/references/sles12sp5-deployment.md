@@ -83,7 +83,7 @@ monitor_dir/
 - `run.sh` 具有可执行权限。
 - `run.sh` 在读取 env 或交给 systemd 前，将 `$APP_HOME`/`${APP_HOME}` 写成绝对路径，并仅首次创建 `.paths.bak`。
 - 启动脚本缺少依赖时能用包内 wheel 通过 `--no-index` 创建 `venv`。
-- 应用默认监听 8000 端口，并暴露 `/api/ready` 和 `/api/health`。
+- 应用默认监听 19090 端口，并暴露 `/api/ready` 和 `/api/health`。
 
 ## 常见问题
 

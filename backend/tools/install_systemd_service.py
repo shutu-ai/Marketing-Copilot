@@ -127,7 +127,7 @@ def build_exec_start(args, root: Path) -> str:
     python = find_python(root)
     env_path = Path(args.env_file) if args.env_file else Path()
     host = args.host or read_env_value(env_path, "MC_HOST", "0.0.0.0")
-    port = args.port or read_env_value(env_path, "MC_PORT", "8000")
+    port = args.port or read_env_value(env_path, "MC_PORT", "19090")
     return f"{python} -m uvicorn main:app --host {host} --port {port} --workers 1"
 
 
@@ -219,7 +219,7 @@ def main() -> int:
     parser.add_argument("--env-file", default="", help="environment file (default: <app root>/marketing-copilot.env)")
     parser.add_argument("--exec-start", default="", help="override ExecStart (e.g. full path to run.sh or uvicorn)")
     parser.add_argument("--host", default="", help="listen host when starting uvicorn directly (default: from env or 0.0.0.0)")
-    parser.add_argument("--port", default="", help="listen port when starting uvicorn directly (default: from env or 8000)")
+    parser.add_argument("--port", default="", help="listen port when starting uvicorn directly (default: from env or 19090)")
     parser.add_argument("--update-mode", choices=("systemd", "manual", ""), default="systemd",
                         help="MC_UPDATE_MODE written into the env file; empty keeps the current value")
     parser.add_argument("--no-polkit", action="store_true", help="skip the polkit rule for self start/stop")

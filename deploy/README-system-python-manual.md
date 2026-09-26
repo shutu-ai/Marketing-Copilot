@@ -1,13 +1,16 @@
-# Manual offline deployment with system Python 3.11.5
+# Manual offline deployment with standalone SLES12SP5 Python 3.11.5
 
-This package does not include Python, OpenSSL, systemd service files, Docker,
-Podman, Node.js, or npm. It runs in the foreground using an existing target
-`python3.11` installation.
+Install the separate `sles12sp5-python-3.11.5-*.tar.gz` runtime package first.
+This application package does not include Python or OpenSSL. It contains the
+Marketing Copilot source, frontend dist, offline wheels, and launcher only.
+The default runtime is `/opt/marketing-copilot/python/bin/python3.11`.
+Systemd service files, Docker, Podman, Node.js, and npm are not required on the
+target.
 
-## 1. Verify system Python
+## 1. Verify the standalone Python runtime
 
 ```bash
-python3.11 - <<'PY'
+/opt/marketing-copilot/python/bin/python3.11 - <<'PY'
 import ssl, sys
 assert sys.version_info[:3] == (3, 11, 5), sys.version
 assert ssl.OPENSSL_VERSION_INFO >= (1, 1, 1), ssl.OPENSSL_VERSION
@@ -17,8 +20,8 @@ PY
 ```
 
 The command must succeed. Python must also have the `venv` module. If the
-Python executable is not named `python3.11`, set `PYTHON_BIN` before running
-`run.sh`.
+runtime is installed elsewhere, set `MC_PYTHON_BIN` in `marketing-copilot.env`
+before running `run.sh`.
 
 ## 2. Verify and unpack
 
@@ -69,12 +72,12 @@ dependencies from `offline/wheels` using `--no-index`. If `venv` already exists
 but core dependencies are missing, it repairs the environment from the same
 offline wheelhouse before starting the service.
 
-The service remains attached to the current terminal and listens on port 8000.
+The service remains attached to the current terminal and listens on port 19090.
 Verify in a second terminal:
 
 ```bash
-curl --fail http://127.0.0.1:8000/api/ready
-curl --fail http://127.0.0.1:8000/api/health
+curl --fail http://127.0.0.1:19090/api/ready
+curl --fail http://127.0.0.1:19090/api/health
 ```
 
 Stop it with `Ctrl+C`. For background execution, use the organization-approved
