@@ -9,12 +9,12 @@ export interface DashboardStats {
   today_sent_count: number
   total_sms_campaigns: number
   realtime_campaigns: number
-  realtime_files: number
-  realtime_event_users: number
-  realtime_matched_users: number
+  today_realtime_files: number
+  today_realtime_event_users: number
+  today_realtime_matched_users: number
   daily_trend: Array<{ stats_date: string; sent_count: number; conversion_count: number }>
-  open_exception_count: number
-  recent_exceptions: Array<{ id: number; category: string; severity: string; code: string; message: string; created_at: string }>
+  today_open_exception_count: number
+  today_recent_exceptions: Array<{ id: number; category: string; severity: string; code: string; message: string; created_at: string }>
 }
 
 export function getDashboardStats() {

@@ -18,9 +18,9 @@
           </div>
         </article>
         <article class="panel">
-          <div class="panel__header"><div><h3>{{ $t('dashboard.exceptions') }}</h3><p>{{ stats.open_exception_count }} {{ $t('legacy.x1c391952') }}</p></div><el-button link type="primary" @click="$router.push({path:'/operations',query:{tab:'exceptions'}})">{{ $t('dashboard.viewAll') }}</el-button></div>
-          <div v-if="stats.recent_exceptions.length" class="exception-list">
-            <button v-for="item in stats.recent_exceptions" :key="item.id" class="exception-item" @click="$router.push({path:'/operations',query:{tab:'exceptions'}})"><el-tag :type="item.severity === 'error' ? 'danger' : 'warning'" size="small">{{ item.severity }}</el-tag><span><strong>{{ item.code }}</strong><small>{{ item.message }}</small></span><el-icon><ArrowRight /></el-icon></button>
+          <div class="panel__header"><div><h3>{{ $t('dashboard.exceptions') }}</h3><p>{{ stats.today_open_exception_count }} {{ $t('legacy.x1c391952') }}</p></div><el-button link type="primary" @click="$router.push({path:'/operations',query:{tab:'exceptions'}})">{{ $t('dashboard.viewAll') }}</el-button></div>
+          <div v-if="stats.today_recent_exceptions.length" class="exception-list">
+            <button v-for="item in stats.today_recent_exceptions" :key="item.id" class="exception-item" @click="$router.push({path:'/operations',query:{tab:'exceptions'}})"><el-tag :type="item.severity === 'error' ? 'danger' : 'warning'" size="small">{{ item.severity }}</el-tag><span><strong>{{ item.code }}</strong><small>{{ item.message }}</small></span><el-icon><ArrowRight /></el-icon></button>
           </div>
           <div v-else class="healthy-empty"><el-icon><CircleCheckFilled /></el-icon><strong>{{ $t('legacy.xf61f4cf6') }}{{ $t('dashboard.exceptions') }}</strong><span>{{ $t('dashboard.healthy') }}</span></div>
         </article>
@@ -35,10 +35,10 @@ import { useI18n } from 'vue-i18n'
 import { getDashboardStats } from '@/api/dashboard'
 import PageHeader from '@/components/PageHeader.vue'
 import DataState from '@/components/DataState.vue'
-const stats=reactive({total_batch_campaigns:0,in_progress_campaigns:0,in_progress_batch_campaigns:0,in_progress_realtime_campaigns:0,ended_campaigns:0,today_sent_count:0,total_sms_campaigns:0,realtime_campaigns:0,realtime_files:0,realtime_event_users:0,realtime_matched_users:0,daily_trend:[] as Array<{stats_date:string;sent_count:number;conversion_count:number}>,open_exception_count:0,recent_exceptions:[] as any[]})
+const stats=reactive({total_batch_campaigns:0,in_progress_campaigns:0,in_progress_batch_campaigns:0,in_progress_realtime_campaigns:0,ended_campaigns:0,today_sent_count:0,total_sms_campaigns:0,realtime_campaigns:0,today_realtime_files:0,today_realtime_event_users:0,today_realtime_matched_users:0,daily_trend:[] as Array<{stats_date:string;sent_count:number;conversion_count:number}>,today_open_exception_count:0,today_recent_exceptions:[] as any[]})
 const loading=ref(false),loaded=ref(false),error=ref('')
 const { t } = useI18n()
-const kpis=computed(()=>[{label:t('dashboard.todaySent'),value:stats.today_sent_count,hint:t('dashboard.deliveredSms')},{label:t('dashboard.inProgress'),value:stats.in_progress_campaigns,hint:t('dashboard.batchRealtime',{batch:stats.in_progress_batch_campaigns,realtime:stats.in_progress_realtime_campaigns})},{label:t('dashboard.realtimeMatched'),value:stats.realtime_matched_users,hint:t('dashboard.fromFiles',{count:stats.realtime_files})},{label:t('dashboard.openExceptions'),value:stats.open_exception_count,hint:stats.open_exception_count?t('dashboard.handleSoon'):t('dashboard.healthy')}])
+const kpis=computed(()=>[{label:t('dashboard.todaySent'),value:stats.today_sent_count,hint:t('dashboard.deliveredSms')},{label:t('dashboard.inProgress'),value:stats.in_progress_campaigns,hint:t('dashboard.batchRealtime',{batch:stats.in_progress_batch_campaigns,realtime:stats.in_progress_realtime_campaigns})},{label:t('dashboard.realtimeMatched'),value:stats.today_realtime_matched_users,hint:t('dashboard.fromFiles',{count:stats.today_realtime_files})},{label:t('dashboard.openExceptions'),value:stats.today_open_exception_count,hint:stats.today_open_exception_count?t('dashboard.handleSoon'):t('dashboard.healthy')}])
 const trendTotal=computed(()=>stats.daily_trend.reduce((sum,item)=>sum+item.sent_count,0)),trendMax=computed(()=>Math.max(1,...stats.daily_trend.map(item=>item.sent_count)))
 const barHeight=(value:number)=>value?Math.max(8,Math.round(value/trendMax.value*100)):2
 async function load(){loading.value=true;error.value='';try{Object.assign(stats,(await getDashboardStats()).data);loaded.value=true}catch(e:any){error.value=e.response?.data?.detail||t('common.connectionFailed')}finally{loading.value=false}}
