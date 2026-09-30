@@ -1491,7 +1491,9 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
         already_processed_skipped = 0
         backpressure_rejected = 0
         backpressure_reason = ""
-        for fname in os.listdir(watch_dir):
+        # The watched filename contains a fixed-width YYYYMMDDHHMMSS token;
+        # lexical order therefore matches file time order.
+        for fname in sorted(os.listdir(watch_dir)):
             src = os.path.join(watch_dir, fname)
             if not os.path.isfile(src):
                 continue
@@ -1586,7 +1588,8 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             capacity = _inbox_capacity_snapshot(campaign["id"])
             completed_files = _completed_processed_filenames(campaign["id"])
             already_processed_skipped = 0
-            for entry in entries:
+            # Keep SFTP intake order consistent with local watch intake.
+            for entry in sorted(entries, key=lambda item: item.filename):
                 fname = entry.filename
                 if fname in (".", "..") or os.path.basename(fname) != fname:
                     continue

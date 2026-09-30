@@ -110,7 +110,9 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
                       SELECT 1 FROM realtime_campaigns c
                       WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
                  ))
-               ORDER BY created_at,id LIMIT 1""", (campaign_type,)
+               -- Realtime filenames carry a fixed-width YYYYMMDDHHMMSS token,
+               -- so lexical order is chronological for the watched files.
+               ORDER BY CASE WHEN campaign_type='realtime' THEN filename ELSE created_at END,id LIMIT 1""", (campaign_type,)
         ).fetchone()
         if not row:
             return None
