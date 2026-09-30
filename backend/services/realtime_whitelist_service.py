@@ -201,9 +201,14 @@ def get_index_status(campaign: dict) -> dict:
     latest = latest_version(campaign_id)
     version = latest or active
     status = "missing"
+    error_source = version
     if active and active.get("status") == "ready":
         status = "ready" if os.path.isfile(active.get("index_path") or "") else "missing_index"
         version = active
+        # A previously failed, newer version may remain in the history after an
+        # old release switched the campaign back. It must not make the active
+        # version look broken in the detail page.
+        error_source = active if status == "ready" else (latest or active)
     elif version and version.get("status") == "building":
         status = "building"
     elif version and version.get("status") == "failed":
@@ -220,7 +225,7 @@ def get_index_status(campaign: dict) -> dict:
         "row_count": int(version.get("row_count") or 0) if version else int(campaign.get("row_count") or 0),
         "normalized_count": int(version.get("normalized_count") or 0) if version else 0,
         "index_path": version.get("index_path") if version else "",
-        "error_detail": (latest or {}).get("error_detail") or "",
+        "error_detail": (error_source or {}).get("error_detail") or "",
         "created_at": version.get("created_at") if version else None,
         "ready_at": active.get("ready_at") if active else None,
         "waiting_file_count": waiting_files,
