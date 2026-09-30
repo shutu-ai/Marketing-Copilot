@@ -592,9 +592,14 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 {"source_file": source_file},
             )
         conn.commit()
+        # Keep INFO logs bounded.  The created MSISDN list can contain tens of
+        # thousands of sensitive values and is not needed to diagnose queue
+        # throughput; callers still receive it in the API result when needed.
         logger.info(
-            "Tasks enqueued campaign=%s:%s file=%s result=%s",
-            campaign_type, campaign["id"], source_file, result,
+            "Tasks enqueued campaign=%s:%s file=%s created=%s duplicate=%s excluded=%s invalid=%s no_template=%s",
+            campaign_type, campaign["id"], source_file,
+            result["created"], result["duplicate"], result["excluded"],
+            result["invalid"], result["no_template"],
         )
         return result
     finally:
