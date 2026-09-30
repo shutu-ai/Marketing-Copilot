@@ -4,9 +4,15 @@ export interface RealtimeStats {
   file_count: number
   total_msisdn_sum: number
   total_matched: number
+  task_created_users: number
+  accepted_users: number
+  delivered_users: number
   today_file_count: number
   today_msisdn_sum: number
   today_matched: number
+  today_task_created_users: number
+  today_accepted_users: number
+  today_delivered_users: number
   today_reached_users: number
 }
 

@@ -427,11 +427,49 @@ def _count_output_rows(campaign_dir: str, date_prefix: str = "") -> int:
     return total
 
 
+_REALTIME_TASK_STATUS_KEYS = (
+    "queued", "sending", "submitted", "accepted", "delivered",
+    "retrying", "failed", "expired", "cancelled", "archived",
+)
+
+
+def _realtime_task_status_counts(conn, campaign_id: int, date_value: Optional[str] = None) -> dict:
+    """Return one consistent task-state view for realtime campaign metrics.
+
+    Counts are based on sms_tasks, not the output CSV snapshot. ``delivered``
+    means a confirmed delivery receipt; ``accepted`` means the SMSC accepted
+    the submission and is kept separate from confirmed delivery.
+    """
+    where = "campaign_type='realtime' AND campaign_id=?"
+    params = [campaign_id]
+    if date_value:
+        where += " AND CAST(created_at AS DATE)=CAST(? AS DATE)"
+        params.append(date_value)
+    rows = conn.execute(
+        f"SELECT status, COUNT(*) AS count FROM sms_tasks WHERE {where} GROUP BY status",
+        params,
+    ).fetchall()
+    raw = {str(row["status"] or ""): int(row["count"] or 0) for row in rows}
+    result = {key: raw.get(key, 0) for key in _REALTIME_TASK_STATUS_KEYS}
+    result["task_created"] = sum(raw.values())
+    result["accepted_or_delivered"] = result["accepted"] + result["delivered"]
+    result["reached"] = result["delivered"]
+    return result
+
+
 def get_detail(campaign_id: int) -> Optional[dict]:
     campaign = get_one(campaign_id)
     if not campaign:
         return None
-    campaign["reached_users"] = _count_output_rows(campaign.get("campaign_dir", ""))
+    conn = get_connection()
+    try:
+        task_counts = _realtime_task_status_counts(conn, campaign_id)
+    finally:
+        conn.close()
+    campaign["reached_users"] = task_counts["delivered"]
+    campaign["task_created_users"] = task_counts["task_created"]
+    campaign["accepted_users"] = task_counts["accepted"]
+    campaign["delivered_users"] = task_counts["delivered"]
     campaign["whitelist_index"] = realtime_whitelist_service.get_index_status(campaign)
     return campaign
 
@@ -1050,12 +1088,46 @@ def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> 
            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
         (campaign_id, page_size, max(0, page - 1) * page_size),
     ).fetchall()
+    filenames = [str(row["filename"] or "") for row in rows if row["filename"]]
+    task_counts = {}
+    if filenames:
+        placeholders = ",".join("?" for _ in filenames)
+        task_rows = conn.execute(
+            f"""SELECT source_file, status, COUNT(*) AS count
+                FROM sms_tasks
+                WHERE campaign_type='realtime' AND campaign_id=?
+                  AND source_file IN ({placeholders})
+                GROUP BY source_file, status""",
+            [campaign_id, *filenames],
+        ).fetchall()
+        for task_row in task_rows:
+            task_counts.setdefault(str(task_row["source_file"] or ""), {})[
+                str(task_row["status"] or "")
+            ] = int(task_row["count"] or 0)
     conn.close()
+    items = []
+    for row in rows:
+        item = dict(row)
+        raw = task_counts.get(str(item.get("filename") or ""), {})
+        counts = {key: int(raw.get(key, 0)) for key in _REALTIME_TASK_STATUS_KEYS}
+        item.update({
+            "task_count": sum(raw.values()),
+            "accepted_count": counts["accepted"],
+            "delivered_count": counts["delivered"],
+            "queued_count": counts["queued"],
+            "sending_count": counts["sending"],
+            "submitted_count": counts["submitted"],
+            "retrying_count": counts["retrying"],
+            "failed_count": counts["failed"],
+            "expired_count": counts["expired"],
+            "cancelled_count": counts["cancelled"],
+        })
+        items.append(item)
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
-        "items": [dict(r) for r in rows],
+        "items": items,
     }
 
 
@@ -1195,26 +1267,54 @@ def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 
     if not campaign:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
     output_dir = os.path.join(campaign.get("campaign_dir", ""), "output")
-    if not os.path.isdir(output_dir):
-        return {"total": 0, "page": page, "page_size": page_size, "items": []}
+    output_dates = set()
+    if os.path.isdir(output_dir):
+        output_dates = {
+            os.path.splitext(fname)[0]
+            for fname in os.listdir(output_dir)
+            if re.match(r"^\d{8}\.csv$", fname)
+        }
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT CAST(created_at AS DATE) AS report_date, status, COUNT(*) AS count
+               FROM sms_tasks
+               WHERE campaign_type='realtime' AND campaign_id=?
+               GROUP BY CAST(created_at AS DATE), status""",
+            (campaign_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_date = {}
+    for row in rows:
+        date = str(row["report_date"])[:10]
+        date_key = date.replace("-", "")
+        by_date.setdefault(date_key, {})[str(row["status"] or "")] = int(row["count"] or 0)
+
     records = []
-    for fname in sorted(os.listdir(output_dir), reverse=True):
-        if not re.match(r"^\d{8}\.csv$", fname):
-            continue
-        file_path = os.path.join(output_dir, fname)
-        user_count = 0
-        try:
-            df = pd.read_csv(file_path, dtype=str, encoding="utf-8-sig")
-            user_count = len(df)
-        except Exception:
-            pass
-        date_raw = os.path.splitext(fname)[0]
-        try:
-            date = datetime.strptime(date_raw, "%Y%m%d").strftime("%Y-%m-%d")
-        except ValueError:
-            date = date_raw
-        records.append({"date": date, "filename": fname, "user_count": user_count})
-    records.sort(key=lambda item: item["filename"], reverse=True)
+    for date_key in sorted(output_dates | set(by_date), reverse=True):
+        raw = by_date.get(date_key, {})
+        counts = {key: int(raw.get(key, 0)) for key in _REALTIME_TASK_STATUS_KEYS}
+        task_count = sum(raw.values())
+        delivered_count = counts["delivered"]
+        records.append({
+            "date": f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}" if len(date_key) == 8 else date_key,
+            "filename": f"{date_key}.csv",
+            # Backward-compatible field: it now has one strict meaning.
+            "user_count": delivered_count,
+            "task_count": task_count,
+            "accepted_count": counts["accepted"],
+            "delivered_count": delivered_count,
+            "queued_count": counts["queued"],
+            "sending_count": counts["sending"],
+            "submitted_count": counts["submitted"],
+            "retrying_count": counts["retrying"],
+            "failed_count": counts["failed"],
+            "expired_count": counts["expired"],
+            "cancelled_count": counts["cancelled"],
+        })
     total = len(records)
     offset = max(0, page - 1) * page_size
     return {
@@ -1243,6 +1343,8 @@ def get_realtime_stats(campaign_id: int) -> dict:
            WHERE campaign_id=? AND CAST(created_at AS DATE)=CAST(? AS DATE)""",
         (campaign_id, today),
     ).fetchone()
+    task_counts = _realtime_task_status_counts(conn, campaign_id)
+    today_task_counts = _realtime_task_status_counts(conn, campaign_id, today)
     conn.close()
     result = dict(row) if row else {"file_count": 0, "total_msisdn_sum": 0, "total_matched": 0}
     today_result = dict(today_row) if today_row else {
@@ -1251,9 +1353,15 @@ def get_realtime_stats(campaign_id: int) -> dict:
     result["today_file_count"] = int(today_result.get("file_count") or 0)
     result["today_msisdn_sum"] = int(today_result.get("total_msisdn_sum") or 0)
     result["today_matched"] = int(today_result.get("total_matched") or 0)
-    campaign_dir = campaign["campaign_dir"] if campaign else ""
-    result["today_reached_users"] = _count_output_rows(campaign_dir, today.replace("-", ""))
-    result["today_users"] = result["today_reached_users"]
+    for key, value in task_counts.items():
+        result[f"{key}_users"] = value
+    for key, value in today_task_counts.items():
+        result[f"today_{key}_users"] = value
+    # Keep these aliases stable for existing clients while making their
+    # meaning explicit: only confirmed delivery receipts count as reached.
+    result["today_reached_users"] = today_task_counts["delivered"]
+    result["today_users"] = today_task_counts["delivered"]
+    result["reached_users"] = task_counts["delivered"]
     return result
 
 

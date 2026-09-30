@@ -1277,7 +1277,12 @@ def task_stats() -> dict:
             ).fetchall()
             raw = {r["status"]: r["count"] for r in rows}
             result = dict(raw)
-            result["delivered"] = raw.get("delivered", 0) + raw.get("accepted", 0)
+            for status in ("queued", "sending", "submitted", "accepted", "delivered",
+                           "retrying", "failed", "expired", "cancelled", "archived"):
+                result.setdefault(status, 0)
+            # Keep delivery semantics strict. ``accepted`` means the SMSC
+            # accepted submit_sm; it is not a handset delivery receipt.
+            result["accepted_or_delivered"] = raw.get("accepted", 0) + raw.get("delivered", 0)
             result["total"] = sum(raw.values())
         finally:
             conn.close()

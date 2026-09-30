@@ -91,10 +91,24 @@
               </div>
             </div>
             <div class="summary-card">
-              <div class="summary-label">{{ $t('campaign.reachedUsers') }}</div>
+              <div class="summary-label">{{ $t('campaign.taskCreatedUsers') }}</div>
               <div class="summary-value warning">
-                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ campaign?.reached_users ?? '-' }}</div>
-                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_reached_users }}</div>
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.task_created_users }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_task_created_users }}</div>
+              </div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-label">{{ $t('campaign.acceptedUsers') }}</div>
+              <div class="summary-value primary">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.accepted_users }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_accepted_users }}</div>
+              </div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-label">{{ $t('campaign.deliveredUsers') }}</div>
+              <div class="summary-value success">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.delivered_users }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_delivered_users }}</div>
               </div>
             </div>
           </div>
@@ -103,6 +117,8 @@
             <el-table-column prop="filename" :label="$t('campaign.filename')" min-width="200" />
             <el-table-column prop="total_msisdn" :label="$t('campaign.receiveFileTotal')" width="140" />
             <el-table-column prop="matched_count" :label="$t('campaign.receiveFileMatched')" width="140" />
+            <el-table-column prop="task_count" :label="$t('campaign.taskCreatedUsers')" width="140" />
+            <el-table-column prop="delivered_count" :label="$t('campaign.deliveredUsers')" width="120" />
             <el-table-column prop="created_at" :label="$t('common.created_at')" width="180" />
           </el-table>
           <div class="received-pagination">
@@ -121,11 +137,13 @@
           <el-table :data="sentRecords" stripe style="width: 100%" v-loading="sentRecordsLoading">
             <el-table-column prop="date" :label="$t('campaign.date')" width="140" />
             <el-table-column prop="filename" :label="$t('legacy.x29139c2a')" min-width="220" />
-            <el-table-column prop="user_count" :label="$t('legacy.x71cb565f')" width="100" />
+            <el-table-column prop="task_count" :label="$t('campaign.taskCreatedUsers')" width="120" />
+            <el-table-column prop="accepted_count" :label="$t('campaign.acceptedUsers')" width="120" />
+            <el-table-column prop="delivered_count" :label="$t('campaign.deliveredUsers')" width="120" />
             <el-table-column :label="$t('legacy.x82623f9e')" width="150" fixed="right">
               <template #default="{ row }">
                 <el-button text type="primary" size="small" @click="downloadSentRecord(row)">
-                  {{ $t('common.download') }}
+                  {{ $t('campaign.downloadTaskSnapshot') }}
                 </el-button>
               </template>
             </el-table-column>
@@ -204,9 +222,15 @@ const stats = reactive({
   file_count: 0,
   total_msisdn_sum: 0,
   total_matched: 0,
+  task_created_users: 0,
+  accepted_users: 0,
+  delivered_users: 0,
   today_file_count: 0,
   today_msisdn_sum: 0,
   today_matched: 0,
+  today_task_created_users: 0,
+  today_accepted_users: 0,
+  today_delivered_users: 0,
   today_reached_users: 0,
 })
 const smppOptions = ref<any[]>([])
@@ -410,12 +434,12 @@ watch(activeTab, (tab) => {
   z-index: 2;
 }
 .summary-row {
-  display: flex;
+  display: flex; flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
 }
 .summary-card {
-  flex: 1;
+  flex: 1 1 150px;
   background: var(--mc-surface-muted);
   border: 1px solid var(--mc-border);
   border-radius: var(--mc-radius);
