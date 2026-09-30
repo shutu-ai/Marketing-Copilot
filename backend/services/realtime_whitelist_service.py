@@ -179,53 +179,6 @@ def get_version(version_id: int) -> Optional[dict]:
         conn.close()
 
 
-def invalidate_version(version_id: int, error_detail: str) -> Optional[dict]:
-    """Mark a broken index failed and restore the newest usable ready version."""
-    conn = get_connection()
-    try:
-        version = conn.execute(
-            "SELECT * FROM realtime_whitelist_versions WHERE id=?", (version_id,)
-        ).fetchone()
-        if not version:
-            return None
-        campaign_id = version["campaign_id"]
-        campaign = conn.execute(
-            "SELECT active_whitelist_version_id FROM realtime_campaigns WHERE id=?",
-            (campaign_id,),
-        ).fetchone()
-        conn.execute(
-            "UPDATE realtime_whitelist_versions SET status='failed',error_detail=? WHERE id=?",
-            (str(error_detail)[:4000], version_id),
-        )
-        if not campaign or campaign["active_whitelist_version_id"] != version_id:
-            conn.commit()
-            return None
-        fallback = conn.execute(
-            """SELECT * FROM realtime_whitelist_versions
-               WHERE campaign_id=? AND status='ready' AND id<>?
-                 AND COALESCE(index_path,'')<>''
-               ORDER BY version_no DESC LIMIT 1""",
-            (campaign_id, version_id),
-        ).fetchone()
-        if fallback:
-            conn.execute(
-                """UPDATE realtime_campaigns SET active_whitelist_version_id=?,
-                   customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP
-                   WHERE id=?""",
-                (fallback["id"], fallback["source_filename"], fallback["source_path"],
-                 fallback["row_count"], campaign_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE realtime_campaigns SET active_whitelist_version_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (campaign_id,),
-            )
-        conn.commit()
-        return dict(fallback) if fallback else None
-    finally:
-        conn.close()
-
-
 def latest_version(campaign_id: int) -> Optional[dict]:
     conn = get_connection()
     try:

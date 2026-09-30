@@ -556,8 +556,7 @@ def _open_whitelist_index(path: str):
         try:
             conn = duckdb.connect(path, read_only=True)
             # Connecting to a damaged DuckDB file can succeed before the first
-            # table access. Validate the schema once so a bad active version can
-            # be invalidated and rolled back before any input rows are consumed.
+            # table access. Validate the schema before consuming any input rows.
             conn.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
             return conn
         except Exception as exc:
@@ -707,58 +706,30 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 "retryable": True,
                 "message": f"whitelist index temporarily busy: {e}",
             }
-        fallback = None
-        if campaign.get("use_whitelist", True) and whitelist_version and whitelist_version_id:
-            failed_version_id = whitelist_version_id
-            fallback = realtime_whitelist_service.invalidate_version(
-                failed_version_id,
-                f"Cannot read whitelist index: {e}",
-            )
-            if fallback:
-                whitelist_version = fallback
-                whitelist_version_id = fallback["id"]
-                whitelist_path = fallback["index_path"]
-                conn = get_connection()
-                try:
-                    conn.execute(
-                        "UPDATE processed_files SET whitelist_version_id=?,processing_phase='validating' WHERE id=?",
-                        (whitelist_version_id, file_record_id),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-                ingestion_job_service.update_progress(
-                    ingestion_file_id, "validating", whitelist_version_id=whitelist_version_id
-                )
-                try:
-                    progress("loading_index")
-                    whitelist_conn = _open_whitelist_index(whitelist_path)
-                    whitelist_languages = None
-                    whitelist_set = None
-                except Exception as fallback_error:
-                    e = RuntimeError(
-                        f"Cannot read whitelist index version {failed_version_id}; "
-                        f"fallback version {whitelist_version_id} also failed: {fallback_error}"
-                    )
-                    fallback = None
-        if fallback:
-            operations_service.event(
-                "realtime_ingestion", "WHITELIST_INDEX_ROLLBACK",
-                f"Whitelist index version {failed_version_id} was invalid; "
-                f"using version {whitelist_version_id}",
-                severity="warning",
-                context={"campaign_id": campaign_id, "failed_version_id": failed_version_id,
-                         "fallback_version_id": whitelist_version_id},
-            )
-        else:
-            operations_service.finish_file(file_record_id, "failed", file_path, error=f"Cannot read whitelist: {e}")
-            return {
-                "success": False,
-                "status": "failed",
-                "error_class": "WHITELIST_INDEX",
-                "retryable": False,
-                "message": f"Cannot read whitelist: {e}",
-            }
+        # The active whitelist is authoritative. Never mark it failed or
+        # substitute an older version when its index cannot be read. Keep the
+        # file pending so the index can be repaired/rebuilt and retried.
+        ingestion_job_service.update_progress(
+            ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
+        )
+        operations_service.event(
+            "realtime_ingestion", "WHITELIST_INDEX_UNAVAILABLE",
+            f"Cannot read active whitelist index: {e}",
+            severity="error",
+            context={
+                "campaign_id": campaign_id,
+                "version_id": whitelist_version_id,
+                "index_path": whitelist_path,
+                "filename": original_filename,
+            },
+        )
+        return {
+            "success": False,
+            "status": "waiting_for_whitelist",
+            "error_class": "WHITELIST_INDEX",
+            "retryable": True,
+            "message": f"Cannot read active whitelist index: {e}",
+        }
 
     # Match input MSISDNs against whitelist. CSV chunks are fully matched,
     # enqueued and written before the next chunk is read. A disk-backed unique
