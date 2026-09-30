@@ -390,6 +390,7 @@ def start_worker():
         _cleanup_orphaned_intermediate_files()
         _last_expiry_sweep_date = datetime.now().date()
         _last_inactive_campaign_sweep_at = time.monotonic()
+        realtime_whitelist_service.repair_active_failed(limit=5)
     except Exception:
         logger.exception("Realtime expired-file startup cleanup failed")
     _stop.clear()

@@ -296,15 +296,39 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
     conn = get_connection()
     try:
         campaign = conn.execute(
-            "SELECT active_whitelist_version_id FROM realtime_campaigns WHERE id=?",
+            "SELECT active_whitelist_version_id,customer_list_path FROM realtime_campaigns WHERE id=?",
             (version["campaign_id"],),
         ).fetchone()
     finally:
         conn.close()
     if not campaign or int(campaign["active_whitelist_version_id"] or 0) != int(version_id):
         return False
-    if not os.path.isfile(version.get("source_path") or ""):
-        return False
+    source_path = version.get("source_path") or ""
+    if not os.path.isfile(source_path):
+        # An upgrade or manual cleanup can remove the historical path. It is
+        # safe to restore it only when the campaign's current source has the
+        # exact hash recorded for this same version; never substitute another
+        # whitelist silently.
+        candidate = campaign["customer_list_path"] or ""
+        try:
+            same_source = (
+                os.path.isfile(candidate)
+                and operations_service.file_digest(candidate) == version.get("source_hash")
+            )
+        except Exception:
+            same_source = False
+        if not same_source:
+            logger.error(
+                "Active whitelist rebuild skipped: source missing or hash mismatch campaign=%s version=%s source=%s",
+                version["campaign_id"], version_id, source_path,
+            )
+            return False
+        conn = get_connection()
+        try:
+            conn.execute("UPDATE realtime_whitelist_versions SET source_path=? WHERE id=?", (candidate, version_id))
+            conn.commit()
+        finally:
+            conn.close()
     if version.get("status") == "building":
         return True
     _set_status(
