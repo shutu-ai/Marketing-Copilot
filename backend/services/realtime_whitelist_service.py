@@ -282,6 +282,45 @@ def _set_status(version_id: int, status: str, **fields) -> None:
         conn.close()
 
 
+def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
+    """Put the currently active whitelist version back into the build queue.
+
+    This deliberately keeps the campaign bound to ``version_id``.  It is a
+    repair of the authoritative version, never a fallback to an older index.
+    Returning False means the version is no longer active or its source is no
+    longer available, so callers can fail the waiting file explicitly.
+    """
+    version = get_version(version_id)
+    if not version:
+        return False
+    conn = get_connection()
+    try:
+        campaign = conn.execute(
+            "SELECT active_whitelist_version_id FROM realtime_campaigns WHERE id=?",
+            (version["campaign_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not campaign or int(campaign["active_whitelist_version_id"] or 0) != int(version_id):
+        return False
+    if not os.path.isfile(version.get("source_path") or ""):
+        return False
+    if version.get("status") == "building":
+        return True
+    _set_status(
+        version_id,
+        "building",
+        error_detail=str(error_detail or "")[:4000],
+        ready_at=None,
+        retired_at=None,
+    )
+    logger.warning(
+        "Realtime whitelist rebuild scheduled campaign=%s version=%s reason=%s",
+        version["campaign_id"], version_id, str(error_detail or "")[:500],
+    )
+    return True
+
+
 def _configure(conn) -> None:
     try:
         conn.execute("SET memory_limit = ?", (settings_service.get_setting(

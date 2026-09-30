@@ -543,6 +543,45 @@ def _is_transient_whitelist_index_error(error: Exception) -> bool:
     ))
 
 
+def _is_repairable_whitelist_error(error) -> bool:
+    """Identify index failures that can be repaired from the same source file."""
+    message = str(error or "").lower()
+    return any(marker in message for marker in (
+        "write-write conflict",
+        "transactioncontext",
+        "transaction conflict",
+        "database is locked",
+        "could not set lock",
+        "conflicting lock",
+        "cannot read whitelist index",
+        "cannot read active whitelist index",
+        "catalog error",
+        "io error",
+        "corrupt",
+    ))
+
+
+def _schedule_active_whitelist_rebuild(campaign_id: int, version_id: Optional[int], error) -> bool:
+    if not version_id:
+        return False
+    try:
+        scheduled = realtime_whitelist_service.schedule_active_rebuild(version_id, str(error))
+    except Exception:
+        logger.exception(
+            "Unable to schedule active whitelist rebuild campaign=%s version=%s",
+            campaign_id, version_id,
+        )
+        return False
+    if scheduled:
+        operations_service.event(
+            "realtime_ingestion", "WHITELIST_INDEX_REBUILD_SCHEDULED",
+            f"Rebuilding active whitelist index: {str(error)[:1000]}",
+            severity="warning",
+            context={"campaign_id": campaign_id, "version_id": version_id},
+        )
+    return scheduled
+
+
 def _open_whitelist_index(path: str):
     """Open and minimally validate a persistent whitelist index.
 
@@ -651,7 +690,31 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
                 "message": "whitelist index is still building"}
     if campaign.get("use_whitelist", True) and whitelist_version:
-        if whitelist_version.get("status") != "ready" or not os.path.isfile(whitelist_version.get("index_path", "")):
+        whitelist_status = whitelist_version.get("status")
+        if whitelist_status == "failed":
+            error_detail = whitelist_version.get("error_detail") or "whitelist index build failed"
+            if _is_repairable_whitelist_error(error_detail) and _schedule_active_whitelist_rebuild(
+                campaign_id, whitelist_version_id, error_detail,
+            ):
+                ingestion_job_service.update_progress(
+                    ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
+                )
+                return {
+                    "success": False,
+                    "status": "waiting_for_whitelist",
+                    "retryable": True,
+                    "message": f"active whitelist index repair scheduled: {error_detail}",
+                }
+            terminal_error = f"whitelist index build failed: {error_detail}"
+            operations_service.finish_file(file_record_id, "failed", file_path, error=terminal_error)
+            return {
+                "success": False,
+                "status": "failed",
+                "error_class": "WHITELIST_INDEX",
+                "retryable": False,
+                "message": terminal_error,
+            }
+        if whitelist_status != "ready" or not os.path.isfile(whitelist_version.get("index_path", "")):
             ingestion_job_service.update_progress(ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id)
             return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
                     "message": "whitelist index is still building"}
@@ -696,6 +759,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     except Exception as e:
         if whitelist_conn:
             whitelist_conn.close()
+        rebuild_scheduled = _schedule_active_whitelist_rebuild(campaign_id, whitelist_version_id, e)
         if _is_transient_whitelist_index_error(e):
             ingestion_job_service.update_progress(
                 ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
@@ -704,7 +768,8 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 "success": False,
                 "status": "waiting_for_whitelist",
                 "retryable": True,
-                "message": f"whitelist index temporarily busy: {e}",
+                "message": f"active whitelist index repair scheduled: {e}" if rebuild_scheduled
+                else f"whitelist index temporarily busy: {e}",
             }
         # The active whitelist is authoritative. Never mark it failed or
         # substitute an older version when its index cannot be read. Keep the
@@ -712,23 +777,25 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         ingestion_job_service.update_progress(
             ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
         )
-        operations_service.event(
-            "realtime_ingestion", "WHITELIST_INDEX_UNAVAILABLE",
-            f"Cannot read active whitelist index: {e}",
-            severity="error",
-            context={
-                "campaign_id": campaign_id,
-                "version_id": whitelist_version_id,
-                "index_path": whitelist_path,
-                "filename": original_filename,
-            },
-        )
+        if not rebuild_scheduled:
+            operations_service.event(
+                "realtime_ingestion", "WHITELIST_INDEX_UNAVAILABLE",
+                f"Cannot read active whitelist index: {e}",
+                severity="error",
+                context={
+                    "campaign_id": campaign_id,
+                    "version_id": whitelist_version_id,
+                    "index_path": whitelist_path,
+                    "filename": original_filename,
+                },
+            )
         return {
             "success": False,
             "status": "waiting_for_whitelist",
             "error_class": "WHITELIST_INDEX",
             "retryable": True,
-            "message": f"Cannot read active whitelist index: {e}",
+            "message": f"active whitelist index repair scheduled: {e}" if rebuild_scheduled
+            else f"Cannot read active whitelist index: {e}",
         }
 
     # Match input MSISDNs against whitelist. CSV chunks are fully matched,
