@@ -188,7 +188,7 @@ def requeue_waiting_whitelist_files(campaign_id: int) -> int:
         count = conn.execute(
             """SELECT COUNT(*) AS count FROM ingestion_files
                WHERE campaign_type='realtime' AND campaign_id=?
-                 AND last_error_class='WAITING_DEPENDENCY'
+                 AND last_error_class IN ('WAITING_DEPENDENCY','WHITELIST_INDEX')
                  AND status IN ('retrying','failed','quarantined')""",
             (campaign_id,),
         ).fetchone()["count"]
@@ -197,7 +197,7 @@ def requeue_waiting_whitelist_files(campaign_id: int) -> int:
                       last_error_class='',last_error_at=NULL,next_retry_at=NULL,error_detail='',
                       lease_token='',lease_expires_at=NULL,worker_id='',updated_at=CURRENT_TIMESTAMP
                WHERE campaign_type='realtime' AND campaign_id=?
-                 AND last_error_class='WAITING_DEPENDENCY'
+                 AND last_error_class IN ('WAITING_DEPENDENCY','WHITELIST_INDEX')
                  AND status IN ('retrying','failed','quarantined')""",
             (campaign_id,),
         )
