@@ -1192,22 +1192,35 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
     conn = get_connection()
     # This is the hard cross-day guard. It also repairs tasks missed by the
     # scheduler at midnight; task_date is independently enforced by the worker.
-    stale = conn.execute(
+    stale_count = conn.execute(
+        """SELECT COUNT(*) AS count FROM sms_tasks
+           WHERE campaign_type='realtime' AND CAST(task_date AS DATE) < CAST(? AS DATE)
+             AND status IN ('queued','retrying','sending')""",
+        (today,),
+    ).fetchone()["count"]
+    conn.execute(
         """UPDATE sms_tasks SET status='cancelled', error_msg='previous day task cancelled',
            claim_token='',updated_at=CURRENT_TIMESTAMP
            WHERE campaign_type='realtime' AND CAST(task_date AS DATE) < CAST(? AS DATE)
              AND status IN ('queued','retrying','sending')""",
         (today,),
-    ).rowcount or 0
+    )
     campaigns = conn.execute(
         "SELECT id,send_start_time,send_end_time FROM realtime_campaigns"
     ).fetchall()
-    cancelled = stale
+    cancelled = int(stale_count or 0)
     for row in campaigns:
         campaign = dict(row)
         if not _daily_window_ended(campaign, now):
             continue
-        result = conn.execute(
+        daily_count = conn.execute(
+            """SELECT COUNT(*) AS count FROM sms_tasks
+               WHERE campaign_type='realtime' AND campaign_id=?
+                 AND CAST(task_date AS DATE)=CAST(? AS DATE)
+                 AND status IN ('queued','retrying','sending')""",
+            (campaign["id"], today),
+        ).fetchone()["count"]
+        conn.execute(
             """UPDATE sms_tasks SET status='cancelled', error_msg='daily send window ended',
                claim_token='',updated_at=CURRENT_TIMESTAMP
                WHERE campaign_type='realtime' AND campaign_id=?
@@ -1215,7 +1228,7 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
                  AND status IN ('queued','retrying','sending')""",
             (campaign["id"], today),
         )
-        cancelled += result.rowcount or 0
+        cancelled += int(daily_count or 0)
     conn.commit()
     conn.close()
     if cancelled:
