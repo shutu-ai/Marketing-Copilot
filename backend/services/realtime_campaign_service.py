@@ -1146,6 +1146,7 @@ def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 
 
 
 def get_realtime_stats(campaign_id: int) -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
     conn = get_connection()
     campaign = conn.execute(
         "SELECT campaign_dir FROM realtime_campaigns WHERE id=?",
@@ -1155,10 +1156,24 @@ def get_realtime_stats(campaign_id: int) -> dict:
         "SELECT COUNT(*) AS file_count, COALESCE(SUM(total_msisdn),0) AS total_msisdn_sum, COALESCE(SUM(matched_count),0) AS total_matched FROM realtime_campaign_files WHERE campaign_id=?",
         (campaign_id,)
     ).fetchone()
+    today_row = conn.execute(
+        """SELECT COUNT(*) AS file_count, COALESCE(SUM(total_msisdn),0) AS total_msisdn_sum,
+                  COALESCE(SUM(matched_count),0) AS total_matched
+           FROM realtime_campaign_files
+           WHERE campaign_id=? AND CAST(created_at AS DATE)=CAST(? AS DATE)""",
+        (campaign_id, today),
+    ).fetchone()
     conn.close()
     result = dict(row) if row else {"file_count": 0, "total_msisdn_sum": 0, "total_matched": 0}
+    today_result = dict(today_row) if today_row else {
+        "file_count": 0, "total_msisdn_sum": 0, "total_matched": 0,
+    }
+    result["today_file_count"] = int(today_result.get("file_count") or 0)
+    result["today_msisdn_sum"] = int(today_result.get("total_msisdn_sum") or 0)
+    result["today_matched"] = int(today_result.get("total_matched") or 0)
     campaign_dir = campaign["campaign_dir"] if campaign else ""
-    result["today_users"] = _count_output_rows(campaign_dir, datetime.now().strftime("%Y%m%d"))
+    result["today_reached_users"] = _count_output_rows(campaign_dir, today.replace("-", ""))
+    result["today_users"] = result["today_reached_users"]
     return result
 
 

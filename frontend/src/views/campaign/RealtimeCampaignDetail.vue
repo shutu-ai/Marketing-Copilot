@@ -71,19 +71,31 @@
           <div class="summary-row">
             <div class="summary-card">
               <div class="summary-label">{{ $t('campaign.receivedFiles') }}</div>
-              <div class="summary-value primary">{{ stats.file_count }}</div>
+              <div class="summary-value primary">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.file_count }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_file_count }}</div>
+              </div>
             </div>
             <div class="summary-card">
               <div class="summary-label">{{ $t('campaign.eventUsers') }}</div>
-              <div class="summary-value primary">{{ stats.total_msisdn_sum }}</div>
+              <div class="summary-value primary">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.total_msisdn_sum }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_msisdn_sum }}</div>
+              </div>
             </div>
             <div class="summary-card">
               <div class="summary-label">{{ $t('campaign.matchedUsers') }}</div>
-              <div class="summary-value success">{{ stats.total_matched }}</div>
+              <div class="summary-value success">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.total_matched }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_matched }}</div>
+              </div>
             </div>
             <div class="summary-card">
               <div class="summary-label">{{ $t('campaign.reachedUsers') }}</div>
-              <div class="summary-value warning">{{ campaign?.reached_users ?? '-' }}</div>
+              <div class="summary-value warning">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ campaign?.reached_users ?? '-' }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_reached_users }}</div>
+              </div>
             </div>
           </div>
 
@@ -188,7 +200,15 @@ const watchFiles = ref<any[]>([])
 const watchFilesTotal = ref(0)
 const watchFilesLoading = ref(false)
 const activeTab = ref('received')
-const stats = reactive({ file_count: 0, total_msisdn_sum: 0, total_matched: 0 })
+const stats = reactive({
+  file_count: 0,
+  total_msisdn_sum: 0,
+  total_matched: 0,
+  today_file_count: 0,
+  today_msisdn_sum: 0,
+  today_matched: 0,
+  today_reached_users: 0,
+})
 const smppOptions = ref<any[]>([])
 
 function smppName(configId: number | null) {
@@ -410,6 +430,21 @@ watch(activeTab, (tab) => {
 .summary-value {
   font-size: 20px;
   font-weight: 700;
+  line-height: 1.35;
+}
+.summary-period {
+  display: inline-block;
+  min-width: 34px;
+  margin-right: 4px;
+  color: var(--mc-text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+.summary-today {
+  margin-top: 2px;
+  font-size: 15px;
+  font-weight: 600;
 }
 .summary-value.primary { color: var(--mc-primary-hover); }
 .summary-value.success { color: var(--mc-success); }

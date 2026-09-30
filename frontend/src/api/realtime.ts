@@ -4,6 +4,10 @@ export interface RealtimeStats {
   file_count: number
   total_msisdn_sum: number
   total_matched: number
+  today_file_count: number
+  today_msisdn_sum: number
+  today_matched: number
+  today_reached_users: number
 }
 
 export function getRealtimeStats(campaignId: number) {

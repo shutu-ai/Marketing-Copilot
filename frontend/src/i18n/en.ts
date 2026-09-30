@@ -176,6 +176,8 @@ export default {
     receiveFileTotal: 'Unique Numbers',
     receiveFileMatched: 'Matched Users',
     eventUsers: 'Event Users',
+    cumulative: 'Total',
+    today: 'Today',
     overallProgress: 'Overall Progress',
     dailyProgress: 'Daily Progress',
     date: 'Date',

@@ -181,6 +181,8 @@ export default {
     receiveFileTotal: '去重号码数',
     receiveFileMatched: '匹配用户数',
     eventUsers: '事件用户数',
+    cumulative: '累计',
+    today: '今日',
     overallProgress: '整体进度',
     dailyProgress: '日进度',
     date: '日期',
