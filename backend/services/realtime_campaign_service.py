@@ -451,24 +451,33 @@ def _task_msisdn_for_campaign(value, campaign: dict) -> str:
     return prefix + normalized if prefix and not normalized.startswith(prefix) else normalized
 
 
-def _inbox_capacity_available(campaign_id: int, file_size: int = 0) -> tuple[bool, str]:
+def _inbox_capacity_snapshot(campaign_id: int) -> dict:
     conn = get_connection()
     try:
-        campaign_count = conn.execute(
-            """SELECT COUNT(*) AS count FROM ingestion_files
-               WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('pending','processing','retrying')""",
+        row = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN campaign_id=? THEN 1 ELSE 0 END) AS campaign_count,
+                 COUNT(*) AS total_count,
+                 COALESCE(SUM(file_size),0) AS total_bytes
+               FROM ingestion_files
+               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')""",
             (campaign_id,),
-        ).fetchone()["count"]
-        total_count = conn.execute(
-            """SELECT COUNT(*) AS count FROM ingestion_files
-               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')"""
-        ).fetchone()["count"]
-        total_bytes = conn.execute(
-            """SELECT COALESCE(SUM(file_size),0) AS bytes FROM ingestion_files
-               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')"""
-        ).fetchone()["bytes"]
+        ).fetchone()
     finally:
         conn.close()
+    return {
+        "campaign_count": int(row["campaign_count"] or 0),
+        "total_count": int(row["total_count"] or 0),
+        "total_bytes": int(row["total_bytes"] or 0),
+    }
+
+
+def _inbox_capacity_available(campaign_id: int, file_size: int = 0,
+                              capacity: Optional[dict] = None) -> tuple[bool, str]:
+    capacity = capacity or _inbox_capacity_snapshot(campaign_id)
+    campaign_count = capacity["campaign_count"]
+    total_count = capacity["total_count"]
+    total_bytes = capacity["total_bytes"]
     if int(campaign_count or 0) >= MAX_PENDING_FILES_PER_CAMPAIGN:
         return False, "campaign realtime inbox pending limit reached"
     if int(total_count or 0) >= MAX_INBOX_FILES:
@@ -476,6 +485,12 @@ def _inbox_capacity_available(campaign_id: int, file_size: int = 0) -> tuple[boo
     if int(total_bytes or 0) + int(file_size or 0) > MAX_INBOX_BYTES:
         return False, "global realtime inbox byte limit reached"
     return True, ""
+
+
+def _record_inbox_capacity_file(capacity: dict, file_size: int) -> None:
+    capacity["campaign_count"] += 1
+    capacity["total_count"] += 1
+    capacity["total_bytes"] += max(0, int(file_size or 0))
 
 
 def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
@@ -1408,6 +1423,9 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
         prefix = campaign.get("watch_filename_prefix", "Android_4G_Switch_Somali_")
         if not prefix:
             prefix = "Android_4G_Switch_Somali_"
+        capacity = _inbox_capacity_snapshot(campaign["id"])
+        backpressure_rejected = 0
+        backpressure_reason = ""
         for fname in os.listdir(watch_dir):
             src = os.path.join(watch_dir, fname)
             if not os.path.isfile(src):
@@ -1435,10 +1453,14 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
                 logger.info("Watch file skipped campaign=%s file=%s reason=already processed", campaign.get("id"), fname)
                 continue
             try:
-                allowed, capacity_reason = _inbox_capacity_available(campaign["id"], os.path.getsize(src))
+                file_size = os.path.getsize(src)
+                allowed, capacity_reason = _inbox_capacity_available(
+                    campaign["id"], file_size, capacity=capacity,
+                )
                 if not allowed:
-                    logger.warning("Realtime inbox backpressure campaign=%s file=%s reason=%s", campaign["id"], fname, capacity_reason)
-                    continue
+                    backpressure_rejected += 1
+                    backpressure_reason = capacity_reason
+                    break
                 shutil.copy2(src, dest)
                 try:
                     os.utime(dest, None)
@@ -1449,10 +1471,16 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
                     "realtime", campaign["id"], fname, dest,
                     chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
                 )
+                _record_inbox_capacity_file(capacity, file_size)
                 total_moved += 1
                 logger.info("Watch file copied campaign=%s src=%s dest=%s", campaign.get("id"), src, dest)
             except OSError:
                 pass
+        if backpressure_rejected:
+            logger.warning(
+                "Realtime inbox backpressure campaign=%s rejected=%s reason=%s",
+                campaign["id"], backpressure_rejected, backpressure_reason,
+            )
     if total_moved:
         logger.info("Watch sync complete moved=%s", total_moved)
     return {"moved": total_moved}
@@ -1473,6 +1501,8 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
     for row in rows:
         campaign = dict(row)
         client = sftp = None
+        backpressure_rejected = 0
+        backpressure_reason = ""
         try:
             active, reason = sms_task_service.campaign_is_active(campaign, now)
             if not active:
@@ -1489,6 +1519,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             os.makedirs(inbox_dir, exist_ok=True)
             prefix = campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_"
             remote_dir = campaign["watch_dir"].rstrip("/") or "/"
+            capacity = _inbox_capacity_snapshot(campaign["id"])
             for entry in entries:
                 fname = entry.filename
                 if fname in (".", "..") or os.path.basename(fname) != fname:
@@ -1508,10 +1539,14 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                 processed = _processed_file_record(campaign["id"], fname)
                 if processed and processed.get("status") == "completed":
                     continue
-                allowed, capacity_reason = _inbox_capacity_available(campaign["id"], entry.st_size or 0)
+                file_size = entry.st_size or 0
+                allowed, capacity_reason = _inbox_capacity_available(
+                    campaign["id"], file_size, capacity=capacity,
+                )
                 if not allowed:
-                    logger.warning("SFTP realtime inbox backpressure campaign=%s file=%s reason=%s", campaign["id"], fname, capacity_reason)
-                    continue
+                    backpressure_rejected += 1
+                    backpressure_reason = capacity_reason
+                    break
                 temp_fd, temp_path = tempfile.mkstemp(prefix=".sftp-", suffix=".part", dir=inbox_dir)
                 os.close(temp_fd)
                 try:
@@ -1527,6 +1562,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                         "realtime", campaign["id"], fname, dest,
                         chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
                     )
+                    _record_inbox_capacity_file(capacity, file_size)
                     total_downloaded += 1
                     logger.info("SFTP watch file downloaded campaign=%s host=%s file=%s", campaign["id"], campaign.get("sftp_host"), fname)
                 finally:
@@ -1539,6 +1575,11 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                 sftp.close()
             if client:
                 client.close()
+        if backpressure_rejected:
+            logger.warning(
+                "SFTP realtime inbox backpressure campaign=%s rejected=%s reason=%s",
+                campaign["id"], backpressure_rejected, backpressure_reason,
+            )
     return {"downloaded": total_downloaded}
 
 
