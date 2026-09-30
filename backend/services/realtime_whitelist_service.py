@@ -576,8 +576,10 @@ def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
                 retired += 1
                 continue
             old_enough = conn.execute(
-                "SELECT CAST(COALESCE(retired_at,created_at) AS TIMESTAMP) < CURRENT_TIMESTAMP - (? * INTERVAL '1 day') old_enough",
-                (retention_days,),
+                """SELECT CAST(COALESCE(retired_at,created_at) AS TIMESTAMP)
+                          < CURRENT_TIMESTAMP - (? * INTERVAL '1 day') old_enough
+                   FROM realtime_whitelist_versions WHERE id=?""",
+                (retention_days, row["id"]),
             ).fetchone()["old_enough"]
             if not old_enough:
                 continue

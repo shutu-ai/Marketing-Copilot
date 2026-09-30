@@ -707,6 +707,7 @@ def init_db():
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS phone_prefix TEXT DEFAULT ''",
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS active_whitelist_version_id INTEGER",
+        "ALTER TABLE realtime_whitelist_versions ADD COLUMN IF NOT EXISTS retired_at TEXT",
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS whitelist_version_id INTEGER",
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS processing_started_at TEXT",
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS last_progress_at TEXT",
