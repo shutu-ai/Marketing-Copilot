@@ -140,7 +140,8 @@ def update_progress(file_id: int, phase: str, processed_rows: Optional[int] = No
         conn.close()
 
 
-def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int) -> dict:
+def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int,
+                   allow_unbounded: bool = False) -> dict:
     conn = get_connection()
     try:
         row = conn.execute("SELECT retry_count,max_retry_count FROM ingestion_files WHERE id=?", (file_id,)).fetchone()
@@ -148,7 +149,7 @@ def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int) ->
             return {"scheduled": False, "retry_count": 0, "max_retry_count": 0}
         retry_count = int(row["retry_count"] or 0) + 1
         max_retry_count = int(row["max_retry_count"] or 4)
-        if retry_count > max_retry_count:
+        if retry_count > max_retry_count and not allow_unbounded:
             return {"scheduled": False, "retry_count": retry_count, "max_retry_count": max_retry_count}
         conn.execute(
             """UPDATE ingestion_files SET status='retrying',retry_count=?,last_error_class=?,
@@ -163,6 +164,47 @@ def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int) ->
         conn.close()
 
 
+def requeue_waiting_whitelist_files(campaign_id: int) -> int:
+    """Immediately retry realtime files held only by a whitelist dependency."""
+    conn = get_connection()
+    try:
+        count = conn.execute(
+            """SELECT COUNT(*) AS count FROM ingestion_files
+               WHERE campaign_type='realtime' AND campaign_id=?
+                 AND last_error_class='WAITING_DEPENDENCY'
+                 AND status IN ('retrying','failed','quarantined')""",
+            (campaign_id,),
+        ).fetchone()["count"]
+        result = conn.execute(
+            """UPDATE ingestion_files SET status='pending',processing_phase='queued',retry_count=0,
+                      last_error_class='',last_error_at=NULL,next_retry_at=NULL,error_detail='',
+                      lease_token='',lease_expires_at=NULL,worker_id='',updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type='realtime' AND campaign_id=?
+                 AND last_error_class='WAITING_DEPENDENCY'
+                 AND status IN ('retrying','failed','quarantined')""",
+            (campaign_id,),
+        )
+        conn.commit()
+        return int(count or 0)
+    finally:
+        conn.close()
+
+
+def count_waiting_whitelist_files(campaign_id: int) -> int:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) AS count FROM ingestion_files
+               WHERE campaign_type='realtime' AND campaign_id=?
+                 AND last_error_class='WAITING_DEPENDENCY'
+                 AND status IN ('pending','retrying','failed','quarantined')""",
+            (campaign_id,),
+        ).fetchone()
+        return int(row["count"] or 0)
+    finally:
+        conn.close()
+
+
 def fail_file(file_id: int, error_class: str, error: str, status: str = "failed") -> None:
     conn = get_connection()
     try:
@@ -173,6 +215,75 @@ def fail_file(file_id: int, error_class: str, error: str, status: str = "failed"
             (status, "quarantined" if status == "quarantined" else "failed", error_class, str(error)[:4000], file_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def expire_file(file_id: int, error: str, include_processing: bool = False) -> bool:
+    """Mark an out-of-date realtime file terminal so it no longer occupies the queue."""
+    conn = get_connection()
+    try:
+        active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
+        conn.execute(
+            """UPDATE ingestion_files SET status='failed',processing_phase='failed',
+               last_error_class='EXPIRED_FILE',last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,
+               lease_token='',lease_expires_at=NULL,worker_id='',error_detail=?,
+               completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND status IN """ + active_statuses,
+            (str(error)[:4000], file_id),
+        )
+        row = conn.execute(
+            "SELECT status,last_error_class FROM ingestion_files WHERE id=?", (file_id,),
+        ).fetchone()
+        expired = bool(row and row["status"] == "failed" and row["last_error_class"] == "EXPIRED_FILE")
+        if expired:
+            conn.execute(
+                """UPDATE ingestion_chunks SET status='failed',lease_token='',lease_expires_at=NULL,
+                   error_detail=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE file_id=? AND status IN ('pending','processing','retrying')""",
+                (str(error)[:4000], file_id),
+            )
+        conn.commit()
+        return expired
+    finally:
+        conn.close()
+
+
+def expire_files(file_ids: Iterable[int], error: str,
+                 include_processing: bool = False) -> set[int]:
+    """Expire a batch of queued files in one database update."""
+    ids = sorted({int(file_id) for file_id in file_ids})
+    if not ids:
+        return set()
+    placeholders = ",".join("?" for _ in ids)
+    active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE ingestion_files SET status='failed',processing_phase='failed',
+               last_error_class='EXPIRED_FILE',last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,
+               lease_token='',lease_expires_at=NULL,worker_id='',error_detail=?,
+               completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               WHERE id IN (""" + placeholders + ") AND status IN " + active_statuses,
+            (str(error)[:4000], *ids),
+        )
+        rows = conn.execute(
+            """SELECT id FROM ingestion_files WHERE id IN (""" + placeholders + ")
+               AND status='failed' AND last_error_class='EXPIRED_FILE'",
+            ids,
+        ).fetchall()
+        expired_ids = {int(row["id"]) for row in rows}
+        if expired_ids:
+            expired_placeholders = ",".join("?" for _ in expired_ids)
+            conn.execute(
+                """UPDATE ingestion_chunks SET status='failed',lease_token='',lease_expires_at=NULL,
+                   error_detail=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE file_id IN (""" + expired_placeholders + ")
+                     AND status IN ('pending','processing','retrying')",
+                (str(error)[:4000], *sorted(expired_ids)),
+            )
+        conn.commit()
+        return expired_ids
     finally:
         conn.close()
 

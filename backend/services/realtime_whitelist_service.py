@@ -12,7 +12,7 @@ import duckdb
 import pandas as pd
 
 from database import get_connection
-from services import operations_service, sms_task_service, settings_service
+from services import ingestion_job_service, operations_service, sms_task_service, settings_service
 
 logger = logging.getLogger(__name__)
 INDEX_DIRNAME = "index"
@@ -238,6 +238,42 @@ def latest_version(campaign_id: int) -> Optional[dict]:
         conn.close()
 
 
+def get_index_status(campaign: dict) -> dict:
+    campaign_id = int(campaign["id"])
+    waiting_files = ingestion_job_service.count_waiting_whitelist_files(campaign_id)
+    if not campaign.get("use_whitelist", True):
+        return {"status": "disabled", "waiting_file_count": waiting_files}
+
+    active = get_version(campaign["active_whitelist_version_id"]) if campaign.get("active_whitelist_version_id") else None
+    latest = latest_version(campaign_id)
+    version = latest or active
+    status = "missing"
+    if active and active.get("status") == "ready":
+        status = "ready" if os.path.isfile(active.get("index_path") or "") else "missing_index"
+        version = active
+    elif version and version.get("status") == "building":
+        status = "building"
+    elif version and version.get("status") == "failed":
+        status = "failed"
+    elif version and version.get("status") == "ready":
+        status = "inactive"
+    elif campaign.get("customer_list_path"):
+        status = "queued" if os.path.isfile(campaign["customer_list_path"]) else "source_missing"
+
+    return {
+        "status": status,
+        "version_no": version.get("version_no") if version else None,
+        "active_version_no": active.get("version_no") if active else None,
+        "row_count": int(version.get("row_count") or 0) if version else int(campaign.get("row_count") or 0),
+        "normalized_count": int(version.get("normalized_count") or 0) if version else 0,
+        "index_path": version.get("index_path") if version else "",
+        "error_detail": (latest or {}).get("error_detail") or "",
+        "created_at": version.get("created_at") if version else None,
+        "ready_at": active.get("ready_at") if active else None,
+        "waiting_file_count": waiting_files,
+    }
+
+
 def create_version(campaign_id: int, source_filename: str, source_path: str,
                    source_hash: str) -> tuple[dict, bool]:
     conn = get_connection()
@@ -292,7 +328,7 @@ def _configure(conn) -> None:
     try:
         conn.execute("SET memory_limit = ?", (settings_service.get_setting(
             "realtime_whitelist_build_memory_limit",
-            os.environ.get("MC_REALTIME_WHITELIST_BUILD_MEMORY_LIMIT", "512MB"),
+            os.environ.get("MC_REALTIME_WHITELIST_BUILD_MEMORY_LIMIT", "4GB"),
         ),))
     except Exception:
         pass
@@ -402,6 +438,14 @@ def build_version(version_id: int) -> dict:
                      {"campaign_id": version["campaign_id"]})
         logger.info("Realtime whitelist index ready campaign=%s version=%s rows=%s normalized=%s elapsed_ms=%s",
                     version["campaign_id"], version_id, rows, count, elapsed_ms)
+        try:
+            requeued = ingestion_job_service.requeue_waiting_whitelist_files(version["campaign_id"])
+            if requeued:
+                logger.info("Realtime whitelist ready campaign=%s version=%s waiting_files_requeued=%s",
+                            version["campaign_id"], version_id, requeued)
+        except Exception:
+            logger.exception("Unable to requeue files after whitelist became ready campaign=%s version=%s",
+                             version["campaign_id"], version_id)
         return get_version(version_id) or version
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)

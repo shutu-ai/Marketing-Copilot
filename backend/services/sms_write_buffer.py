@@ -62,6 +62,11 @@ def submit(kind: str, payload: dict[str, Any], wait: bool = False,
     item = WriteItem(kind=kind, payload=payload)
     _queues[queue_name].put(item, timeout=timeout)
     _available.release()
+    try:
+        from services import metrics_service
+        metrics_service.inc("marketing_copilot_sms_write_enqueued_total", labels={"kind": kind})
+    except Exception:
+        pass
     if wait:
         if not item.done.wait(timeout):
             raise TimeoutError(f"SMS write buffer timed out for {kind}")
@@ -132,6 +137,31 @@ def _commit(items: list[WriteItem]) -> None:
         conn.close()
 
 
+def _record_batch_metrics(items: list[WriteItem], duration: float,
+                         error: Optional[BaseException]) -> None:
+    actionable = [item for item in items if item.kind != "barrier"]
+    if not actionable:
+        return
+    try:
+        from collections import Counter
+        from services import metrics_service
+
+        if error is not None:
+            metrics_service.inc("marketing_copilot_sms_write_batches_failed_total")
+            return
+        metrics_service.inc("marketing_copilot_sms_write_batches_committed_total")
+        metrics_service.observe("marketing_copilot_sms_write_batch_seconds", duration)
+        metrics_service.observe("marketing_copilot_sms_write_batch_items", len(actionable))
+        for kind, count in Counter(item.kind for item in actionable).items():
+            metrics_service.inc(
+                "marketing_copilot_sms_write_committed_total",
+                amount=count,
+                labels={"kind": kind},
+            )
+    except Exception:
+        logger.debug("Failed to record SMS write batch metrics", exc_info=True)
+
+
 def _run() -> None:
     global _next_queue
     while not _stop.is_set() or any(not target.empty() for target in _queues.values()):
@@ -160,6 +190,7 @@ def _run() -> None:
         if not items:
             continue
         error = None
+        batch_started = time.monotonic()
         for attempt in range(1, 4):
             try:
                 _commit(items)
@@ -173,6 +204,7 @@ def _run() -> None:
                 )
                 if attempt < 3:
                     time.sleep(0.05 * attempt)
+        _record_batch_metrics(items, time.monotonic() - batch_started, error)
         for item in items:
             item.error = error
             item.done.set()

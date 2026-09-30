@@ -34,6 +34,8 @@ def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic
     if not target:
         raise ValueError(f"cannot {action} campaign from {current}")
     updated = service.update(campaign_id, update_model(status=target))
+    if campaign_type == "realtime":
+        updated = realtime_campaign_service.public_campaign(updated)
     conn = get_connection()
     cancelled_task_count = 0
     if target == "cancelled":

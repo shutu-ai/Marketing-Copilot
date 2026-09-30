@@ -26,7 +26,7 @@ class TemplateRestoreRequest(BaseModel):
 @router.get("/marketing-campaigns")
 def list_marketing_campaigns(type: str = Query("batch", alias="type")):
     if type == "realtime":
-        return realtime_campaign_service.get_all()
+        return [realtime_campaign_service.public_campaign(item) for item in realtime_campaign_service.get_all()]
     return batch_campaign_service.get_all()
 
 

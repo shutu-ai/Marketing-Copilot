@@ -11,6 +11,7 @@ from services import (batch_campaign_service, realtime_campaign_service, sms_tas
 logger = logging.getLogger(__name__)
 _stop = threading.Event()
 _thread = None
+_sftp_thread = None
 _batch_worker_stop = threading.Event()
 _batch_worker_thread = None
 _batch_jobs = queue.Queue(maxsize=1)
@@ -121,8 +122,21 @@ def _run():
             logger.exception("Activity scheduler iteration failed")
 
 
+def _run_sftp_watch():
+    """Poll remote SSH/SFTP sources separately so network timeouts do not stall scheduling."""
+    while not _stop.is_set():
+        try:
+            result = realtime_campaign_service.sync_sftp_watch_dirs_to_inboxes()
+            if result.get("downloaded"):
+                logger.info("SFTP watch sync complete downloaded=%s", result["downloaded"])
+        except Exception:
+            logger.exception("SFTP watch sync iteration failed")
+        if _stop.wait(15):
+            break
+
+
 def start_scheduler():
-    global _thread, _batch_worker_thread
+    global _thread, _sftp_thread, _batch_worker_thread
     if _thread and _thread.is_alive():
         return
     with _batch_state_lock:
@@ -145,6 +159,8 @@ def start_scheduler():
     realtime_ingestion_worker.start_worker()
     _thread = threading.Thread(target=_run, name="activity-scheduler", daemon=True)
     _thread.start()
+    _sftp_thread = threading.Thread(target=_run_sftp_watch, name="sftp-watch-poller", daemon=True)
+    _sftp_thread.start()
     logger.info("Activity scheduler started")
 
 
@@ -154,5 +170,8 @@ def stop_scheduler():
     worker = _batch_worker_thread
     if worker and worker.is_alive():
         worker.join(timeout=2)
+    sftp_worker = _sftp_thread
+    if sftp_worker and sftp_worker.is_alive():
+        sftp_worker.join(timeout=18)
     from services import realtime_ingestion_worker
     realtime_ingestion_worker.stop_worker()

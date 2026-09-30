@@ -54,7 +54,7 @@
               <div class="form-tip">Rows processed per input chunk.</div>
             </el-form-item>
             <el-form-item label="Whitelist build memory">
-              <el-input v-model="form.realtime_whitelist_build_memory_limit" placeholder="512MB" />
+              <el-input v-model="form.realtime_whitelist_build_memory_limit" placeholder="4GB" />
             </el-form-item>
             <el-form-item label="Whitelist build threads">
               <el-input-number v-model="form.realtime_whitelist_build_threads" :min="1" :max="16" :precision="0" controls-position="right" />
@@ -173,7 +173,7 @@ const form = reactive({
   realtime_file_retention_days: 1,
   realtime_output_retention_days: 30,
   realtime_match_chunk_size: 5000,
-  realtime_whitelist_build_memory_limit: '512MB',
+  realtime_whitelist_build_memory_limit: '4GB',
   realtime_whitelist_build_threads: 1,
   realtime_index_build_timeout: 7200,
   realtime_whitelist_retention_days: 7,
@@ -218,7 +218,7 @@ onMounted(async () => {
       } else if (s.key === 'realtime_match_chunk_size') {
         form.realtime_match_chunk_size = Number(s.value) || 5000
       } else if (s.key === 'realtime_whitelist_build_memory_limit') {
-        form.realtime_whitelist_build_memory_limit = s.value || '512MB'
+        form.realtime_whitelist_build_memory_limit = s.value || '4GB'
       } else if (s.key === 'realtime_whitelist_build_threads') {
         form.realtime_whitelist_build_threads = Number(s.value) || 1
       } else if (s.key === 'realtime_index_build_timeout') {

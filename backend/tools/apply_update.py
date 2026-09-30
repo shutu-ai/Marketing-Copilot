@@ -290,6 +290,17 @@ def install_dependencies(state: dict) -> None:
     if not venv_python.is_file():
         log(f"venv python missing: {venv_python}; skipping dependency install")
         return
+    pip_code, _ = run([str(venv_python), "-c", "import pip"])
+    if pip_code != 0:
+        log("pip is missing from the application venv; bootstrapping with bundled ensurepip")
+        ensure_code, ensure_out = run(
+            [str(venv_python), "-m", "ensurepip", "--upgrade"], timeout=300
+        )
+        if ensure_code != 0:
+            raise RuntimeError(
+                "pip is missing and the venv could not bootstrap it with ensurepip "
+                f"({ensure_code}): {ensure_out[-500:]}"
+            )
     cmd = [
         str(venv_python), "-m", "pip", "install", "--no-index",
         "--find-links", str(wheels), "-r", str(requirements),

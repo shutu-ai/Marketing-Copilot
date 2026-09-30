@@ -58,6 +58,7 @@
         </el-table-column>
         <el-table-column :label="$t('campaign.watchDir')" min-width="220">
           <template #default="{ row }">
+            <el-tag v-if="row.watch_source === 'sftp'" size="small" type="warning">SFTP</el-tag>
             <code class="path-code">{{ row.watch_dir || '-' }}</code>
           </template>
         </el-table-column>
@@ -187,14 +188,38 @@
             style="width: 100%"
           />
         </el-form-item>
+        <el-form-item :label="$t('campaign.watchSource')" required>
+          <el-select v-model="editForm.watch_source" style="width:100%" :disabled="editForm.status === 'in_progress'">
+            <el-option value="local" :label="$t('campaign.localWatchSource')" />
+            <el-option value="sftp" label="SSH / SFTP" />
+          </el-select>
+        </el-form-item>
         <el-form-item :label="$t('campaign.watchDir')" required>
-          <el-input v-model="editForm.watch_dir" :placeholder="$t('campaign.watchDirPlaceholder')" :disabled="editForm.status === 'in_progress'">
-            <template #append>
+          <el-input v-model="editForm.watch_dir" :placeholder="editForm.watch_source === 'sftp' ? $t('campaign.sftpPathPlaceholder') : $t('campaign.watchDirPlaceholder')" :disabled="editForm.status === 'in_progress'">
+            <template v-if="editForm.watch_source === 'local'" #append>
               <el-button :disabled="editForm.status === 'in_progress'" @click="openDirectoryPicker('watch')">{{ $t('campaign.browseDirectory') }}</el-button>
             </template>
           </el-input>
-          <div class="form-tip">{{ $t('campaign.watchDirTip') }}</div>
+          <div class="form-tip">{{ editForm.watch_source === 'sftp' ? $t('campaign.sftpPathTip') : $t('campaign.watchDirTip') }}</div>
         </el-form-item>
+        <template v-if="editForm.watch_source === 'sftp'">
+          <el-form-item :label="$t('campaign.sftpHost')" required>
+            <el-input v-model="editForm.sftp_host" placeholder="sftp.example.com" :disabled="editForm.status === 'in_progress'" />
+          </el-form-item>
+          <el-form-item :label="$t('campaign.sftpPort')" required>
+            <el-input-number v-model="editForm.sftp_port" :min="1" :max="65535" :disabled="editForm.status === 'in_progress'" style="width:100%" />
+          </el-form-item>
+          <el-form-item :label="$t('campaign.sftpUsername')" required>
+            <el-input v-model="editForm.sftp_username" :disabled="editForm.status === 'in_progress'" />
+          </el-form-item>
+          <el-form-item :label="$t('campaign.sftpPassword')" required>
+            <el-input v-model="editForm.sftp_password" type="password" show-password autocomplete="new-password" :placeholder="$t('campaign.sftpPasswordPlaceholder')" :disabled="editForm.status === 'in_progress'" />
+            <div class="form-tip">{{ $t('campaign.sftpPasswordTip') }}</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button :loading="testingSftp" :disabled="editForm.status === 'in_progress'" @click="testSftpConnection">{{ $t('campaign.testSftpConnection') }}</el-button>
+          </el-form-item>
+        </template>
         <el-form-item :label="$t('campaign.watchFilenamePrefix')" required>
           <el-input v-model="editForm.watch_filename_prefix" placeholder="Android_4G_Switch_Somali_" :disabled="editForm.status === 'in_progress'" />
           <div class="form-tip">{{ $t('campaign.watchFilenamePrefixTip') }}</div>
@@ -326,7 +351,12 @@ interface Campaign {
   row_count: number
   campaign_dir: string
   use_custom_directory: boolean
+  watch_source: 'local' | 'sftp'
   watch_dir: string
+  sftp_host: string
+  sftp_port: number
+  sftp_username: string
+  sftp_password: string
  watch_filename_prefix: string
  phone_prefix: string
  sms_template_id: number | null
@@ -340,6 +370,8 @@ const page = ref(1)
 const pageSize = ref(50)
 const rtStats = reactive<Record<number, { file_count: number; total_msisdn_sum: number; total_matched: number }>>({})
 const loading = ref(false)
+const testingSftp = ref(false)
+const hasStoredSftpPassword = ref(false)
 const dialogVisible = ref(false)
 const saving = ref(false)
 const smppOptions = ref<any[]>([])
@@ -354,7 +386,12 @@ const editForm = ref<{
   send_end_time: string
   send_days: string[]
   campaign_dir: string
+  watch_source: 'local' | 'sftp'
   watch_dir: string
+  sftp_host: string
+  sftp_port: number
+  sftp_username: string
+  sftp_password: string
  watch_filename_prefix: string
  phone_prefix: string
  smpp_config_id: number | null
@@ -369,7 +406,12 @@ const editForm = ref<{
   send_end_time: '',
   send_days: [],
   campaign_dir: '',
+  watch_source: 'local',
   watch_dir: '',
+  sftp_host: '',
+  sftp_port: 22,
+  sftp_username: '',
+  sftp_password: '',
  watch_filename_prefix: 'Android_4G_Switch_Somali_',
  phone_prefix: '',
  smpp_config_id: null,
@@ -412,6 +454,7 @@ function changePage(nextPage: number) {
 
 function showDialog(row: Campaign | null) {
   if (row) {
+    hasStoredSftpPassword.value = Boolean(row.sftp_password)
     inProgressEdit.value = row.status !== 'not_started' && row.status !== 'ended'
     customDirectory.value = Boolean(row.use_custom_directory)
     editForm.value = {
@@ -424,13 +467,19 @@ function showDialog(row: Campaign | null) {
       send_end_time: row.send_end_time || '',
       send_days: row.send_days || [],
       campaign_dir: row.campaign_dir || '',
+      watch_source: row.watch_source || 'local',
       watch_dir: row.watch_dir || '',
+      sftp_host: row.sftp_host || '',
+      sftp_port: row.sftp_port || 22,
+      sftp_username: row.sftp_username || '',
+      sftp_password: row.sftp_password || '',
      watch_filename_prefix: row.watch_filename_prefix || 'Android_4G_Switch_Somali_',
      phone_prefix: row.phone_prefix || '',
      smpp_config_id: row.smpp_config_id ?? null,
       status: row.status,
     }
   } else {
+    hasStoredSftpPassword.value = false
     inProgressEdit.value = false
     customDirectory.value = false
     editForm.value = {
@@ -443,7 +492,12 @@ function showDialog(row: Campaign | null) {
       send_end_time: '',
       send_days: [],
       campaign_dir: '',
+      watch_source: 'local',
       watch_dir: '',
+      sftp_host: '',
+      sftp_port: 22,
+      sftp_username: '',
+      sftp_password: '',
      watch_filename_prefix: 'Android_4G_Switch_Somali_',
      phone_prefix: '',
      smpp_config_id: null,
@@ -461,7 +515,7 @@ function readinessItems(row: Campaign) {
     { ok: Boolean(row.sms_template_id), label: t(row.sms_template_id ? 'campaign.templateReady' : 'campaign.templateMissing') },
     { ok: Boolean(row.smpp_config_id), label: t(row.smpp_config_id ? 'campaign.smppReady' : 'campaign.smppMissing') },
     { ok: scheduleReady, label: t(scheduleReady ? 'campaign.scheduleReady' : 'campaign.scheduleMissing') },
-    { ok: Boolean(row.watch_dir), label: t(row.watch_dir ? 'campaign.watchDirReady' : 'campaign.watchDirMissing') },
+    { ok: Boolean(row.watch_dir && (row.watch_source !== 'sftp' || (row.sftp_host && row.sftp_username && row.sftp_password))), label: t(row.watch_dir && (row.watch_source !== 'sftp' || (row.sftp_host && row.sftp_username && row.sftp_password)) ? 'campaign.watchDirReady' : 'campaign.watchDirMissing') },
     { ok: Boolean(watchFilenamePrefix), label: t(watchFilenamePrefix ? 'campaign.watchFilenamePrefixReady' : 'campaign.watchFilenamePrefixMissing') },
   ]
 }
@@ -484,6 +538,30 @@ function selectDirectory(path: string) {
   }
 }
 
+async function testSftpConnection() {
+  if (!editForm.value.sftp_host || !editForm.value.sftp_username
+      || (!editForm.value.sftp_password && !hasStoredSftpPassword.value) || !editForm.value.watch_dir) {
+    ElMessage.warning(t('campaign.sftpFieldsRequired'))
+    return
+  }
+  testingSftp.value = true
+  try {
+    const result = await api.testRealtimeSftpConnection({
+      campaign_id: editForm.value.id || undefined,
+      watch_dir: editForm.value.watch_dir,
+      sftp_host: editForm.value.sftp_host,
+      sftp_port: editForm.value.sftp_port,
+      sftp_username: editForm.value.sftp_username,
+      sftp_password: editForm.value.sftp_password,
+    })
+    ElMessage.success(t('campaign.sftpConnectionSuccess', { count: result.data.entry_count }))
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || t('campaign.sftpConnectionFailed'))
+  } finally {
+    testingSftp.value = false
+  }
+}
+
 function isReady(row: Campaign) {
   return readinessItems(row).every(item => item.ok)
 }
@@ -501,6 +579,16 @@ async function handleSave() {
     ElMessage.warning('\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00')
     return
   }
+  if (!inProgressEdit.value && !editForm.value.watch_dir.trim()) {
+    ElMessage.warning(t('campaign.watchDirMissing'))
+    return
+  }
+  if (!inProgressEdit.value && editForm.value.watch_source === 'sftp'
+      && (!editForm.value.sftp_host.trim() || !editForm.value.sftp_username.trim()
+        || (!editForm.value.sftp_password && !hasStoredSftpPassword.value))) {
+    ElMessage.warning(t('campaign.sftpFieldsRequired'))
+    return
+  }
   saving.value = true
   try {
     let payload: any = {
@@ -514,6 +602,11 @@ async function handleSave() {
       campaign_dir: customDirectory.value ? editForm.value.campaign_dir : '',
       use_custom_directory: customDirectory.value,
       watch_dir: editForm.value.watch_dir,
+      watch_source: editForm.value.watch_source,
+      sftp_host: editForm.value.sftp_host,
+      sftp_port: editForm.value.sftp_port,
+      sftp_username: editForm.value.sftp_username,
+      sftp_password: editForm.value.sftp_password,
      watch_filename_prefix: editForm.value.watch_filename_prefix,
      phone_prefix: editForm.value.phone_prefix,
      smpp_config_id: editForm.value.smpp_config_id || undefined,
@@ -527,6 +620,11 @@ async function handleSave() {
        send_end_time: editForm.value.send_end_time,
        send_days: editForm.value.send_days,
        watch_dir: editForm.value.watch_dir,
+       watch_source: editForm.value.watch_source,
+       sftp_host: editForm.value.sftp_host,
+       sftp_port: editForm.value.sftp_port,
+       sftp_username: editForm.value.sftp_username,
+       sftp_password: editForm.value.sftp_password,
        watch_filename_prefix: editForm.value.watch_filename_prefix,
        phone_prefix: editForm.value.phone_prefix,
        smpp_config_id: editForm.value.smpp_config_id || undefined,

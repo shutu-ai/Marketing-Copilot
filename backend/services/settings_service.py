@@ -6,7 +6,7 @@ RETENTION_SETTING_DEFAULTS = {
     "realtime_output_retention_days": "30",
     "realtime_match_chunk_size": "5000",
     "realtime_whitelist_build_chunk_size": "10000",
-    "realtime_whitelist_build_memory_limit": "512MB",
+    "realtime_whitelist_build_memory_limit": "4GB",
     "realtime_whitelist_build_threads": "1",
     "realtime_index_build_timeout": "7200",
     "realtime_whitelist_retention_days": "7",

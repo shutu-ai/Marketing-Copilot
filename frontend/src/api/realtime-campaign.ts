@@ -15,7 +15,12 @@ export interface RealtimeCampaign {
   row_count: number
   campaign_dir: string
   use_custom_directory: boolean
+  watch_source: 'local' | 'sftp'
   watch_dir: string
+  sftp_host: string
+  sftp_port: number
+  sftp_username: string
+  sftp_password: string
  watch_filename_prefix: string
  phone_prefix: string
  sms_template_id: number | null
@@ -42,7 +47,8 @@ export function createRealtimeCampaign(data: {
   name: string; use_whitelist?: boolean; start_time?: string; end_time?: string;
   send_start_time?: string; send_end_time?: string; send_days?: string[];
   campaign_dir?: string; use_custom_directory?: boolean;
-  watch_dir?: string;
+  watch_source?: 'local' | 'sftp'; watch_dir?: string;
+  sftp_host?: string; sftp_port?: number; sftp_username?: string; sftp_password?: string;
  watch_filename_prefix?: string;
  phone_prefix?: string;
  sms_template_id?: number;
@@ -94,4 +100,14 @@ export function copyRealtimeCampaign(id: number) {
 
 export function getRealtimeCampaignDetail(id: number) {
   return api.get<any>(`/realtime-campaigns/${id}/detail`)
+}
+
+export function testRealtimeSftpConnection(data: {
+  campaign_id?: number;
+  watch_dir: string; sftp_host: string; sftp_port: number;
+  sftp_username: string; sftp_password?: string
+}) {
+  return api.post<{ success: boolean; directory: string; entry_count: number }>(
+    '/realtime-campaigns/test-sftp', data, { timeout: 30000 },
+  )
 }

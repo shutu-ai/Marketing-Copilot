@@ -195,10 +195,36 @@ def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:
             errors.append(f"campaign directory is not writable: {exc}")
     if campaign_type == "realtime":
         watch_dir = (campaign.get("watch_dir") or "").strip()
+        watch_source = (campaign.get("watch_source") or "local").strip().lower()
         if not watch_dir:
             errors.append("realtime watch directory is missing")
-        elif not os.path.isdir(watch_dir):
-            errors.append(f"realtime watch directory does not exist: {watch_dir}")
+        elif watch_source == "local":
+            if not os.path.isdir(watch_dir):
+                errors.append(f"realtime watch directory does not exist: {watch_dir}")
+        elif watch_source == "sftp":
+            sftp_host = (campaign.get("sftp_host") or "").strip()
+            sftp_username = (campaign.get("sftp_username") or "").strip()
+            sftp_password = campaign.get("sftp_password") or ""
+            if not sftp_host:
+                errors.append("SFTP host is missing")
+            if not sftp_username:
+                errors.append("SFTP username is missing")
+            if not sftp_password:
+                errors.append("SFTP password is missing")
+            try:
+                sftp_port = int(campaign.get("sftp_port") or 22)
+            except (TypeError, ValueError):
+                sftp_port = 0
+            if not 1 <= sftp_port <= 65535:
+                errors.append("SFTP port must be between 1 and 65535")
+            if sftp_host and sftp_username and sftp_password and 1 <= sftp_port <= 65535 and watch_dir:
+                try:
+                    from services import sftp_watch_service
+                    sftp_watch_service.test_connection(campaign)
+                except Exception as exc:
+                    errors.append(f"SFTP connection failed: {exc}")
+        else:
+            errors.append("watch source must be local or sftp")
         if not (campaign.get("watch_filename_prefix") or "").strip():
             errors.append("realtime watch filename prefix is missing")
     conn = get_connection()

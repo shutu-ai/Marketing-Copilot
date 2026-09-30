@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 
 from fastapi.responses import FileResponse
 
-from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
+from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate, SftpConnectionTest
 
 from services import realtime_campaign_service
 
@@ -16,14 +16,35 @@ from services import realtime_campaign_service
 router = APIRouter(prefix="/api/realtime-campaigns", tags=["Realtime Campaign"])
 
 
+@router.post("/test-sftp")
+def test_sftp_connection(data: SftpConnectionTest):
+    try:
+        from services import sftp_watch_service
+
+        config = data.model_dump()
+        if data.campaign_id and data.sftp_password in ("", "********"):
+            config["sftp_password"] = realtime_campaign_service.get_sftp_password(data.campaign_id)
+        return sftp_watch_service.test_connection(config)
+    except ModuleNotFoundError as exc:
+        if exc.name == "paramiko":
+            raise HTTPException(
+                status_code=503,
+                detail="SSH/SFTP dependency is missing. Install backend requirements and restart the server.",
+            ) from exc
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SFTP connection failed: {exc}")
+
+
 
 
 
 @router.get("")
 
 def list_campaigns(page: int = 1, page_size: int = Query(50, le=200)):
-
-    return realtime_campaign_service.list_campaigns(page, page_size)
+    result = realtime_campaign_service.list_campaigns(page, page_size)
+    result["items"] = [realtime_campaign_service.public_campaign(item) for item in result["items"]]
+    return result
 
 
 
@@ -39,7 +60,7 @@ def get_campaign(campaign_id: int):
 
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    return campaign
+    return realtime_campaign_service.public_campaign(campaign)
 
 
 
@@ -49,7 +70,7 @@ def get_campaign(campaign_id: int):
 
 def create_campaign(data: RealtimeCampaignCreate):
     try:
-        return realtime_campaign_service.create(data)
+        return realtime_campaign_service.public_campaign(realtime_campaign_service.create(data))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -73,7 +94,7 @@ def update_campaign(campaign_id: int, data: RealtimeCampaignUpdate):
 
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    return campaign
+    return realtime_campaign_service.public_campaign(campaign)
 
 
 
@@ -89,7 +110,7 @@ def copy_campaign(campaign_id: int):
 
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    return campaign
+    return realtime_campaign_service.public_campaign(campaign)
 
 
 
@@ -105,7 +126,7 @@ def campaign_detail(campaign_id: int):
 
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    return detail
+    return realtime_campaign_service.public_campaign(detail)
 
 
 
@@ -166,7 +187,7 @@ def upload_customer_list(campaign_id: int, file: UploadFile = File(...)):
 
                 pass
 
-        return result
+        return realtime_campaign_service.public_campaign(result)
 
     except Exception as e:
 

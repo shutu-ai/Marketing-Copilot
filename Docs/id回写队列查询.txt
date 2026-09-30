@@ -1,0 +1,17 @@
+cat /opt/marketing-copilot/backend/release.json
+
+for i in 1 2 3; do
+  date
+  curl -sS http://127.0.0.1:19090/metrics \
+    | grep -E 'sms_write_queue_depth|sms_write_(enqueued|committed|batches_committed|batch_seconds|batch_items)'
+  sleep 30
+done
+
+
+
+部署后可用下面的命令采集新指标：
+
+```
+curl -sS http://127.0.0.1:19090/metrics \
+  | grep -E 'database_(statement_seconds|write_lock_wait_seconds)|sms_write_queue_depth|sms_write_(enqueued|committed)'
+```

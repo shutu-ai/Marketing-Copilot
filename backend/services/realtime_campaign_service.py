@@ -2,6 +2,7 @@ import os
 import json
 import re
 import math
+import stat
 import shutil
 import logging
 from datetime import datetime, timedelta
@@ -109,6 +110,28 @@ def _enrich(c: dict) -> dict:
     return c
 
 
+def public_campaign(campaign: Optional[dict]) -> Optional[dict]:
+    """Redact SSH credentials before returning a campaign from the API."""
+    if not campaign:
+        return campaign
+    result = dict(campaign)
+    if result.get("sftp_password"):
+        result["sftp_password"] = "********"
+    result.pop("sftp_identity_file", None)
+    return result
+
+
+def get_sftp_password(campaign_id: int) -> str:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT sftp_password FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        return (row["sftp_password"] or "") if row else ""
+    finally:
+        conn.close()
+
+
 def get_all() -> list:
     conn = get_connection()
     rows = conn.execute("SELECT * FROM realtime_campaigns ORDER BY created_at DESC").fetchall()
@@ -148,11 +171,12 @@ def create(data: RealtimeCampaignCreate) -> dict:
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
     cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_dir, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_source, watch_dir, sftp_host, sftp_port, sftp_username, sftp_password, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, data.use_whitelist if data.use_whitelist is not None else True, data.start_time or "", data.end_time or "",
          data.send_start_time or "", data.send_end_time or "",
          _fmt_days(data.send_days), campaign_dir, use_custom_directory,
-         data.watch_dir or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
+         data.watch_source or "local", data.watch_dir or "", data.sftp_host or "", data.sftp_port or 22,
+         data.sftp_username or "", data.sftp_password or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
          data.phone_prefix or "", data.sms_template_id, data.smpp_config_id)
     )
     conn.commit()
@@ -205,9 +229,11 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             conn.close()
             raise ValueError("Campaign has already started — cannot edit")
     fields = {}
-    for field in ["name", "use_whitelist", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_dir", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
+    for field in ["name", "use_whitelist", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_source", "watch_dir", "sftp_host", "sftp_port", "sftp_username", "sftp_password", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
         val = getattr(data, field, None)
         if val is not None:
+            if field == "sftp_password" and val in ("", "********"):
+                continue
             fields[field] = val
     if auto_campaign_dir:
         fields["campaign_dir"] = auto_campaign_dir
@@ -398,6 +424,7 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     if not campaign:
         return None
     campaign["reached_users"] = _count_output_rows(campaign.get("campaign_dir", ""))
+    campaign["whitelist_index"] = realtime_whitelist_service.get_index_status(campaign)
     return campaign
 
 
@@ -668,6 +695,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         try:
             unique_conn.execute("CREATE TABLE seen_msisdns (msisdn TEXT PRIMARY KEY, matched INTEGER NOT NULL)")
             for chunk_index, chunk in enumerate(reader):
+                expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
+                if expired_reason:
+                    return {"success": False, "status": "expired", "message": expired_reason}
                 pressure, _ = backpressure_service.reasons()
                 if pressure:
                     raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
@@ -714,6 +744,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 unique_conn.commit()
                 matched_row_count += chunk_matched_rows
                 if matched_records and not chunk_completed:
+                    expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
+                    if expired_reason:
+                        return {"success": False, "status": "expired", "message": expired_reason}
                     chunk_result = sms_task_service.enqueue_rows(
                         "realtime", campaign, matched_records, original_filename
                     )
@@ -810,6 +843,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     "created_msisdns": [],
                 }
             else:
+                expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
+                if expired_reason:
+                    return {"success": False, "status": "expired", "message": expired_reason}
                 task_result = sms_task_service.enqueue_rows(
                     "realtime", campaign, matched_records, original_filename
                 )
@@ -829,6 +865,10 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         finally:
             if whitelist_conn:
                 whitelist_conn.close()
+
+    expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
+    if expired_reason:
+        return {"success": False, "status": "expired", "message": expired_reason}
 
     campaign_dir = campaign.get("campaign_dir", "")
     progress("finalizing", total_rows, matched_count, 0, 0)
@@ -890,6 +930,49 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
     campaign = get_one(campaign_id)
     if not campaign:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+    if campaign.get("watch_source", "local") == "sftp":
+        from services import sftp_watch_service
+        files = []
+        client = sftp = None
+        try:
+            client, sftp, entries = sftp_watch_service.list_directory(campaign)
+            prefix = campaign.get("watch_filename_prefix") or ""
+            remote_label = f"sftp://{campaign.get('sftp_host')}:{campaign.get('sftp_port')}{campaign.get('watch_dir')}"
+            for entry in sorted(entries, key=lambda item: item.filename):
+                name = entry.filename
+                if not stat.S_ISREG(entry.st_mode) or os.path.splitext(name)[1].lower() != ".csv":
+                    continue
+                match_prefix = bool(prefix and name.startswith(prefix))
+                match_schedule = _watch_file_matches_campaign(name, campaign)
+                processed_record = _processed_file_record(campaign_id, name)
+                age = datetime.now().timestamp() - (entry.st_mtime or 0)
+                if processed_record:
+                    status, label, reason = "processed", "Processed", f"Already processed: {name}"
+                elif not match_prefix:
+                    status, label, reason = "ignored", "Ignored", "Filename prefix does not match"
+                elif not match_schedule:
+                    status, label, reason = "ignored", "Ignored", "Filename timestamp does not match campaign schedule"
+                elif age < 5:
+                    status, label, reason = "pending", "Writing", "Waiting for remote file to become stable"
+                else:
+                    status, label, reason = "pending", "Pending", ""
+                files.append({
+                    "filename": name, "directory_path": remote_label,
+                    "file_size": entry.st_size or 0, "row_count": 0,
+                    "match_prefix": match_prefix, "match_schedule": match_schedule,
+                    "status": status, "status_label": label, "skip_reason": reason,
+                    "created_at": "", "updated_at": "",
+                })
+        finally:
+            if sftp:
+                sftp.close()
+            if client:
+                client.close()
+        total = len(files)
+        offset = max(0, page - 1) * page_size
+        return {"total": total, "page": page, "page_size": page_size,
+                "items": files[offset:offset + page_size]}
 
     watch_dir = os.path.abspath(campaign.get("watch_dir") or "")
     if not os.path.isdir(watch_dir):
@@ -1088,6 +1171,20 @@ def _daily_window_ended(campaign: dict, now: Optional[datetime] = None) -> bool:
     return current > end
 
 
+def _realtime_ingestion_expired_reason(campaign: dict, now: Optional[datetime] = None,
+                                      filename: str = "") -> str:
+    now = now or datetime.now()
+    file_time = _watch_file_timestamp(
+        filename, campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_",
+    ) if filename else None
+    if file_time and file_time.date() != now.date():
+        return "file timestamp is outside the current day"
+    active, reason = sms_task_service.campaign_is_active(campaign, now)
+    if not active and (reason == "campaign has ended" or _daily_window_ended(campaign, now)):
+        return "campaign has ended" if reason == "campaign has ended" else "daily send window ended"
+    return ""
+
+
 def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
     """Close realtime work at a daily boundary and prevent cross-day carryover."""
     now = now or datetime.now()
@@ -1097,13 +1194,13 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
     # scheduler at midnight; task_date is independently enforced by the worker.
     stale = conn.execute(
         """UPDATE sms_tasks SET status='cancelled', error_msg='previous day task cancelled',
-           updated_at=CURRENT_TIMESTAMP
+           claim_token='',updated_at=CURRENT_TIMESTAMP
            WHERE campaign_type='realtime' AND CAST(task_date AS DATE) < CAST(? AS DATE)
              AND status IN ('queued','retrying','sending')""",
         (today,),
     ).rowcount or 0
     campaigns = conn.execute(
-        "SELECT id,send_start_time,send_end_time FROM realtime_campaigns WHERE status='in_progress'"
+        "SELECT id,send_start_time,send_end_time FROM realtime_campaigns"
     ).fetchall()
     cancelled = stale
     for row in campaigns:
@@ -1112,7 +1209,7 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
             continue
         result = conn.execute(
             """UPDATE sms_tasks SET status='cancelled', error_msg='daily send window ended',
-               updated_at=CURRENT_TIMESTAMP
+               claim_token='',updated_at=CURRENT_TIMESTAMP
                WHERE campaign_type='realtime' AND campaign_id=?
                  AND CAST(task_date AS DATE)=CAST(? AS DATE)
                  AND status IN ('queued','retrying','sending')""",
@@ -1125,16 +1222,83 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
         logger.info("Realtime daily tasks cancelled=%s", cancelled)
     return cancelled
 
+
+def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
+                                         include_processing: bool = False) -> int:
+    """Discard unstarted realtime file jobs after that day's send window closes."""
+    now = now or datetime.now()
+    conn = get_connection()
+    try:
+        campaigns = conn.execute(
+            """SELECT id,send_start_time,send_end_time,campaign_dir
+               FROM realtime_campaigns WHERE campaign_dir<>''"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    discarded = 0
+    for row in campaigns:
+        campaign = dict(row)
+        if not _daily_window_ended(campaign, now):
+            continue
+        conn = get_connection()
+        try:
+            active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
+            jobs = [dict(item) for item in conn.execute(
+                """SELECT id,campaign_id,filename,file_path FROM ingestion_files
+                   WHERE campaign_type='realtime' AND campaign_id=?
+                     AND status IN """ + active_statuses,
+                (campaign["id"],),
+            ).fetchall()]
+        finally:
+            conn.close()
+
+        reason = "daily send window ended"
+        expired_jobs = []
+        if jobs:
+            expired_ids = ingestion_job_service.expire_files(
+                (job["id"] for job in jobs), reason,
+                include_processing=include_processing,
+            )
+            expired_jobs = [job for job in jobs if job["id"] in expired_ids]
+            if expired_jobs:
+                conn = get_connection()
+                try:
+                    conn.executemany(
+                        """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
+                           processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
+                           completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
+                           WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
+                        ((reason, job["campaign_id"], job["filename"]) for job in expired_jobs),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        for job in expired_jobs:
+            try:
+                path = job.get("file_path", "")
+                if path and os.path.isfile(path):
+                    os.remove(path)
+            except OSError as exc:
+                logger.warning(
+                    "Realtime expired file deletion failed campaign=%s file=%s error=%s",
+                    campaign["id"], job["filename"], exc,
+                )
+        discarded += len(expired_jobs)
+    if discarded:
+        logger.info("Realtime closed-window ingestion jobs discarded count=%s", discarded)
+    return discarded
+
 def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
     conn = get_connection()
     if campaign_id:
         rows = conn.execute(
-            "SELECT * FROM realtime_campaigns WHERE id=? AND status='in_progress' AND COALESCE(watch_dir,'')<>''",
+            "SELECT * FROM realtime_campaigns WHERE id=? AND status='in_progress' AND COALESCE(watch_dir,'')<>'' AND COALESCE(watch_source,'local')='local'",
             (campaign_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM realtime_campaigns WHERE status='in_progress' AND COALESCE(watch_dir,'')<>''"
+            "SELECT * FROM realtime_campaigns WHERE status='in_progress' AND COALESCE(watch_dir,'')<>'' AND COALESCE(watch_source,'local')='local'"
         ).fetchall()
     conn.close()
     if now is None:
@@ -1214,7 +1378,92 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
     return {"moved": total_moved}
 
 
+def sync_sftp_watch_dirs_to_inboxes(now=None):
+    """Poll configured SFTP folders and atomically download eligible files."""
+    from services import sftp_watch_service
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM realtime_campaigns WHERE status='in_progress' "
+        "AND watch_source='sftp' AND COALESCE(watch_dir,'')<>''"
+    ).fetchall()
+    conn.close()
+    now = now or datetime.now()
+    total_downloaded = 0
+    for row in rows:
+        campaign = dict(row)
+        client = sftp = None
+        try:
+            active, reason = sms_task_service.campaign_is_active(campaign, now)
+            if not active:
+                continue
+            client, sftp, entries = sftp_watch_service.list_directory(campaign)
+            campaign_dir = campaign.get("campaign_dir", "") or _ensure_campaign_dir(campaign)
+            _ensure_realtime_dirs(campaign_dir)
+            if not campaign.get("campaign_dir"):
+                update_conn = get_connection()
+                update_conn.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign["id"]))
+                update_conn.commit()
+                update_conn.close()
+            inbox_dir = os.path.join(campaign_dir, "inbox")
+            os.makedirs(inbox_dir, exist_ok=True)
+            prefix = campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_"
+            remote_dir = campaign["watch_dir"].rstrip("/") or "/"
+            for entry in entries:
+                fname = entry.filename
+                if fname in (".", "..") or os.path.basename(fname) != fname:
+                    continue
+                if not stat.S_ISREG(entry.st_mode) or not fname.startswith(prefix):
+                    continue
+                if os.path.splitext(fname)[1].lower() not in (".csv", ".txt", ".xlsx", ".xls"):
+                    continue
+                if not _watch_file_matches_campaign(fname, campaign, now):
+                    continue
+                remote_path = f"{remote_dir}/{fname}" if remote_dir != "/" else f"/{fname}"
+                if not sftp_watch_service.file_is_stable(campaign["id"], remote_path, entry):
+                    continue
+                dest = os.path.join(inbox_dir, fname)
+                if os.path.exists(dest):
+                    continue
+                processed = _processed_file_record(campaign["id"], fname)
+                if processed and processed.get("status") == "completed":
+                    continue
+                allowed, capacity_reason = _inbox_capacity_available(campaign["id"], entry.st_size or 0)
+                if not allowed:
+                    logger.warning("SFTP realtime inbox backpressure campaign=%s file=%s reason=%s", campaign["id"], fname, capacity_reason)
+                    continue
+                temp_fd, temp_path = tempfile.mkstemp(prefix=".sftp-", suffix=".part", dir=inbox_dir)
+                os.close(temp_fd)
+                try:
+                    sftp.get(remote_path, temp_path)
+                    if os.path.getsize(temp_path) != (entry.st_size or 0):
+                        raise IOError("remote file changed while it was being downloaded")
+                    if os.path.exists(dest):
+                        continue
+                    os.replace(temp_path, dest)
+                    os.utime(dest, None)
+                    whitelist_version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
+                    ingestion_job_service.register_file(
+                        "realtime", campaign["id"], fname, dest,
+                        chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
+                    )
+                    total_downloaded += 1
+                    logger.info("SFTP watch file downloaded campaign=%s host=%s file=%s", campaign["id"], campaign.get("sftp_host"), fname)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+        except Exception as exc:
+            logger.warning("SFTP watch poll failed campaign=%s host=%s error=%s", campaign.get("id"), campaign.get("sftp_host"), exc)
+        finally:
+            if sftp:
+                sftp.close()
+            if client:
+                client.close()
+    return {"downloaded": total_downloaded}
+
+
 def process_realtime_inboxes(campaign_id: Optional[int] = None):
+    cleanup_closed_window_ingestion_files()
     conn = get_connection()
     if campaign_id:
         rows = conn.execute(
@@ -1233,8 +1482,22 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
         if not campaign_dir:
             continue
         inbox_dir = os.path.join(campaign_dir, "inbox")
+        if _daily_window_ended(campaign):
+            continue
         if not os.path.isdir(inbox_dir):
             continue
+        processing_conn = get_connection()
+        try:
+            processing_files = {
+                item["filename"]
+                for item in processing_conn.execute(
+                    """SELECT filename FROM ingestion_files
+                       WHERE campaign_type='realtime' AND campaign_id=? AND status='processing'""",
+                    (campaign["id"],),
+                ).fetchall()
+            }
+        finally:
+            processing_conn.close()
         for fname in sorted(os.listdir(inbox_dir)):
             src = os.path.join(inbox_dir, fname)
             if not os.path.isfile(src):
@@ -1244,11 +1507,45 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
                 continue
             active, reason = sms_task_service.campaign_is_active(campaign, datetime.now())
             file_time = _watch_file_timestamp(fname, campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_")
-            if (file_time and file_time.date() != datetime.now().date()) or (not active and reason in {"after daily send window", "campaign has ended", "campaign is not enabled"}):
+            if file_time and file_time.date() != datetime.now().date():
+                if fname in processing_files:
+                    # A worker may have claimed this file just before the date changed.
+                    # Let its pre-processing expiry check finish the job.
+                    continue
+                try:
+                    os.remove(src)
+                    logger.info(
+                        "Realtime expired inbox file deleted campaign=%s file=%s",
+                        campaign["id"], fname,
+                    )
+                except OSError as exc:
+                    results["errors"].append({"filename": fname, "message": str(exc)})
+                    logger.warning(
+                        "Realtime expired inbox file deletion failed campaign=%s file=%s error=%s",
+                        campaign["id"], fname, exc,
+                    )
+                continue
+            if not active and _daily_window_ended(campaign):
+                if fname in processing_files:
+                    continue
+                try:
+                    os.remove(src)
+                    logger.info(
+                        "Realtime closed-window inbox file deleted campaign=%s file=%s",
+                        campaign["id"], fname,
+                    )
+                except OSError as exc:
+                    results["errors"].append({"filename": fname, "message": str(exc)})
+                    logger.warning(
+                        "Realtime closed-window inbox file deletion failed campaign=%s file=%s error=%s",
+                        campaign["id"], fname, exc,
+                    )
+                continue
+            if not active and reason in {"after daily send window", "campaign has ended", "campaign is not enabled"}:
                 try:
                     target = operations_service.quarantine(src, campaign.get("campaign_dir", ""), fname)
-                    results["errors"].append({"filename": fname, "message": reason if not active else "file belongs to a previous day"})
-                    logger.info("Realtime inbox file archived campaign=%s file=%s reason=%s", campaign["id"], fname, reason if not active else "previous day")
+                    results["errors"].append({"filename": fname, "message": reason})
+                    logger.info("Realtime inbox file archived campaign=%s file=%s reason=%s", campaign["id"], fname, reason)
                 except OSError as exc:
                     results["errors"].append({"filename": fname, "message": str(exc)})
                 continue

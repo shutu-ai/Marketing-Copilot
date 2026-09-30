@@ -142,6 +142,8 @@ def start_worker():
     with _guard:
         if any(thread.is_alive() for thread in _workers.values()):
             return
+        from services import realtime_campaign_service
+        realtime_campaign_service.finalize_daily_tasks()
         _stop.clear(); _workers.clear(); _last_active.clear()
         for index in range(configured_worker_count()):
             _spawn(index)

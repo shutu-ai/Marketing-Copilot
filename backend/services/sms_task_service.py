@@ -222,6 +222,34 @@ def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
     return count
 
 
+def _insert_message_mappings(conn, rows) -> None:
+    # A single SMSC can reuse an id, so collapse duplicate ids in a batch and
+    # preserve the existing "latest task wins" behavior before the upsert.
+    latest_task_by_id = {}
+    for message_id, task_id in rows:
+        message_id = str(message_id)
+        if message_id:
+            latest_task_by_id[message_id] = int(task_id)
+    if not latest_task_by_id:
+        return
+    values = ",".join("(?,?)" for _ in latest_task_by_id)
+    params = [value for row in latest_task_by_id.items() for value in row]
+    conn.execute(
+        f"""INSERT INTO sms_task_message_ids (smsc_message_id, task_id) VALUES {values}
+            ON CONFLICT (smsc_message_id) DO UPDATE SET task_id = excluded.task_id
+            WHERE task_id IS DISTINCT FROM excluded.task_id""",
+        params,
+    )
+
+
+def _mapped_message_ids(conn, task_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT smsc_message_id FROM sms_task_message_ids WHERE task_id=?",
+        (int(task_id),),
+    ).fetchall()
+    return [str(row["smsc_message_id"]) for row in rows if row["smsc_message_id"]]
+
+
 def _insert_message_mapping(conn, task_id: int, message_ids) -> None:
     """Record the latest task that used each SMSC message id.
 
@@ -231,15 +259,7 @@ def _insert_message_mapping(conn, task_id: int, message_ids) -> None:
     REPLACE`` silently does nothing on conflict when the table has a secondary
     index (DuckDB quirk), so an explicit ``ON CONFLICT ... DO UPDATE`` is used.
     """
-    rows = [(str(mid), task_id) for mid in (message_ids or []) if str(mid)]
-    if not rows:
-        return
-    values = ",".join("(?,?)" for _ in rows)
-    conn.execute(
-        f"""INSERT INTO sms_task_message_ids (smsc_message_id, task_id) VALUES {values}
-            ON CONFLICT (smsc_message_id) DO UPDATE SET task_id = excluded.task_id""",
-        [value for row in rows for value in row],
-    )
+    _insert_message_mappings(conn, ((mid, task_id) for mid in (message_ids or [])))
 
 
 def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: dict) -> dict:
@@ -619,15 +639,27 @@ def claim_next_task() -> Optional[dict]:
 
 def apply_buffered_writes(conn, items) -> None:
     """Apply one buffered delivery batch inside a single database transaction."""
-    submitted_ids = []
+    # The buffer polls its per-kind queues fairly, so message_id entries can be
+    # interleaved with submitted/receipt entries. Collect them across the whole
+    # transaction; otherwise each interleaved item breaks the batch and turns
+    # bulk id persistence back into one SELECT/UPDATE/UPSERT per message.
+    message_id_items = [item for item in items if item.kind == "message_id"]
+    submitted_payloads = [item.payload for item in items if item.kind == "submitted"]
+    submitted_ids = [int(payload["task_id"]) for payload in submitted_payloads]
+    if submitted_payloads:
+        # submit_sm_resp callbacks enqueue each part's message id immediately
+        # for crash recovery; the later submitted event contains those same ids.
+        # Combine both sources so a successful part reaches the indexed mapping
+        # table only once per transaction.
+        _apply_submitted_batch(conn, submitted_payloads, message_id_items)
+    elif message_id_items:
+        _apply_message_id_batch(conn, message_id_items)
+
     for item in items:
         payload = item.payload
-        if item.kind == "submitted":
-            _apply_submitted(conn, **payload)
-            submitted_ids.append(int(payload["task_id"]))
-        elif item.kind == "message_id":
-            _apply_message_id(conn, **payload)
-        elif item.kind == "send_failure":
+        if item.kind in {"message_id", "submitted"}:
+            continue
+        if item.kind == "send_failure":
             _apply_send_failure(conn, **payload)
         elif item.kind == "receipt":
             _apply_receipt(conn, **payload)
@@ -698,71 +730,140 @@ def _apply_submitted(conn, task_id: int, message_ids: list[str],
                      delivery_receipt_mode: str = "optional",
                      transport_smpp_config_id: Optional[int] = None,
                      submit_sm_parts: Optional[int] = None):
-    row = conn.execute(
-        "SELECT smsc_message_ids,batch_id,campaign_type,campaign_id,status FROM sms_tasks WHERE id=?",
-        (task_id,),
-    ).fetchone()
-    existing_ids = []
-    if row:
-        try:
-            existing_ids = json.loads(row["smsc_message_ids"] or "[]")
-        except json.JSONDecodeError:
-            existing_ids = []
-    message_ids = list(dict.fromkeys(existing_ids + list(message_ids or [])))
-    mode = delivery_receipt_mode if delivery_receipt_mode in {"required", "optional", "disabled"} else "optional"
-    final_status = "submitted" if mode == "required" else "accepted"
-    updated = conn.execute(
-        """UPDATE sms_tasks SET status=?, smsc_message_ids=?, error_msg='',
-            transport_smpp_config_id=COALESCE(?,transport_smpp_config_id),
-            submit_sm_parts=CASE WHEN ? IS NULL THEN submit_sm_parts ELSE GREATEST(1,?) END,
-            submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
-            delivered_at=CASE WHEN ? <> 'required'
-                              THEN COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR))
-                              ELSE delivered_at END,
-            updated_at=CURRENT_TIMESTAMP
-            WHERE id=? AND status IN ('sending','submitted')
-            RETURNING id""",
-        (final_status, json.dumps(message_ids), transport_smpp_config_id,
-         submit_sm_parts, submit_sm_parts, mode, task_id),
-    ).fetchone()
-    if updated and final_status == "accepted" and row and row["batch_id"]:
-        conn.execute(
+    _apply_submitted_batch(conn, [{
+        "task_id": task_id, "message_ids": message_ids,
+        "delivery_receipt_mode": delivery_receipt_mode,
+        "transport_smpp_config_id": transport_smpp_config_id,
+        "submit_sm_parts": submit_sm_parts,
+    }])
+
+
+def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
+    """Apply submission outcomes while consolidating secondary writes per batch."""
+    if not payloads:
+        return
+
+    task_ids = list(dict.fromkeys(int(payload["task_id"]) for payload in payloads))
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""SELECT id,smsc_message_ids,batch_id,campaign_type,campaign_id,status
+            FROM sms_tasks WHERE id IN ({placeholders})""",
+        task_ids,
+    ).fetchall()
+    rows_by_id = {int(row["id"]): row for row in rows}
+    grouped = {}
+    for payload in payloads:
+        task_id = int(payload["task_id"])
+        grouped.setdefault(task_id, []).append(payload)
+
+    # Preserve the historical ordering: standalone response ids were upserted
+    # first, then submitted outcomes. If an SMSC reuses an id, the later
+    # submitted mapping still wins, while both sources share one SQL upsert.
+    mapping_rows = []
+    for item in message_id_items:
+        message_payload = item.payload
+        message_id = str(message_payload.get("message_id") or "")
+        if message_id:
+            mapping_rows.append((message_id, int(message_payload["task_id"])))
+    pending_task_by_message_id = {}
+    batch_delivered_increments = {}
+    daily_sent_increments = {}
+    for task_id, task_payloads in grouped.items():
+        row = rows_by_id.get(task_id)
+        existing_ids = []
+        if row:
+            try:
+                existing_ids = json.loads(row["smsc_message_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                existing_ids = []
+
+        # Multiple outcomes for the same task in one flush are unusual, but
+        # merge their message ids and retain the last supplied configuration.
+        message_ids = list(existing_ids)
+        for payload in task_payloads:
+            message_ids.extend(payload.get("message_ids") or [])
+        message_ids = list(dict.fromkeys(str(mid) for mid in message_ids if str(mid)))
+        payload = task_payloads[-1]
+        mode = payload.get("delivery_receipt_mode")
+        mode = mode if mode in {"required", "optional", "disabled"} else "optional"
+        final_status = "submitted" if mode == "required" else "accepted"
+        mapping_rows.extend((message_id, task_id) for message_id in message_ids)
+        pending_task_by_message_id.update((message_id, task_id) for message_id in message_ids)
+
+        updated = conn.execute(
+            """UPDATE sms_tasks SET status=?, smsc_message_ids=?, error_msg='',
+                transport_smpp_config_id=COALESCE(?,transport_smpp_config_id),
+                submit_sm_parts=CASE WHEN ? IS NULL THEN submit_sm_parts ELSE GREATEST(1,?) END,
+                submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+                delivered_at=CASE WHEN ? <> 'required'
+                                  THEN COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR))
+                                  ELSE delivered_at END,
+                updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status IN ('sending','submitted')
+                RETURNING id""",
+            (final_status, json.dumps(message_ids),
+             payload.get("transport_smpp_config_id"), payload.get("submit_sm_parts"),
+             payload.get("submit_sm_parts"), mode, task_id),
+        ).fetchone()
+        if updated and final_status == "accepted" and row and row["batch_id"]:
+            batch_id = int(row["batch_id"])
+            campaign_id = int(row["campaign_id"])
+            batch_delivered_increments[batch_id] = batch_delivered_increments.get(batch_id, 0) + 1
+            daily_sent_increments[campaign_id] = daily_sent_increments.get(campaign_id, 0) + 1
+
+    _insert_message_mappings(conn, mapping_rows)
+    if batch_delivered_increments:
+        conn.executemany(
             """UPDATE batch_campaign_batches
-               SET delivered_count=COALESCE(delivered_count,0)+1,
+               SET delivered_count=COALESCE(delivered_count,0)+?,
                    status=CASE
-                     WHEN task_count>0 AND COALESCE(delivered_count,0)+1>=task_count
+                     WHEN task_count>0 AND COALESCE(delivered_count,0)+?>=task_count
                      THEN 'sent' ELSE status END,
-                   updated_at=CURRENT_TIMESTAMP
-               WHERE id=?""",
-            (row["batch_id"],),
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            [(count, count, batch_id) for batch_id, count in batch_delivered_increments.items()],
         )
         stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
-        conn.execute(
+        conn.executemany(
             """UPDATE batch_campaign_daily_stats
-               SET sent_count=COALESCE(sent_count,0)+1, updated_at=CURRENT_TIMESTAMP
+               SET sent_count=COALESCE(sent_count,0)+?, updated_at=CURRENT_TIMESTAMP
                WHERE campaign_id=? AND stats_date=?""",
-            (row["campaign_id"], stats_date),
+            [(count, campaign_id, stats_date)
+             for campaign_id, count in daily_sent_increments.items()],
         )
-    _insert_message_mapping(conn, task_id, message_ids)
-    pending_receipts = conn.execute(
-        """SELECT smsc_message_id, message_state, raw_receipt
-           FROM delivery_receipts
-           WHERE task_id IS NULL AND smsc_message_id IN
-             (SELECT UNNEST(from_json(?, '[\"VARCHAR\"]')))""",
-        (json.dumps(message_ids),),
-    ).fetchall()
-    if pending_receipts:
-        conn.execute(
-            """UPDATE delivery_receipts SET task_id=?
-               WHERE task_id IS NULL AND smsc_message_id IN
-                 (SELECT UNNEST(from_json(?, '[\"VARCHAR\"]')))""",
-            (task_id, json.dumps(message_ids)),
-        )
-    for receipt in pending_receipts:
-        _apply_receipt(
-            conn, receipt["smsc_message_id"], receipt["message_state"],
-            receipt["raw_receipt"], task_id=task_id, skip_insert=True,
-        )
+
+    # Receipts may arrive before submit_sm_resp. Preserve that reconciliation,
+    # but query all submitted ids together instead of once per task.
+    message_ids = list(pending_task_by_message_id)
+    for offset in range(0, len(message_ids), 500):
+        id_chunk = message_ids[offset:offset + 500]
+        id_placeholders = ",".join("?" for _ in id_chunk)
+        pending_receipts = conn.execute(
+            f"""SELECT smsc_message_id,message_state,raw_receipt
+                FROM delivery_receipts
+                WHERE task_id IS NULL AND smsc_message_id IN ({id_placeholders})""",
+            id_chunk,
+        ).fetchall()
+        if not pending_receipts:
+            continue
+        matched = [
+            (pending_task_by_message_id[str(receipt["smsc_message_id"])],
+             str(receipt["smsc_message_id"]))
+            for receipt in pending_receipts
+            if str(receipt["smsc_message_id"]) in pending_task_by_message_id
+        ]
+        if matched:
+            conn.executemany(
+                "UPDATE delivery_receipts SET task_id=? WHERE task_id IS NULL AND smsc_message_id=?",
+                matched,
+            )
+        for receipt in pending_receipts:
+            message_id = str(receipt["smsc_message_id"])
+            task_id = pending_task_by_message_id.get(message_id)
+            if task_id is not None:
+                _apply_receipt(
+                    conn, message_id, receipt["message_state"], receipt["raw_receipt"],
+                    task_id=task_id, skip_insert=True,
+                )
 
 
 def append_message_id(task_id: int, message_id: str, wait: bool = True):
@@ -773,19 +874,24 @@ def append_message_id(task_id: int, message_id: str, wait: bool = True):
 
 
 def _apply_message_id(conn, task_id: int, message_id: str):
-    row = conn.execute("SELECT smsc_message_ids FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
-    if row:
-        try:
-            values = json.loads(row["smsc_message_ids"] or "[]")
-        except json.JSONDecodeError:
-            values = []
-        if message_id and message_id not in values:
-            values.append(message_id)
-        conn.execute(
-            "UPDATE sms_tasks SET smsc_message_ids=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (json.dumps(values), task_id),
-        )
-        _insert_message_mapping(conn, task_id, [message_id])
+    _apply_message_id_batch(conn, [{"payload": {"task_id": task_id, "message_id": message_id}}])
+
+
+def _apply_message_id_batch(conn, items) -> None:
+    """Persist SMSC ids in the indexed lookup table as one batch.
+
+    The task's JSON snapshot is written once when submission succeeds or fails;
+    updating that wide task row for every response part creates avoidable DuckDB
+    row rewrites on the hottest write path.
+    """
+    mapping_candidates = []
+    for item in items:
+        payload = item.payload
+        task_id = int(payload["task_id"])
+        message_id = str(payload.get("message_id") or "")
+        if message_id:
+            mapping_candidates.append((message_id, task_id))
+    _insert_message_mappings(conn, mapping_candidates)
 
 
 def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
@@ -805,12 +911,22 @@ def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int]
     retry = retryable and task["attempts"] < task.get("max_attempts", 3)
     status = "retrying" if retry else "failed"
     delay_minutes = min(30, 2 ** max(0, task["attempts"] - 1))
+    try:
+        existing_ids = json.loads(task.get("smsc_message_ids") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        existing_ids = []
+    message_ids = list(dict.fromkeys(
+        [str(value) for value in existing_ids if str(value)]
+        + _mapped_message_ids(conn, task["id"])
+    ))
     updated = conn.execute(
         f"""UPDATE sms_tasks SET status=?, error_msg=?, last_smpp_status=?, failure_class=?,
+            smsc_message_ids=?,
             next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '{delay_minutes} minutes',
             updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending'
             RETURNING id""",
-        (status, str(error)[:2000], status_code, failure_class, task["id"]),
+        (status, str(error)[:2000], status_code, failure_class,
+         json.dumps(message_ids), task["id"]),
     ).fetchone()
     if updated:
         _add_task_event(conn, task["id"], "send_failure", task.get("status", "sending"), status,
@@ -1274,11 +1390,39 @@ def defer_task(task_id: int, reason: str, expired: bool = False):
 
 def recover_stale_tasks():
     conn = get_connection()
-    conn.execute(
-        """UPDATE sms_tasks SET status='retrying', error_msg='worker interrupted; recovered',
-            next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-            WHERE status='sending' AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
-    )
+    stale_rows = conn.execute(
+        """SELECT id,smsc_message_ids FROM sms_tasks
+           WHERE status='sending'
+             AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
+    ).fetchall()
+    if stale_rows:
+        mapped_rows = conn.execute(
+            """SELECT m.task_id,m.smsc_message_id FROM sms_task_message_ids m
+               JOIN sms_tasks t ON t.id=m.task_id
+               WHERE t.status='sending'
+                 AND CAST(t.updated_at AS TIMESTAMP WITH TIME ZONE) <
+                     CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
+        ).fetchall()
+        mapped_by_task = {}
+        for row in mapped_rows:
+            mapped_by_task.setdefault(int(row["task_id"]), []).append(str(row["smsc_message_id"]))
+        updates = []
+        for row in stale_rows:
+            try:
+                existing = json.loads(row["smsc_message_ids"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                existing = []
+            all_ids = list(dict.fromkeys(
+                [str(value) for value in existing if str(value)]
+                + mapped_by_task.get(int(row["id"]), [])
+            ))
+            updates.append((json.dumps(all_ids), int(row["id"])))
+        conn.executemany(
+            """UPDATE sms_tasks SET status='retrying', error_msg='worker interrupted; recovered',
+                smsc_message_ids=?, next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='sending'""",
+            updates,
+        )
     conn.execute(
         """UPDATE sms_tasks SET status='expired', error_msg='delivery receipt timeout',
             updated_at=CURRENT_TIMESTAMP

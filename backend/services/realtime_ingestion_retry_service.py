@@ -7,6 +7,7 @@ from dataclasses import dataclass
 MAX_RETRIES = max(0, int(os.environ.get("MC_REALTIME_MAX_RETRIES", "4")))
 RETRY_DELAYS = tuple(int(value) for value in os.environ.get("MC_REALTIME_RETRY_DELAYS", "30,120,600,1800").split(",") if value.strip())
 WAITING_DELAYS = tuple(int(value) for value in os.environ.get("MC_REALTIME_WAITING_RETRY_DELAYS", "60,300,900,1800").split(",") if value.strip())
+RESOURCE_DELAYS = tuple(int(value) for value in os.environ.get("MC_REALTIME_RESOURCE_RETRY_DELAYS", "30,60,120,300").split(",") if value.strip())
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,12 @@ def classify(error, status: str = "") -> ErrorDecision:
 
 
 def delay_for(decision: ErrorDecision, retry_count: int) -> int:
-    delays = WAITING_DELAYS if decision.error_class == "WAITING_DEPENDENCY" else RETRY_DELAYS
+    if decision.error_class == "WAITING_DEPENDENCY":
+        delays = WAITING_DELAYS
+    elif decision.error_class == "RESOURCE_LIMIT":
+        delays = RESOURCE_DELAYS
+    else:
+        delays = RETRY_DELAYS
     if not delays:
         return 60
     return delays[min(max(0, retry_count), len(delays) - 1)]

@@ -2,6 +2,7 @@ import shutil
 import json
 from database import get_connection
 import os
+import stat
 import pandas as pd
 from datetime import datetime
 from typing import Optional
@@ -385,16 +386,16 @@ def get_realtime_monitor(
     source_files = []
     conn = get_connection()
     all_campaign_rows = conn.execute(
-        "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns ORDER BY created_at DESC"
+        "SELECT id,name,status,watch_source,watch_dir,watch_filename_prefix,sftp_host,sftp_port,sftp_username FROM realtime_campaigns ORDER BY created_at DESC"
     ).fetchall()
     if campaign_id:
         campaign_rows = conn.execute(
-            "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns WHERE id=? AND COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC",
+            "SELECT * FROM realtime_campaigns WHERE id=? AND COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC",
             (campaign_id,),
         ).fetchall()
     else:
         campaign_rows = conn.execute(
-            "SELECT id,name,status,watch_dir,watch_filename_prefix FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC"
+            "SELECT * FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC"
         ).fetchall()
     active_campaigns = conn.execute("SELECT COUNT(*) AS count FROM realtime_campaigns WHERE status='in_progress'").fetchone()
     processed_where = "campaign_type='realtime'"
@@ -434,10 +435,15 @@ def get_realtime_monitor(
     watch_dirs = {}
     for row in campaign_rows:
         campaign = dict(row)
-        watch_dir = os.path.abspath(campaign.get("watch_dir", ""))
+        source = campaign.get("watch_source", "local")
+        watch_dir = (f"sftp://{campaign.get('sftp_host')}:{campaign.get('sftp_port')}{campaign.get('watch_dir')}"
+                     if source == "sftp" else os.path.abspath(campaign.get("watch_dir", "")))
         item = watch_dirs.setdefault(watch_dir, {
             "directory_path": watch_dir,
-            "exists": os.path.isdir(watch_dir),
+            "exists": os.path.isdir(campaign.get("watch_dir", "")) if source == "local" else None,
+            "source": source,
+            "error": "",
+            "config": campaign,
             "campaigns": [],
         })
         item["campaigns"].append({
@@ -448,6 +454,39 @@ def get_realtime_monitor(
         })
 
     for watch_dir, meta in watch_dirs.items():
+        if meta["source"] == "sftp":
+            client = sftp = None
+            try:
+                from services import sftp_watch_service
+                client, sftp, entries = sftp_watch_service.list_directory(meta["config"])
+                meta["exists"] = True
+                if selected_campaign:
+                    from services import realtime_campaign_service
+                    for entry in entries:
+                        name = entry.filename
+                        if not stat.S_ISREG(entry.st_mode) or os.path.splitext(name)[1].lower() != ".csv":
+                            continue
+                        match_prefix = bool(selected_campaign.get("watch_filename_prefix") and name.startswith(selected_campaign["watch_filename_prefix"]))
+                        match_schedule = realtime_campaign_service._watch_file_matches_campaign(name, selected_campaign)
+                        processed = realtime_campaign_service._processed_file_record(selected_campaign["id"], name)
+                        status = "processed" if processed else ("pending" if match_prefix and match_schedule else "ignored")
+                        source_files.append({
+                            "filename": name, "directory_path": watch_dir,
+                            "file_size": entry.st_size or 0, "row_count": 0,
+                            "match_prefix": match_prefix, "match_schedule": match_schedule,
+                            "status": status, "status_label": status.title(), "skip_reason": "",
+                            "created_at": "", "updated_at": "",
+                        })
+            except Exception as exc:
+                meta["exists"] = False
+                meta["error"] = str(exc)
+            finally:
+                if sftp:
+                    sftp.close()
+                if client:
+                    client.close()
+            meta.pop("config", None)
+            continue
         if not meta["exists"]:
             continue
         for name in sorted(os.listdir(watch_dir)):

@@ -1,12 +1,38 @@
 import os
 import threading
 import logging
+import time
 
 import duckdb
 
 logger = logging.getLogger(__name__)
 
-_lock = threading.Lock()
+# Serialize mutations, but allow independent read connections to run while the
+# SMS writer is committing. Every WrappedConnection is still protected against
+# simultaneous use by multiple Python threads.
+_write_lock = threading.Lock()
+
+_READ_ONLY_STATEMENTS = {"SELECT", "EXPLAIN", "DESCRIBE", "SHOW"}
+
+
+def _is_read_only_statement(sql: str) -> bool:
+    statement = str(sql or "").lstrip()
+    while statement.startswith("--"):
+        _, separator, remainder = statement.partition("\n")
+        if not separator:
+            return True
+        statement = remainder.lstrip()
+    first_token = statement.split(None, 1)[0].upper() if statement else ""
+    return first_token in _READ_ONLY_STATEMENTS
+
+
+def _observe_database_metric(name: str, value: float, labels=None) -> None:
+    try:
+        from services import metrics_service
+        metrics_service.observe(name, value, labels=labels)
+    except Exception:
+        # Database operations must not fail because runtime metrics are down.
+        pass
 
 DATABASE_FILE = os.environ.get(
     "DUCKDB_PATH",
@@ -90,35 +116,74 @@ class WrappedConnection:
     def __init__(self, conn):
         self.conn = conn
         self._last_sql = ""
+        self._connection_lock = threading.RLock()
 
     def execute(self, sql, params=None):
         sql = sql.replace("datetime('now','localtime')", "CURRENT_TIMESTAMP")
         self._last_sql = sql
-        with _lock:
-            if params is not None:
-                if not isinstance(params, (list, tuple)):
-                    params = [params]
-                self.conn.execute(sql, params)
-            else:
-                self.conn.execute(sql)
+        read_only = _is_read_only_statement(sql)
+        write_wait = 0.0
+        with self._connection_lock:
+            if not read_only:
+                wait_started = time.perf_counter()
+                _write_lock.acquire()
+                write_wait = time.perf_counter() - wait_started
+            execution_started = time.perf_counter()
+            try:
+                if params is not None:
+                    if not isinstance(params, (list, tuple)):
+                        params = [params]
+                    self.conn.execute(sql, params)
+                else:
+                    self.conn.execute(sql)
+            finally:
+                execution_seconds = time.perf_counter() - execution_started
+                if not read_only:
+                    _write_lock.release()
+        kind = "read" if read_only else "write"
+        _observe_database_metric(
+            "marketing_copilot_database_statement_seconds", execution_seconds,
+            labels={"kind": kind},
+        )
+        if not read_only:
+            _observe_database_metric(
+                "marketing_copilot_database_write_lock_wait_seconds", write_wait,
+            )
         return self
 
     def executemany(self, sql, rows):
         sql = sql.replace("datetime('now','localtime')", "CURRENT_TIMESTAMP")
         self._last_sql = sql
-        with _lock:
-            self.conn.executemany(sql, rows)
+        with self._connection_lock:
+            wait_started = time.perf_counter()
+            _write_lock.acquire()
+            write_wait = time.perf_counter() - wait_started
+            execution_started = time.perf_counter()
+            try:
+                self.conn.executemany(sql, rows)
+            finally:
+                execution_seconds = time.perf_counter() - execution_started
+                _write_lock.release()
+        _observe_database_metric(
+            "marketing_copilot_database_statement_seconds", execution_seconds,
+            labels={"kind": "write"},
+        )
+        _observe_database_metric(
+            "marketing_copilot_database_write_lock_wait_seconds", write_wait,
+        )
         return self
 
     def fetchone(self):
-        row = self.conn.fetchone()
+        with self._connection_lock:
+            row = self.conn.fetchone()
         if row is None:
             return None
         cols = [desc[0] for desc in self.conn.description] if self.conn.description else []
         return DuckRow(cols, list(row))
 
     def fetchall(self):
-        rows = self.conn.fetchall()
+        with self._connection_lock:
+            rows = self.conn.fetchall()
         if not rows:
             return []
         cols = [desc[0] for desc in self.conn.description] if self.conn.description else []
@@ -153,12 +218,28 @@ class WrappedConnection:
             return 1
 
     def commit(self):
-        with _lock:
-            self.conn.commit()
+        with self._connection_lock:
+            wait_started = time.perf_counter()
+            _write_lock.acquire()
+            write_wait = time.perf_counter() - wait_started
+            execution_started = time.perf_counter()
+            try:
+                self.conn.commit()
+            finally:
+                execution_seconds = time.perf_counter() - execution_started
+                _write_lock.release()
+        _observe_database_metric(
+            "marketing_copilot_database_statement_seconds", execution_seconds,
+            labels={"kind": "commit"},
+        )
+        _observe_database_metric(
+            "marketing_copilot_database_write_lock_wait_seconds", write_wait,
+        )
 
     def close(self):
         try:
-            self.conn.close()
+            with self._connection_lock:
+                self.conn.close()
         except Exception:
             pass
 
@@ -330,7 +411,12 @@ def init_db():
             row_count INTEGER DEFAULT 0,
             campaign_dir TEXT DEFAULT '',
             use_custom_directory BOOLEAN NOT NULL DEFAULT FALSE,
+            watch_source TEXT NOT NULL DEFAULT 'local',
             watch_dir TEXT NOT NULL DEFAULT '',
+            sftp_host TEXT NOT NULL DEFAULT '',
+            sftp_port INTEGER NOT NULL DEFAULT 22,
+            sftp_username TEXT NOT NULL DEFAULT '',
+            sftp_password TEXT NOT NULL DEFAULT '',
             watch_filename_prefix TEXT NOT NULL DEFAULT 'Android_4G_Switch_Somali_',
             sms_template_id INTEGER DEFAULT NULL,
             smpp_config_id INTEGER DEFAULT NULL,
@@ -612,6 +698,11 @@ def init_db():
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS use_custom_directory BOOLEAN DEFAULT FALSE",
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS use_whitelist BOOLEAN DEFAULT TRUE",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_dir TEXT DEFAULT ''",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_source TEXT DEFAULT 'local'",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS sftp_host TEXT DEFAULT ''",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS sftp_port INTEGER DEFAULT 22",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS sftp_username TEXT DEFAULT ''",
+       "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS sftp_password TEXT DEFAULT ''",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS watch_filename_prefix TEXT DEFAULT 'Android_4G_Switch_Somali_'",
        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS phone_prefix TEXT DEFAULT ''",
         "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
@@ -816,7 +907,7 @@ def init_db():
         ("realtime_output_retention_days", "30"),
         ("realtime_match_chunk_size", os.environ.get("MC_REALTIME_MATCH_CHUNK_SIZE", "5000")),
         ("realtime_whitelist_build_chunk_size", os.environ.get("MC_REALTIME_WHITELIST_BUILD_CHUNK", "10000")),
-        ("realtime_whitelist_build_memory_limit", os.environ.get("MC_REALTIME_WHITELIST_BUILD_MEMORY_LIMIT", "512MB")),
+        ("realtime_whitelist_build_memory_limit", os.environ.get("MC_REALTIME_WHITELIST_BUILD_MEMORY_LIMIT", "4GB")),
         ("realtime_whitelist_build_threads", os.environ.get("MC_REALTIME_WHITELIST_BUILD_THREADS", "1")),
         ("realtime_index_build_timeout", os.environ.get("MC_REALTIME_INDEX_BUILD_TIMEOUT", "7200")),
         ("realtime_whitelist_retention_days", os.environ.get("MC_REALTIME_WHITELIST_RETENTION_DAYS", "7")),

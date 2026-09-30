@@ -22,6 +22,26 @@
           {{ campaign.customer_list_filename || '-' }}
           <el-tag v-if="campaign.row_count" size="small" type="info" style="margin-left: 4px">{{ campaign.row_count }} rows</el-tag>
         </el-descriptions-item>
+        <el-descriptions-item :label="$t('campaign.whitelistIndex')" :span="2">
+          <div class="whitelist-index-summary">
+            <el-tag :type="whitelistIndexTagType(campaign.whitelist_index?.status)" size="small">
+              {{ $t(`campaign.whitelistIndexStatus_${campaign.whitelist_index?.status || 'missing'}`) }}
+            </el-tag>
+            <span v-if="campaign.whitelist_index?.version_no">{{ $t('campaign.whitelistIndexVersion', { version: campaign.whitelist_index.version_no }) }}</span>
+            <span v-if="campaign.whitelist_index?.status === 'ready'">
+              {{ $t('campaign.whitelistIndexRows', { rows: campaign.whitelist_index.normalized_count || 0 }) }}
+            </span>
+            <el-tag v-if="campaign.whitelist_index?.waiting_file_count" type="warning" size="small">
+              {{ $t('campaign.whitelistWaitingFiles', { count: campaign.whitelist_index.waiting_file_count }) }}
+            </el-tag>
+          </div>
+          <div v-if="campaign.whitelist_index?.error_detail" class="whitelist-index-error">
+            {{ campaign.whitelist_index.error_detail }}
+          </div>
+          <div v-if="campaign.whitelist_index?.index_path" class="whitelist-index-path">
+            <code>{{ campaign.whitelist_index.index_path }}</code>
+          </div>
+        </el-descriptions-item>
         <el-descriptions-item :label="$t('campaign.sendDays')">
           <template v-if="campaign.send_days?.length">
             <el-tag v-for="d in campaign.send_days" :key="d" size="small" style="margin: 1px">
@@ -30,6 +50,8 @@
           </template>
           <span v-else>-</span>
         </el-descriptions-item>
+        <el-descriptions-item :label="$t('campaign.watchSource')">{{ campaign?.watch_source === 'sftp' ? 'SSH / SFTP' : $t('campaign.localWatchSource') }}</el-descriptions-item>
+        <el-descriptions-item v-if="campaign?.watch_source === 'sftp'" :label="$t('campaign.sftpHost')">{{ campaign?.sftp_username }}@{{ campaign?.sftp_host }}:{{ campaign?.sftp_port }}</el-descriptions-item>
         <el-descriptions-item :label="$t('campaign.watchDir')" :span="2"><code style="font-size: 12px">{{ campaign?.watch_dir || '-' }}</code></el-descriptions-item>
        <el-descriptions-item :label="$t('campaign.watchFilenamePrefix')" :span="2"><code style="font-size: 12px">{{ campaign?.watch_filename_prefix || '-' }}</code></el-descriptions-item>
        <el-descriptions-item :label="$t('campaign.phonePrefix')" :span="2"><code style="font-size: 12px">{{ campaign?.phone_prefix || '-' }}</code></el-descriptions-item>
@@ -258,6 +280,13 @@ function watchStatusType(status: string) {
   return 'warning' as const
 }
 
+function whitelistIndexTagType(status?: string) {
+  if (status === 'ready') return 'success' as const
+  if (status === 'failed' || status === 'missing_index') return 'danger' as const
+  if (status === 'disabled') return 'info' as const
+  return 'warning' as const
+}
+
 function watchStatusLabel(row: any) {
   if (row.status === 'processed') return i18n.global.t('monitor.status_processed')
   if (row.status === 'ignored' && row.match_prefix === false) return i18n.global.t('monitor.status_prefix_mismatch')
@@ -300,12 +329,13 @@ async function loadReceivedData(reset = true) {
 }
 
 function refreshActiveTab() {
+  void loadCampaignDetail()
   if (activeTab.value === 'sent') void loadSentRecords(true)
   else if (activeTab.value === 'watch-files') void loadWatchFiles(true)
   else void loadReceivedData(true)
 }
 
-async function loadDetail() {
+async function loadCampaignDetail() {
   const id = Number(route.params.id)
   try {
     const res = await api.getRealtimeCampaignDetail(id)
@@ -313,6 +343,10 @@ async function loadDetail() {
   } catch (e) {
     console.error(e)
   }
+}
+
+async function loadDetail() {
+  await loadCampaignDetail()
   await loadSmppOptions()
   await loadReceivedData(true)
   await loadSentRecords(true)
@@ -343,6 +377,9 @@ watch(activeTab, (tab) => {
   margin-bottom: 12px;
 }
 .page-header h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.whitelist-index-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.whitelist-index-error { margin-top: 6px; color: var(--el-color-danger); white-space: pre-wrap; overflow-wrap: anywhere; }
+.whitelist-index-path { margin-top: 6px; overflow-wrap: anywhere; }
 .tabs-with-refresh {
   position: relative;
 }
