@@ -399,6 +399,103 @@ def repair_active_failed(limit: int = 1) -> int:
     return repaired
 
 
+def repair_active_binding(limit: int = 10) -> int:
+    """Restore a newer ready index as active when the binding is stale.
+
+    A failed version must not hide a newer ready version. This is a binding
+    repair, not a rollback: the candidate must have a higher version number
+    than the failed active version (or the campaign must have no binding).
+    """
+    conn = get_connection()
+    try:
+        campaigns = conn.execute(
+            """SELECT id,active_whitelist_version_id FROM realtime_campaigns
+               WHERE use_whitelist=TRUE ORDER BY id LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    restored = 0
+    for campaign in campaigns:
+        campaign_id = int(campaign["id"])
+        active_id = int(campaign["active_whitelist_version_id"] or 0)
+        active = get_version(active_id) if active_id else None
+        if active and active.get("status") == "ready" and os.path.isfile(active.get("index_path") or ""):
+            continue
+        conn = get_connection()
+        try:
+            candidates = conn.execute(
+                """SELECT * FROM realtime_whitelist_versions
+                   WHERE campaign_id=? AND status IN ('ready','retired')
+                   ORDER BY version_no DESC""",
+                (campaign_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        candidate = next(
+            (dict(row) for row in candidates if os.path.isfile(row["index_path"] or "")),
+            None,
+        )
+        if not candidate:
+            continue
+        if not active:
+            latest = latest_version(campaign_id)
+            if latest and int(candidate["version_no"]) < int(latest["version_no"]):
+                # A newer failed version exists; do not silently fall back to
+                # an older ready index. Repair the newest version instead.
+                continue
+        if active and int(candidate["version_no"]) <= int(active.get("version_no") or 0):
+            # Never fall back to an older version when the current version is
+            # damaged or missing. It must be repaired from its own source.
+            continue
+        conn = get_connection()
+        try:
+            conn.execute(
+                """UPDATE realtime_whitelist_versions
+                   SET status='ready',retired_at=NULL,error_detail=''
+                   WHERE id=?""",
+                (candidate["id"],),
+            )
+            conn.execute(
+                """UPDATE realtime_campaigns SET active_whitelist_version_id=?,
+                   customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (candidate["id"], candidate["source_filename"], candidate["source_path"],
+                 int(candidate["row_count"] or 0), campaign_id),
+            )
+            if active_id:
+                conn.execute(
+                    """UPDATE ingestion_files SET whitelist_version_id=?,status='pending',
+                       processing_phase='queued',retry_count=0,last_error_class='',last_error_at=NULL,
+                       next_retry_at=NULL,error_detail='',lease_token='',lease_expires_at=NULL,
+                       worker_id='',updated_at=CURRENT_TIMESTAMP
+                       WHERE campaign_type='realtime' AND campaign_id=? AND whitelist_version_id=?
+                         AND status IN ('pending','retrying','failed','quarantined')""",
+                    (candidate["id"], campaign_id, active_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE ingestion_files SET whitelist_version_id=?,status='pending',
+                       processing_phase='queued',retry_count=0,last_error_class='',last_error_at=NULL,
+                       next_retry_at=NULL,error_detail='',lease_token='',lease_expires_at=NULL,
+                       worker_id='',updated_at=CURRENT_TIMESTAMP
+                       WHERE campaign_type='realtime' AND campaign_id=?
+                         AND status IN ('pending','retrying','failed','quarantined')
+                         AND (whitelist_version_id IS NULL
+                              OR last_error_class IN ('WAITING_DEPENDENCY','WHITELIST_INDEX'))""",
+                    (candidate["id"], campaign_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        restored += 1
+        logger.warning(
+            "Realtime active whitelist binding restored campaign=%s from_version=%s to_version=%s",
+            campaign_id, active_id or "none", candidate["id"],
+        )
+    return restored
+
+
 def _configure(conn) -> None:
     try:
         conn.execute("SET memory_limit = ?", (settings_service.get_setting(

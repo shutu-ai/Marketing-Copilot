@@ -369,6 +369,7 @@ def _run():
             # level; keeping it in this dedicated worker prevents scheduler ticks
             # from being held by a multi-million-row whitelist.
             realtime_whitelist_service.migrate_legacy_versions(limit=1)
+            realtime_whitelist_service.repair_active_binding(limit=10)
             realtime_whitelist_service.repair_active_failed(limit=1)
             realtime_whitelist_service.build_pending(limit=1)
             if not process_once():
@@ -390,6 +391,7 @@ def start_worker():
         _cleanup_orphaned_intermediate_files()
         _last_expiry_sweep_date = datetime.now().date()
         _last_inactive_campaign_sweep_at = time.monotonic()
+        realtime_whitelist_service.repair_active_binding(limit=10)
         realtime_whitelist_service.repair_active_failed(limit=5)
     except Exception:
         logger.exception("Realtime expired-file startup cleanup failed")
