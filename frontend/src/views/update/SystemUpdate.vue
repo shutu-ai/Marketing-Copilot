@@ -224,7 +224,9 @@ import {
 
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 
-const CHUNK_SIZE = 8 * 1024 * 1024
+// Smaller chunks make progress responsive and keep each request below common
+// reverse-proxy/body-timeout thresholds. The server accepts chunks up to 64 MiB.
+const CHUNK_SIZE = 4 * 1024 * 1024
 
 const status = ref<UpdateStatus | null>(null)
 const history = ref<UpdateHistoryRow[]>([])
@@ -361,6 +363,9 @@ async function uploadAndVerify() {
   uploadProgress.value = 0
   try {
     const chunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
+    // SHA-256 is calculated before the first request. Show that work has
+    // started instead of leaving the progress bar at zero.
+    uploadProgress.value = 1
     const sha256 = await sha256File(file)
     const started = await startUpload({
       filename: file.name,
@@ -371,9 +376,13 @@ async function uploadAndVerify() {
     uploadId.value = started.data.upload_id
     for (let i = 0; i < chunks; i += 1) {
       const blob = file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size))
-      await uploadChunk(uploadId.value, i, blob)
-      uploadProgress.value = Math.round(((i + 1) / chunks) * 100)
+      await uploadChunk(uploadId.value, i, blob, (loaded, total) => {
+        const uploaded = i * CHUNK_SIZE + Math.min(loaded, total || blob.size)
+        uploadProgress.value = Math.min(99, Math.max(uploadProgress.value, Math.round((uploaded / file.size) * 100)))
+      })
+      uploadProgress.value = Math.min(99, Math.round(((i + 1) * CHUNK_SIZE / file.size) * 100))
     }
+    uploadProgress.value = 100
     ElMessage.success(i18n.global.t('legacy.xed76a30b'))
     const verified = await verifyUpload(uploadId.value)
     precheck.value = verified.data

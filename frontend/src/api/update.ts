@@ -57,18 +57,26 @@ export function startUpload(payload: UploadStartPayload) {
   return api.post<{ upload_id: string; filename: string }>('/update/upload/start', payload)
 }
 
-export function uploadChunk(uploadId: string, chunk: number, blob: Blob) {
+export function uploadChunk(
+  uploadId: string,
+  chunk: number,
+  blob: Blob,
+  onProgress?: (loaded: number, total: number) => void,
+) {
   return api.post('/update/upload/chunk', blob, {
     params: { upload_id: uploadId, chunk },
     headers: { 'Content-Type': 'application/octet-stream' },
-    timeout: 120000,
+    timeout: 600000,
+    onUploadProgress: (event) => {
+      onProgress?.(event.loaded, event.total || blob.size)
+    },
   })
 }
 
 export function verifyUpload(uploadId: string) {
   return api.post<{ ok: boolean; version: string; checks: any[]; errors: string[] }>('/update/verify', null, {
     params: { upload_id: uploadId },
-    timeout: 120000,
+    timeout: 600000,
   })
 }
 

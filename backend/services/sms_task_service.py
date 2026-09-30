@@ -1275,9 +1275,13 @@ def task_stats() -> dict:
         conn = get_connection()
         try:
             rows = conn.execute(
-                "SELECT status, COUNT(*) count FROM sms_tasks GROUP BY status"
+                """SELECT status, COUNT(*) AS count,
+                          SUM(CASE WHEN CAST(created_at AS DATE)=CURRENT_DATE THEN 1 ELSE 0 END) AS today_count
+                   FROM sms_tasks
+                   GROUP BY status"""
             ).fetchall()
-            raw = {r["status"]: r["count"] for r in rows}
+            raw = {r["status"]: int(r["count"] or 0) for r in rows}
+            today_raw = {r["status"]: int(r["today_count"] or 0) for r in rows}
             result = dict(raw)
             for status in ("queued", "sending", "submitted", "accepted", "delivered",
                            "retrying", "failed", "expired", "cancelled", "archived"):
@@ -1285,6 +1289,13 @@ def task_stats() -> dict:
             # Keep delivery semantics strict. ``accepted`` means the SMSC
             # accepted submit_sm; it is not a handset delivery receipt.
             result["accepted_or_delivered"] = raw.get("accepted", 0) + raw.get("delivered", 0)
+            result["today_total"] = sum(today_raw.values())
+            for status in ("queued", "sending", "submitted", "accepted", "delivered",
+                           "retrying", "failed", "expired", "cancelled", "archived"):
+                result[f"today_{status}"] = today_raw.get(status, 0)
+            result["today_accepted_or_delivered"] = (
+                today_raw.get("accepted", 0) + today_raw.get("delivered", 0)
+            )
             result["total"] = sum(raw.values())
         finally:
             conn.close()
