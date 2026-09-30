@@ -104,10 +104,11 @@ def _run():
             metrics_service.set_gauge("realtime_scheduler_last_tick_timestamp", time.time())
             _process_batches()
             realtime_campaign_service.finalize_daily_tasks()
-            realtime_campaign_service.sync_watch_dirs_to_inboxes()
-            realtime_result = realtime_campaign_service.process_realtime_inboxes()
-            if realtime_result.get("errors"):
-                logger.error("Realtime inbox registration errors=%s", len(realtime_result["errors"]))
+            if realtime_campaign_service.has_active_realtime_campaigns():
+                realtime_campaign_service.sync_watch_dirs_to_inboxes()
+                realtime_result = realtime_campaign_service.process_realtime_inboxes()
+                if realtime_result.get("errors"):
+                    logger.error("Realtime inbox registration errors=%s", len(realtime_result["errors"]))
             if ticks % 20 == 0:
                 ingestion_job_service.recover_expired_chunks()
                 realtime_campaign_service.cleanup_realtime_retention()

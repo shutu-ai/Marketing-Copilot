@@ -1205,7 +1205,11 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
             due_campaigns = []
             for row in campaigns:
                 campaign = dict(row)
-                key = (int(campaign["id"]), today)
+                key = (
+                    int(campaign["id"]), today,
+                    (campaign.get("send_start_time") or "")[:5],
+                    (campaign.get("send_end_time") or "")[:5],
+                )
                 if _daily_window_ended(campaign, now) and key not in finalized_windows:
                     due_campaigns.append((campaign, key))
             # This is the hard cross-day guard. It also repairs tasks missed by
@@ -1255,9 +1259,33 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
             _daily_finalized_windows = finalized_windows
         finally:
             conn.close()
+        # Expire queued ingestion records and remove their input files once at
+        # the boundary.  The scheduler skips closed windows after this point.
+        if due_campaigns:
+            cleanup_closed_window_ingestion_files(now)
     if cancelled:
         logger.info("Realtime daily tasks cancelled=%s", cancelled)
     return cancelled
+
+
+def has_active_realtime_campaigns(now: Optional[datetime] = None) -> bool:
+    """Return whether the scheduler needs to scan realtime watch/inbox paths."""
+    now = now or datetime.now()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE status='in_progress'"
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        campaign = dict(row)
+        if _daily_window_ended(campaign, now):
+            continue
+        active, _ = sms_task_service.campaign_is_active(campaign, now)
+        if active:
+            return True
+    return False
 
 
 def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
