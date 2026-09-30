@@ -301,8 +301,18 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
         ).fetchone()
     finally:
         conn.close()
-    if not campaign or int(campaign["active_whitelist_version_id"] or 0) != int(version_id):
+    if not campaign:
         return False
+    active_version_id = int(campaign["active_whitelist_version_id"] or 0)
+    if active_version_id not in (0, int(version_id)):
+        return False
+    if active_version_id == 0:
+        # A first whitelist build can fail before the campaign receives an
+        # active binding. Only repair the newest failed version in that case;
+        # never resurrect an older historical version.
+        latest = latest_version(version["campaign_id"])
+        if not latest or int(latest["id"]) != int(version_id):
+            return False
     source_path = version.get("source_path") or ""
     if not os.path.isfile(source_path):
         # An upgrade or manual cleanup can remove the historical path. It is
@@ -364,8 +374,13 @@ def repair_active_failed(limit: int = 1) -> int:
     try:
         rows = conn.execute(
             """SELECT v.id,v.error_detail FROM realtime_whitelist_versions v
-               JOIN realtime_campaigns c ON c.active_whitelist_version_id=v.id
-               WHERE v.status='failed' ORDER BY v.created_at,v.id LIMIT ?""",
+               JOIN realtime_campaigns c ON c.id=v.campaign_id
+               WHERE v.status='failed'
+                 AND (c.active_whitelist_version_id=v.id
+                      OR (c.active_whitelist_version_id IS NULL AND v.version_no=(
+                          SELECT MAX(v2.version_no) FROM realtime_whitelist_versions v2
+                          WHERE v2.campaign_id=v.campaign_id)))
+               ORDER BY v.created_at,v.id LIMIT ?""",
             (max(1, int(limit)),),
         ).fetchall()
     finally:
