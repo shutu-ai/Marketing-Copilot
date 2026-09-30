@@ -12,6 +12,7 @@ import csv
 import time
 import duckdb
 import tempfile
+import threading
 from database import get_connection
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
@@ -26,6 +27,9 @@ CHUNK_SIZE = 5000  # fallback; the effective value is read from app settings
 MAX_PENDING_FILES_PER_CAMPAIGN = max(1, int(os.environ.get("MC_REALTIME_MAX_PENDING_FILES_PER_CAMPAIGN", "100")))
 MAX_INBOX_FILES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_FILES", "1000")))
 MAX_INBOX_BYTES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_GB", "10")) * 1024 ** 3)
+_daily_finalize_lock = threading.Lock()
+_daily_finalize_date = None
+_daily_finalized_windows = set()
 
 
 def _realtime_chunk_size() -> int:
@@ -1187,50 +1191,70 @@ def _realtime_ingestion_expired_reason(campaign: dict, now: Optional[datetime] =
 
 def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
     """Close realtime work at a daily boundary and prevent cross-day carryover."""
+    global _daily_finalize_date, _daily_finalized_windows
     now = now or datetime.now()
     today = now.date().isoformat()
-    conn = get_connection()
-    # This is the hard cross-day guard. It also repairs tasks missed by the
-    # scheduler at midnight; task_date is independently enforced by the worker.
-    stale_count = conn.execute(
-        """SELECT COUNT(*) AS count FROM sms_tasks
-           WHERE campaign_type='realtime' AND CAST(task_date AS DATE) < CAST(? AS DATE)
-             AND status IN ('queued','retrying','sending')""",
-        (today,),
-    ).fetchone()["count"]
-    conn.execute(
-        """UPDATE sms_tasks SET status='cancelled', error_msg='previous day task cancelled',
-           claim_token='',updated_at=CURRENT_TIMESTAMP
-           WHERE campaign_type='realtime' AND CAST(task_date AS DATE) < CAST(? AS DATE)
-             AND status IN ('queued','retrying','sending')""",
-        (today,),
-    )
-    campaigns = conn.execute(
-        "SELECT id,send_start_time,send_end_time FROM realtime_campaigns"
-    ).fetchall()
-    cancelled = int(stale_count or 0)
-    for row in campaigns:
-        campaign = dict(row)
-        if not _daily_window_ended(campaign, now):
-            continue
-        daily_count = conn.execute(
-            """SELECT COUNT(*) AS count FROM sms_tasks
-               WHERE campaign_type='realtime' AND campaign_id=?
-                 AND CAST(task_date AS DATE)=CAST(? AS DATE)
-                 AND status IN ('queued','retrying','sending')""",
-            (campaign["id"], today),
-        ).fetchone()["count"]
-        conn.execute(
-            """UPDATE sms_tasks SET status='cancelled', error_msg='daily send window ended',
-               claim_token='',updated_at=CURRENT_TIMESTAMP
-               WHERE campaign_type='realtime' AND campaign_id=?
-                 AND CAST(task_date AS DATE)=CAST(? AS DATE)
-                 AND status IN ('queued','retrying','sending')""",
-            (campaign["id"], today),
-        )
-        cancelled += int(daily_count or 0)
-    conn.commit()
-    conn.close()
+    with _daily_finalize_lock:
+        new_day = _daily_finalize_date != today
+        finalized_windows = set() if new_day else _daily_finalized_windows
+        conn = get_connection()
+        try:
+            campaigns = conn.execute(
+                "SELECT id,send_start_time,send_end_time FROM realtime_campaigns"
+            ).fetchall()
+            due_campaigns = []
+            for row in campaigns:
+                campaign = dict(row)
+                key = (int(campaign["id"]), today)
+                if _daily_window_ended(campaign, now) and key not in finalized_windows:
+                    due_campaigns.append((campaign, key))
+            # This is the hard cross-day guard. It also repairs tasks missed by
+            # the scheduler at midnight; task_date is independently enforced by
+            # the worker. Run it once per local calendar day.
+            if not new_day and not due_campaigns:
+                return 0
+            cancelled = 0
+            if new_day:
+                stale_count = conn.execute(
+                    """SELECT COUNT(*) AS count FROM sms_tasks
+                       WHERE campaign_type='realtime' AND task_date < CAST(? AS DATE)
+                         AND status IN ('queued','retrying','sending')""",
+                    (today,),
+                ).fetchone()["count"]
+                if int(stale_count or 0):
+                    conn.execute(
+                        """UPDATE sms_tasks SET status='cancelled', error_msg='previous day task cancelled',
+                           claim_token='',updated_at=CURRENT_TIMESTAMP
+                           WHERE campaign_type='realtime' AND task_date < CAST(? AS DATE)
+                             AND status IN ('queued','retrying','sending')""",
+                        (today,),
+                    )
+                    cancelled += int(stale_count)
+            for campaign, key in due_campaigns:
+                daily_count = conn.execute(
+                    """SELECT COUNT(*) AS count FROM sms_tasks
+                       WHERE campaign_type='realtime' AND campaign_id=?
+                         AND task_date=CAST(? AS DATE)
+                         AND status IN ('queued','retrying','sending')""",
+                    (campaign["id"], today),
+                ).fetchone()["count"]
+                if int(daily_count or 0):
+                    conn.execute(
+                        """UPDATE sms_tasks SET status='cancelled', error_msg='daily send window ended',
+                           claim_token='',updated_at=CURRENT_TIMESTAMP
+                           WHERE campaign_type='realtime' AND campaign_id=?
+                             AND task_date=CAST(? AS DATE)
+                             AND status IN ('queued','retrying','sending')""",
+                        (campaign["id"], today),
+                    )
+                    cancelled += int(daily_count)
+                finalized_windows.add(key)
+            if cancelled:
+                conn.commit()
+            _daily_finalize_date = today
+            _daily_finalized_windows = finalized_windows
+        finally:
+            conn.close()
     if cancelled:
         logger.info("Realtime daily tasks cancelled=%s", cancelled)
     return cancelled
