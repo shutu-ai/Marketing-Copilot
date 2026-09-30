@@ -268,18 +268,18 @@ def expire_files(file_ids: Iterable[int], error: str,
             (str(error)[:4000], *ids),
         )
         rows = conn.execute(
-            """SELECT id FROM ingestion_files WHERE id IN (""" + placeholders + ")
-               AND status='failed' AND last_error_class='EXPIRED_FILE'",
+            f"""SELECT id FROM ingestion_files WHERE id IN ({placeholders})
+               AND status='failed' AND last_error_class='EXPIRED_FILE'""",
             ids,
         ).fetchall()
         expired_ids = {int(row["id"]) for row in rows}
         if expired_ids:
             expired_placeholders = ",".join("?" for _ in expired_ids)
             conn.execute(
-                """UPDATE ingestion_chunks SET status='failed',lease_token='',lease_expires_at=NULL,
+                f"""UPDATE ingestion_chunks SET status='failed',lease_token='',lease_expires_at=NULL,
                    error_detail=?,updated_at=CURRENT_TIMESTAMP
-                   WHERE file_id IN (""" + expired_placeholders + ")
-                     AND status IN ('pending','processing','retrying')",
+                   WHERE file_id IN ({expired_placeholders})
+                     AND status IN ('pending','processing','retrying')""",
                 (str(error)[:4000], *sorted(expired_ids)),
             )
         conn.commit()
