@@ -369,6 +369,7 @@ def _run():
             # level; keeping it in this dedicated worker prevents scheduler ticks
             # from being held by a multi-million-row whitelist.
             realtime_whitelist_service.migrate_legacy_versions(limit=1)
+            realtime_whitelist_service.repair_active_failed(limit=1)
             realtime_whitelist_service.build_pending(limit=1)
             if not process_once():
                 continue

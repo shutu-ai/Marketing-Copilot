@@ -310,7 +310,10 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
     _set_status(
         version_id,
         "building",
-        error_detail=str(error_detail or "")[:4000],
+        # Do not keep rendering the previous failure while the repair is in
+        # progress. The reason remains in the service log and event record;
+        # a new build failure will write a fresh error detail.
+        error_detail="",
         ready_at=None,
         retired_at=None,
     )
@@ -319,6 +322,42 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
         version["campaign_id"], version_id, str(error_detail or "")[:500],
     )
     return True
+
+
+def _is_repairable_error(error) -> bool:
+    message = str(error or "").lower()
+    return any(marker in message for marker in (
+        "write-write conflict", "transactioncontext", "transaction conflict",
+        "database is locked", "could not set lock", "conflicting lock",
+        "cannot read whitelist index", "cannot read active whitelist index",
+        "catalog error", "io error", "corrupt",
+    ))
+
+
+def repair_active_failed(limit: int = 1) -> int:
+    """Queue repair for active failed indexes without changing the binding."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT v.id,v.error_detail FROM realtime_whitelist_versions v
+               JOIN realtime_campaigns c ON c.active_whitelist_version_id=v.id
+               WHERE v.status='failed' ORDER BY v.created_at,v.id LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    repaired = 0
+    for row in rows:
+        if not _is_repairable_error(row["error_detail"]):
+            continue
+        try:
+            if schedule_active_rebuild(row["id"], row["error_detail"]):
+                repaired += 1
+        except Exception:
+            logger.exception("Unable to repair active failed whitelist version=%s", row["id"])
+    if repaired:
+        logger.warning("Realtime active whitelist repairs queued count=%s", repaired)
+    return repaired
 
 
 def _configure(conn) -> None:

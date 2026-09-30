@@ -714,6 +714,19 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 "retryable": False,
                 "message": terminal_error,
             }
+        if whitelist_status == "ready" and not os.path.isfile(whitelist_version.get("index_path", "")):
+            if _schedule_active_whitelist_rebuild(
+                campaign_id, whitelist_version_id, "active whitelist index file is missing",
+            ):
+                ingestion_job_service.update_progress(
+                    ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
+                )
+                return {
+                    "success": False,
+                    "status": "waiting_for_whitelist",
+                    "retryable": True,
+                    "message": "active whitelist index repair scheduled: index file is missing",
+                }
         if whitelist_status != "ready" or not os.path.isfile(whitelist_version.get("index_path", "")):
             ingestion_job_service.update_progress(ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id)
             return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
