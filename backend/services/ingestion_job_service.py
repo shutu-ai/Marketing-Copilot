@@ -99,6 +99,10 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
             """SELECT id FROM ingestion_files
                WHERE campaign_type=? AND status IN ('pending','retrying')
                  AND (next_retry_at IS NULL OR CAST(next_retry_at AS TIMESTAMP)<=CURRENT_TIMESTAMP)
+                 AND (campaign_type<>'realtime' OR EXISTS (
+                      SELECT 1 FROM realtime_campaigns c
+                      WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
+                 ))
                ORDER BY created_at,id LIMIT 1""", (campaign_type,)
         ).fetchone()
         if not row:
@@ -109,6 +113,10 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
                last_progress_at=CURRENT_TIMESTAMP,processing_phase='queued',updated_at=CURRENT_TIMESTAMP
                WHERE id=? AND status IN ('pending','retrying')
                  AND (next_retry_at IS NULL OR CAST(next_retry_at AS TIMESTAMP)<=CURRENT_TIMESTAMP)
+                 AND (campaign_type<>'realtime' OR EXISTS (
+                      SELECT 1 FROM realtime_campaigns c
+                      WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
+                 ))
                RETURNING *""", (worker_id, token, lease_until, row["id"]),
         ).fetchone()
         if claimed:

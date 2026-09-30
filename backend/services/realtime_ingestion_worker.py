@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 _stop = threading.Event()
 _thread = None
 _last_expiry_sweep_date = None
+_last_inactive_campaign_sweep_at = 0.0
+_INACTIVE_CAMPAIGN_SWEEP_INTERVAL_SECONDS = 5.0
 WORKER_ID = "realtime-ingestion-1"
 
 
@@ -90,6 +92,69 @@ def _discard_expired_queued_files(include_processing: bool = False):
                 job["campaign_id"], job["filename"], exc,
             )
     logger.info("Realtime expired queued files discarded count=%s", len(discarded_jobs))
+
+
+def _discard_inactive_campaign_files() -> None:
+    """Batch-cancel queued files whose campaign was disabled or removed."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT f.id,f.campaign_id,f.filename,f.file_path,
+                      c.id AS matched_campaign_id
+               FROM ingestion_files f
+               LEFT JOIN realtime_campaigns c ON c.id=f.campaign_id
+               WHERE f.campaign_type='realtime'
+                 AND f.status IN ('pending','retrying')
+                 AND (c.id IS NULL OR c.status <> 'in_progress')"""
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return
+
+    groups = {}
+    for row in rows:
+        job = dict(row)
+        reason = "campaign not found" if job.get("matched_campaign_id") is None else "campaign is not enabled"
+        groups.setdefault(reason, []).append(job)
+
+    discarded_jobs = []
+    for reason, jobs in groups.items():
+        expired_ids = ingestion_job_service.expire_files(
+            (job["id"] for job in jobs), reason,
+        )
+        discarded_jobs.extend(job for job in jobs if job["id"] in expired_ids)
+    if not discarded_jobs:
+        return
+
+    conn = get_connection()
+    try:
+        conn.executemany(
+            """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
+               processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
+               completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
+               WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
+            (("campaign not found" if job.get("matched_campaign_id") is None else "campaign is not enabled",
+              job["campaign_id"], job["filename"]) for job in discarded_jobs),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    for job in discarded_jobs:
+        try:
+            path = job.get("file_path", "")
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            logger.warning(
+                "Realtime inactive campaign file deletion failed campaign=%s file=%s error=%s",
+                job["campaign_id"], job["filename"], exc,
+            )
+    logger.info(
+        "Realtime inactive campaign queued files discarded count=%s",
+        len(discarded_jobs),
+    )
 
 
 def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str):
@@ -196,11 +261,15 @@ def _quarantine(job: dict, processed_id, decision, error, target_path=None):
 
 def process_once() -> bool:
     global _current_file_id, _current_campaign_id, _current_filename, _campaign_dir
-    global _last_expiry_sweep_date
+    global _last_expiry_sweep_date, _last_inactive_campaign_sweep_at
     today = datetime.now().date()
     if _last_expiry_sweep_date != today:
         _discard_expired_queued_files()
         _last_expiry_sweep_date = today
+    now_monotonic = time.monotonic()
+    if now_monotonic - _last_inactive_campaign_sweep_at >= _INACTIVE_CAMPAIGN_SWEEP_INTERVAL_SECONDS:
+        _discard_inactive_campaign_files()
+        _last_inactive_campaign_sweep_at = now_monotonic
     job = ingestion_job_service.claim_file("realtime", WORKER_ID)
     if not job:
         return False
@@ -309,15 +378,17 @@ def _run():
 
 
 def start_worker():
-    global _thread, _last_expiry_sweep_date
+    global _thread, _last_expiry_sweep_date, _last_inactive_campaign_sweep_at
     if _thread and _thread.is_alive():
         return
     try:
         ingestion_job_service.recover_expired_files()
         _discard_expired_queued_files(include_processing=True)
+        _discard_inactive_campaign_files()
         realtime_campaign_service.cleanup_closed_window_ingestion_files(include_processing=True)
         _cleanup_orphaned_intermediate_files()
         _last_expiry_sweep_date = datetime.now().date()
+        _last_inactive_campaign_sweep_at = time.monotonic()
     except Exception:
         logger.exception("Realtime expired-file startup cleanup failed")
     _stop.clear()

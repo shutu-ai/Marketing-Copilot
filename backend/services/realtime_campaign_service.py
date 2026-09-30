@@ -608,8 +608,17 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         )
     active, inactive_reason = sms_task_service.campaign_is_active(campaign)
     if not active:
+        # A worker can claim a file just as an operator closes the campaign.
+        # Treat terminal campaign closure as expiration, not an input failure.
         operations_service.finish_file(file_record_id, "failed", file_path, error=inactive_reason)
-        return {"success": False, "message": inactive_reason}
+        terminal = inactive_reason in {"campaign is not enabled", "campaign has ended"}
+        return {
+            "success": False,
+            "status": "expired" if terminal else "inactive",
+            "error_class": "EXPIRED_FILE" if terminal else "INVALID_CAMPAIGN",
+            "retryable": False,
+            "message": inactive_reason,
+        }
     whitelist_version = realtime_whitelist_service.get_version(whitelist_version_id) if whitelist_version_id else None
     latest_whitelist_version = realtime_whitelist_service.latest_version(campaign_id)
     whitelist_path = campaign.get("customer_list_path", "")
@@ -1263,8 +1272,13 @@ def _realtime_ingestion_expired_reason(campaign: dict, now: Optional[datetime] =
     if file_time and file_time.date() != now.date():
         return "file timestamp is outside the current day"
     active, reason = sms_task_service.campaign_is_active(campaign, now)
-    if not active and (reason == "campaign has ended" or _daily_window_ended(campaign, now)):
-        return "campaign has ended" if reason == "campaign has ended" else "daily send window ended"
+    if not active and (
+        reason in {"campaign is not enabled", "campaign has ended"}
+        or _daily_window_ended(campaign, now)
+    ):
+        if reason in {"campaign is not enabled", "campaign has ended"}:
+            return reason
+        return "daily send window ended"
     return ""
 
 
