@@ -30,6 +30,8 @@ MAX_INBOX_BYTES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_GB", "10")) *
 _daily_finalize_lock = threading.Lock()
 _daily_finalize_date = None
 _daily_finalized_windows = set()
+_backpressure_log_lock = threading.Lock()
+_backpressure_log_state = {}
 
 
 def _realtime_chunk_size() -> int:
@@ -491,6 +493,23 @@ def _record_inbox_capacity_file(capacity: dict, file_size: int) -> None:
     capacity["campaign_count"] += 1
     capacity["total_count"] += 1
     capacity["total_bytes"] += max(0, int(file_size or 0))
+
+
+def _log_inbox_backpressure(campaign_id: int, rejected: int, reason: str,
+                            source: str = "local") -> None:
+    """Rate-limit repeated capacity warnings while retaining suppressed counts."""
+    key = (source, int(campaign_id), reason)
+    now = time.monotonic()
+    with _backpressure_log_lock:
+        last, suppressed = _backpressure_log_state.get(key, (0.0, 0))
+        if now - last < 30.0:
+            _backpressure_log_state[key] = (last, suppressed + int(rejected or 0))
+            return
+        _backpressure_log_state[key] = (now, 0)
+    logger.warning(
+        "%s realtime inbox backpressure campaign=%s rejected=%s suppressed=%s reason=%s",
+        source.upper(), campaign_id, int(rejected or 0), suppressed, reason,
+    )
 
 
 def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
@@ -1477,10 +1496,7 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
             except OSError:
                 pass
         if backpressure_rejected:
-            logger.warning(
-                "Realtime inbox backpressure campaign=%s rejected=%s reason=%s",
-                campaign["id"], backpressure_rejected, backpressure_reason,
-            )
+            _log_inbox_backpressure(campaign["id"], backpressure_rejected, backpressure_reason)
     if total_moved:
         logger.info("Watch sync complete moved=%s", total_moved)
     return {"moved": total_moved}
@@ -1576,9 +1592,8 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             if client:
                 client.close()
         if backpressure_rejected:
-            logger.warning(
-                "SFTP realtime inbox backpressure campaign=%s rejected=%s reason=%s",
-                campaign["id"], backpressure_rejected, backpressure_reason,
+            _log_inbox_backpressure(
+                campaign["id"], backpressure_rejected, backpressure_reason, source="sftp",
             )
     return {"downloaded": total_downloaded}
 
