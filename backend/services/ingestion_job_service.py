@@ -11,6 +11,13 @@ from database import get_connection
 DEFAULT_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_CHUNK_LEASE_SECONDS", "300")))
 FILE_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_FILE_LEASE_SECONDS", "600")))
 
+# ``CURRENT_TIMESTAMP`` is a TIMESTAMPTZ in DuckDB.  Retry timestamps are
+# stored as text for compatibility with existing manifests, so they must be
+# parsed back as TIMESTAMPTZ before comparing them.  Casting a value such as
+# ``2026-09-30 13:55:00+03`` to plain TIMESTAMP silently converts it to UTC
+# wall-clock time and makes a future retry look immediately due.
+_RETRY_DUE_SQL = "(next_retry_at IS NULL OR TRY_CAST(next_retry_at AS TIMESTAMPTZ) <= CURRENT_TIMESTAMP)"
+
 
 def get_file(campaign_type: str, campaign_id: int, filename: str) -> Optional[dict]:
     conn = get_connection()
@@ -98,7 +105,7 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
         row = conn.execute(
             """SELECT id FROM ingestion_files
                WHERE campaign_type=? AND status IN ('pending','retrying')
-                 AND (next_retry_at IS NULL OR CAST(next_retry_at AS TIMESTAMP)<=CURRENT_TIMESTAMP)
+                 AND """ + _RETRY_DUE_SQL + """
                  AND (campaign_type<>'realtime' OR EXISTS (
                       SELECT 1 FROM realtime_campaigns c
                       WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
@@ -112,7 +119,7 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
                lease_expires_at=?,processing_started_at=COALESCE(processing_started_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
                last_progress_at=CURRENT_TIMESTAMP,processing_phase='queued',updated_at=CURRENT_TIMESTAMP
                WHERE id=? AND status IN ('pending','retrying')
-                 AND (next_retry_at IS NULL OR CAST(next_retry_at AS TIMESTAMP)<=CURRENT_TIMESTAMP)
+                 AND """ + _RETRY_DUE_SQL + """
                  AND (campaign_type<>'realtime' OR EXISTS (
                       SELECT 1 FROM realtime_campaigns c
                       WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
