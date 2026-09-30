@@ -930,7 +930,7 @@ def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> 
 
 
 def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
-    """List the current CSV files in one realtime campaign's watch directory."""
+    """List watch-directory files without parsing the entire directory first."""
     campaign = get_one(campaign_id)
     if not campaign:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
@@ -986,7 +986,8 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
     files = []
     for name in sorted(os.listdir(watch_dir)):
         path = os.path.join(watch_dir, name)
-        if not os.path.isfile(path) or os.path.splitext(name)[1].lower() != ".csv":
+        ext = os.path.splitext(name)[1].lower()
+        if not os.path.isfile(path) or ext not in (".csv", ".txt", ".xlsx", ".xls"):
             continue
 
         match_prefix = bool(prefix and name.startswith(prefix))
@@ -1014,10 +1015,6 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
             skip_reason = "文件仍在写入稳定等待期内" if writing else ""
 
         try:
-            row_count = len(pd.read_csv(path, dtype=str, encoding="utf-8-sig"))
-        except Exception:
-            row_count = 0
-        try:
             file_size = os.path.getsize(path)
         except OSError:
             file_size = 0
@@ -1025,7 +1022,9 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
             "filename": name,
             "directory_path": watch_dir,
             "file_size": file_size,
-            "row_count": row_count,
+            "row_count": 0,
+            "_path": path,
+            "_ext": ext,
             "match_prefix": match_prefix,
             "match_schedule": match_schedule,
             "status": status,
@@ -1037,11 +1036,27 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
 
     total = len(files)
     offset = max(0, page - 1) * page_size
+    page_items = files[offset:offset + page_size]
+    # Row counts are useful in the UI, but parsing every historical file made
+    # this endpoint unbounded. Calculate them only for the visible page and
+    # stream CSV rows instead of loading each file into a DataFrame.
+    for item in page_items:
+        if item["_ext"] != ".csv":
+            item.pop("_path", None)
+            item.pop("_ext", None)
+            continue
+        try:
+            with open(item["_path"], "r", encoding="utf-8-sig", newline="") as handle:
+                item["row_count"] = max(0, sum(1 for _ in csv.reader(handle)) - 1)
+        except (OSError, UnicodeError, csv.Error):
+            item["row_count"] = 0
+        item.pop("_path", None)
+        item.pop("_ext", None)
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
-        "items": files[offset:offset + page_size],
+        "items": page_items,
     }
 
 
