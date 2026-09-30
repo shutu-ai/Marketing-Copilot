@@ -178,7 +178,7 @@ export default {
     receiveFile: '接收文件',
     filename: '接收文件名',
     receiveFileHint: '上传包含 msisdn 的文件，系统将自动匹配潜客清单中的用户',
-    receiveFileTotal: '文件总数',
+    receiveFileTotal: '去重号码数',
     receiveFileMatched: '匹配用户数',
     eventUsers: '事件用户数',
     overallProgress: '整体进度',

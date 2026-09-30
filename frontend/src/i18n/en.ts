@@ -173,7 +173,7 @@ export default {
     receiveFile: 'Receive File',
     filename: 'Received Filename',
     receiveFileHint: 'Upload a file with msisdns; system will auto-match against the whitelist',
-    receiveFileTotal: 'Total in File',
+    receiveFileTotal: 'Unique Numbers',
     receiveFileMatched: 'Matched Users',
     eventUsers: 'Event Users',
     overallProgress: 'Overall Progress',
