@@ -426,16 +426,28 @@ def repair_active_binding(limit: int = 10) -> int:
         try:
             candidates = conn.execute(
                 """SELECT * FROM realtime_whitelist_versions
-                   WHERE campaign_id=? AND status IN ('ready','retired')
+                   WHERE campaign_id=? AND status IN ('ready','retired','failed')
                    ORDER BY version_no DESC""",
                 (campaign_id,),
             ).fetchall()
         finally:
             conn.close()
-        candidate = next(
-            (dict(row) for row in candidates if os.path.isfile(row["index_path"] or "")),
-            None,
-        )
+        candidate = None
+        for row in candidates:
+            index_path = row["index_path"] or ""
+            if not os.path.isfile(index_path):
+                continue
+            probe = None
+            try:
+                probe = duckdb.connect(index_path, read_only=True)
+                probe.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
+                candidate = dict(row)
+                break
+            except Exception:
+                continue
+            finally:
+                if probe:
+                    probe.close()
         if not candidate:
             continue
         if not active:
@@ -595,11 +607,22 @@ def build_version(version_id: int) -> dict:
                    index_path=?,error_detail='',ready_at=CAST(CURRENT_TIMESTAMP AS VARCHAR) WHERE id=?""",
                 (int(rows), int(count), final_path, version_id),
             )
-            conn.execute(
-                """UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,
-                   customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (version_id, version["source_filename"], version["source_path"], int(rows), version["campaign_id"]),
-            )
+            active_row = conn.execute(
+                """SELECT c.active_whitelist_version_id,v.version_no AS active_version_no
+                   FROM realtime_campaigns c
+                   LEFT JOIN realtime_whitelist_versions v
+                     ON v.id=c.active_whitelist_version_id
+                   WHERE c.id=?""",
+                (version["campaign_id"],),
+            ).fetchone()
+            active_version_no = int(active_row["active_version_no"] or 0) if active_row else 0
+            if not active_row or not active_row["active_whitelist_version_id"] \
+                    or active_version_no <= int(version["version_no"]):
+                conn.execute(
+                    """UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,
+                       customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (version_id, version["source_filename"], version["source_path"], int(rows), version["campaign_id"]),
+                )
             conn.commit()
         finally:
             conn.close()
