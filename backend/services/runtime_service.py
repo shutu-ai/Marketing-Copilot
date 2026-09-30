@@ -160,7 +160,7 @@ def backup_database(target_dir: str = "") -> str:
     conn = database.get_connection()
     conn.execute("CHECKPOINT")
     conn.close()
-    with database._lock:
+    with database._write_lock:
         shutil.copy2(source, target)
     keep = int(os.environ.get("MC_BACKUP_KEEP", "14"))
     backups = sorted(destination_dir.glob(f"{source.stem}-*{source.suffix}"), reverse=True)
