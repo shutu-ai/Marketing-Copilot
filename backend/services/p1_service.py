@@ -1,5 +1,6 @@
 import json
 import os
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -7,6 +8,8 @@ from database import get_connection, get_database_file
 from models.batch_campaign import BatchCampaignUpdate
 from models.realtime_campaign import RealtimeCampaignUpdate
 from services import batch_campaign_service, operations_service, realtime_campaign_service, sms_task_service
+
+logger = logging.getLogger(__name__)
 
 
 CAMPAIGN_TRANSITIONS = {
@@ -60,6 +63,12 @@ def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic
         "campaign.auto_complete" if automatic else f"campaign.{action}",
         f"{campaign_type}_campaign", campaign_id,
         {"from_status": current, "to_status": target, "cancelled_task_count": cancelled_task_count},
+    )
+    logger.info(
+        "Campaign action campaign_type=%s campaign=%s action=%s from_status=%s "
+        "to_status=%s automatic=%s cancelled_tasks=%s",
+        campaign_type, campaign_id, action, current, target,
+        str(bool(automatic)).lower(), cancelled_task_count,
     )
     if target == "cancelled":
         updated["cancelled_task_count"] = cancelled_task_count

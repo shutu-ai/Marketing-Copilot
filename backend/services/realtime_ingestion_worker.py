@@ -406,6 +406,7 @@ def stop_worker():
     thread = _thread
     if thread and thread.is_alive():
         thread.join(timeout=2)
+    logger.info("Realtime ingestion worker stopped")
 
 
 def worker_status() -> dict:

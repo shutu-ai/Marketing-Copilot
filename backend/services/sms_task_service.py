@@ -392,10 +392,12 @@ def campaign_is_active(campaign: dict, now: Optional[datetime] = None) -> tuple[
         if window_start and window_end:
             # An end time earlier than the start time crosses midnight, e.g.
             # 11:19–00:00 permits 11:34 and continues until midnight.
-            in_window = (window_start <= current <= window_end) if window_start <= window_end else (
-                current >= window_start or current <= window_end
-            )
-            if not in_window:
+            if window_start <= window_end:
+                if current < window_start:
+                    return False, "before daily send window"
+                if current > window_end:
+                    return False, "after daily send window"
+            elif window_end < current < window_start:
                 return False, "outside daily send window"
         elif window_start and current < window_start:
             return False, "before daily send window"
@@ -1385,13 +1387,14 @@ def defer_task(task_id: int, reason: str, expired: bool = False):
     conn = get_connection()
     if expired:
         conn.execute(
-            "UPDATE sms_tasks SET status='expired', error_msg=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE sms_tasks SET status='expired', error_msg=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending'",
             (reason, task_id),
         )
     else:
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=GREATEST(attempts-1,0), error_msg=?,
-                next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes', updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes', updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='sending'""",
             (reason, task_id),
         )
     conn.commit()

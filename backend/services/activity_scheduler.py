@@ -166,6 +166,7 @@ def start_scheduler():
 
 
 def stop_scheduler():
+    logger.info("Activity scheduler stopping")
     _stop.set()
     _batch_worker_stop.set()
     worker = _batch_worker_thread
@@ -176,3 +177,4 @@ def stop_scheduler():
         sftp_worker.join(timeout=18)
     from services import realtime_ingestion_worker
     realtime_ingestion_worker.stop_worker()
+    logger.info("Activity scheduler stopped")
