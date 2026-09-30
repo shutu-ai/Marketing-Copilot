@@ -32,6 +32,8 @@ _daily_finalize_date = None
 _daily_finalized_windows = set()
 _backpressure_log_lock = threading.Lock()
 _backpressure_log_state = {}
+_watch_skip_log_lock = threading.Lock()
+_watch_skip_log_state = {}
 
 
 def _realtime_chunk_size() -> int:
@@ -1211,6 +1213,34 @@ def _processed_file_record(campaign_id: int, filename: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _completed_processed_filenames(campaign_id: int) -> set[str]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT filename FROM processed_files
+               WHERE campaign_type='realtime' AND campaign_id=? AND status='completed'""",
+            (campaign_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(row["filename"]) for row in rows if row["filename"]}
+
+
+def _log_watch_skip_summary(campaign_id: int, skipped: int, reason: str = "already processed") -> None:
+    key = (int(campaign_id), reason)
+    now = time.monotonic()
+    with _watch_skip_log_lock:
+        last, suppressed = _watch_skip_log_state.get(key, (0.0, 0))
+        if now - last < 30.0:
+            _watch_skip_log_state[key] = (last, suppressed + int(skipped or 0))
+            return
+        _watch_skip_log_state[key] = (now, 0)
+    logger.info(
+        "Watch files skipped campaign=%s count=%s suppressed=%s reason=%s",
+        campaign_id, int(skipped or 0), suppressed, reason,
+    )
+
+
 def _daily_window_ended(campaign: dict, now: Optional[datetime] = None) -> bool:
     """Return whether the current local calendar day has passed its send window."""
     now = now or datetime.now()
@@ -1443,6 +1473,8 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
         if not prefix:
             prefix = "Android_4G_Switch_Somali_"
         capacity = _inbox_capacity_snapshot(campaign["id"])
+        completed_files = _completed_processed_filenames(campaign["id"])
+        already_processed_skipped = 0
         backpressure_rejected = 0
         backpressure_reason = ""
         for fname in os.listdir(watch_dir):
@@ -1467,9 +1499,8 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
             dest = os.path.join(inbox_dir, fname)
             if os.path.exists(dest):
                 continue
-            processed = _processed_file_record(campaign["id"], fname)
-            if processed and processed.get("status") == "completed":
-                logger.info("Watch file skipped campaign=%s file=%s reason=already processed", campaign.get("id"), fname)
+            if fname in completed_files:
+                already_processed_skipped += 1
                 continue
             try:
                 file_size = os.path.getsize(src)
@@ -1497,6 +1528,8 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
                 pass
         if backpressure_rejected:
             _log_inbox_backpressure(campaign["id"], backpressure_rejected, backpressure_reason)
+        if already_processed_skipped:
+            _log_watch_skip_summary(campaign["id"], already_processed_skipped)
     if total_moved:
         logger.info("Watch sync complete moved=%s", total_moved)
     return {"moved": total_moved}
@@ -1519,6 +1552,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
         client = sftp = None
         backpressure_rejected = 0
         backpressure_reason = ""
+        already_processed_skipped = 0
         try:
             active, reason = sms_task_service.campaign_is_active(campaign, now)
             if not active:
@@ -1536,6 +1570,8 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             prefix = campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_"
             remote_dir = campaign["watch_dir"].rstrip("/") or "/"
             capacity = _inbox_capacity_snapshot(campaign["id"])
+            completed_files = _completed_processed_filenames(campaign["id"])
+            already_processed_skipped = 0
             for entry in entries:
                 fname = entry.filename
                 if fname in (".", "..") or os.path.basename(fname) != fname:
@@ -1552,8 +1588,8 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                 dest = os.path.join(inbox_dir, fname)
                 if os.path.exists(dest):
                     continue
-                processed = _processed_file_record(campaign["id"], fname)
-                if processed and processed.get("status") == "completed":
+                if fname in completed_files:
+                    already_processed_skipped += 1
                     continue
                 file_size = entry.st_size or 0
                 allowed, capacity_reason = _inbox_capacity_available(
@@ -1595,6 +1631,8 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             _log_inbox_backpressure(
                 campaign["id"], backpressure_rejected, backpressure_reason, source="sftp",
             )
+        if already_processed_skipped:
+            _log_watch_skip_summary(campaign["id"], already_processed_skipped)
     return {"downloaded": total_downloaded}
 
 
