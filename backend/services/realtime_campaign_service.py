@@ -532,18 +532,42 @@ def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
     return result
 
 
+def _is_transient_whitelist_index_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "write-write conflict",
+        "could not set lock",
+        "conflicting lock",
+        "database is locked",
+        "transaction conflict",
+    ))
+
+
 def _open_whitelist_index(path: str):
-    """Open and minimally validate a persistent whitelist index."""
-    conn = duckdb.connect(path, read_only=True)
-    try:
-        # Connecting to a damaged DuckDB file can succeed before the first
-        # table access. Validate the schema once so a bad active version can
-        # be invalidated and rolled back before any input rows are consumed.
-        conn.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
-    except Exception:
-        conn.close()
-        raise
-    return conn
+    """Open and minimally validate a persistent whitelist index.
+
+    A version file can be replaced while a worker is starting a read-only
+    connection. DuckDB reports that short race as a lock or write conflict;
+    retry the open before treating the index as damaged.
+    """
+    last_error = None
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = duckdb.connect(path, read_only=True)
+            # Connecting to a damaged DuckDB file can succeed before the first
+            # table access. Validate the schema once so a bad active version can
+            # be invalidated and rolled back before any input rows are consumed.
+            conn.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
+            return conn
+        except Exception as exc:
+            last_error = exc
+            if conn:
+                conn.close()
+            if not _is_transient_whitelist_index_error(exc) or attempt >= 2:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+    raise last_error
 
 
 def receive_file(campaign_id: int, file_path: str, original_filename: str,
@@ -673,6 +697,16 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     except Exception as e:
         if whitelist_conn:
             whitelist_conn.close()
+        if _is_transient_whitelist_index_error(e):
+            ingestion_job_service.update_progress(
+                ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
+            )
+            return {
+                "success": False,
+                "status": "waiting_for_whitelist",
+                "retryable": True,
+                "message": f"whitelist index temporarily busy: {e}",
+            }
         fallback = None
         if campaign.get("use_whitelist", True) and whitelist_version and whitelist_version_id:
             failed_version_id = whitelist_version_id
