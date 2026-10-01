@@ -20,7 +20,7 @@ export const legacySms = {
     x6e4f4b33: "Enter a phone number",
     x0f7991c2: "Total tasks",
     xe5ac1d20: "Queued",
-    xf5e626da: "Submitted",
+    xf5e626da: "Awaiting receipt",
     xf87f48f2: "Delivered",
     xd7a2a293: "Retrying"
   },
@@ -45,7 +45,7 @@ export const legacySms = {
     x6e4f4b33: "\u8bf7\u8f93\u5165\u624b\u673a\u53f7",
     x0f7991c2: "\u603b\u4efb\u52a1",
     xe5ac1d20: "\u6392\u961f\u4e2d",
-    xf5e626da: "\u5df2\u63d0\u4ea4",
+    xf5e626da: "\u7b49\u5f85\u56de\u6267",
     xf87f48f2: "\u5df2\u9001\u8fbe",
     xd7a2a293: "\u91cd\u8bd5\u4e2d"
   },
@@ -70,7 +70,7 @@ export const legacySms = {
     x6e4f4b33: "Enter a phone number",
     x0f7991c2: "Total tasks",
     xe5ac1d20: "Queued",
-    xf5e626da: "Submitted",
+    xf5e626da: "Awaiting receipt",
     xf87f48f2: "Delivered",
     xd7a2a293: "Retrying"
   },
@@ -95,7 +95,7 @@ export const legacySms = {
     x6e4f4b33: "Enter a phone number",
     x0f7991c2: "Total tasks",
     xe5ac1d20: "Queued",
-    xf5e626da: "Submitted",
+    xf5e626da: "Awaiting receipt",
     xf87f48f2: "Delivered",
     xd7a2a293: "Retrying"
   },
@@ -120,7 +120,7 @@ export const legacySms = {
     x6e4f4b33: "Enter a phone number",
     x0f7991c2: "Total tasks",
     xe5ac1d20: "Queued",
-    xf5e626da: "Submitted",
+    xf5e626da: "Awaiting receipt",
     xf87f48f2: "Delivered",
     xd7a2a293: "Retrying"
   },
