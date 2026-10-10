@@ -153,7 +153,41 @@ def test_delivery_hot_path_is_committed_in_bounded_batches(isolated_db, monkeypa
     assert mappings == 300
     assert submitted_detail == 0
     assert submitted_batch == 300
-    assert 1 <= len(commits) <= 3
+    assert 1 <= len(commits) <= 30
+
+
+def test_no_dlr_successes_use_one_set_based_update_without_message_ids(isolated_db, monkeypatch):
+    task_ids = _insert_tasks(300)
+    updates = []
+    original_execute = database.WrappedConnection.execute
+
+    def tracked_execute(self, sql, params=None):
+        if "UPDATE sms_tasks AS t SET" in sql:
+            updates.append(1)
+        return original_execute(self, sql, params)
+
+    monkeypatch.setattr(database.WrappedConnection, "execute", tracked_execute)
+    for task_id in task_ids:
+        sms_task_service.mark_submitted(task_id, [], "disabled", wait=False)
+    sms_task_service.flush_pending_writes()
+
+    conn = database.get_connection()
+    accepted = conn.execute(
+        "SELECT COUNT(*) count FROM sms_tasks WHERE status='accepted'"
+    ).fetchone()["count"]
+    mappings = conn.execute(
+        "SELECT COUNT(*) count FROM sms_task_message_ids"
+    ).fetchone()["count"]
+    conn.close()
+
+    assert accepted == 300
+    assert mappings == 0
+    # The durable result journal fsyncs before enqueueing each outcome, so a
+    # single-threaded producer may span several 100 ms writer windows.  Every
+    # window must still use one set-based update and never fall back to 300
+    # per-task statements.  Production has concurrent SMPP callback threads,
+    # which group-commit these records more densely.
+    assert 1 <= len(updates) <= 30
 
 
 def test_hot_writes_use_independent_bounded_queues(isolated_db):
@@ -163,6 +197,15 @@ def test_hot_writes_use_independent_bounded_queues(isolated_db):
     }
     assert 100 <= state["batch_size"] <= 1000
     assert 50 <= state["flush_interval_ms"] <= 200
+
+
+def test_duckdb_read_only_cte_does_not_take_writer_gate():
+    assert database._is_read_only_statement(
+        "WITH cleaned AS (SELECT * FROM ingest_task_stage) SELECT * FROM cleaned"
+    )
+    assert not database._is_read_only_statement(
+        "WITH changed AS (SELECT id FROM sms_tasks) UPDATE sms_tasks SET status='sending'"
+    )
 
 
 def test_delivery_receipts_increment_batch_progress_without_task_count_scan(isolated_db):

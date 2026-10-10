@@ -24,7 +24,13 @@ export function getRealtimeFiles(campaignId: number, params: { page?: number; pa
   return api.get<any>(`/realtime-campaigns/${campaignId}/files`, { params })
 }
 
-export function getRealtimeWatchFiles(campaignId: number, params: { page?: number; page_size?: number } = {}) {
+export function getRealtimeWatchFiles(campaignId: number, params: {
+  page?: number
+  page_size?: number
+  extension?: string
+  status?: string
+  reason?: string
+} = {}) {
   return api.get<any>(`/realtime-campaigns/${campaignId}/watch-files`, { params })
 }
 

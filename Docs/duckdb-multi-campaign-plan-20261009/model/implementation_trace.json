@@ -1,0 +1,390 @@
+{
+  "items": [
+    {
+      "id": "IMP-001",
+      "name": "原子可靠写入与发送恢复",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "capability_ids": [
+        "CAP-101"
+      ],
+      "solution_element_ids": [
+        "ELM-001"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-001",
+        "TST-002",
+        "TST-009",
+        "TST-015",
+        "TST-016",
+        "TST-017",
+        "TST-018",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "notes": "A：可靠性；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-002",
+      "name": "活动发送公平和有条件保底",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-002"
+      ],
+      "capability_ids": [
+        "CAP-102"
+      ],
+      "solution_element_ids": [
+        "ELM-002"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-003",
+        "TST-004",
+        "TST-005",
+        "TST-011",
+        "TST-013",
+        "TST-014",
+        "TST-019"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "notes": "B：公平发送；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-003",
+      "name": "文件处理及白名单资源隔离",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-003"
+      ],
+      "capability_ids": [
+        "CAP-103"
+      ],
+      "solution_element_ids": [
+        "ELM-003"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-006",
+        "TST-007",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "notes": "C：入库隔离；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-004",
+      "name": "准入和局部背压",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-004"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-005",
+        "TST-006",
+        "TST-008",
+        "TST-011",
+        "TST-014",
+        "TST-017",
+        "TST-019",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "notes": "B/C：容量准入；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-005",
+      "name": "Web读写健壮性",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-005"
+      ],
+      "capability_ids": [
+        "CAP-105"
+      ],
+      "solution_element_ids": [
+        "ELM-005"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-010",
+        "TST-013"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "notes": "D：Web保护；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-006",
+      "name": "各活动观测及运维恢复",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-006"
+      ],
+      "capability_ids": [
+        "CAP-106"
+      ],
+      "solution_element_ids": [
+        "ELM-006"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-011",
+        "TST-013"
+      ],
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "notes": "B/D：可观测性；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-007",
+      "name": "长期运行与升级回退",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "capability_ids": [
+        "CAP-107"
+      ],
+      "solution_element_ids": [
+        "ELM-007"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-002",
+        "TST-009",
+        "TST-011",
+        "TST-012",
+        "TST-015",
+        "TST-017",
+        "TST-018"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "notes": "A/D：恢复和发布；详见主文文件级实施表"
+    },
+    {
+      "id": "IMP-008",
+      "name": "保留DuckDB和短信业务语义",
+      "current_scope": false,
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-008"
+      ],
+      "component_type": "BACKEND_AND_OPERATIONS",
+      "inputs": [
+        "带campaign/type/config及token的有界业务命令",
+        "实测容量与当前资源预算"
+      ],
+      "outputs": [
+        "可持久追踪的状态或显式等待/未知原因"
+      ],
+      "dependencies": [
+        "ELM-001"
+      ],
+      "interfaces": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_objects": [
+        "task/attempt/part、campaign/resource_budget、持久事件日志"
+      ],
+      "failure_modes": [
+        "锁忙/长SQL/IO停滞/部分发送/进程崩溃/旧token"
+      ],
+      "test_ids": [
+        "TST-004",
+        "TST-009",
+        "TST-012",
+        "TST-014",
+        "TST-015",
+        "TST-016",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "notes": "全阶段：兼容边界；详见主文文件级实施表"
+    }
+  ]
+}

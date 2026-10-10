@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from typing import Iterable, Optional
 
-from database import get_connection
+from database import get_connection, read_transaction, write_transaction
 from services import settings_service
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ _EXCLUSION_COUNT_CACHE = None
 _EXCLUSION_COUNT_CACHE_AT = 0.0
 _EXCLUSION_COUNT_LOCK = threading.Lock()
 _CACHE_LOCK = threading.RLock()
+_TASK_CLAIM_LOCK = threading.Lock()
 _CAMPAIGN_CACHE = {}
 _TEMPLATE_CACHE = {}
 _CAMPAIGN_CACHE_TTL = 30.0
@@ -35,7 +36,10 @@ _TEMPLATE_CACHE_GENERATION = 0
 DB_INSERT_BATCH_SIZE = 2000
 
 
-FINAL_STATES = {"delivered", "failed", "expired", "cancelled", "archived", "accepted"}
+FINAL_STATES = {
+    "delivered", "failed", "expired", "cancelled", "archived", "accepted",
+    "unknown", "partial",
+}
 
 DLR_STATE_MAP = {
     "DELIVRD": {"status": "delivered", "label": "Delivered", "retryable": False},
@@ -223,8 +227,8 @@ def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
 
 
 def _insert_message_mappings(conn, rows) -> None:
-    # A single SMSC can reuse an id, so collapse duplicate ids in a batch and
-    # preserve the existing "latest task wins" behavior before the upsert.
+    # Legacy compatibility index. Never overwrite an older task: a recycled
+    # SMSC id must not silently move a late receipt to a newer campaign.
     latest_task_by_id = {}
     for message_id, task_id in rows:
         message_id = str(message_id)
@@ -236,16 +240,45 @@ def _insert_message_mappings(conn, rows) -> None:
     params = [value for row in latest_task_by_id.items() for value in row]
     conn.execute(
         f"""INSERT INTO sms_task_message_ids (smsc_message_id, task_id) VALUES {values}
-            ON CONFLICT (smsc_message_id) DO UPDATE SET task_id = excluded.task_id
-            WHERE task_id IS DISTINCT FROM excluded.task_id""",
+            ON CONFLICT (smsc_message_id) DO NOTHING""",
         params,
     )
 
 
+def smpp_source_namespace(config_id: Optional[int]) -> str:
+    return f"smpp:{int(config_id)}" if config_id is not None else "legacy"
+
+
+def _insert_message_bindings(conn, rows) -> None:
+    unique = {}
+    for source_namespace, message_id, task_id, attempt_token, part_no in rows:
+        message_id = str(message_id or "")
+        if not message_id:
+            continue
+        key = (
+            str(source_namespace or "legacy"), message_id, int(task_id),
+            str(attempt_token or ""), int(part_no or 0),
+        )
+        unique[key] = key
+    if not unique:
+        return
+    values = ",".join("(?,?,?,?,?,CURRENT_TIMESTAMP)" for _ in unique)
+    params = [value for row in unique.values() for value in row]
+    conn.execute(
+        f"""INSERT INTO sms_message_bindings_v2
+              (source_namespace,smsc_message_id,task_id,attempt_token,part_no,created_at)
+              VALUES {values} ON CONFLICT DO NOTHING""",
+        params,
+    )
+    # Keep the old lookup populated for archive/backward compatibility only.
+    _insert_message_mappings(conn, ((row[1], row[2]) for row in unique.values()))
+
+
 def _mapped_message_ids(conn, task_id: int) -> list[str]:
     rows = conn.execute(
-        "SELECT smsc_message_id FROM sms_task_message_ids WHERE task_id=?",
-        (int(task_id),),
+        """SELECT smsc_message_id FROM sms_message_bindings_v2 WHERE task_id=?
+           UNION SELECT smsc_message_id FROM sms_task_message_ids WHERE task_id=?""",
+        (int(task_id), int(task_id)),
     ).fetchall()
     return [str(row["smsc_message_id"]) for row in rows if row["smsc_message_id"]]
 
@@ -472,7 +505,11 @@ def _template_for(conn, campaign_type: str, campaign_id: int, language: str):
 
 
 def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], source_file: str = "",
-                batch_id: Optional[int] = None, validate_schedule: bool = True) -> dict:
+                batch_id: Optional[int] = None, validate_schedule: bool = True,
+                ingestion_lease: Optional[tuple] = None,
+                ingestion_chunk: Optional[dict] = None) -> dict:
+    if ingestion_chunk and not ingestion_lease:
+        raise ValueError("ingestion_chunk requires ingestion_lease")
     if validate_schedule:
         active, reason = campaign_is_active(campaign)
         if not active:
@@ -508,6 +545,11 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             conn.executemany(
                 "INSERT INTO ingest_task_stage VALUES (?,?,?)", stage_rows
             )
+        # Release the DuckDB writer gate before the read-heavy normalization,
+        # whitelist join, and Python template expansion below.  The temporary
+        # staging table remains available after commit, while task insertion is
+        # handled later as a short, separate write transaction.
+        conn.commit()
         normalized_expression = (
             "regexp_replace(regexp_replace(COALESCE(raw_msisdn,''),'[^0-9]','','g'),'^0','')"
         )
@@ -579,6 +621,12 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 template.get("source_addr") or "",
                 json.dumps(payload, ensure_ascii=False), source_file, task_date, dedupe_key,
             ))
+        if ingestion_lease:
+            # Fence at the actual task insertion boundary, not before
+            # potentially slow parsing/template expansion. No file IO in tx.
+            from services import realtime_ingestion_state
+            conn.execute("BEGIN TRANSACTION")
+            realtime_ingestion_state.assert_owned(conn, *ingestion_lease)
         if task_rows:
             created = _bulk_insert_tasks(conn, task_rows)
             result["duplicate"] += len(task_rows) - len(created)
@@ -593,6 +641,12 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 [task_id for task_id, _dedupe in created],
                 {"source_file": source_file},
             )
+        if ingestion_chunk:
+            realtime_ingestion_state.complete_chunk_in_transaction(
+                conn, ingestion_lease[0], ingestion_chunk, result, ingestion_lease[1],
+            )
+            result["chunk_committed"] = True
+        conn.execute("DROP TABLE IF EXISTS ingest_task_stage")
         conn.commit()
         # Keep INFO logs bounded.  The created MSISDN list can contain tens of
         # thousands of sensitive values and is not needed to diagnose queue
@@ -610,33 +664,104 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
 
 def claim_next_tasks(limit: int = 20) -> list:
     limit = max(1, int(limit or 20))
-    conn = get_connection()
-    token = uuid.uuid4().hex
-    rows = conn.execute(
-        """UPDATE sms_tasks SET status='sending', attempts=attempts+1, claim_token=?,
-            updated_at=CURRENT_TIMESTAMP
-            WHERE id IN (SELECT id FROM sms_tasks WHERE status IN ('queued','retrying')
-            AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
-            AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE) ORDER BY created_at,id LIMIT ?)
-            AND status IN ('queued','retrying') RETURNING *""", (token, limit)
-    ).fetchall()
-    tasks = [dict(r) for r in rows]
-    if tasks:
-        grouped = {}
-        for task in tasks:
-            key = (task["campaign_type"], task["campaign_id"], task.get("batch_id"))
-            grouped.setdefault(key, []).append(task)
-        for (campaign_type, campaign_id, batch_id), items in grouped.items():
-            _add_task_event_batch(
-                conn, campaign_type, campaign_id, batch_id,
-                "claimed", "queued", "sending",
-                [task["id"] for task in items],
-                {"claim_token": token, "attempt_min": min(task["attempts"] for task in items),
-                 "attempt_max": max(task["attempts"] for task in items)},
-            )
-    conn.commit()
-    conn.close()
-    return tasks
+    # DuckDB allows concurrent readers, but concurrent UPDATE ... RETURNING
+    # claims can conflict before the explicit commit when many task workers
+    # select the same queue head. Serialize only this short claim transaction
+    # and retry conflicts caused by unrelated writers.
+    with _TASK_CLAIM_LOCK:
+        token = uuid.uuid4().hex
+
+        def claim(conn):
+            from services import campaign_capacity_service
+            if campaign_capacity_service.enabled():
+                per_campaign = campaign_capacity_service.per_campaign_candidates()
+                candidate_limit = (
+                    per_campaign * campaign_capacity_service.active_campaign_limit()
+                )
+                candidates = conn.execute(
+                    """WITH active_groups AS (
+                           SELECT campaign_type,campaign_id,COALESCE(smpp_config_id,0) route_id,
+                                  MIN(created_at) oldest
+                           FROM sms_tasks
+                           WHERE status IN ('queued','retrying')
+                             AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+                             AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE)
+                           GROUP BY campaign_type,campaign_id,COALESCE(smpp_config_id,0)
+                           ORDER BY oldest,campaign_type,campaign_id,route_id
+                           LIMIT ?
+                       ), ranked AS (
+                           SELECT t.*,COALESCE(t.smpp_config_id,0) target_smpp_config_id,
+                                  COALESCE(p.weight,1.0) scheduling_weight,
+                                  p.max_parts_tps,p.max_outstanding_parts,
+                                  ROW_NUMBER() OVER (
+                                    PARTITION BY t.campaign_type,t.campaign_id,
+                                                 COALESCE(t.smpp_config_id,0)
+                                    ORDER BY t.created_at,t.id
+                                  ) fair_row
+                           FROM sms_tasks t
+                           JOIN active_groups g
+                             ON g.campaign_type=t.campaign_type
+                            AND g.campaign_id=t.campaign_id
+                            AND g.route_id=COALESCE(t.smpp_config_id,0)
+                           LEFT JOIN campaign_capacity_policies p
+                             ON p.campaign_type=t.campaign_type
+                            AND p.campaign_id=t.campaign_id AND p.enabled=1
+                           WHERE t.status IN ('queued','retrying')
+                             AND CAST(t.next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+                             AND (t.campaign_type <> 'realtime' OR t.task_date=CURRENT_DATE)
+                       )
+                       SELECT * EXCLUDE(fair_row) FROM ranked
+                       WHERE fair_row<=?
+                       ORDER BY created_at,id LIMIT ?""",
+                    (
+                        campaign_capacity_service.active_campaign_limit(),
+                        per_campaign,
+                        candidate_limit,
+                    ),
+                ).fetchall()
+                scheduled = campaign_capacity_service.select(
+                    (dict(row) for row in candidates), limit
+                )
+                selected_ids = [int(task["id"]) for task in scheduled]
+            else:
+                selected_ids = [
+                    int(row["id"]) for row in conn.execute(
+                        """SELECT id FROM sms_tasks
+                           WHERE status IN ('queued','retrying')
+                             AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+                             AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE)
+                           ORDER BY created_at,id LIMIT ?""",
+                        (limit,),
+                    ).fetchall()
+                ]
+            if not selected_ids:
+                return []
+            placeholders = ",".join("?" for _ in selected_ids)
+            claimed_rows = conn.execute(
+                f"""UPDATE sms_tasks SET status='sending', attempts=attempts+1,
+                       claim_token=?,updated_at=CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders}) AND status IN ('queued','retrying')
+                    RETURNING *""",
+                [token, *selected_ids],
+            ).fetchall()
+            claimed_by_id = {int(row["id"]): dict(row) for row in claimed_rows}
+            # DuckDB UPDATE RETURNING order is not a scheduling contract.
+            tasks = [claimed_by_id[task_id] for task_id in selected_ids if task_id in claimed_by_id]
+            grouped = {}
+            for task in tasks:
+                key = (task["campaign_type"], task["campaign_id"], task.get("batch_id"))
+                grouped.setdefault(key, []).append(task)
+            for (campaign_type, campaign_id, batch_id), items in grouped.items():
+                _add_task_event_batch(
+                    conn, campaign_type, campaign_id, batch_id,
+                    "claimed", "queued", "sending",
+                    [task["id"] for task in items],
+                    {"claim_token": token, "attempt_min": min(task["attempts"] for task in items),
+                     "attempt_max": max(task["attempts"] for task in items)},
+                )
+            return tasks
+
+        return write_transaction(claim, attempts=3, operation="sms_tasks.claim")
 
 
 def claim_next_task() -> Optional[dict]:
@@ -646,25 +771,63 @@ def claim_next_task() -> Optional[dict]:
 
 def apply_buffered_writes(conn, items) -> None:
     """Apply one buffered delivery batch inside a single database transaction."""
+    # Persist intents and per-part facts before folding the task-level result.
+    # All changes share the caller's explicit transaction and event-id fence.
+    for item in items:
+        if item.kind == "send_intent":
+            _apply_send_intent(conn, **item.payload)
+        elif item.kind == "part_result":
+            _apply_part_result(conn, **item.payload)
     # The buffer polls its per-kind queues fairly, so message_id entries can be
     # interleaved with submitted/receipt entries. Collect them across the whole
     # transaction; otherwise each interleaved item breaks the batch and turns
     # bulk id persistence back into one SELECT/UPDATE/UPSERT per message.
     message_id_items = [item for item in items if item.kind == "message_id"]
     submitted_payloads = [item.payload for item in items if item.kind == "submitted"]
-    submitted_ids = [int(payload["task_id"]) for payload in submitted_payloads]
-    if submitted_payloads:
+
+    # When delivery receipts are disabled, submit_sm_resp is still processed in
+    # memory by the SMPP gateway, but its successful task finalization does not
+    # need one UPDATE statement per task.  Keep the durable accepted state and
+    # campaign counters, while applying all disabled-mode successes with one
+    # set-based UPDATE below.  Explicit submit failures continue through the
+    # normal send_failure path and remain durable immediately in this batch.
+    payloads_by_task = {}
+    for payload in submitted_payloads:
+        payloads_by_task.setdefault(int(payload["task_id"]), []).append(payload)
+    disabled_task_ids = {
+        task_id for task_id, task_payloads in payloads_by_task.items()
+        if task_payloads and all(
+            (payload.get("delivery_receipt_mode") or "optional") == "disabled"
+            for payload in task_payloads
+        )
+    }
+    disabled_payloads = [
+        payload for payload in submitted_payloads
+        if int(payload["task_id"]) in disabled_task_ids
+    ]
+    regular_payloads = [
+        payload for payload in submitted_payloads
+        if int(payload["task_id"]) not in disabled_task_ids
+    ]
+    regular_message_id_items = [
+        item for item in message_id_items
+        if int(item.payload["task_id"]) not in disabled_task_ids
+    ]
+
+    if disabled_payloads:
+        _apply_disabled_submitted_batch(conn, disabled_payloads)
+    if regular_payloads:
         # submit_sm_resp callbacks enqueue each part's message id immediately
         # for crash recovery; the later submitted event contains those same ids.
         # Combine both sources so a successful part reaches the indexed mapping
         # table only once per transaction.
-        _apply_submitted_batch(conn, submitted_payloads, message_id_items)
-    elif message_id_items:
-        _apply_message_id_batch(conn, message_id_items)
+        _apply_submitted_batch(conn, regular_payloads, regular_message_id_items)
+    elif regular_message_id_items:
+        _apply_message_id_batch(conn, regular_message_id_items)
 
     for item in items:
         payload = item.payload
-        if item.kind in {"message_id", "submitted"}:
+        if item.kind in {"message_id", "submitted", "send_intent", "part_result"}:
             continue
         if item.kind == "send_failure":
             _apply_send_failure(conn, **payload)
@@ -672,23 +835,285 @@ def apply_buffered_writes(conn, items) -> None:
             _apply_receipt(conn, **payload)
         else:
             raise ValueError(f"unknown SMS buffered write kind: {item.kind}")
-    if submitted_ids:
-        placeholders = ",".join("?" for _ in submitted_ids)
-        rows = conn.execute(
-            f"""SELECT id,campaign_type,campaign_id,batch_id,status FROM sms_tasks
-                 WHERE id IN ({placeholders})""",
-            submitted_ids,
-        ).fetchall()
-        grouped = {}
-        for row in rows:
-            key = (row["campaign_type"], row["campaign_id"], row["batch_id"], row["status"])
-            grouped.setdefault(key, []).append(row["id"])
-        for (campaign_type, campaign_id, batch_id, status), task_ids in grouped.items():
-            _add_task_event_batch(
-                conn, campaign_type, campaign_id, batch_id,
-                "submitted", "sending", status, task_ids,
-                {"buffered": True},
+
+
+def record_send_intent(task: dict, smpp_config_id: int, slot: int,
+                       planned_parts: int, connection_generation: str = "") -> str:
+    """Durably record an attempt before its first socket write."""
+    from services import sms_write_buffer
+    claim_token = str(task.get("claim_token") or "")
+    attempt_token = str(task.get("_attempt_token") or "")
+    if not attempt_token:
+        attempt_token = f"{claim_token or 'external'}:{uuid.uuid4().hex}"
+        task["_attempt_token"] = attempt_token
+    task["_source_namespace"] = smpp_source_namespace(smpp_config_id)
+    # In no-DLR mode the claim row is already the durable send intent and
+    # stale `sending` recovery deliberately becomes `unknown` (never an
+    # automatic retry).  Persisting another intent for every task would add a
+    # hot DuckDB write with no additional safety.  Explicit submit failures
+    # and the final accepted outcome remain durable journal events.
+    if (task.get("_delivery_receipt_mode") or "optional") == "disabled":
+        return attempt_token
+    sms_write_buffer.submit(
+        "send_intent",
+        {
+            "task_id": int(task["id"]),
+            "claim_token": claim_token,
+            "attempt_token": attempt_token,
+            "source_namespace": task["_source_namespace"],
+            "smpp_config_id": int(smpp_config_id),
+            "slot": int(slot),
+            "planned_parts": max(1, int(planned_parts)),
+            "connection_generation": str(connection_generation or ""),
+        },
+        wait=False,
+    )
+    return attempt_token
+
+
+def _apply_send_intent(conn, task_id: int, claim_token: str, attempt_token: str,
+                       source_namespace: str, smpp_config_id: int, slot: int,
+                       planned_parts: int, connection_generation: str = "") -> None:
+    owner = conn.execute(
+        """SELECT id FROM sms_tasks WHERE id=? AND status='sending' AND claim_token=?""",
+        (int(task_id), str(claim_token or "")),
+    ).fetchone()
+    if not owner:
+        return
+    conn.execute(
+        """INSERT INTO sms_send_attempts
+              (attempt_token,task_id,claim_token,source_namespace,smpp_config_id,slot,
+               planned_parts,state,lease_until,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,'intent',CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+                   CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+           ON CONFLICT(attempt_token) DO UPDATE SET
+               lease_until=CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+               updated_at=CURRENT_TIMESTAMP""",
+        (str(attempt_token), int(task_id), str(claim_token or ""),
+         str(source_namespace or "legacy"), int(smpp_config_id), int(slot),
+         max(1, int(planned_parts))),
+    )
+    for part_no in range(1, max(1, int(planned_parts)) + 1):
+        conn.execute(
+            """INSERT INTO sms_send_parts
+                  (attempt_token,part_no,connection_generation,source_namespace,state,updated_at)
+               VALUES (?,?,?,?,'planned',CURRENT_TIMESTAMP)
+               ON CONFLICT(attempt_token,part_no) DO NOTHING""",
+            (str(attempt_token), part_no, str(connection_generation or ""),
+             str(source_namespace or "legacy")),
+        )
+
+
+def record_part_result(task: dict, part_no: int, sequence: int, ok: bool,
+                       status: int, message_id: str, smpp_config_id: int,
+                       connection_generation: str = "") -> None:
+    from services import sms_write_buffer
+    # Successful no-DLR responses carry no later correlation value and the
+    # task-level accepted event is sufficient.  Keep failures durable so an
+    # explicit SMSC rejection can never be hidden by this optimization.
+    if ok and (task.get("_delivery_receipt_mode") or "optional") == "disabled":
+        return
+    sms_write_buffer.submit(
+        "part_result",
+        {
+            "task_id": int(task["id"]),
+            "claim_token": str(task.get("claim_token") or ""),
+            "attempt_token": str(task.get("_attempt_token") or ""),
+            "source_namespace": str(
+                task.get("_source_namespace") or smpp_source_namespace(smpp_config_id)
+            ),
+            "part_no": int(part_no),
+            "sequence": int(sequence),
+            "ok": bool(ok),
+            "status": int(status or 0),
+            "message_id": str(message_id or ""),
+            "connection_generation": str(connection_generation or ""),
+            "persist_message_id":
+                (task.get("_delivery_receipt_mode") or "optional") != "disabled",
+        },
+        wait=False,
+    )
+
+
+def _apply_part_result(conn, task_id: int, claim_token: str, attempt_token: str,
+                       source_namespace: str, part_no: int, sequence: int,
+                       ok: bool, status: int, message_id: str,
+                       connection_generation: str = "",
+                       persist_message_id: bool = True) -> None:
+    if not attempt_token:
+        return
+    state = "accepted" if ok else "rejected"
+    conn.execute(
+        """INSERT INTO sms_send_parts
+              (attempt_token,part_no,sequence,connection_generation,source_namespace,
+               response_status,smsc_message_id,state,sent_at,responded_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+           ON CONFLICT(attempt_token,part_no) DO UPDATE SET
+              sequence=excluded.sequence,
+              connection_generation=excluded.connection_generation,
+              source_namespace=excluded.source_namespace,
+              response_status=excluded.response_status,
+              smsc_message_id=excluded.smsc_message_id,
+              state=excluded.state,
+              responded_at=excluded.responded_at,
+              updated_at=CURRENT_TIMESTAMP""",
+        (str(attempt_token), int(part_no), int(sequence),
+         str(connection_generation or ""), str(source_namespace or "legacy"),
+         int(status or 0), str(message_id or ""), state),
+    )
+    conn.execute(
+        """UPDATE sms_send_attempts SET
+              accepted_parts=(SELECT COUNT(*) FROM sms_send_parts
+                              WHERE attempt_token=? AND state='accepted'),
+              failed_parts=(SELECT COUNT(*) FROM sms_send_parts
+                            WHERE attempt_token=? AND state='rejected'),
+              state=CASE
+                WHEN (SELECT COUNT(*) FROM sms_send_parts
+                      WHERE attempt_token=? AND state='rejected')>0 AND
+                     (SELECT COUNT(*) FROM sms_send_parts
+                      WHERE attempt_token=? AND state='accepted')>0 THEN 'partial'
+                WHEN (SELECT COUNT(*) FROM sms_send_parts
+                      WHERE attempt_token=? AND state='rejected')>0 THEN 'rejected'
+                ELSE 'responding' END,
+              lease_until=CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+              updated_at=CURRENT_TIMESTAMP
+           WHERE attempt_token=? AND task_id=? AND claim_token=?""",
+        (str(attempt_token), str(attempt_token), str(attempt_token),
+         str(attempt_token), str(attempt_token), str(attempt_token),
+         int(task_id), str(claim_token or "")),
+    )
+    if ok and message_id and persist_message_id:
+        _insert_message_bindings(conn, [(
+            source_namespace, message_id, task_id, attempt_token, part_no
+        )])
+
+
+def _apply_disabled_submitted_batch(conn, payloads) -> None:
+    """Finalize no-DLR successes with one set-based task update.
+
+    ``submit_sm_resp`` must still be consumed by the protocol layer so the
+    SMPP window is released and explicit failures can be handled.  For a
+    configuration that does not request delivery receipts, successful message
+    ids have no business value.  This path therefore keeps only the compact
+    accepted-task state and aggregates the campaign counters, avoiding the
+    per-task UPDATE/JSON work of the general submission path.
+    """
+    if not payloads:
+        return
+
+    # A multipart task can produce several completion callbacks in one flush.
+    # Retain the last transport metadata while deduplicating the task update.
+    latest = {}
+    for payload in payloads:
+        latest[int(payload["task_id"])] = payload
+    task_ids = list(latest)
+    placeholders = ",".join("?" for _ in task_ids)
+    before_rows = conn.execute(
+        f"""SELECT id,batch_id,campaign_type,campaign_id,status,claim_token
+            FROM sms_tasks WHERE id IN ({placeholders})
+              AND status IN ('sending','submitted','unknown')""",
+        task_ids,
+    ).fetchall()
+    if not before_rows:
+        return
+
+    values = ",".join("(?,?,?,?,?)" for _ in task_ids)
+    params = []
+    for task_id in task_ids:
+        payload = latest[task_id]
+        params.extend([
+            task_id,
+            payload.get("transport_smpp_config_id"),
+            payload.get("submit_sm_parts"),
+            str(payload.get("claim_token") or ""),
+            str(payload.get("attempt_token") or ""),
+        ])
+    updated = conn.execute(
+        f"""UPDATE sms_tasks AS t SET
+                status='accepted', smsc_message_ids='[]', error_msg='',
+                failure_class='', last_smpp_status=NULL,
+                transport_smpp_config_id=COALESCE(i.transport_smpp_config_id,
+                                                   t.transport_smpp_config_id),
+                submit_sm_parts=CASE WHEN i.submit_sm_parts IS NULL
+                                     THEN t.submit_sm_parts
+                                     ELSE GREATEST(1,i.submit_sm_parts) END,
+                submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+                delivered_at=COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+                updated_at=CURRENT_TIMESTAMP
+            FROM (VALUES {values}) AS i(task_id,transport_smpp_config_id,submit_sm_parts,
+                                        claim_token,attempt_token)
+            WHERE t.id=i.task_id AND t.status IN ('sending','submitted','unknown')
+              AND t.claim_token=i.claim_token
+            RETURNING t.id""",
+        params,
+    ).fetchall()
+    updated_ids = {int(row["id"]) for row in updated}
+    if not updated_ids:
+        return
+
+    attempt_updates = [
+        (str(latest[task_id].get("attempt_token") or ""), task_id,
+         str(latest[task_id].get("claim_token") or ""))
+        for task_id in updated_ids
+        if latest[task_id].get("attempt_token")
+    ]
+    if attempt_updates:
+        conn.executemany(
+            """UPDATE sms_send_attempts SET state='accepted',lease_until=NULL,
+               updated_at=CURRENT_TIMESTAMP
+               WHERE attempt_token=? AND task_id=? AND claim_token=?""",
+            attempt_updates,
+        )
+
+    rows_by_id = {int(row["id"]): row for row in before_rows}
+    batch_delivered_increments = {}
+    daily_sent_increments = {}
+    event_groups = {}
+    for task_id in updated_ids:
+        row = rows_by_id.get(task_id)
+        if not row:
+            continue
+        event_key = (
+            row["campaign_type"], row["campaign_id"], row["batch_id"], row["status"]
+        )
+        event_groups.setdefault(event_key, []).append(task_id)
+        if row["batch_id"]:
+            batch_id = int(row["batch_id"])
+            campaign_id = int(row["campaign_id"])
+            batch_delivered_increments[batch_id] = (
+                batch_delivered_increments.get(batch_id, 0) + 1
             )
+            daily_sent_increments[campaign_id] = (
+                daily_sent_increments.get(campaign_id, 0) + 1
+            )
+
+    for (campaign_type, campaign_id, batch_id, from_status), task_group in event_groups.items():
+        _add_task_event_batch(
+            conn, campaign_type, campaign_id, batch_id,
+            "submitted", from_status, "accepted", task_group,
+            {"buffered": True, "no_delivery_receipt": True, "set_based": True},
+        )
+
+    if batch_delivered_increments:
+        conn.executemany(
+            """UPDATE batch_campaign_batches
+               SET delivered_count=COALESCE(delivered_count,0)+?,
+                   status=CASE
+                     WHEN task_count>0 AND COALESCE(delivered_count,0)+?>=task_count
+                     THEN 'sent' ELSE status END,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            [(count, count, batch_id) for batch_id, count in batch_delivered_increments.items()],
+        )
+        stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+        conn.executemany(
+            """UPDATE batch_campaign_daily_stats
+               SET sent_count=COALESCE(sent_count,0)+?, updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_id=? AND stats_date=?""",
+            [
+                (count, campaign_id, stats_date)
+                for campaign_id, count in daily_sent_increments.items()
+            ],
+        )
 
 
 def flush_pending_writes(timeout: float = 10.0) -> None:
@@ -721,14 +1146,22 @@ def create_external_task(campaign_id: int, campaign_name: str, msisdn: str,
 def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: str = "optional",
                    wait: bool = True,
                    transport_smpp_config_id: Optional[int] = None,
-                   submit_sm_parts: Optional[int] = None):
+                   submit_sm_parts: Optional[int] = None,
+                   claim_token: str = "", attempt_token: str = "",
+                   source_namespace: str = ""):
     from services import sms_write_buffer
+    stored_message_ids = list(message_ids or []) if delivery_receipt_mode != "disabled" else []
     sms_write_buffer.submit(
         "submitted",
-        {"task_id": task_id, "message_ids": list(message_ids or []),
+        {"task_id": task_id, "message_ids": stored_message_ids,
          "delivery_receipt_mode": delivery_receipt_mode,
          "transport_smpp_config_id": transport_smpp_config_id,
-         "submit_sm_parts": submit_sm_parts},
+         "submit_sm_parts": submit_sm_parts,
+         "claim_token": str(claim_token or ""),
+         "attempt_token": str(attempt_token or ""),
+         "source_namespace": str(
+             source_namespace or smpp_source_namespace(transport_smpp_config_id)
+         )},
         wait=wait,
     )
 
@@ -736,12 +1169,17 @@ def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: 
 def _apply_submitted(conn, task_id: int, message_ids: list[str],
                      delivery_receipt_mode: str = "optional",
                      transport_smpp_config_id: Optional[int] = None,
-                     submit_sm_parts: Optional[int] = None):
+                     submit_sm_parts: Optional[int] = None,
+                     claim_token: str = "", attempt_token: str = "",
+                     source_namespace: str = ""):
     _apply_submitted_batch(conn, [{
         "task_id": task_id, "message_ids": message_ids,
         "delivery_receipt_mode": delivery_receipt_mode,
         "transport_smpp_config_id": transport_smpp_config_id,
         "submit_sm_parts": submit_sm_parts,
+        "claim_token": claim_token,
+        "attempt_token": attempt_token,
+        "source_namespace": source_namespace or smpp_source_namespace(transport_smpp_config_id),
     }])
 
 
@@ -753,7 +1191,7 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
     task_ids = list(dict.fromkeys(int(payload["task_id"]) for payload in payloads))
     placeholders = ",".join("?" for _ in task_ids)
     rows = conn.execute(
-        f"""SELECT id,smsc_message_ids,batch_id,campaign_type,campaign_id,status
+        f"""SELECT id,smsc_message_ids,batch_id,campaign_type,campaign_id,status,claim_token
             FROM sms_tasks WHERE id IN ({placeholders})""",
         task_ids,
     ).fetchall()
@@ -771,10 +1209,16 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
         message_payload = item.payload
         message_id = str(message_payload.get("message_id") or "")
         if message_id:
-            mapping_rows.append((message_id, int(message_payload["task_id"])))
+            mapping_rows.append((
+                str(message_payload.get("source_namespace") or "legacy"),
+                message_id, int(message_payload["task_id"]),
+                str(message_payload.get("attempt_token") or ""),
+                int(message_payload.get("part_no") or 0),
+            ))
     pending_task_by_message_id = {}
     batch_delivered_increments = {}
     daily_sent_increments = {}
+    event_groups = {}
     for task_id, task_payloads in grouped.items():
         row = rows_by_id.get(task_id)
         existing_ids = []
@@ -794,11 +1238,14 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
         mode = payload.get("delivery_receipt_mode")
         mode = mode if mode in {"required", "optional", "disabled"} else "optional"
         final_status = "submitted" if mode == "required" else "accepted"
-        mapping_rows.extend((message_id, task_id) for message_id in message_ids)
-        pending_task_by_message_id.update((message_id, task_id) for message_id in message_ids)
-
+        source_namespace = str(
+            payload.get("source_namespace")
+            or smpp_source_namespace(payload.get("transport_smpp_config_id"))
+        )
+        attempt_token = str(payload.get("attempt_token") or "")
         updated = conn.execute(
             """UPDATE sms_tasks SET status=?, smsc_message_ids=?, error_msg='',
+                failure_class='', last_smpp_status=NULL,
                 transport_smpp_config_id=COALESCE(?,transport_smpp_config_id),
                 submit_sm_parts=CASE WHEN ? IS NULL THEN submit_sm_parts ELSE GREATEST(1,?) END,
                 submitted_at=COALESCE(submitted_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
@@ -806,19 +1253,53 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
                                   THEN COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR))
                                   ELSE delivered_at END,
                 updated_at=CURRENT_TIMESTAMP
-                WHERE id=? AND status IN ('sending','submitted')
+                WHERE id=? AND status IN ('sending','submitted','unknown')
+                  AND claim_token=?
                 RETURNING id""",
             (final_status, json.dumps(message_ids),
              payload.get("transport_smpp_config_id"), payload.get("submit_sm_parts"),
-             payload.get("submit_sm_parts"), mode, task_id),
+             payload.get("submit_sm_parts"), mode, task_id,
+             str(payload.get("claim_token") or "")),
         ).fetchone()
-        if updated and final_status == "accepted" and row and row["batch_id"]:
+        if not updated:
+            continue
+        # Only the currently owned claim may publish message-id mappings.
+        # A delayed callback from an expired attempt must not make an old SMSC
+        # response addressable as if it belonged to the replacement attempt.
+        mapping_rows.extend(
+            (source_namespace, message_id, task_id, attempt_token, part_no)
+            for part_no, message_id in enumerate(message_ids, 1)
+        )
+        pending_task_by_message_id.update(
+            ((source_namespace, message_id), task_id) for message_id in message_ids
+        )
+        if row:
+            event_key = (
+                row["campaign_type"], row["campaign_id"], row["batch_id"],
+                row["status"], final_status,
+            )
+            event_groups.setdefault(event_key, []).append(task_id)
+        if attempt_token:
+            conn.execute(
+                """UPDATE sms_send_attempts SET state='accepted',
+                   lease_until=NULL,updated_at=CURRENT_TIMESTAMP
+                   WHERE attempt_token=? AND task_id=? AND claim_token=?""",
+                (attempt_token, task_id, str(payload.get("claim_token") or "")),
+            )
+        if final_status == "accepted" and row and row["batch_id"]:
             batch_id = int(row["batch_id"])
             campaign_id = int(row["campaign_id"])
             batch_delivered_increments[batch_id] = batch_delivered_increments.get(batch_id, 0) + 1
             daily_sent_increments[campaign_id] = daily_sent_increments.get(campaign_id, 0) + 1
 
-    _insert_message_mappings(conn, mapping_rows)
+    for (campaign_type, campaign_id, batch_id, from_status, to_status), task_group in event_groups.items():
+        _add_task_event_batch(
+            conn, campaign_type, campaign_id, batch_id,
+            "submitted", from_status, to_status, task_group,
+            {"buffered": True, "attempt_fenced": True},
+        )
+
+    _insert_message_bindings(conn, mapping_rows)
     if batch_delivered_increments:
         conn.executemany(
             """UPDATE batch_campaign_batches
@@ -840,43 +1321,48 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
 
     # Receipts may arrive before submit_sm_resp. Preserve that reconciliation,
     # but query all submitted ids together instead of once per task.
-    message_ids = list(pending_task_by_message_id)
-    for offset in range(0, len(message_ids), 500):
-        id_chunk = message_ids[offset:offset + 500]
-        id_placeholders = ",".join("?" for _ in id_chunk)
-        pending_receipts = conn.execute(
-            f"""SELECT smsc_message_id,message_state,raw_receipt
-                FROM delivery_receipts
-                WHERE task_id IS NULL AND smsc_message_id IN ({id_placeholders})""",
-            id_chunk,
-        ).fetchall()
-        if not pending_receipts:
-            continue
-        matched = [
-            (pending_task_by_message_id[str(receipt["smsc_message_id"])],
-             str(receipt["smsc_message_id"]))
-            for receipt in pending_receipts
-            if str(receipt["smsc_message_id"]) in pending_task_by_message_id
-        ]
-        if matched:
-            conn.executemany(
-                "UPDATE delivery_receipts SET task_id=? WHERE task_id IS NULL AND smsc_message_id=?",
-                matched,
-            )
-        for receipt in pending_receipts:
-            message_id = str(receipt["smsc_message_id"])
-            task_id = pending_task_by_message_id.get(message_id)
-            if task_id is not None:
+    ids_by_source = {}
+    for source_namespace, message_id in pending_task_by_message_id:
+        ids_by_source.setdefault(source_namespace, []).append(message_id)
+    for source_namespace, message_ids in ids_by_source.items():
+        for offset in range(0, len(message_ids), 500):
+            id_chunk = message_ids[offset:offset + 500]
+            id_placeholders = ",".join("?" for _ in id_chunk)
+            pending_receipts = conn.execute(
+                f"""SELECT smsc_message_id,message_state,raw_receipt,source_namespace
+                    FROM delivery_receipts
+                    WHERE task_id IS NULL AND source_namespace=?
+                      AND smsc_message_id IN ({id_placeholders})""",
+                [source_namespace, *id_chunk],
+            ).fetchall()
+            matched = []
+            for receipt in pending_receipts:
+                message_id = str(receipt["smsc_message_id"])
+                task_id = pending_task_by_message_id.get((source_namespace, message_id))
+                if task_id is None:
+                    continue
+                matched.append((task_id, source_namespace, message_id))
                 _apply_receipt(
                     conn, message_id, receipt["message_state"], receipt["raw_receipt"],
                     task_id=task_id, skip_insert=True,
+                    source_namespace=source_namespace,
+                )
+            if matched:
+                conn.executemany(
+                    """UPDATE delivery_receipts SET task_id=? WHERE task_id IS NULL
+                       AND source_namespace=? AND smsc_message_id=?""",
+                    matched,
                 )
 
 
-def append_message_id(task_id: int, message_id: str, wait: bool = True):
+def append_message_id(task_id: int, message_id: str, wait: bool = True,
+                      source_namespace: str = "legacy", attempt_token: str = "",
+                      part_no: int = 0):
     from services import sms_write_buffer
     sms_write_buffer.submit(
-        "message_id", {"task_id": task_id, "message_id": message_id}, wait=wait
+        "message_id", {"task_id": task_id, "message_id": message_id,
+                       "source_namespace": source_namespace,
+                       "attempt_token": attempt_token, "part_no": part_no}, wait=wait
     )
 
 
@@ -897,17 +1383,28 @@ def _apply_message_id_batch(conn, items) -> None:
         task_id = int(payload["task_id"])
         message_id = str(payload.get("message_id") or "")
         if message_id:
-            mapping_candidates.append((message_id, task_id))
-    _insert_message_mappings(conn, mapping_candidates)
+            mapping_candidates.append((
+                str(payload.get("source_namespace") or "legacy"), message_id, task_id,
+                str(payload.get("attempt_token") or ""), int(payload.get("part_no") or 0),
+            ))
+    _insert_message_bindings(conn, mapping_candidates)
 
 
 def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
                       retryable: bool = True, failure_class: str = "transport",
                       wait: bool = True):
     from services import sms_write_buffer
+    durable_task = {
+        key: task.get(key) for key in (
+            "id", "attempts", "max_attempts", "batch_id", "campaign_type",
+            "campaign_id", "status", "claim_token", "smsc_message_ids",
+            "_attempt_token", "_source_namespace", "_submit_sm_parts",
+            "_transport_smpp_config_id", "_accepted_parts",
+        )
+    }
     sms_write_buffer.submit(
         "send_failure",
-        {"task": dict(task), "error": str(error), "status_code": status_code,
+        {"task": durable_task, "error": str(error), "status_code": status_code,
          "retryable": retryable, "failure_class": failure_class},
         wait=wait,
     )
@@ -915,8 +1412,26 @@ def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
 
 def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int] = None,
                         retryable: bool = True, failure_class: str = "transport"):
-    retry = retryable and task["attempts"] < task.get("max_attempts", 3)
-    status = "retrying" if retry else "failed"
+    attempt_token = str(task.get("_attempt_token") or "")
+    accepted_parts = int(task.get("_accepted_parts") or 0)
+    if attempt_token:
+        part_row = conn.execute(
+            """SELECT COUNT(*) count FROM sms_send_parts
+               WHERE attempt_token=? AND state='accepted'""",
+            (attempt_token,),
+        ).fetchone()
+        accepted_parts = max(accepted_parts, int(part_row["count"] or 0))
+    if accepted_parts:
+        status = "partial"
+        failure_class = "partial_submit"
+        retry = False
+    elif failure_class == "delivery_unknown" or status_code == -1:
+        status = "unknown"
+        failure_class = "delivery_unknown"
+        retry = False
+    else:
+        retry = retryable and int(task.get("attempts") or 0) < int(task.get("max_attempts") or 3)
+        status = "retrying" if retry else "failed"
     delay_minutes = min(30, 2 ** max(0, task["attempts"] - 1))
     try:
         existing_ids = json.loads(task.get("smsc_message_ids") or "[]")
@@ -926,19 +1441,42 @@ def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int]
         [str(value) for value in existing_ids if str(value)]
         + _mapped_message_ids(conn, task["id"])
     ))
+    # Recovery may have isolated this same claim while the durable result was
+    # waiting for the writer. Only a definite rejection or known partial send
+    # can reconcile unknown: another transport timeout must not permit resend.
+    reconcile_unknown = status != "unknown" and (
+        accepted_parts > 0 or (status_code is not None and status_code > 0)
+    )
+    before = conn.execute(
+        "SELECT status FROM sms_tasks WHERE id=? AND claim_token=?",
+        (task["id"], str(task.get("claim_token") or "")),
+    ).fetchone()
+    if not before:
+        return
     updated = conn.execute(
         f"""UPDATE sms_tasks SET status=?, error_msg=?, last_smpp_status=?, failure_class=?,
             smsc_message_ids=?,
             next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '{delay_minutes} minutes',
-            updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending'
+            updated_at=CURRENT_TIMESTAMP WHERE id=?
+              AND (status='sending' OR (status='unknown' AND ?))
+              AND claim_token=?
             RETURNING id""",
         (status, str(error)[:2000], status_code, failure_class,
-         json.dumps(message_ids), task["id"]),
+          json.dumps(message_ids), task["id"], reconcile_unknown,
+          str(task.get("claim_token") or "")),
     ).fetchone()
     if updated:
-        _add_task_event(conn, task["id"], "send_failure", task.get("status", "sending"), status,
+        _add_task_event(conn, task["id"], "send_failure", before["status"], status,
                         str(error)[:500], {"smpp_status": status_code, "failure_class": failure_class})
-        if status == "failed" and task.get("batch_id"):
+        if attempt_token:
+            conn.execute(
+                """UPDATE sms_send_attempts SET state=?,lease_until=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+                   WHERE attempt_token=? AND task_id=? AND claim_token=?""",
+                (status, attempt_token, int(task["id"]),
+                 str(task.get("claim_token") or "")),
+            )
+        if status in {"failed", "partial", "unknown"} and task.get("batch_id"):
             conn.execute(
                 """UPDATE batch_campaign_batches
                    SET failed_count=COALESCE(failed_count,0)+1,updated_at=CURRENT_TIMESTAMP
@@ -979,21 +1517,23 @@ def requeue_transport_failures() -> int:
 
 def record_receipt(message_id: str, state: str, raw: str,
                    _task_id: Optional[int] = None, _skip_insert: bool = False,
-                   wait: bool = True):
+                   wait: bool = True, source_namespace: str = "legacy"):
     from services import sms_write_buffer
     sms_write_buffer.submit(
         "receipt",
         {"message_id": str(message_id), "state": str(state), "raw": str(raw),
-         "task_id": _task_id, "skip_insert": _skip_insert},
+         "task_id": _task_id, "skip_insert": _skip_insert,
+         "source_namespace": str(source_namespace or "legacy")},
         wait=wait,
     )
 
 
 def _apply_receipt(conn, message_id: str, state: str, raw: str,
-                   task_id: Optional[int] = None, skip_insert: bool = False):
+                   task_id: Optional[int] = None, skip_insert: bool = False,
+                   source_namespace: str = "legacy"):
     normalized_state = str(state or "").upper()
     if task_id is None:
-        task = _find_task_by_message_id(conn, message_id)
+        task = _find_task_by_message_id(conn, message_id, source_namespace)
         task_id = task["id"] if task else None
     else:
         row = conn.execute("SELECT * FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
@@ -1001,9 +1541,10 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
     if not skip_insert:
         inserted = conn.execute(
             """INSERT INTO delivery_receipts
-               (task_id,smsc_message_id,message_state,raw_receipt)
-               VALUES (?,?,?,?) ON CONFLICT DO NOTHING RETURNING id""",
-            (task_id, message_id, normalized_state, raw[:4000]),
+               (task_id,source_namespace,smsc_message_id,message_state,raw_receipt)
+               VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING RETURNING id""",
+            (task_id, str(source_namespace or "legacy"), message_id,
+             normalized_state, raw[:4000]),
         ).fetchone()
         if task_id is not None and not inserted:
             return
@@ -1115,15 +1656,34 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
                 )
 
 
-def _find_task_by_message_id(conn, message_id: str) -> Optional[dict]:
-    """Find the task through the indexed SMSC message-id mapping."""
-    row = conn.execute(
-        """SELECT t.* FROM sms_task_message_ids m
+def _find_task_by_message_id(conn, message_id: str,
+                             source_namespace: str = "legacy") -> Optional[dict]:
+    """Resolve a receipt only when its SMSC-scoped id has one task owner."""
+    rows = conn.execute(
+        """SELECT DISTINCT t.* FROM sms_message_bindings_v2 m
            JOIN sms_tasks t ON t.id=m.task_id
-           WHERE m.smsc_message_id=? LIMIT 1""",
-        (str(message_id),),
-    ).fetchone()
-    return dict(row) if row else None
+           WHERE m.source_namespace=? AND m.smsc_message_id=?
+           ORDER BY t.id DESC LIMIT 2""",
+        (str(source_namespace or "legacy"), str(message_id)),
+    ).fetchall()
+    if len(rows) == 1:
+        return dict(rows[0])
+    if len(rows) > 1:
+        logger.error(
+            "Ambiguous SMPP receipt source=%s message_id=%s candidates=%s",
+            source_namespace, message_id, [row["id"] for row in rows],
+        )
+        return None
+    # Compatibility for mappings created before source namespaces existed.
+    if str(source_namespace or "legacy") == "legacy":
+        row = conn.execute(
+            """SELECT t.* FROM sms_task_message_ids m
+               JOIN sms_tasks t ON t.id=m.task_id
+               WHERE m.smsc_message_id=? LIMIT 1""",
+            (str(message_id),),
+        ).fetchone()
+        return dict(row) if row else None
+    return None
 
 
 def cleanup_task_retention() -> int:
@@ -1194,7 +1754,6 @@ def _cached_task_count(conn, where: str, params: list) -> int:
 
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
                smpp_config_id: int = -1, cursor: Optional[int] = None) -> dict:
-    conn = get_connection()
     conditions, params = [], []
     if status:
         conditions.append("status=?")
@@ -1209,20 +1768,23 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
             conditions.append("smpp_config_id=?")
             params.append(smpp_config_id)
     count_where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    total = task_stats()["total"] if not conditions else _cached_task_count(conn, count_where, params)
-    query_conditions = list(conditions)
-    query_params = list(params)
-    if cursor is not None and int(cursor) > 0:
-        query_conditions.append("id<?")
-        query_params.append(int(cursor))
-    where = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
-    rows = conn.execute(
-        f"""SELECT id,campaign_type,campaign_id,campaign_name,smpp_config_id,
-                   msisdn,language,content,status,attempts,error_msg,updated_at
-            FROM sms_tasks {where} ORDER BY id DESC LIMIT ?""",
-        query_params + [page_size + 1],
-    ).fetchall()
-    conn.close()
+    def read(conn):
+        total = task_stats()["total"] if not conditions else _cached_task_count(conn, count_where, params)
+        query_conditions = list(conditions)
+        query_params = list(params)
+        if cursor is not None and int(cursor) > 0:
+            query_conditions.append("id<?")
+            query_params.append(int(cursor))
+        where = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
+        rows = conn.execute(
+            f"""SELECT id,campaign_type,campaign_id,campaign_name,smpp_config_id,
+                       msisdn,language,content,status,attempts,error_msg,updated_at
+                FROM sms_tasks {where} ORDER BY id DESC LIMIT ?""",
+            query_params + [page_size + 1],
+        ).fetchall()
+        return total, rows
+
+    total, rows = read_transaction(read, operation="sms_tasks.list")
     has_more = len(rows) > page_size
     rows = rows[:page_size]
     items = [dict(r) for r in rows]
@@ -1252,13 +1814,15 @@ def _cached_exclusion_count(conn) -> int:
         return total
 
 def list_exclusions(page: int = 1, page_size: int = 50) -> dict:
-    conn = get_connection()
-    total = _cached_exclusion_count(conn)
-    rows = conn.execute(
-        "SELECT id,msisdn,reason,enabled,created_at FROM exclusion_users ORDER BY id DESC LIMIT ? OFFSET ?",
-        (page_size, max(0, page - 1) * page_size),
-    ).fetchall()
-    conn.close()
+    def read(conn):
+        total = _cached_exclusion_count(conn)
+        rows = conn.execute(
+            "SELECT id,msisdn,reason,enabled,created_at FROM exclusion_users ORDER BY id DESC LIMIT ? OFFSET ?",
+            (page_size, max(0, page - 1) * page_size),
+        ).fetchall()
+        return total, rows
+
+    total, rows = read_transaction(read, operation="sms_tasks.exclusions.list")
     return {"total": total, "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
 
 
@@ -1284,14 +1848,16 @@ def task_stats() -> dict:
             today_raw = {r["status"]: int(r["today_count"] or 0) for r in rows}
             result = dict(raw)
             for status in ("queued", "sending", "submitted", "accepted", "delivered",
-                           "retrying", "failed", "expired", "cancelled", "archived"):
+                           "retrying", "failed", "partial", "unknown", "expired",
+                           "cancelled", "archived"):
                 result.setdefault(status, 0)
             # Keep delivery semantics strict. ``accepted`` means the SMSC
             # accepted submit_sm; it is not a handset delivery receipt.
             result["accepted_or_delivered"] = raw.get("accepted", 0) + raw.get("delivered", 0)
             result["today_total"] = sum(today_raw.values())
             for status in ("queued", "sending", "submitted", "accepted", "delivered",
-                           "retrying", "failed", "expired", "cancelled", "archived"):
+                           "retrying", "failed", "partial", "unknown", "expired",
+                           "cancelled", "archived"):
                 result[f"today_{status}"] = today_raw.get(status, 0)
             result["today_accepted_or_delivered"] = (
                 today_raw.get("accepted", 0) + today_raw.get("delivered", 0)
@@ -1304,9 +1870,12 @@ def task_stats() -> dict:
         return dict(result)
 
 def retry_task(task_id: int) -> bool:
-    conn = get_connection()
-    row = conn.execute("SELECT id,status,batch_id FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
-    if row:
+    def write(conn):
+        row = conn.execute(
+            "SELECT id,status,batch_id FROM sms_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
         previous = row["status"]
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='', claim_token='',
@@ -1322,64 +1891,70 @@ def retry_task(task_id: int) -> bool:
                 (row["batch_id"],),
             )
         _add_task_event(conn, task_id, "manual_retry", previous, "queued", "manual retry requested")
-        conn.commit()
-    conn.close()
-    return bool(row)
+        return True
+
+    return write_transaction(
+        write,
+        attempts=3,
+        operation="sms_task.retry",
+        base_delay=0.1,
+    )
 
 
 def mark_delivered(task_id: int) -> tuple[bool, str]:
-    """Manually confirm a submitted task as delivered.
-
-    Once the SMSC accepts a submission (status='submitted') the message is
-    almost always sent; if the final delivery receipt is lost or delayed, an
-    operator can confirm delivery manually. Only ``submitted`` tasks can be
-    confirmed; already-delivered tasks are treated as an idempotent success.
-    """
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
-    if not row:
-        conn.close()
-        return False, "Task not found"
-    task = dict(row)
-    if task["status"] == "delivered":
-        conn.close()
-        return True, "Task already delivered"
-    if task["status"] not in {"submitted", "accepted"}:
-        conn.close()
-        return False, f"Only submitted or accepted tasks can be confirmed as delivered (current: {task['status']})"
-    conn.execute(
-        """UPDATE sms_tasks SET status='delivered', failure_class='', error_msg='',
-            delivered_at=COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
-            updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-        (task_id,),
-    )
-    _add_task_event(conn, task_id, "manual_delivered", task["status"], "delivered",
-                    "manually confirmed as delivered")
-    if task.get("batch_id") and task["status"] not in {"delivered", "accepted"}:
-        conn.execute(
-            """UPDATE batch_campaign_batches
-               SET delivered_count=COALESCE(delivered_count,0)+1,
-                   status=CASE
-                     WHEN task_count>0 AND COALESCE(delivered_count,0)+1>=task_count
-                     THEN 'sent' ELSE status END,
-                   updated_at=CURRENT_TIMESTAMP
-               WHERE id=?""",
-            (task["batch_id"],),
-        )
-    if task.get("campaign_type") == "batch" and task["status"] not in {"delivered", "accepted"}:
-        stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
-        existing = conn.execute(
-            "SELECT id FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",
-            (task["campaign_id"], stats_date),
+    def write(conn):
+        row = conn.execute(
+            "SELECT * FROM sms_tasks WHERE id=?", (task_id,)
         ).fetchone()
-        if existing:
-            conn.execute(
-                "UPDATE batch_campaign_daily_stats SET sent_count=sent_count+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (existing["id"],),
+        if not row:
+            return False, "Task not found"
+        task = dict(row)
+        if task["status"] == "delivered":
+            return True, "Task already delivered"
+        if task["status"] not in {"submitted", "accepted"}:
+            return False, (
+                "Only submitted or accepted tasks can be confirmed as delivered "
+                f"(current: {task['status']})"
             )
-    conn.commit()
-    conn.close()
-    return True, "Task confirmed as delivered"
+        conn.execute(
+            """UPDATE sms_tasks SET status='delivered', failure_class='', error_msg='',
+                delivered_at=COALESCE(delivered_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+                updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (task_id,),
+        )
+        _add_task_event(
+            conn, task_id, "manual_delivered", task["status"], "delivered",
+            "manually confirmed as delivered",
+        )
+        if task.get("batch_id") and task["status"] not in {"delivered", "accepted"}:
+            conn.execute(
+                """UPDATE batch_campaign_batches
+                   SET delivered_count=COALESCE(delivered_count,0)+1,
+                       status=CASE
+                         WHEN task_count>0 AND COALESCE(delivered_count,0)+1>=task_count
+                         THEN 'sent' ELSE status END,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (task["batch_id"],),
+            )
+        if task.get("campaign_type") == "batch" and task["status"] not in {"delivered", "accepted"}:
+            stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+            existing = conn.execute(
+                "SELECT id FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",
+                (task["campaign_id"], stats_date),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE batch_campaign_daily_stats SET sent_count=sent_count+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (existing["id"],),
+                )
+        return True, "Task confirmed as delivered"
+
+    return write_transaction(
+        write,
+        attempts=3,
+        operation="sms_task.mark_delivered",
+        base_delay=0.1,
+    )
 
 
 def validate_task_schedule(task: dict) -> tuple[bool, str]:
@@ -1394,63 +1969,73 @@ def validate_task_schedule(task: dict) -> tuple[bool, str]:
     return campaign_is_active(campaign)
 
 
-def defer_task(task_id: int, reason: str, expired: bool = False):
-    conn = get_connection()
-    if expired:
-        conn.execute(
-            "UPDATE sms_tasks SET status='expired', error_msg=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='sending'",
-            (reason, task_id),
-        )
-    else:
-        conn.execute(
-            """UPDATE sms_tasks SET status='queued', attempts=GREATEST(attempts-1,0), error_msg=?,
-                next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes', updated_at=CURRENT_TIMESTAMP
-                WHERE id=? AND status='sending'""",
-            (reason, task_id),
-        )
-    conn.commit()
-    conn.close()
+def defer_task(task_id: int, reason: str, expired: bool = False,
+               claim_token: str = ""):
+    def write(conn):
+        if expired:
+            conn.execute(
+                """UPDATE sms_tasks SET status='expired', error_msg=?,
+                   updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND status='sending' AND claim_token=?""",
+                (reason, task_id, str(claim_token or "")),
+            )
+        else:
+            conn.execute(
+                """UPDATE sms_tasks SET status='queued', attempts=GREATEST(attempts-1,0),
+                    error_msg=?,next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+                    updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND status='sending' AND claim_token=?""",
+                (reason, task_id, str(claim_token or "")),
+            )
+
+    write_transaction(write, operation="sms_tasks.defer")
 
 
 def recover_stale_tasks():
-    conn = get_connection()
-    stale_rows = conn.execute(
-        """SELECT id,smsc_message_ids FROM sms_tasks
-           WHERE status='sending'
-             AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) < CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
-    ).fetchall()
-    if stale_rows:
-        mapped_rows = conn.execute(
-            """SELECT m.task_id,m.smsc_message_id FROM sms_task_message_ids m
-               JOIN sms_tasks t ON t.id=m.task_id
-               WHERE t.status='sending'
-                 AND CAST(t.updated_at AS TIMESTAMP WITH TIME ZONE) <
+    def recover(conn):
+        stale_rows = conn.execute(
+            """SELECT id,campaign_type,campaign_id,batch_id,claim_token,smsc_message_ids
+               FROM sms_tasks WHERE status='sending'
+                 AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) <
                      CURRENT_TIMESTAMP - INTERVAL '5 minutes'"""
         ).fetchall()
-        mapped_by_task = {}
-        for row in mapped_rows:
-            mapped_by_task.setdefault(int(row["task_id"]), []).append(str(row["smsc_message_id"]))
-        updates = []
+        recovered = 0
         for row in stale_rows:
+            mapped = _mapped_message_ids(conn, int(row["id"]))
             try:
                 existing = json.loads(row["smsc_message_ids"] or "[]")
             except (TypeError, json.JSONDecodeError):
                 existing = []
             all_ids = list(dict.fromkeys(
-                [str(value) for value in existing if str(value)]
-                + mapped_by_task.get(int(row["id"]), [])
+                [str(value) for value in existing if str(value)] + mapped
             ))
-            updates.append((json.dumps(all_ids), int(row["id"])))
-        conn.executemany(
-            """UPDATE sms_tasks SET status='retrying', error_msg='worker interrupted; recovered',
-                smsc_message_ids=?, next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-                WHERE id=? AND status='sending'""",
-            updates,
+            updated = conn.execute(
+                """UPDATE sms_tasks SET status='unknown',failure_class='delivery_unknown',
+                    error_msg='worker interrupted; delivery state requires reconciliation',
+                    smsc_message_ids=?,updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND status='sending' AND claim_token=? RETURNING id""",
+                (json.dumps(all_ids), int(row["id"]), str(row["claim_token"] or "")),
+            ).fetchone()
+            if not updated:
+                continue
+            recovered += 1
+            conn.execute(
+                """UPDATE sms_send_attempts SET state='unknown',lease_until=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+                   WHERE task_id=? AND claim_token=? AND state NOT IN ('accepted','partial')""",
+                (int(row["id"]), str(row["claim_token"] or "")),
+            )
+            _add_task_event(
+                conn, int(row["id"]), "recovered_unknown", "sending", "unknown",
+                "stale sending attempt isolated; not automatically retried",
+                {"claim_token": str(row["claim_token"] or "")},
+            )
+        conn.execute(
+            """UPDATE sms_tasks SET status='expired', error_msg='delivery receipt timeout',
+                updated_at=CURRENT_TIMESTAMP
+                WHERE status='submitted' AND CAST(submitted_at AS TIMESTAMP WITH TIME ZONE) <
+                    CURRENT_TIMESTAMP - INTERVAL '24 hours'"""
         )
-    conn.execute(
-        """UPDATE sms_tasks SET status='expired', error_msg='delivery receipt timeout',
-            updated_at=CURRENT_TIMESTAMP
-            WHERE status='submitted' AND CAST(submitted_at AS TIMESTAMP WITH TIME ZONE) < CURRENT_TIMESTAMP - INTERVAL '24 hours'"""
-    )
-    conn.commit()
-    conn.close()
+        return recovered
+
+    return write_transaction(recover, operation="sms_tasks.recover_stale")

@@ -1,0 +1,175 @@
+{
+  "evidence": [
+    {
+      "id": "EVD-001",
+      "material_id": "MAT-001",
+      "statement": "显式事务帮助函数已有 BEGIN；全局应用写锁自首个写入持有到 commit/rollback/close。此锁是本程序策略，DuckDB 本身并非只能有一个线程写入",
+      "location": "backend/database.py：write_transaction、WrappedConnection",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-002",
+      "material_id": "MAT-002",
+      "statement": "按 created_at,id 从全局队列领取；未显式 BEGIN。任务 UPDATE 与事件记录不是天然一个多语句事务",
+      "location": "backend/services/sms_task_service.py：claim_next_tasks",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-003",
+      "material_id": "MAT-003",
+      "statement": "一个全局 dispatcher；领取量 min(500, workers×claim_batch)。worker 数不会为每个活动创建独立配额",
+      "location": "backend/services/task_worker.py：_claim_fetch_size、_claim_dispatch_loop",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-004",
+      "material_id": "MAT-004",
+      "statement": "_commit 未显式 BEGIN；三次失败后依然 done/task_done，wait=False 调用者没有等待该错误。存在批次部分提交/结果未可靠恢复的风险",
+      "location": "backend/services/sms_write_buffer.py：_commit、_run",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-005",
+      "material_id": "MAT-005",
+      "statement": "文件按活动轮询；领取到整个文件完成才释放 worker；白名单维护/构建共用一个维护锁并占用入库 worker",
+      "location": "backend/services/realtime_ingestion_worker.py：_claim_realtime_file、_run_maintenance",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-006",
+      "material_id": "MAT-006",
+      "statement": "campaign 顺序扫描，目录 enumerate/sort；注册没有轮次时间预算。长目录或慢复制会延迟后续活动",
+      "location": "backend/services/realtime_campaign_service.py：sync_watch_dirs_to_inboxes、process_realtime_inboxes",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-007",
+      "material_id": "MAT-007",
+      "statement": "构建候选按 created_at,id 串行选择；索引按活动/版本保存在独立 DuckDB 文件。默认构建限制并不等于整个进程内存上限",
+      "location": "backend/services/realtime_whitelist_service.py：build_pending、build_version",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-008",
+      "material_id": "MAT-008",
+      "statement": "连接公共 FIFO，连接轮询；满队列产生可重试失败。window semaphore 按整条任务获取，状态 inflight 按 sequence 计数",
+      "location": "backend/services/smpp_gateway.py：send_async、_connection_for、_send_windowed_async",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-009",
+      "material_id": "MAT-009",
+      "statement": "task_depth 包含 queued/retrying/sending；paused 状态在 reasons 更新，snapshot 返回已有状态；缓存快照不能当作实时调度决定",
+      "location": "backend/services/backpressure_service.py：reasons、snapshot",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-010",
+      "material_id": "MAT-010",
+      "statement": "disabled 不存 message_id，成功响应仍产生 submitted 写入；accepted 同时填写 delivered_at；sending 超过 5 分钟会恢复为 retrying",
+      "location": "backend/services/sms_task_service.py：mark_submitted、_apply_disabled_submitted_batch、recover_stale_tasks",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-011",
+      "material_id": "MAT-011",
+      "statement": "实际发出和响应按 config/slot 聚合，任务统计主要是全局；尚无完整 campaign 发送份额/等待时间指标",
+      "location": "backend/services/metrics_service.py、smpp_service.py",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-012",
+      "material_id": "MAT-012",
+      "statement": "文件 token fencing、独立心跳、进度合并节流已有。文件级 transaction 帮助函数需与统一重试接口对齐",
+      "location": "backend/services/realtime_ingestion_state.py",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-013",
+      "material_id": "MAT-013",
+      "statement": "前期短事务、批量去重和扫描研究已存在，不能把旧设计描述当作当前未修复事实",
+      "location": "Docs/duckdb-realtime-batches-implementation-20261008.md；Docs/duckdb-realtime-progress-study-20261008.md",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "CODE_INSPECTION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-014",
+      "material_id": "MAT-014",
+      "statement": "未 BEGIN 的 INSERT 已提交，rollback 报无活动事务；显式 BEGIN 后 INSERT 可回滚。现有文件轮询和单所有者恢复两项测试通过",
+      "location": "本地 DuckDB 1.2.0 实验与现有测试",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "LOCAL_TEST",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-015",
+      "material_id": "MAT-015",
+      "statement": "曾有 write-write conflict、写锁超时、积压和零 TPS；多个不同配置和版本混在历史中，不是受控 A/B",
+      "location": "历史用户日志/采样",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "USER_HISTORICAL_SAMPLE",
+      "confidence": 0.8,
+      "notes": "历史多版本数据，不用于当前容量承诺。"
+    },
+    {
+      "id": "EVD-016",
+      "material_id": "MAT-016",
+      "statement": "单进程支持多个线程并发读写，同一行竞争可能失败；多语句业务原子性需显式事务",
+      "location": "DuckDB 1.2 官方文档",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "OFFICIAL_DOCUMENTATION",
+      "confidence": 0.95,
+      "notes": "只证明已检查的代码/文档事实，不证明目标设计已实施。"
+    },
+    {
+      "id": "EVD-017",
+      "material_id": "MAT-017",
+      "statement": "claim_token未用于短信完成写回；部分分片成功后临时错误可重试整条；映射主键仅message-id；DLR先入内存队列即确认。审计报告含内存故障复现，不是线上容量测试",
+      "location": "独立代码审计：成功/失败回调、recover_stale_tasks、message-id映射和DLR路径",
+      "evidence_state": "CONFIRMED",
+      "evidence_type": "INDEPENDENT_REVIEW",
+      "confidence": 0.95,
+      "notes": "独立审计报告的内存故障复现；不代表线上测试。"
+    }
+  ]
+}
+

@@ -27,10 +27,10 @@ def classify(error, status: str = "") -> ErrorDecision:
         return ErrorDecision("RESOURCE_LIMIT", True, RETRY_DELAYS[0] if RETRY_DELAYS else 30)
     if "whitelist index" in lower and any(token in lower for token in ("cannot read", "invalid", "corrupt", "failed")):
         return ErrorDecision("WHITELIST_INDEX", False, 0)
+    if any(token in lower for token in ("lock", "database is locked", "duckdb", "checkpoint", "write-write conflict", "transactioncontext")):
+        return ErrorDecision("TRANSIENT_DB", True, RETRY_DELAYS[0] if RETRY_DELAYS else 30)
     if isinstance(error, (FileNotFoundError, PermissionError, TimeoutError)) or "temporar" in lower or "i/o" in lower:
         return ErrorDecision("TRANSIENT_IO", True, RETRY_DELAYS[0] if RETRY_DELAYS else 30)
-    if any(token in lower for token in ("lock", "database is locked", "duckdb", "checkpoint")):
-        return ErrorDecision("TRANSIENT_DB", True, RETRY_DELAYS[0] if RETRY_DELAYS else 30)
     if any(token in lower for token in ("campaign not found", "campaign is not enabled", "no enabled", "template", "smpp")):
         return ErrorDecision("INVALID_CAMPAIGN", False, 0)
     if any(token in lower for token in ("parsererror", "tokenizing", "cannot read file", "unsupported file", "columns")):

@@ -1,0 +1,121 @@
+{
+  "canonical_markdown": "Solution_Final.md",
+  "canonical_markdown_sha256": "7d811727ffe55ae64c003f744728165c3473e7cf4d304b8bda304f72015a9e9e",
+  "claims": [
+    {
+      "id": "CLM-001",
+      "kind": "STATUS",
+      "statement": "本次仅研究方案，不是实施",
+      "markdown_anchor": "状态：工程研究方案",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-016"
+      ],
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-002",
+      "kind": "CONSTRAINT",
+      "statement": "不承诺固定400TPS或exactly-once",
+      "markdown_anchor": "本方案不承诺固定达到 400 TPS",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-016"
+      ],
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-008"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-003",
+      "kind": "CONSTRAINT",
+      "statement": "保持单进程管理主库",
+      "markdown_anchor": "## 3. 目标架构与所有权",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-016"
+      ],
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-004",
+      "kind": "FACT",
+      "statement": "领取和buffer缺少显式BEGIN",
+      "markdown_anchor": "_commit 未显式 BEGIN",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-004"
+      ],
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-005",
+      "kind": "FACT",
+      "statement": "窗口按任务，inflight按PDU",
+      "markdown_anchor": "window 当前是任务 semaphore",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-008"
+      ],
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-008"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-006",
+      "kind": "NUMERIC",
+      "statement": "目标测试阈值为建议，不是实测容量",
+      "markdown_anchor": "这些阈值是建议发布标准",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-016"
+      ],
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-007",
+      "kind": "UNKNOWN",
+      "statement": "线上现状未刷新",
+      "markdown_anchor": "## 13. 决策、假设与实测缺口",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-016"
+      ],
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    },
+    {
+      "id": "CLM-008",
+      "kind": "CONSTRAINT",
+      "statement": "未知和部分接受不能盲目重发",
+      "markdown_anchor": "任何分片已经接受后",
+      "required_in_final": true,
+      "evidence_ids": [
+        "EVD-017"
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-008"
+      ],
+      "notes": "最终指主文事实/边界保真，不要求聊天摘要逐条重复。"
+    }
+  ]
+}

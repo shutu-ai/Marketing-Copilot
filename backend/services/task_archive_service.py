@@ -108,7 +108,7 @@ def archive_terminal_tasks(cutoff: str, limit: int = 5000) -> dict:
         return {"archived": len(ids), "archive_key": archive_key, "root_path": final_dir}
     except Exception:
         try:
-            conn.conn.rollback()
+            conn.rollback()
         except Exception:
             pass
         if temporary_dir:

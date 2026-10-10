@@ -1,0 +1,158 @@
+{
+  "materials": [
+    {
+      "id": "MAT-001",
+      "path": "backend/database.py：write_transaction、WrappedConnection",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-002",
+      "path": "backend/services/sms_task_service.py：claim_next_tasks",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-003",
+      "path": "backend/services/task_worker.py：_claim_fetch_size、_claim_dispatch_loop",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-004",
+      "path": "backend/services/sms_write_buffer.py：_commit、_run",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-005",
+      "path": "backend/services/realtime_ingestion_worker.py：_claim_realtime_file、_run_maintenance",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-006",
+      "path": "backend/services/realtime_campaign_service.py：sync_watch_dirs_to_inboxes、process_realtime_inboxes",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-007",
+      "path": "backend/services/realtime_whitelist_service.py：build_pending、build_version",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-008",
+      "path": "backend/services/smpp_gateway.py：send_async、_connection_for、_send_windowed_async",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-009",
+      "path": "backend/services/backpressure_service.py：reasons、snapshot",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-010",
+      "path": "backend/services/sms_task_service.py：mark_submitted、_apply_disabled_submitted_batch、recover_stale_tasks",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-011",
+      "path": "backend/services/metrics_service.py、smpp_service.py",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-012",
+      "path": "backend/services/realtime_ingestion_state.py",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-013",
+      "path": "Docs/duckdb-realtime-batches-implementation-20261008.md；Docs/duckdb-realtime-progress-study-20261008.md",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-014",
+      "path": "本地 DuckDB 1.2.0 实验与现有测试",
+      "type": "source_evidence",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-015",
+      "path": "历史用户日志/采样",
+      "type": "user_context",
+      "route": "CodeGraph_then_scoped_read",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-016",
+      "path": "DuckDB 1.2 官方文档",
+      "type": "official_docs",
+      "route": "official_versioned_docs",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    },
+    {
+      "id": "MAT-017",
+      "path": "独立代码审计：成功/失败回调、recover_stale_tasks、message-id映射和DLR路径",
+      "type": "review_report",
+      "route": "independent_read_only_review",
+      "state": "PROCESSED_LOCAL",
+      "semantic_processing_required": true,
+      "notes": "材料范围为该条所列符号/调用链及相关测试，不是整仓库全文认证；需求与历史资料仅使用本次上下文，未访问线上。"
+    }
+  ]
+}
+

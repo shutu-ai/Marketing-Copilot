@@ -1,0 +1,181 @@
+{
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "text": "原子可靠写入与发送恢复",
+      "priority": "P0",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-001",
+        "MAT-002",
+        "MAT-004",
+        "MAT-010",
+        "MAT-017"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "requirement_type": "NFR",
+      "acceptance_intent": "显式短事务、结果持久日志、attempt fencing和未知隔离",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-002",
+      "text": "活动发送公平和有条件保底",
+      "priority": "P1",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-002",
+        "MAT-003",
+        "MAT-008",
+        "MAT-011"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "requirement_type": "FUNCTIONAL",
+      "acceptance_intent": "分片成本DRR、保底准入与闲置借用",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-003",
+      "text": "文件处理及白名单资源隔离",
+      "priority": "P1",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-005",
+        "MAT-006",
+        "MAT-007",
+        "MAT-012"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "requirement_type": "FUNCTIONAL",
+      "acceptance_intent": "公平扫描、原子预留、并发上限、可恢复chunk及专用白名单线程",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-004",
+      "text": "准入和局部背压",
+      "priority": "P1",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-003",
+        "MAT-008",
+        "MAT-009"
+      ],
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "requirement_type": "NFR",
+      "acceptance_intent": "活动与route信用联动，局部暂停和全局危险水位",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-005",
+      "text": "Web读写健壮性",
+      "priority": "P1",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-001",
+        "MAT-009",
+        "MAT-013"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "requirement_type": "NFR",
+      "acceptance_intent": "写命令幂等/结果查询、轻读缓存、重任务后台化",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-006",
+      "text": "各活动观测及运维恢复",
+      "priority": "P1",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-010",
+        "MAT-011",
+        "MAT-017"
+      ],
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "requirement_type": "OPERABILITY",
+      "acceptance_intent": "socket/resp/accepted分离，队列最老年龄和完整未完成工作量",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-007",
+      "text": "长期运行与升级回退",
+      "priority": "P0",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-004",
+        "MAT-010",
+        "MAT-014",
+        "MAT-015",
+        "MAT-016",
+        "MAT-017"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "requirement_type": "OPERABILITY",
+      "acceptance_intent": "恢复先重放；副本故障测试、离线依赖验证及24/72h浸泡",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    },
+    {
+      "id": "REQ-008",
+      "text": "保留DuckDB和短信业务语义",
+      "priority": "P0",
+      "scope": "本次交付研究方案；代码实施为后续独立阶段",
+      "source_material_ids": [
+        "MAT-001",
+        "MAT-008",
+        "MAT-010",
+        "MAT-016"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "requirement_type": "OTHER",
+      "acceptance_intent": "单主进程、禁盲目重发、accepted不冒充DLR、任务/PDU窗口单位明确",
+      "stakeholder": "业务运营、研发和运维",
+      "notes": "不承诺固定TPS；需准入和受控基线。"
+    }
+  ]
+}
+

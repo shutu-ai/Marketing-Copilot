@@ -60,6 +60,34 @@ automatic rollback. `run.sh` prepares `$APP_HOME/updates` and exports the
 `MC_UPDATE_MODE=manual` settings automatically. See
 `Docs/前端在线更新与认证.md` for details.
 
+## Local version and rollback CLI
+
+The Web UI is not required for local recovery. Run the CLI with the bundled
+virtual environment from the application host:
+
+```bash
+cd /opt/marketing-copilot
+bin/marketing-copilot-cli version
+bin/marketing-copilot-cli status
+bin/marketing-copilot-cli backups
+bin/marketing-copilot-cli history
+```
+
+If the Web UI or backend cannot start after an update, inspect the backups and
+restore the newest application backup:
+
+```bash
+cd /opt/marketing-copilot
+bin/marketing-copilot-cli rollback --yes
+bin/marketing-copilot-cli status
+```
+
+`rollback` uses the same backup and detached-runner workflow as the Web UI,
+stops/drains the service before swapping files, and health-checks the restored
+version. Run it as the service account or root, depending on who controls the
+systemd unit. The command does not delete the database; it creates a fresh
+database backup before starting the rollback.
+
 ## 4. Run manually
 
 ```bash

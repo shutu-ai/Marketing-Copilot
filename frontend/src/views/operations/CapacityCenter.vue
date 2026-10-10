@@ -69,6 +69,27 @@
         </el-table-column>
       </el-table>
     </el-card>
+    <el-card shadow="never" :header="$t('capacity.campaignFairness')" class="stats">
+      <el-alert v-if="campaignCapacityError" type="warning" :closable="false" show-icon :title="$t('capacity.campaignLoadFailed')" :description="campaignCapacityError" class="state-alert" />
+      <div class="scheduler-state">
+        <el-tag :type="campaignCapacity.scheduler?.enabled ? 'success' : 'warning'">
+          {{ $t(campaignCapacity.scheduler?.enabled ? 'capacity.schedulerEnabled' : 'capacity.schedulerDisabled') }}
+        </el-tag>
+        <span class="muted">quantum={{ campaignCapacity.scheduler?.quantum_parts || 0 }}, per_campaign={{ campaignCapacity.scheduler?.per_campaign_candidates || 0 }}</span>
+      </div>
+      <el-table :data="campaignCapacity.items || []" stripe>
+        <el-table-column :label="$t('capacity.campaign')" min-width="180">
+          <template #default="{ row }"><div>{{ row.campaign_name || `#${row.campaign_id}` }}</div><small class="muted">{{ row.campaign_type }} #{{ row.campaign_id }}</small></template>
+        </el-table-column>
+        <el-table-column prop="config_id" :label="$t('capacity.route')" width="100" />
+        <el-table-column :label="$t('capacity.backlog')" min-width="170"><template #default="{ row }">{{ row.queued || 0 }} / {{ row.retrying || 0 }} / {{ row.sending || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.outcomes')" min-width="150"><template #default="{ row }">{{ row.partial || 0 }} / {{ row.unknown || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.weight')" width="90"><template #default="{ row }">{{ row.policy?.weight || 1 }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.rateLimit')" width="120"><template #default="{ row }">{{ row.policy?.max_parts_tps || '—' }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.socketRate')" width="130"><template #default="{ row }">{{ Math.round(row.transport?.socket_parts_1m || 0) }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.responseRate')" width="130"><template #default="{ row }">{{ Math.round((row.transport?.submit_sm_resp_success_1m || 0) + (row.transport?.submit_sm_resp_failure_1m || 0)) }}</template></el-table-column>
+      </el-table>
+    </el-card>
     <el-card shadow="never" :header="$t('legacy.x44b54a85')" class="metrics">
       <el-table :data="metricRows" stripe><el-table-column prop="name" :label="$t('legacy.x7e687515')" /><el-table-column prop="labels" :label="$t('legacy.x14d34236')" /><el-table-column prop="value" :label="$t('legacy.xfe7509e0')" width="140" /></el-table>
     </el-card>
@@ -79,12 +100,12 @@ import i18n from '@/i18n'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import PollingStatus from '@/components/PollingStatus.vue'
-import { evaluateCapacityAlerts, getCapacityStatus, getSmppStats } from '@/api/capacity'
+import { evaluateCapacityAlerts, getCampaignCapacity, getCapacityStatus, getSmppStats } from '@/api/capacity'
 import { useAuthStore } from '@/stores/auth'
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 const authStore = useAuthStore()
 const canEvaluate = computed(() => ['admin', 'marketing'].includes(authStore.role))
-const loading=ref(false),status=ref<any>({}),stats=ref<any>({ summary: {}, items: [] }),statsError=ref(''),error=ref(''),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale');let timer=0
+const loading=ref(false),status=ref<any>({}),stats=ref<any>({ summary: {}, items: [] }),campaignCapacity=ref<any>({ scheduler: {}, items: [] }),statsError=ref(''),campaignCapacityError=ref(''),error=ref(''),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale');let timer=0,inFlight=false
 const metricRows = computed(() => [...(status.value.metrics?.gauges || []), ...(status.value.metrics?.counters || [])].map((m:any) => ({ ...m, labels: Object.entries(m.labels || {}).map(([k,v]) => `${k}=${v}`).join(', ') || '—' })))
 function pct(value:number|undefined){return value == null ? '—' : `${(value * 100).toFixed(1)}%`}
 function statusOf(row:any): { type: 'success'|'danger'|'info'|'warning'; label: string } {
@@ -104,6 +125,8 @@ function errorText(row:any): string {
   return current ? errors.join('; ') : i18n.global.t('dynamic.historicalErrors',{errors:errors.join('; ')})
 }
 async function load(){
+  if(inFlight)return
+  inFlight=true
   loading.value=true
   try{
     status.value=(await getCapacityStatus()).data
@@ -111,14 +134,19 @@ async function load(){
       stats.value=(await getSmppStats()).data
       statsError.value=''
     }catch{
-      stats.value={ summary: {}, items: [] }
       statsError.value=i18n.global.t('legacy.xe9c8033e')
+    }
+    try{
+      campaignCapacity.value=(await getCampaignCapacity()).data
+      campaignCapacityError.value=''
+    }catch(e:any){
+      campaignCapacityError.value=e.response?.data?.detail||i18n.global.t('capacity.campaignLoadFailed')
     }
     lastUpdated.value=new Date();pollState.value='live';error.value=''
   }catch(e:any){error.value=e.response?.data?.detail||i18n.global.t('common.connectionFailed');pollState.value=lastUpdated.value?'stale':'offline'}
-  finally{loading.value=false}
+  finally{inFlight=false;loading.value=false}
 }
 async function evaluate(){ const result=(await evaluateCapacityAlerts()).data; ElMessage.success(i18n.global.t('dynamic.alertEvaluationComplete',{count:result.alerts.length})); await load() }
 onMounted(()=>{load();timer=window.setInterval(()=>{if(!document.hidden)load()},15000)});onBeforeUnmount(()=>window.clearInterval(timer))
 </script>
-<style scoped>.page-header,.embedded-header{display:flex;justify-content:space-between;gap:20px;margin-bottom:18px}.page-header h2,.embedded-header h3{margin:0}.embedded-header h3{color:var(--mc-text);font-size:16px}.page-header p,.embedded-header p{margin:5px 0 0;color:var(--mc-text-secondary)}.embedded-header p{font-size:12px}.header-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px}.state-alert,.summary{margin-bottom:16px}.metrics,.stats{margin-top:16px}.stats .summary .el-card{margin-bottom:16px}.muted{color:var(--mc-text-secondary)}@media(max-width:767px){.page-header,.embedded-header{flex-direction:column;gap:12px}.header-actions{justify-content:flex-start}.summary :deep(.el-col){width:100%;max-width:100%;flex:0 0 100%;margin-bottom:10px}}.stats .summary :deep(.el-col){width:33.333333%;max-width:33.333333%;flex:0 0 33.333333%}@media(max-width:767px){.stats .summary :deep(.el-col){width:100%;max-width:100%;flex:0 0 100%}}</style>
+<style scoped>.page-header,.embedded-header{display:flex;justify-content:space-between;gap:20px;margin-bottom:18px}.page-header h2,.embedded-header h3{margin:0}.embedded-header h3{color:var(--mc-text);font-size:16px}.page-header p,.embedded-header p{margin:5px 0 0;color:var(--mc-text-secondary)}.embedded-header p{font-size:12px}.header-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:8px}.state-alert,.summary{margin-bottom:16px}.metrics,.stats{margin-top:16px}.stats .summary .el-card{margin-bottom:16px}.scheduler-state{display:flex;align-items:center;gap:12px;margin-bottom:12px}.muted{color:var(--mc-text-secondary)}@media(max-width:767px){.page-header,.embedded-header{flex-direction:column;gap:12px}.header-actions{justify-content:flex-start}.summary :deep(.el-col){width:100%;max-width:100%;flex:0 0 100%;margin-bottom:10px}.scheduler-state{align-items:flex-start;flex-direction:column}}.stats .summary :deep(.el-col){width:33.333333%;max-width:33.333333%;flex:0 0 33.333333%}@media(max-width:767px){.stats .summary :deep(.el-col){width:100%;max-width:100%;flex:0 0 100%}}</style>

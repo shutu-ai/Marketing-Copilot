@@ -1,0 +1,454 @@
+{
+  "capabilities": [
+    {
+      "id": "CAP-001",
+      "name": "当前部分能力：原子可靠写入与发送恢复",
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "显式短事务、结果持久日志、attempt fencing和未知隔离 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-001"
+      ]
+    },
+    {
+      "id": "CAP-101",
+      "name": "目标：原子可靠写入与发送恢复",
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-001"
+      ]
+    },
+    {
+      "id": "CAP-002",
+      "name": "当前部分能力：活动发送公平和有条件保底",
+      "requirement_ids": [
+        "REQ-002"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "分片成本DRR、保底准入与闲置借用 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-002"
+      ]
+    },
+    {
+      "id": "CAP-102",
+      "name": "目标：活动发送公平和有条件保底",
+      "requirement_ids": [
+        "REQ-002"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-002"
+      ]
+    },
+    {
+      "id": "CAP-003",
+      "name": "当前部分能力：文件处理及白名单资源隔离",
+      "requirement_ids": [
+        "REQ-003"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "公平扫描、原子预留、并发上限、可恢复chunk及专用白名单线程 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-003"
+      ]
+    },
+    {
+      "id": "CAP-103",
+      "name": "目标：文件处理及白名单资源隔离",
+      "requirement_ids": [
+        "REQ-003"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-003"
+      ]
+    },
+    {
+      "id": "CAP-004",
+      "name": "当前部分能力：准入和局部背压",
+      "requirement_ids": [
+        "REQ-004"
+      ],
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "活动与route信用联动，局部暂停和全局危险水位 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-004"
+      ]
+    },
+    {
+      "id": "CAP-104",
+      "name": "目标：准入和局部背压",
+      "requirement_ids": [
+        "REQ-004"
+      ],
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-004"
+      ]
+    },
+    {
+      "id": "CAP-005",
+      "name": "当前部分能力：Web读写健壮性",
+      "requirement_ids": [
+        "REQ-005"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "写命令幂等/结果查询、轻读缓存、重任务后台化 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-005"
+      ]
+    },
+    {
+      "id": "CAP-105",
+      "name": "目标：Web读写健壮性",
+      "requirement_ids": [
+        "REQ-005"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-005"
+      ]
+    },
+    {
+      "id": "CAP-006",
+      "name": "当前部分能力：各活动观测及运维恢复",
+      "requirement_ids": [
+        "REQ-006"
+      ],
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "socket/resp/accepted分离，队列最老年龄和完整未完成工作量 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-006"
+      ]
+    },
+    {
+      "id": "CAP-106",
+      "name": "目标：各活动观测及运维恢复",
+      "requirement_ids": [
+        "REQ-006"
+      ],
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-006"
+      ]
+    },
+    {
+      "id": "CAP-007",
+      "name": "当前部分能力：长期运行与升级回退",
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "恢复先重放；副本故障测试、离线依赖验证及24/72h浸泡 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-007"
+      ]
+    },
+    {
+      "id": "CAP-107",
+      "name": "目标：长期运行与升级回退",
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-007"
+      ]
+    },
+    {
+      "id": "CAP-008",
+      "name": "当前部分能力：保留DuckDB和短信业务语义",
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "evidence_state": "CONFIRMED",
+      "support_basis": "DIRECT",
+      "capability_state": "PARTIALLY_SUPPORTED",
+      "gaps": [
+        "单主进程、禁盲目重发、accepted不冒充DLR、任务/PDU窗口单位明确 尚未完整实施/验收",
+        "该element表示在现有组件上的目标改造路径，不表示目标已实现"
+      ],
+      "solution_element_ids": [
+        "ELM-008"
+      ]
+    },
+    {
+      "id": "CAP-108",
+      "name": "目标：保留DuckDB和短信业务语义",
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "evidence_state": "PROPOSED",
+      "support_basis": "RECOMMENDATION_ONLY",
+      "capability_state": "PROPOSED",
+      "gaps": [
+        "研究方案，不是已部署能力"
+      ],
+      "solution_element_ids": [
+        "ELM-008"
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "requirement_id": "REQ-001",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-001"
+      ],
+      "solution_element_ids": [
+        "ELM-001"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-002",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-002"
+      ],
+      "solution_element_ids": [
+        "ELM-002"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-003",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-003"
+      ],
+      "solution_element_ids": [
+        "ELM-003"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-004",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-004"
+      ],
+      "solution_element_ids": [
+        "ELM-004"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-005",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-005"
+      ],
+      "solution_element_ids": [
+        "ELM-005"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-006",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-006"
+      ],
+      "solution_element_ids": [
+        "ELM-006"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-007",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-007"
+      ],
+      "solution_element_ids": [
+        "ELM-007"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    },
+    {
+      "requirement_id": "REQ-008",
+      "disposition": "PARTIAL_CURRENT",
+      "capability_ids": [
+        "CAP-008"
+      ],
+      "solution_element_ids": [
+        "ELM-008"
+      ],
+      "reason": "现有能力部分满足；目标方案已定义、实现和系统验收未执行。"
+    }
+  ]
+}

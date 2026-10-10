@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APP_HOME=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ENV_FILE="${MC_ENV_FILE:-$APP_HOME/marketing-copilot.env}"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+fi
+VENV_DIR="${MC_VENV_DIR:-$APP_HOME/venv}"
+PYTHON_BIN="${MC_PYTHON_BIN:-${PYTHON_BIN:-/opt/marketing-copilot/python/bin/python3.11}}"
+if [ -x "$VENV_DIR/bin/python" ]; then
+  exec "$VENV_DIR/bin/python" "$APP_HOME/bin/mcctl.py" "$@"
+fi
+exec "$PYTHON_BIN" "$APP_HOME/bin/mcctl.py" "$@"

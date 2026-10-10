@@ -1,12 +1,21 @@
 import shutil
 import json
-from database import get_connection
+from database import get_connection, is_transient_write_error, read_transaction, write_transaction
 import os
 import stat
 import pandas as pd
 from datetime import datetime
 from typing import Optional
 from services import settings_service
+
+
+def _run_monitor_write(operation: str, writer):
+    return write_transaction(
+        writer,
+        attempts=3,
+        operation=f"monitor.{operation}",
+        base_delay=0.1,
+    )
 
 
 def _parse_targets(val) -> list:
@@ -34,86 +43,101 @@ def _enrich_config(cfg: dict) -> dict:
 
 
 def get_all_configs() -> list:
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM monitor_configs ORDER BY created_at DESC").fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM monitor_configs ORDER BY created_at DESC"
+        ).fetchall(),
+        operation="monitor.configs.list",
+    )
     return [_enrich_config(dict(r)) for r in rows]
 
 
 def add_config(directory_path: str, target_directories: list = None) -> dict:
     abs_path = os.path.abspath(directory_path)
     targets = target_directories or []
-    conn = get_connection()
-    existing = conn.execute(
-        "SELECT * FROM monitor_configs WHERE directory_path=?", (abs_path,)
-    ).fetchone()
-    if existing:
-        conn.close()
-        return _enrich_config(dict(existing))
 
-    cursor = conn.execute(
-        "INSERT INTO monitor_configs (directory_path, target_directories) VALUES (?,?)",
-        (abs_path, _fmt_targets(targets))
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM monitor_configs WHERE id=?", (cursor.lastrowid,)).fetchone()
-    conn.close()
-    return _enrich_config(dict(row))
+    def write(conn):
+        existing = conn.execute(
+            "SELECT * FROM monitor_configs WHERE directory_path=?", (abs_path,)
+        ).fetchone()
+        if existing:
+            return _enrich_config(dict(existing))
+        cursor = conn.execute(
+            "INSERT INTO monitor_configs (directory_path, target_directories) VALUES (?,?)",
+            (abs_path, _fmt_targets(targets)),
+        )
+        row = conn.execute(
+            "SELECT * FROM monitor_configs WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+        return _enrich_config(dict(row))
+
+    return _run_monitor_write("config.create", write)
 
 
 def update_config(config_id: int, data: dict) -> Optional[dict]:
     allowed = {"directory_path", "target_directories", "enabled"}
     fields = {}
-    for k, v in data.items():
-        if k in allowed and v is not None:
-            if k == "target_directories":
-                fields["target_directories"] = _fmt_targets(v if isinstance(v, list) else [v])
-            else:
-                fields[k] = v
-
-    if not fields:
-        conn = get_connection()
-        row = conn.execute("SELECT * FROM monitor_configs WHERE id=?", (config_id,)).fetchone()
-        conn.close()
-        return _enrich_config(dict(row)) if row else None
-
+    for key, value in data.items():
+        if key in allowed and value is not None:
+            fields[key] = (
+                _fmt_targets(value if isinstance(value, list) else [value])
+                if key == "target_directories" else value
+            )
     if "directory_path" in fields:
         fields["directory_path"] = os.path.abspath(fields["directory_path"])
+    if not fields:
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return _enrich_config(dict(row)) if row else None
 
-    conn = get_connection()
-    fields["updated_at"] = "datetime('now','localtime')"
-    set_clause = ", ".join(
-        f"{k}=?" if k != "updated_at" else f"{k}=datetime('now','localtime')"
-        for k in fields
-    )
-    values = [v for k, v in fields.items() if k != "updated_at"]
-    conn.execute(f"UPDATE monitor_configs SET {set_clause} WHERE id=?", (*values, config_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM monitor_configs WHERE id=?", (config_id,)).fetchone()
-    conn.close()
-    return _enrich_config(dict(row)) if row else None
+    def write(conn):
+        set_clause = ", ".join(
+            [f"{key}=?" for key in fields]
+            + ["updated_at=datetime('now','localtime')"]
+        )
+        conn.execute(
+            f"UPDATE monitor_configs SET {set_clause} WHERE id=?",
+            (*fields.values(), config_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
+        ).fetchone()
+        return _enrich_config(dict(row)) if row else None
+
+    return _run_monitor_write("config.update", write)
 
 
 def toggle_config(config_id: int, enabled: int) -> Optional[dict]:
-    conn = get_connection()
-    conn.execute(
-        "UPDATE monitor_configs SET enabled=?, updated_at=datetime('now','localtime') WHERE id=?",
-        (enabled, config_id)
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM monitor_configs WHERE id=?", (config_id,)).fetchone()
-    conn.close()
-    return _enrich_config(dict(row)) if row else None
+    def write(conn):
+        conn.execute(
+            "UPDATE monitor_configs SET enabled=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (enabled, config_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
+        ).fetchone()
+        return _enrich_config(dict(row)) if row else None
+
+    return _run_monitor_write("config.toggle", write)
 
 
 def delete_config(config_id: int) -> bool:
-    conn = get_connection()
-    conn.execute("DELETE FROM monitor_files WHERE monitor_config_id=?", (config_id,))
-    cursor = conn.execute("DELETE FROM monitor_configs WHERE id=?", (config_id,))
-    deleted = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
-    return deleted
+    def write(conn):
+        exists = conn.execute(
+            "SELECT 1 FROM monitor_configs WHERE id=?", (config_id,)
+        ).fetchone()
+        if not exists:
+            return False
+        conn.execute("DELETE FROM monitor_files WHERE monitor_config_id=?", (config_id,))
+        conn.execute("DELETE FROM monitor_configs WHERE id=?", (config_id,))
+        return True
+
+    return _run_monitor_write("config.delete", write)
 
 
 def _move_file(source_path: str, target_dir: str, copy_from: str = None) -> str:
@@ -169,57 +193,91 @@ def _redistribute_pending(conn, directory_path: str, target_dirs: list, config_i
 
 
 def scan_directory(config_id: int, directory_path: str) -> dict:
-    """Scan and auto-distribute new files to all target directories."""
-    conn = get_connection()
-    new_files = []
-    moved_count = 0
+    """Scan files without moving one before its DB record is durable.
 
+    Each file registration is its own short transaction.  A busy DuckDB writer
+    therefore retries only the current file and cannot roll back registrations
+    for earlier files after their files have already been moved.
+    """
     if not os.path.isdir(directory_path):
-        conn.close()
         raise FileNotFoundError(f"Directory does not exist: {directory_path}")
 
-    config_row = conn.execute(
-        "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
-    ).fetchone()
-    target_dirs = _parse_targets(config_row["target_directories"] if config_row else "")
-
-    # Retry distribution for existing pending files
-    if target_dirs:
-        redone = _redistribute_pending(conn, directory_path, target_dirs, config_id)
-        if redone:
+    conn = get_connection()
+    try:
+        config_row = conn.execute(
+            "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
+        ).fetchone()
+        target_dirs = _parse_targets(
+            config_row["target_directories"] if config_row else ""
+        )
+        moved_count = 0
+        if target_dirs:
+            redone = _redistribute_pending(conn, directory_path, target_dirs, config_id)
             moved_count += len(redone)
-        conn.commit()
+            conn.commit()
+    finally:
+        conn.close()
 
+    new_files = []
     for fname in os.listdir(directory_path):
-        if not fname.lower().endswith(('.csv', '.xlsx', '.xls')):
+        if not fname.lower().endswith((".csv", ".xlsx", ".xls")):
             continue
-
         fpath = os.path.join(directory_path, fname)
         if not os.path.isfile(fpath):
             continue
-
-        existing = conn.execute(
-            "SELECT id, status FROM monitor_files WHERE filename=? AND directory_path=?",
-            (fname, directory_path)
-        ).fetchone()
+        probe = get_connection()
+        try:
+            existing = probe.execute(
+                "SELECT id, status FROM monitor_files WHERE filename=? AND directory_path=?",
+                (fname, directory_path),
+            ).fetchone()
+        finally:
+            probe.close()
         if existing:
             continue
 
         fsize = os.path.getsize(fpath)
         row_count = _count_rows(fpath)
-        moved_dirs, _ = _distribute_to_targets(fpath, target_dirs)
-        status = "distributed" if moved_dirs else "pending"
 
-        try:
+        def register(conn, fname=fname, fsize=fsize, row_count=row_count):
+            existing = conn.execute(
+                "SELECT id, status FROM monitor_files WHERE filename=? AND directory_path=?",
+                (fname, directory_path),
+            ).fetchone()
+            if existing:
+                return int(existing["id"]), False
             cursor = conn.execute(
                 """INSERT INTO monitor_files (filename, directory_path, file_size, row_count, status, monitor_config_id)
                    VALUES (?,?,?,?,?,?)""",
-                (fname, directory_path, fsize, row_count, status, config_id)
+                (fname, directory_path, fsize, row_count, "pending", config_id),
             )
-            row_id = cursor.lastrowid
-        except Exception:
-            conn.conn.rollback()
+            return int(cursor.lastrowid), True
+
+        row_id, inserted = write_transaction(
+            register,
+            attempts=3,
+            operation="monitor.file.register",
+            base_delay=0.1,
+        )
+        if not inserted:
             continue
+
+        moved_dirs = []
+        try:
+            moved_dirs, _ = _distribute_to_targets(fpath, target_dirs)
+            if moved_dirs:
+                write_transaction(
+                    lambda conn: conn.execute(
+                        "UPDATE monitor_files SET status='distributed', updated_at=datetime('now','localtime') WHERE id=?",
+                        (row_id,),
+                    ),
+                    attempts=3,
+                    operation="monitor.file.distribute_status",
+                    base_delay=0.1,
+                )
+                moved_count += 1
+        except Exception:
+            logger.warning("Monitor file distribution incomplete file=%s", fname, exc_info=True)
 
         new_files.append({
             "id": row_id,
@@ -227,14 +285,9 @@ def scan_directory(config_id: int, directory_path: str) -> dict:
             "directory_path": directory_path,
             "file_size": fsize,
             "row_count": row_count,
-            "status": status,
+            "status": "distributed" if moved_dirs else "pending",
             "moved_to": moved_dirs,
         })
-        if moved_dirs:
-            moved_count += 1
-
-    conn.commit()
-    conn.close()
     return {"new_files": new_files, "count": len(new_files), "moved_count": moved_count}
 
 
@@ -272,7 +325,6 @@ def distribute_file(file_id: int) -> dict:
 
 
 def get_files(status: Optional[str] = None, directory_path: Optional[str] = None) -> list:
-    conn = get_connection()
     conditions = []
     params = []
     if status:
@@ -282,43 +334,58 @@ def get_files(status: Optional[str] = None, directory_path: Optional[str] = None
         conditions.append("directory_path=?")
         params.append(directory_path)
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    rows = conn.execute(
-        f"SELECT * FROM monitor_files {where} ORDER BY created_at DESC", tuple(params)
-    ).fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            f"SELECT * FROM monitor_files {where} ORDER BY created_at DESC", tuple(params)
+        ).fetchall(),
+        operation="monitor.files.list",
+    )
     return [dict(r) for r in rows]
 
 
 def sync_source_files() -> dict:
     """Check source files against monitor_files; mark as distributed if missing."""
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM monitor_files WHERE status='pending' OR status='processing'"
-    ).fetchall()
-    updated = 0
+    try:
+        rows = conn.execute(
+            "SELECT * FROM monitor_files WHERE status='pending' OR status='processing'"
+        ).fetchall()
+    finally:
+        conn.close()
+    missing_ids = []
     for r in rows:
         f = dict(r)
         src_path = os.path.join(f["directory_path"], f["filename"])
         if not os.path.isfile(src_path):
+            missing_ids.append(f["id"])
+
+    def write(conn):
+        for file_id in missing_ids:
             conn.execute(
                 "UPDATE monitor_files SET status='distributed', updated_at=datetime('now','localtime') WHERE id=?",
-                (f["id"],)
+                (file_id,),
             )
-            updated += 1
-    conn.commit()
-    conn.close()
+        return len(missing_ids)
+
+    updated = write_transaction(
+        write,
+        attempts=3,
+        operation="monitor.files.sync_source",
+        base_delay=0.1,
+    ) if missing_ids else 0
     return {"updated": updated}
 
 
 def update_file_status(file_id: int, status: str) -> bool:
-    conn = get_connection()
-    conn.execute(
-        "UPDATE monitor_files SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
-        (status, file_id)
-    )
-    conn.commit()
-    conn.close()
-    return True
+    return write_transaction(
+        lambda conn: conn.execute(
+            "UPDATE monitor_files SET status=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (status, file_id),
+        ),
+        attempts=3,
+        operation="monitor.file.status",
+        base_delay=0.1,
+    ) is not None
 
 
 def process_file(file_id: int, file_path: str, campaign_name: str = "") -> dict:
@@ -571,7 +638,11 @@ def scan_realtime_watch_dir(
     processed_page_size: int = 50,
 ) -> dict:
     from services import realtime_campaign_service
-    sync_result = realtime_campaign_service.sync_watch_dirs_to_inboxes(campaign_id=campaign_id)
+    # Manual monitoring is an explicit request; bypass the scheduler's
+    # unchanged-directory scan cache so the operator sees the latest source.
+    sync_result = realtime_campaign_service.sync_watch_dirs_to_inboxes(
+        campaign_id=campaign_id, force=True,
+    )
     process_result = realtime_campaign_service.process_realtime_inboxes(campaign_id=campaign_id)
     return {
         "sync": sync_result,
@@ -624,13 +695,15 @@ def retry_realtime_file(file_id: int) -> Optional[dict]:
     result = ingestion_job_service.requeue_file(file_id)
     if not result:
         return None
-    conn = get_connection()
-    try:
-        conn.execute("UPDATE processed_files SET status='queued',processing_phase='queued',next_retry_at=NULL WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
-                     (job["campaign_id"], job["filename"]))
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(
+        lambda conn: conn.execute(
+            "UPDATE processed_files SET status='queued',processing_phase='queued',next_retry_at=NULL WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
+            (job["campaign_id"], job["filename"]),
+        ),
+        attempts=3,
+        operation="monitor.realtime_file.retry",
+        base_delay=0.1,
+    )
     return {"success": True, "file": result}
 
 
@@ -679,24 +752,22 @@ def archive_realtime_file(file_id: int) -> Optional[dict]:
             stem, ext = os.path.splitext(target)
             target = f"{stem}_{file_id}{ext}"
         shutil.move(source, target)
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             "UPDATE ingestion_files SET status='archived',processing_phase='archived',file_path=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (target, file_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
-    processed = get_connection()
-    try:
-        processed.execute(
+        conn.execute(
             "UPDATE processed_files SET status='archived',processing_phase='archived',file_path=?,completed_at=COALESCE(completed_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)) WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
             (target, job["campaign_id"], job["filename"]),
         )
-        processed.commit()
-    finally:
-        processed.close()
+
+    write_transaction(
+        write,
+        attempts=3,
+        operation="monitor.realtime_file.archive",
+        base_delay=0.1,
+    )
     return {"success": True, "file_id": file_id, "archive_path": target}
 
 

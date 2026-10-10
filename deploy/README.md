@@ -86,6 +86,33 @@ Capacity monitoring is built into the Python application:
 - `/capacity` provides the operator dashboard.
 - `/api/metrics/status` returns Worker, queue and SMSC pool state as JSON.
 - `/metrics` exposes Prometheus-compatible text for an existing external monitoring service.
+- `/api/smpp/stats` and `/api/metrics/status` expose independent transport
+  measurements: `send_message_tps_1m` is the rate at which `send_message()`
+  wrote submit PDUs to the socket, while `submit_sm_resp_tps_1m` is the rate
+  at which the SMSC responses completed. These are intentionally separate
+  from the durable task-submission rate.
+- `MC_DUCKDB_WRITE_LOCK_TIMEOUT_SECONDS` bounds the application-level writer
+  gate. DuckDB-mode writes are serialized for the duration of each transaction
+  to prevent optimistic write-write conflicts; long read-heavy realtime
+  matching is kept outside the final task-write transaction.
+- `MC_DUCKDB_READ_RETRIES` and `MC_DUCKDB_READ_RETRY_DELAY_MS` provide bounded
+  retries for transient DuckDB file/WAL/lock read failures. Web/API reads return
+  a retryable 503 when the database remains unavailable instead of leaving a
+  connection or returning an unstructured server error.
+- `MC_SMS_WRITE_TRANSACTION_SIZE` bounds each DuckDB transaction used by the
+  asynchronous SMS result writer. It is intentionally independent of
+  `MC_SMS_WRITE_BATCH_SIZE`, so a large collection window does not create one
+  long writer lock hold. Transient lock failures stay in the durable result
+  journal and are retried after restart.
+- `MC_SMS_WRITE_TRANSIENT_LOG_INTERVAL_SECONDS` rate-limits repeated transient
+  lock-contention warnings (default `60`); it does not disable retries.
+- `MC_BATCH_CANCEL_BATCH_SIZE` and `MC_BATCH_CANCEL_CAMPAIGNS_PER_RUN` bound
+  overdue-task cleanup to short, rotating transactions (defaults `250` rows
+  across `4` campaigns per scheduler run).
+- `/api/metrics/status` includes `database.write_lock` and the metrics gauges
+  `marketing_copilot_database_write_lock_held` and
+  `marketing_copilot_database_write_lock_age_seconds` for identifying a long
+  writer transaction.
 - The Python scheduler evaluates queue depth, failure rate and SMSC availability every minute.
 - Open and resolved alerts are stored in the operations exception center.
 - When `MC_ALERT_WEBHOOK_URL` is set, Python sends JSON `firing` and `resolved` notifications directly without Alertmanager.

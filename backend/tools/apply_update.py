@@ -324,13 +324,15 @@ def swap_into_place(state: dict) -> None:
         for label, source, target in (
             ("backend", payload / "backend", project_root() / "backend"),
             ("frontend", payload / "frontend", project_root() / "frontend"),
+            ("bin", payload / "bin", project_root() / "bin"),
         ):
-            replace_tree(source, target)
+            if source.is_dir():
+                replace_tree(source, target)
         install_dependencies(state)
         log("new version swapped in")
     else:
         backup = Path(state.get("backup_dir", ""))
-        for label in ("backend", "frontend", "offline"):
+        for label in ("backend", "frontend", "offline", "bin"):
             source = backup / label
             target = project_root() / label
             if source.is_dir():
@@ -379,7 +381,7 @@ def main() -> int:
             if backup.is_dir():
                 log("attempting automatic rollback")
                 stop_again = stop_service(load_state())
-                for label in ("backend", "frontend", "offline"):
+                for label in ("backend", "frontend", "offline", "bin"):
                     source = backup / label
                     target = project_root() / label
                     if source.is_dir():

@@ -15,3 +15,6 @@ done
 curl -sS http://127.0.0.1:19090/metrics \
   | grep -E 'database_(statement_seconds|write_lock_wait_seconds)|sms_write_queue_depth|sms_write_(enqueued|committed)'
 ```
+
+
+任务时间结束后应该结束所有的工作，关闭和取消未完成的任务，清理中间文件。也要保证程序重启后会执行这个清理过期任务及数据，还有任务期到当天最后一秒需要在新一天开始也执行对吧。

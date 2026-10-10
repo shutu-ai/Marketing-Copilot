@@ -2,6 +2,7 @@ import os
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+from database import read_transaction
 from services import monitor_service
 
 router = APIRouter(prefix="/api/monitor", tags=["Monitor"])
@@ -116,10 +117,12 @@ def delete_config(config_id: int):
 
 @router.post("/configs/{config_id}/scan")
 def scan_directory(config_id: int):
-    from database import get_connection
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM monitor_configs WHERE id=?", (config_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
+        ).fetchone(),
+        operation="monitor.scan.config",
+    )
     if not row:
         raise HTTPException(status_code=404, detail="配置不存在")
     config = dict(row)
@@ -157,10 +160,12 @@ def distribute_file(file_id: int):
 
 @router.post("/files/publish")
 def publish_file(body: PublishFileReq):
-    from database import get_connection
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM monitor_files WHERE id=?", (body.file_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM monitor_files WHERE id=?", (body.file_id,)
+        ).fetchone(),
+        operation="monitor.publish.file",
+    )
     if not row:
         raise HTTPException(status_code=404, detail="文件不存在")
     file_info = dict(row)

@@ -1,7 +1,9 @@
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
+import os
 from pathlib import Path
 import sys
+import time
 
 import pytest
 import duckdb
@@ -13,6 +15,7 @@ if str(BACKEND_DIR) not in sys.path:
 import database
 from services import ingestion_job_service, realtime_campaign_service, realtime_whitelist_service
 from services import realtime_ingestion_retry_service, sms_task_service
+from services import realtime_ingestion_worker
 from tools import apply_update
 
 
@@ -23,8 +26,8 @@ def isolated_db(tmp_path):
     yield tmp_path
 
 
-def _campaign(tmp_path):
-    campaign_dir = tmp_path / "campaign"
+def _campaign(tmp_path, directory_name="campaign"):
+    campaign_dir = tmp_path / directory_name
     campaign_dir.mkdir()
     conn = database.get_connection()
     campaign_id = conn.execute(
@@ -65,6 +68,45 @@ def test_realtime_watch_files_are_scoped_to_campaign_and_paginated(isolated_db):
     assert second_page["items"][0]["status"] == "ignored"
 
 
+def test_local_watch_ignores_historical_files_and_caches_unchanged_directory(isolated_db, monkeypatch):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    watch_dir = isolated_db / "watch"
+    watch_dir.mkdir()
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE realtime_campaigns SET watch_dir=?,watch_filename_prefix=? WHERE id=?",
+        (str(watch_dir), "Android_", campaign_id),
+    )
+    conn.commit()
+    conn.close()
+
+    now = datetime.now().replace(microsecond=0)
+    current_name = f"Android_{now:%Y%m%d%H%M%S}.csv"
+    historical_name = f"Android_{(now - timedelta(days=1)):%Y%m%d%H%M%S}.csv"
+    for name in (current_name, historical_name):
+        path = watch_dir / name
+        path.write_text("msisdn\n25190001\n", encoding="utf-8")
+        os.utime(path, (time.time() - 10, time.time() - 10))
+
+    realtime_campaign_service._watch_scan_state.clear()
+    first = realtime_campaign_service.sync_watch_dirs_to_inboxes(now=now)
+    assert first["moved"] == 1
+    assert (campaign_dir / "inbox" / current_name).is_file()
+    assert not (campaign_dir / "inbox" / historical_name).exists()
+
+    scanned = []
+    original_scandir = realtime_campaign_service.os.scandir
+
+    def spy_scandir(path):
+        scanned.append(path)
+        return original_scandir(path)
+
+    monkeypatch.setattr(realtime_campaign_service.os, "scandir", spy_scandir)
+    second = realtime_campaign_service.sync_watch_dirs_to_inboxes(now=now)
+    assert second["moved"] == 0
+    assert scanned == []
+
+
 def test_whitelist_hash_is_built_once_and_reused(isolated_db):
     campaign_id, _campaign_dir = _campaign(isolated_db)
     source = isolated_db / "whitelist.csv"
@@ -84,6 +126,43 @@ def test_whitelist_hash_is_built_once_and_reused(isolated_db):
     conn = database.get_connection()
     assert conn.execute("SELECT COUNT(*) AS count FROM realtime_whitelist_versions WHERE campaign_id=?", (campaign_id,)).fetchone()["count"] == 1
     conn.close()
+
+
+def test_transient_whitelist_conflict_reuses_valid_index_without_rebuild(isolated_db):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    source = campaign_dir / "whitelist.csv"
+    source.write_text("msisdn,language\n25190001,en\n", encoding="utf-8")
+    queued = realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    version = realtime_whitelist_service.active_version(campaign_id)
+    assert version and version["id"] == queued["whitelist_version_id"]
+    index_path = Path(version["index_path"])
+    index_mtime = index_path.stat().st_mtime_ns
+
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE realtime_whitelist_versions SET status='failed', error_detail=? WHERE id=?",
+        ("TransactionContext Error: Failed to commit: write-write conflict on key: \"16190\"", version["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    incoming = isolated_db / "incoming.csv"
+    incoming.write_text("msisdn\n90001\n", encoding="utf-8")
+    result = realtime_campaign_service.receive_file(
+        campaign_id, str(incoming), incoming.name, whitelist_version_id=version["id"]
+    )
+
+    assert result["success"] is True, result
+    assert index_path.stat().st_mtime_ns == index_mtime
+    active = realtime_whitelist_service.active_version(campaign_id)
+    assert active and active["status"] == "ready"
+    assert realtime_campaign_service._is_repairable_whitelist_error(
+        "TransactionContext Error: write-write conflict"
+    ) is False
+    assert realtime_campaign_service._is_repairable_whitelist_error(
+        "Cannot read active whitelist index"
+    ) is True
 
 
 def test_vectorized_whitelist_build_preserves_first_language(isolated_db):
@@ -108,7 +187,7 @@ def test_vectorized_whitelist_build_preserves_first_language(isolated_db):
     assert rows == [("90001", "first"), ("90002", "fr")]
 
 
-def test_corrupt_active_whitelist_rolls_back_before_consuming_rows(isolated_db):
+def test_corrupt_active_whitelist_waits_for_repair_without_using_old_version(isolated_db):
     campaign_id, campaign_dir = _campaign(isolated_db)
 
     first_source = isolated_db / "whitelist-v1.csv"
@@ -131,10 +210,14 @@ def test_corrupt_active_whitelist_rolls_back_before_consuming_rows(isolated_db):
     result = realtime_campaign_service.receive_file(
         campaign_id, str(incoming), incoming.name, whitelist_version_id=version_two["id"]
     )
-    assert result["success"] is True
+    assert result["success"] is False, result
+    assert result["status"] == "waiting_for_whitelist"
+    assert incoming.is_file()
 
     active = realtime_whitelist_service.active_version(campaign_id)
-    assert active and active["id"] == version_one["id"]
+    # active_version only returns a ready index; while the authoritative
+    # binding is being repaired it must not fall back to version_one.
+    assert active is None
     conn = database.get_connection()
     try:
         failed = conn.execute(
@@ -146,9 +229,8 @@ def test_corrupt_active_whitelist_rolls_back_before_consuming_rows(isolated_db):
         ).fetchone()
     finally:
         conn.close()
-    assert failed["status"] == "failed"
-    assert "Cannot read whitelist index" in failed["error_detail"]
-    assert binding["whitelist_version_id"] == version_one["id"]
+    assert failed["status"] == "building"
+    assert binding["whitelist_version_id"] == version_two["id"]
 
 
 def test_online_update_swap_preserves_runtime_configuration_and_data(tmp_path):
@@ -194,6 +276,57 @@ def test_realtime_file_lease_is_single_owner_and_recovers(isolated_db):
     assert ingestion_job_service.recover_expired_files() == 1
     recovered = ingestion_job_service.claim_file("realtime", "worker-b")
     assert recovered and recovered["worker_id"] == "worker-b"
+
+
+def test_realtime_file_claims_round_robin_across_campaigns(isolated_db):
+    first_campaign, first_dir = _campaign(isolated_db)
+    second_campaign, second_dir = _campaign(isolated_db, "campaign-second")
+    for campaign_id, campaign_dir, prefix in (
+        (first_campaign, first_dir, "CloudPhone_"),
+        (second_campaign, second_dir, "PhoneSwitchOnOff_"),
+    ):
+        for index in range(2):
+            source = campaign_dir / f"{prefix}20261008{index:06d}.csv"
+            source.write_text("msisdn\n090001\n", encoding="utf-8")
+            ingestion_job_service.register_file("realtime", campaign_id, source.name, str(source))
+
+    realtime_ingestion_worker._campaign_cursor = 0
+    claimed = [
+        realtime_ingestion_worker._claim_realtime_file(f"worker-{index}")
+        for index in range(4)
+    ]
+
+    assert [item["campaign_id"] for item in claimed] == [
+        first_campaign, second_campaign, first_campaign, second_campaign,
+    ]
+
+
+def test_realtime_capacity_reservation_is_atomic_and_consumed(isolated_db):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    first = ingestion_job_service.reserve_realtime_capacity(
+        campaign_id, "first.csv", 100, 1, 10, 1000, source="test",
+    )
+    assert first["ok"]
+    blocked = ingestion_job_service.reserve_realtime_capacity(
+        campaign_id, "second.csv", 100, 1, 10, 1000, source="test",
+    )
+    assert not blocked["ok"]
+    assert "campaign" in blocked["reason"]
+
+    source = campaign_dir / "first.csv"
+    source.write_text("msisdn\n090001\n", encoding="utf-8")
+    file_id, duplicate = ingestion_job_service.register_file(
+        "realtime", campaign_id, source.name, str(source),
+        reservation_token=first["token"],
+    )
+    assert file_id and not duplicate
+    conn = database.get_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) count FROM realtime_inbox_reservations"
+        ).fetchone()["count"] == 0
+    finally:
+        conn.close()
 
 
 def test_retry_policy_classifies_and_backs_off(isolated_db):

@@ -1,5 +1,6 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import pytest
@@ -58,6 +59,29 @@ def test_chunk_manifest_resumes_completed_work_and_recovers_expired_lease(isolat
     assert ingestion_job_service.recover_expired_chunks() == 1
     recovered = ingestion_job_service.claim_chunk(file_id=file_id, chunk_index=1)
     assert recovered["attempts"] == 2
+
+
+def test_concurrent_task_claims_do_not_conflict_or_duplicate_rows(isolated_db):
+    conn = database.get_connection()
+    conn.execute(
+        """INSERT INTO sms_tasks
+           (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status,task_date)
+           SELECT 'batch',1,'claim-lock','251900'||CAST(i AS VARCHAR),'hello',
+                  'claim-lock-'||CAST(i AS VARCHAR),'queued',CURRENT_DATE
+           FROM range(96) t(i)"""
+    )
+    conn.commit()
+    conn.close()
+
+    def claim_batch(_index):
+        return sms_task_service.claim_next_tasks(6)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claimed = [task for batch in pool.map(claim_batch, range(16)) for task in batch]
+
+    ids = [task["id"] for task in claimed]
+    assert len(ids) == 96
+    assert len(set(ids)) == 96
 
 
 def test_sql_staging_deduplicates_and_joins_exclusions(isolated_db):

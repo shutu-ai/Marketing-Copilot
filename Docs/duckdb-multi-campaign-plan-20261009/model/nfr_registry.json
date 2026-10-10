@@ -1,0 +1,230 @@
+{
+  "nfrs": [
+    {
+      "id": "NFR-001",
+      "category": "RELIABILITY",
+      "statement": "结果不得三次失败后静默消失；旧回调不覆盖新attempt",
+      "scope": "TARGET",
+      "target": "结果不得三次失败后静默消失；旧回调不覆盖新attempt",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-008"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-008"
+      ],
+      "test_ids": [
+        "TST-001",
+        "TST-002",
+        "TST-009",
+        "TST-015",
+        "TST-016",
+        "TST-017",
+        "TST-018",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-008",
+        "EVD-016"
+      ],
+      "owner": "研发与运维"
+    },
+    {
+      "id": "NFR-002",
+      "category": "PERFORMANCE",
+      "statement": "负载同等且供给充分时优化后实际socket吞吐不低于基线95%，3×30分钟A/B",
+      "scope": "TARGET",
+      "target": "负载同等且供给充分时优化后实际socket吞吐不低于基线95%，3×30分钟A/B",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-005"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-005"
+      ],
+      "test_ids": [
+        "TST-003",
+        "TST-004",
+        "TST-010",
+        "TST-013",
+        "TST-019"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "owner": "研发与运维"
+    },
+    {
+      "id": "NFR-003",
+      "category": "SCALABILITY",
+      "statement": "有条件保底和局部隔离，非固定TPS",
+      "scope": "TARGET",
+      "target": "有条件保底和局部隔离，非固定TPS",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-003",
+        "REQ-004"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-003",
+        "ELM-004"
+      ],
+      "test_ids": [
+        "TST-003",
+        "TST-005",
+        "TST-006",
+        "TST-007",
+        "TST-008",
+        "TST-014",
+        "TST-019",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012",
+        "EVD-009"
+      ],
+      "owner": "研发与运维"
+    },
+    {
+      "id": "NFR-004",
+      "category": "RECOVERABILITY",
+      "statement": "未知/部分接受不盲目重发；离线扩展、WAL和日志兼容恢复",
+      "scope": "TARGET",
+      "target": "未知/部分接受不盲目重发；离线扩展、WAL和日志兼容恢复",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "test_ids": [
+        "TST-009",
+        "TST-012",
+        "TST-015",
+        "TST-016",
+        "TST-017",
+        "TST-018",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-008"
+      ],
+      "owner": "研发与运维"
+    },
+    {
+      "id": "NFR-005",
+      "category": "OBSERVABILITY",
+      "statement": "按活动分离socket、resp、accepted、DLR及最老等待",
+      "scope": "TARGET",
+      "target": "按活动分离socket、resp、accepted、DLR及最老等待",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-006"
+      ],
+      "solution_element_ids": [
+        "ELM-006"
+      ],
+      "test_ids": [
+        "TST-011",
+        "TST-013"
+      ],
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "owner": "研发与运维"
+    },
+    {
+      "id": "NFR-006",
+      "category": "SECURITY",
+      "statement": "运维/配置权限校验，日志脱敏、回执来源隔离",
+      "scope": "TARGET",
+      "target": "运维/配置权限校验，日志脱敏、回执来源隔离",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "solution_element_ids": [
+        "ELM-008"
+      ],
+      "test_ids": [
+        "TST-014",
+        "TST-016",
+        "TST-020"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "owner": "研发与运维"
+    },
+    {
+      "id": "NFR-007",
+      "category": "OPERABILITY",
+      "statement": "24小时稳定负载再72小时，无不受控队列/RSS持续增长",
+      "scope": "TARGET",
+      "target": "24小时稳定负载再72小时，无不受控队列/RSS持续增长",
+      "verification": "模拟器+脱敏副本，目标测试尚未执行",
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "solution_element_ids": [
+        "ELM-007"
+      ],
+      "test_ids": [
+        "TST-011",
+        "TST-012",
+        "TST-018"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "owner": "研发与运维"
+    }
+  ]
+}

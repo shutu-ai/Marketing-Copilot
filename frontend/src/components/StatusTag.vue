@@ -18,6 +18,7 @@ const typeMap: Record<string, string> = {
   completed: 'success',
   failed: 'danger',
   partial: 'warning',
+  unknown: 'danger',
   active: 'success',
   inactive: 'info',
   enabled: 'success',

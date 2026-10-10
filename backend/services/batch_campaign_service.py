@@ -4,7 +4,7 @@ import math
 import re
 import logging
 from datetime import datetime
-from database import get_connection
+from database import get_connection, read_transaction, write_transaction
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
 from typing import Optional
 import shutil
@@ -15,11 +15,27 @@ from services import (sms_task_service, operations_service, campaign_name_servic
                       ingestion_job_service, backpressure_service)
 
 logger = logging.getLogger(__name__)
+OVERDUE_CANCEL_BATCH_SIZE = max(
+    50, min(2000, int(os.environ.get("MC_BATCH_CANCEL_BATCH_SIZE", "250")))
+)
+OVERDUE_CANCEL_CAMPAIGNS_PER_RUN = max(
+    1, min(32, int(os.environ.get("MC_BATCH_CANCEL_CAMPAIGNS_PER_RUN", "4")))
+)
+_overdue_campaign_cursor = 0
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads", "campaigns")
 ALLOWED_LANGUAGES = {"amharic", "tigrigna", "somali", "english", "oromign", "en"}
 INGEST_QUEUE_HIGH_WATERMARK = backpressure_service.TASK_HIGH
 INGEST_QUEUE_LOW_WATERMARK = backpressure_service.TASK_LOW
+
+
+def _run_campaign_write(operation: str, writer):
+    return write_transaction(
+        writer,
+        attempts=3,
+        operation=f"batch_campaign.{operation}",
+        base_delay=0.1,
+    )
 
 
 def _queued_task_count() -> int:
@@ -47,6 +63,29 @@ def _detect_csv_delimiter(path: str) -> str:
         return ","
     except Exception:
         return ","
+
+
+def _canonicalize_customer_list_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the reserved customer-list headers without changing order.
+
+    ``msisdn`` and ``language`` are logical field names, not case-sensitive
+    source headers.  Keep other columns intact because they may be used as
+    template variables, but always expose the two reserved fields under their
+    canonical lower-case names to the validation and enqueue paths.
+    """
+    rename = {}
+    reserved = {}
+    for column in df.columns:
+        key = str(column).lstrip("\ufeff").strip().casefold()
+        if key not in {"msisdn", "language"}:
+            continue
+        if key in reserved:
+            raise ValueError(
+                f"Customer list file contains duplicate {key} columns"
+            )
+        reserved[key] = column
+        rename[column] = key
+    return df.rename(columns=rename)
 
 
 def _read_excel_chunks(path: str, chunksize: int):
@@ -89,6 +128,7 @@ def _validate_customer_list_file(path: str, chunksize: int = 10000) -> int:
 
 
 def _validate_customer_list(df: pd.DataFrame) -> int:
+    df = _canonicalize_customer_list_columns(df)
     columns = set(df.columns)
     errors = []
     if "msisdn" not in columns:
@@ -160,15 +200,16 @@ def _parse_days(val) -> list:
 
 
 def _get_campaign_templates(batch_campaign_id: int) -> list:
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT st.id, st.language, st.content, st.source_addr
-        FROM sms_templates st
-        JOIN campaigns c ON c.id = st.campaign_id
-        WHERE c.marketing_campaign_id = ? AND c.marketing_type = 'batch'
-        ORDER BY st.language
-    """, (batch_campaign_id,)).fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute("""
+            SELECT st.id, st.language, st.content, st.source_addr
+            FROM sms_templates st
+            JOIN campaigns c ON c.id = st.campaign_id
+            WHERE c.marketing_campaign_id = ? AND c.marketing_type = 'batch'
+            ORDER BY st.language
+        """, (batch_campaign_id,)).fetchall(),
+        operation="batch_campaign.templates.list",
+    )
     return [dict(r) for r in rows]
 
 
@@ -178,21 +219,26 @@ def _enrich(c: dict) -> dict:
 
 
 def get_all() -> list:
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM batch_campaigns ORDER BY created_at DESC").fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM batch_campaigns ORDER BY created_at DESC"
+        ).fetchall(),
+        operation="batch_campaign.list",
+    )
     return [_enrich(dict(r)) for r in rows]
 
 
 def list_campaigns(page: int = 1, page_size: int = 50) -> dict:
-    conn = get_connection()
-    total = conn.execute("SELECT COUNT(*) cnt FROM batch_campaigns").fetchone()["cnt"]
-    offset = max(0, page - 1) * page_size
-    rows = conn.execute(
-        "SELECT * FROM batch_campaigns ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (page_size, offset),
-    ).fetchall()
-    conn.close()
+    def read(conn):
+        total = conn.execute("SELECT COUNT(*) cnt FROM batch_campaigns").fetchone()["cnt"]
+        offset = max(0, page - 1) * page_size
+        rows = conn.execute(
+            "SELECT * FROM batch_campaigns ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (page_size, offset),
+        ).fetchall()
+        return total, rows
+
+    total, rows = read_transaction(read, operation="batch_campaign.list_page")
     return {
         "total": total,
         "page": page,
@@ -202,141 +248,161 @@ def list_campaigns(page: int = 1, page_size: int = 50) -> dict:
 
 
 def get_one(campaign_id: int) -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone(),
+        operation="batch_campaign.get",
+    )
     return _enrich(dict(row)) if row else None
 
 
 def create(data: BatchCampaignCreate) -> dict:
     name = campaign_name_service.ensure_unique_name(data.name)
     if not (data.phone_prefix or "").strip():
-        raise ValueError("\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00")
-    conn = get_connection()
+        raise ValueError("请输入号码前缀")
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
-    cursor = conn.execute(
-        "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, use_custom_directory, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, data.start_time or "", data.end_time or "",
-          data.send_start_time or "", data.send_end_time or "",
-          _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
-          use_custom_directory, data.sms_template_id, data.smpp_config_id,
-          data.phone_prefix or "")
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()
-    conn.close()
-    campaign = _enrich(dict(row))
 
-    # If no campaign_dir provided, auto-compute
+    def write(conn):
+        cursor = conn.execute(
+            "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, use_custom_directory, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, data.start_time or "", data.end_time or "",
+             data.send_start_time or "", data.send_end_time or "",
+             _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
+             use_custom_directory, data.sms_template_id, data.smpp_config_id,
+             data.phone_prefix or ""),
+        )
+        return dict(conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)
+        ).fetchone())
+
+    campaign = _enrich(_run_campaign_write("create", write))
     if not campaign_dir:
         campaign_dir = _ensure_campaign_dir(campaign)
-        conn2 = get_connection()
-        conn2.execute("UPDATE batch_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign["id"]))
-        conn2.commit()
-        conn2.close()
+        _run_campaign_write(
+            "create.directory",
+            lambda conn: conn.execute(
+                "UPDATE batch_campaigns SET campaign_dir=? WHERE id=?",
+                (campaign_dir, campaign["id"]),
+            ),
+        )
         campaign["campaign_dir"] = campaign_dir
-
     os.makedirs(os.path.join(campaign_dir, "whitelist"), exist_ok=True)
     os.makedirs(os.path.join(campaign_dir, "output"), exist_ok=True)
     return campaign
 
 
 def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
-    conn = get_connection()
-    existing = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
+    probe = get_connection()
+    try:
+        existing = probe.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+    finally:
+        probe.close()
     if not existing:
-        conn.close()
         return None
+
     existing_dict = dict(existing)
     if data.name is not None and data.name.strip() != (existing_dict.get("name") or "").strip():
         data.name = campaign_name_service.ensure_unique_name(data.name, "batch", campaign_id)
-    if data.use_custom_directory is not None and existing_dict.get("customer_list_path"):
-        if data.use_custom_directory:
-            new_dir = (data.campaign_dir or "").strip()
-        else:
-            new_dir = _ensure_campaign_dir(existing_dict)
-        old_dir = (existing_dict.get("campaign_dir") or "").strip()
-        if new_dir and os.path.normcase(os.path.normpath(new_dir)) != os.path.normcase(os.path.normpath(old_dir)):
-            conn.close()
-            raise ValueError("Cannot change campaign directory after a target list has been uploaded")
+    auto_campaign_dir = ""
     if data.status == "in_progress":
-        validation_errors = operations_service.validate_campaign("batch", {**existing_dict, "id": campaign_id})
+        validation_campaign = dict(existing_dict)
+        if not (validation_campaign.get("campaign_dir") or "").strip() and not bool(validation_campaign.get("use_custom_directory")):
+            auto_campaign_dir = _ensure_campaign_dir(validation_campaign)
+            validation_campaign["campaign_dir"] = auto_campaign_dir
+        validation_errors = operations_service.validate_campaign(
+            "batch", {**validation_campaign, "id": campaign_id}
+        )
         if validation_errors:
-            conn.close()
             raise ValueError("; ".join(validation_errors))
-    if data.status == "in_progress":
         if not existing_dict.get("row_count", 0):
-            conn.close()
             raise ValueError("请先上传潜客清单")
         if not existing_dict.get("sms_template_id"):
-            conn.close()
             raise ValueError("请先配置短信模板")
+
+    if data.use_custom_directory is not None and existing_dict.get("customer_list_path"):
+        new_dir = ((data.campaign_dir or "").strip()
+                   if data.use_custom_directory
+                   else _ensure_campaign_dir(existing_dict))
+        old_dir = (existing_dict.get("campaign_dir") or "").strip()
+        if new_dir and os.path.normcase(os.path.normpath(new_dir)) != os.path.normcase(os.path.normpath(old_dir)):
+            raise ValueError("Cannot change campaign directory after a target list has been uploaded")
     if existing_dict.get("status") == "ended":
-        only_allowed = all(getattr(data, f, None) is None for f in ["start_time", "batch_size", "campaign_dir", "use_custom_directory"])
+        only_allowed = all(
+            getattr(data, f, None) is None
+            for f in ["start_time", "batch_size", "campaign_dir", "use_custom_directory"]
+        )
         if not only_allowed:
-            conn.close()
             raise ValueError("Ended campaign can only edit name, end time, send window, send days, and SMS template")
     elif existing_dict.get("status") != "not_started":
-        only_allowed = all(getattr(data, f, None) is None for f in ["name", "start_time", "end_time", "send_start_time", "send_end_time", "send_days", "batch_size", "campaign_dir", "use_custom_directory"])
+        only_allowed = all(
+            getattr(data, f, None) is None
+            for f in ["name", "start_time", "end_time", "send_start_time", "send_end_time", "send_days", "batch_size", "campaign_dir", "use_custom_directory"]
+        )
         if not only_allowed:
-            conn.close()
-            raise ValueError("Campaign has already started — cannot edit")
+            raise ValueError("Campaign has already started - cannot edit")
+
     fields = {}
     for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "batch_size", "campaign_dir", "use_custom_directory", "sms_template_id", "smpp_config_id", "phone_prefix"]:
-        val = getattr(data, field, None)
-        if val is not None:
-            fields[field] = val
+        value = getattr(data, field, None)
+        if value is not None:
+            fields[field] = value
     if data.send_days is not None:
         fields["send_days"] = _fmt_days(data.send_days)
-    new_smpp_id = fields.get("smpp_config_id")
-    if new_smpp_id is not None:
-        smpp = conn.execute(
-            "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (new_smpp_id,)
-        ).fetchone()
-        if not smpp:
-            conn.close()
-            raise ValueError("Associated SMPP configuration is missing or disabled")
+    if auto_campaign_dir:
+        fields["campaign_dir"] = auto_campaign_dir
     if data.use_custom_directory is not None:
         if data.use_custom_directory:
             campaign_dir = (data.campaign_dir or "").strip()
             if not campaign_dir:
-                conn.close()
                 raise ValueError("Custom campaign directory is required")
             fields["campaign_dir"] = campaign_dir
         else:
             fields["campaign_dir"] = _ensure_campaign_dir({**existing_dict, **fields})
+    new_smpp_id = fields.get("smpp_config_id")
 
-    if fields:
-        set_clause = ", ".join(f"{k}=?" for k in fields)
-        conn.execute(
-            f"UPDATE batch_campaigns SET {set_clause}, updated_at=datetime('now','localtime') WHERE id=?",
-            (*fields.values(), campaign_id)
-        )
-        conn.commit()
-    if new_smpp_id is not None:
-        # Re-route pending SMS tasks of this campaign to the newly associated SMSC
-        conn.execute(
-            """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
-               WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
-            (new_smpp_id, campaign_id),
-        )
-        conn.commit()
-    row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    conn.close()
+    def write(conn):
+        current = conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        if not current:
+            return None
+        if new_smpp_id is not None:
+            smpp = conn.execute(
+                "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (new_smpp_id,)
+            ).fetchone()
+            if not smpp:
+                raise ValueError("Associated SMPP configuration is missing or disabled")
+        if fields:
+            set_clause = ", ".join(f"{key}=?" for key in fields)
+            conn.execute(
+                f"UPDATE batch_campaigns SET {set_clause}, updated_at=datetime('now','localtime') WHERE id=?",
+                (*fields.values(), campaign_id),
+            )
+        if new_smpp_id is not None:
+            conn.execute(
+                """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
+                (new_smpp_id, campaign_id),
+            )
+        row = conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    updated_campaign = _run_campaign_write("update", write)
+    if updated_campaign is None:
+        return None
     sms_task_service.invalidate_campaign_cache("batch", campaign_id)
-    updated_campaign = _enrich(dict(row))
+    updated_campaign = _enrich(updated_campaign)
     if data.use_custom_directory is not None:
         os.makedirs(os.path.join(updated_campaign["campaign_dir"], "whitelist"), exist_ok=True)
         os.makedirs(os.path.join(updated_campaign["campaign_dir"], "output"), exist_ok=True)
-
-    # Auto: generate batches on start (no auto-send)
     if data.status == "in_progress":
-        # Use the committed value. A single update may change batch_size and
-        # start the campaign, so existing_dict may contain the obsolete size.
-        batch_size = updated_campaign.get("batch_size") or 500
-        generate_batches(campaign_id, batch_size)
-
+        generate_batches(campaign_id, updated_campaign.get("batch_size") or 500)
     return updated_campaign
 
 
@@ -379,48 +445,60 @@ def get_prospects(campaign_id: int, search: str = "", field: str = "", value: st
 
 
 def delete(campaign_id: int) -> bool:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    if row:
-        campaign_dir = dict(row).get("campaign_dir", "")
-        if campaign_dir and os.path.isdir(campaign_dir):
-            try:
-                shutil.rmtree(campaign_dir)
-            except Exception:
-                pass
-    conn.execute("DELETE FROM batch_campaign_daily_stats WHERE campaign_id=?", (campaign_id,))
-    conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,))
-    conn.execute("DELETE FROM batch_campaigns WHERE id=?", (campaign_id,))
-    conn.commit()
-    conn.close()
+    probe = get_connection()
+    try:
+        row = probe.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+    finally:
+        probe.close()
+    if not row:
+        return False
+
+    _run_campaign_write(
+        "delete",
+        lambda conn: (
+            conn.execute("DELETE FROM batch_campaign_daily_stats WHERE campaign_id=?", (campaign_id,)),
+            conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,)),
+            conn.execute("DELETE FROM batch_campaigns WHERE id=?", (campaign_id,)),
+        ),
+    )
+    campaign_dir = dict(row).get("campaign_dir", "")
+    if campaign_dir and os.path.isdir(campaign_dir):
+        try:
+            shutil.rmtree(campaign_dir)
+        except Exception:
+            logger.warning("Unable to remove deleted batch campaign directory=%s", campaign_dir, exc_info=True)
     sms_task_service.invalidate_campaign_cache("batch", campaign_id)
-    # DuckDB does not provide a reliable DB-API rowcount for DELETE and may
-    # return -1 even when the row was removed. The lookup above is the source
-    # of truth for whether this campaign existed.
-    return row is not None
+    return True
 
 
 def copy(campaign_id: int) -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    if not row:
-        conn.close()
-        return None
-    orig = dict(row)
-    new_name = orig["name"] + " (Copy)"
-    cursor = conn.execute(
-        "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (new_name, orig["start_time"], orig["end_time"],
-         orig.get("send_start_time", ""), orig.get("send_end_time", ""),
-         orig.get("send_days", "[]"), orig.get("batch_size", 500),
-         orig.get("sms_template_id"), orig.get("smpp_config_id"), orig.get("phone_prefix", ""))
-    )
-    conn.commit()
-    new_row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()
-    conn.close()
-    new_campaign = _enrich(dict(new_row))
+    def write(conn):
+        row = conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        if not row:
+            return None
+        orig = dict(row)
+        cursor = conn.execute(
+            "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (orig["name"] + " (Copy)", orig["start_time"], orig["end_time"],
+             orig.get("send_start_time", ""), orig.get("send_end_time", ""),
+             orig.get("send_days", "[]"), orig.get("batch_size", 500),
+             orig.get("sms_template_id"), orig.get("smpp_config_id"),
+             orig.get("phone_prefix", "")),
+        )
+        new_row = conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+        return {"original": orig, "campaign": dict(new_row)}
 
-    # Create directory and copy whitelist
+    result = _run_campaign_write("copy", write)
+    if result is None:
+        return None
+    orig = result["original"]
+    new_campaign = _enrich(result["campaign"])
     campaign_dir = _ensure_campaign_dir(new_campaign)
     os.makedirs(os.path.join(campaign_dir, "whitelist"), exist_ok=True)
     os.makedirs(os.path.join(campaign_dir, "output"), exist_ok=True)
@@ -431,22 +509,25 @@ def copy(campaign_id: int) -> Optional[dict]:
             src = os.path.join(old_whitelist, fname)
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(campaign_dir, "whitelist", fname))
-
-    conn2 = get_connection()
-    conn2.execute("UPDATE batch_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, new_campaign["id"]))
-    conn2.commit()
-    conn2.close()
+    _run_campaign_write(
+        "copy.directory",
+        lambda conn: conn.execute(
+            "UPDATE batch_campaigns SET campaign_dir=? WHERE id=?",
+            (campaign_dir, new_campaign["id"]),
+        ),
+    )
     new_campaign["campaign_dir"] = campaign_dir
     return new_campaign
 
 
 def get_daily_stats(campaign_id: int) -> list:
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM batch_campaign_daily_stats WHERE campaign_id=? ORDER BY stats_date DESC",
-        (campaign_id,)
-    ).fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM batch_campaign_daily_stats WHERE campaign_id=? ORDER BY stats_date DESC",
+            (campaign_id,)
+        ).fetchall(),
+        operation="batch_campaign.daily_stats",
+    )
     return [dict(r) for r in rows]
 
 
@@ -536,14 +617,37 @@ def cancel_overdue_daily_tasks() -> int:
     they are already in flight at the SMSC. The next eligible day's batch run will
     re-send the same users.
     """
-    conn = get_connection()
     now = datetime.now()
     current = now.strftime("%H:%M")
-    rows = conn.execute(
-        "SELECT id, send_start_time, send_end_time FROM batch_campaigns WHERE status='in_progress'"
-    ).fetchall()
+    global _overdue_campaign_cursor
+
+    def load_candidates(conn, after_id):
+        return conn.execute(
+            """SELECT c.id, c.send_start_time, c.send_end_time,
+                      EXISTS(
+                          SELECT 1 FROM sms_tasks t
+                          WHERE t.campaign_type='batch' AND t.campaign_id=c.id
+                            AND t.status IN ('queued','retrying')
+                      ) AS has_pending
+               FROM batch_campaigns c
+               WHERE c.status='in_progress' AND c.id>?
+               ORDER BY c.id LIMIT ?""",
+            (after_id, OVERDUE_CANCEL_CAMPAIGNS_PER_RUN),
+        ).fetchall()
+
+    rows = read_transaction(
+        lambda conn: load_candidates(conn, _overdue_campaign_cursor),
+        operation="batch_campaign.overdue_candidates",
+    )
+    if not rows and _overdue_campaign_cursor:
+        _overdue_campaign_cursor = 0
+        rows = read_transaction(
+            lambda conn: load_candidates(conn, 0),
+            operation="batch_campaign.overdue_candidates",
+        )
     cancelled = 0
     for row in rows:
+        _overdue_campaign_cursor = int(row["id"])
         start = (row["send_start_time"] or "")[:5]
         end = (row["send_end_time"] or "")[:5]
         if start and end:
@@ -558,22 +662,43 @@ def cancel_overdue_daily_tasks() -> int:
             continue
         if not window_ended:
             continue
-        pending = conn.execute(
-            """SELECT COUNT(*) cnt FROM sms_tasks
-               WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying')""",
-            (row["id"],),
-        ).fetchone()["cnt"]
-        if not pending:
+        if not row["has_pending"]:
             continue
-        conn.execute(
-            """UPDATE sms_tasks SET status='cancelled', error_msg='daily send window ended',
-               updated_at=CURRENT_TIMESTAMP
-               WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying')""",
-            (row["id"],),
+
+        def cancel(conn, campaign_id=row["id"]):
+            task_ids = conn.execute(
+                """SELECT id FROM sms_tasks
+                   WHERE campaign_type='batch' AND campaign_id=?
+                     AND status IN ('queued','retrying')
+                   ORDER BY id LIMIT ?""",
+                (campaign_id, OVERDUE_CANCEL_BATCH_SIZE),
+            ).fetchall()
+            ids = [int(task["id"]) for task in task_ids]
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            sql = (
+                "UPDATE sms_tasks SET status='cancelled', "
+                "error_msg='daily send window ended', updated_at=CURRENT_TIMESTAMP "
+                "WHERE campaign_type='batch' AND campaign_id=? "
+                "AND status IN ('queued','retrying') AND id IN ("
+                + placeholders + ") RETURNING id"
+            )
+            return conn.execute(
+                sql,
+                [campaign_id, *ids],
+            ).fetchall()
+
+        # One campaign per short transaction prevents a large campaign's
+        # overdue cleanup from holding the writer gate while other campaigns
+        # and the SMS result writer wait behind it.
+        changed = write_transaction(
+            cancel,
+            attempts=3,
+            operation="batch_campaign.cancel_overdue",
+            base_delay=0.1,
         )
-        cancelled += pending
-    conn.commit()
-    conn.close()
+        cancelled += len(changed or [])
     if cancelled:
         logger.info("Batch overdue daily tasks cancelled=%s", cancelled)
     return cancelled
@@ -601,25 +726,33 @@ def generate_batches(campaign_id: int, batch_size: int = 500) -> dict:
         total = 0
     except Exception as e:
         return {"success": False, "message": f"Cannot read file: {e}"}
-    conn = get_connection()
-    conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,))
-    created = []
-    for chunk in source:
-        count = len(chunk)
-        start = total
-        total += count
-        end = total
-        cursor = conn.execute(
-            "INSERT INTO batch_campaign_batches (campaign_id, batch_index, start_row, end_row, total_count) VALUES (?,?,?,?,?)",
-            (campaign_id, len(created), start, end, count)
+    def write(conn):
+        source = (
+            pd.read_csv(path, dtype=str, sep=_detect_csv_delimiter(path),
+                        chunksize=max(1, int(batch_size or 500)))
+            if ext == ".csv"
+            else _read_excel_chunks(path, max(1, int(batch_size or 500)))
         )
-        created.append({
-            "id": cursor.lastrowid, "batch_index": len(created),
-            "start_row": start, "end_row": end, "count": count, "status": "pending"
-        })
-        del chunk
-    conn.commit()
-    conn.close()
+        local_created = []
+        local_total = 0
+        conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,))
+        for chunk in source:
+            count = len(chunk)
+            start = local_total
+            local_total += count
+            end = local_total
+            cursor = conn.execute(
+                "INSERT INTO batch_campaign_batches (campaign_id, batch_index, start_row, end_row, total_count) VALUES (?,?,?,?,?)",
+                (campaign_id, len(local_created), start, end, count),
+            )
+            local_created.append({
+                "id": cursor.lastrowid, "batch_index": len(local_created),
+                "start_row": start, "end_row": end, "count": count, "status": "pending"
+            })
+            del chunk
+        return local_created, local_total
+
+    created, total = _run_campaign_write("generate_batches", write)
     manifest_chunks = [
         {"source_batch_id": item["id"], "chunk_index": item["batch_index"],
          "start_row": item["start_row"], "end_row": item["end_row"]}
@@ -635,12 +768,13 @@ def generate_batches(campaign_id: int, batch_size: int = 500) -> dict:
 
 
 def get_batches(campaign_id: int) -> list:
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM batch_campaign_batches WHERE campaign_id=? ORDER BY batch_index",
-        (campaign_id,)
-    ).fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM batch_campaign_batches WHERE campaign_id=? ORDER BY batch_index",
+            (campaign_id,)
+        ).fetchall(),
+        operation="batch_campaign.batches",
+    )
     return [dict(r) for r in rows]
 
 
@@ -705,9 +839,9 @@ def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[di
         if batch_rows is None:
             raise RuntimeError("batch rows must be supplied by the sequential ingestion reader")
 
-        msisdn_col = "msisdn" if "msisdn" in batch_rows.columns else batch_rows.columns[0]
-        if msisdn_col != "msisdn":
-            batch_rows = batch_rows.rename(columns={msisdn_col: "msisdn"})
+        batch_rows = _canonicalize_customer_list_columns(batch_rows)
+        if "msisdn" not in batch_rows.columns:
+            raise ValueError("Customer list file must contain an msisdn column")
         enqueue_result = sms_task_service.enqueue_rows(
             "batch", campaign, batch_rows.fillna("").to_dict("records"),
             campaign.get("customer_list_filename") or os.path.basename(path), batch_id
@@ -749,6 +883,12 @@ def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[di
         return {"success": True, "message": f"Queued {queued} messages",
                 "queued_count": queued, "filter_result": enqueue_result}
     except Exception as e:
+        if is_transient_write_error(e):
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
+            raise
         conn.execute(
             "UPDATE batch_campaign_batches SET status='failed', updated_at=datetime('now','localtime') WHERE id=?",
             (batch_id,)
@@ -909,10 +1049,13 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
         campaign_dir = _ensure_campaign_dir(campaign)
         os.makedirs(os.path.join(campaign_dir, "whitelist"), exist_ok=True)
         os.makedirs(os.path.join(campaign_dir, "output"), exist_ok=True)
-        conn = get_connection()
-        conn.execute("UPDATE batch_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign_id))
-        conn.commit()
-        conn.close()
+        write_transaction(
+            lambda conn: conn.execute(
+                "UPDATE batch_campaigns SET campaign_dir=? WHERE id=?",
+                (campaign_dir, campaign_id),
+            ),
+            operation="batch_campaign.directory",
+        )
 
     whitelist_dir = os.path.join(campaign_dir, "whitelist")
     os.makedirs(whitelist_dir, exist_ok=True)
@@ -928,14 +1071,16 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
     dest = os.path.join(whitelist_dir, f"whitelist{ext}")
     shutil.move(file_path, dest)
 
-    conn = get_connection()
-    conn.execute(
-        "UPDATE batch_campaigns SET customer_list_filename=?, customer_list_path=?, row_count=?, updated_at=datetime('now','localtime') WHERE id=?",
-        (original_filename, dest, row_count, campaign_id)
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    conn.close()
+    def write(conn):
+        conn.execute(
+            "UPDATE batch_campaigns SET customer_list_filename=?, customer_list_path=?, row_count=?, updated_at=datetime('now','localtime') WHERE id=?",
+            (original_filename, dest, row_count, campaign_id),
+        )
+        return conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+
+    row = write_transaction(write, operation="batch_campaign.upload")
     sms_task_service.invalidate_campaign_cache("batch", campaign_id)
 
     # If campaign is in progress, regenerate batches from new list (no auto-send)

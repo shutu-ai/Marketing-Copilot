@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 
-from database import get_connection
+from database import write_transaction
 from services import sms_task_service
 
 router = APIRouter(prefix="/api/sms-tasks", tags=["SMS Tasks"])
@@ -57,21 +57,27 @@ def add_exclusion(body: ExclusionRequest):
     msisdn = sms_task_service.normalize_msisdn(body.msisdn)
     if not msisdn:
         raise HTTPException(400, "Invalid msisdn")
-    conn = get_connection()
-    existing = conn.execute("SELECT id FROM exclusion_users WHERE msisdn=?", (msisdn,)).fetchone()
-    if existing:
-        conn.execute("UPDATE exclusion_users SET reason=?,enabled=1 WHERE msisdn=?", (body.reason, msisdn))
-    else:
-        conn.execute("INSERT INTO exclusion_users (msisdn,reason,enabled) VALUES (?,?,1)", (msisdn, body.reason))
-    conn.commit()
-    conn.close()
+    def write(conn):
+        existing = conn.execute("SELECT id FROM exclusion_users WHERE msisdn=?", (msisdn,)).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE exclusion_users SET reason=?,enabled=1 WHERE msisdn=?",
+                (body.reason, msisdn),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO exclusion_users (msisdn,reason,enabled) VALUES (?,?,1)",
+                (msisdn, body.reason),
+            )
+
+    write_transaction(write, operation="exclusion.upsert")
     return {"success": True, "msisdn": msisdn}
 
 
 @router.delete("/exclusions/{exclusion_id}")
 def delete_exclusion(exclusion_id: int):
-    conn = get_connection()
-    conn.execute("DELETE FROM exclusion_users WHERE id=?", (exclusion_id,))
-    conn.commit()
-    conn.close()
+    write_transaction(
+        lambda conn: conn.execute("DELETE FROM exclusion_users WHERE id=?", (exclusion_id,)),
+        operation="exclusion.delete",
+    )
     return {"success": True}

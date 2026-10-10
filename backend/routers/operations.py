@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from database import get_connection
+from database import read_transaction
 from services import p1_service
 from services import task_archive_service
 
@@ -122,21 +122,20 @@ def audits(page: int = 1, page_size: int = Query(100, le=500), action: str = "")
 
 
 def _export_rows(report: str):
-    conn = get_connection()
     if report == "tasks":
-        rows = conn.execute("SELECT * FROM sms_tasks ORDER BY created_at DESC").fetchall()
+        query = "SELECT * FROM sms_tasks ORDER BY created_at DESC"
     elif report == "files":
-        rows = conn.execute("SELECT * FROM processed_files ORDER BY detected_at DESC").fetchall()
+        query = "SELECT * FROM processed_files ORDER BY detected_at DESC"
     elif report == "failures":
-        rows = conn.execute("SELECT * FROM failed_task_archive ORDER BY archived_at DESC").fetchall()
+        query = "SELECT * FROM failed_task_archive ORDER BY archived_at DESC"
     elif report == "audits":
-        rows = conn.execute("SELECT * FROM audit_logs ORDER BY created_at DESC").fetchall()
+        query = "SELECT * FROM audit_logs ORDER BY created_at DESC"
     else:
-        conn.close()
         raise ValueError("report must be tasks, files, failures or audits")
-    result = [dict(r) for r in rows]
-    conn.close()
-    return result
+    return read_transaction(
+        lambda conn: [dict(r) for r in conn.execute(query).fetchall()],
+        operation=f"operations.export.{report}",
+    )
 
 
 @router.get("/export/{report}")

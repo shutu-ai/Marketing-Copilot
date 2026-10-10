@@ -73,6 +73,7 @@ export default {
     noData: '暂无数据'
   },
   monitor: {
+    status_ignored: '已忽略',
     title: '实时营销目录监控',
     directoryPath: '实时营销名单文件侦听目录',
     directoryPlaceholder: '请输入实时营销名单文件侦听目录路径',
@@ -89,6 +90,7 @@ export default {
     status_pending: '待处理',
     status_processing: '处理中',
     status_completed: '已完成',
+    status_processed: '已处理',
     status_failed: '处理失败',
     autoRefresh: '自动刷新',
     lastScan: '上次扫描',
@@ -113,6 +115,12 @@ export default {
     processedRealtimeFiles: '已处理实时营销文件记录',
   },
   campaign: {
+    watchFileExtension: '文件后缀',
+    watchFileExtensionPlaceholder: '默认 csv',
+    watchFileStatusPlaceholder: '按状态筛选',
+    watchFileReasonPlaceholder: '输入原因文本',
+    watchFileLoadFailed: '当前监听文件加载失败，请重试。',
+    watchFileRetry: '重试',
     batchTitle: '批量营销',
     batchDesc: '基于数据文件批量下发短信营销活动',
     realtimeTitle: '实时营销',
@@ -316,9 +324,9 @@ export default {
     configSms: '配置短信',
     template: '短信模板',
   },
-  smsTasks: { title: '\u77ed\u4fe1\u4efb\u52a1', accepted: '\u77ed\u4fe1\u4e2d\u5fc3\u5df2\u63a5\u53d7', delivered: '\u77ed\u4fe1\u5df2\u9001\u8fbe' },
+  smsTasks: { title: '\u77ed\u4fe1\u4efb\u52a1', accepted: '\u77ed\u4fe1\u4e2d\u5fc3\u5df2\u63a5\u53d7', delivered: '\u77ed\u4fe1\u5df2\u9001\u8fbe', partial: '\u90e8\u5206\u63a5\u53d7', unknown: '\u7ed3\u679c\u672a\u77e5' },
   operations: { title: '运营中心' },
-  capacity: { title: '容量与高可用' },
+  capacity: { title: '容量与高可用', campaignFairness: '活动公平调度与发送能力', campaign: '活动', route: 'SMPP路由', backlog: '排队 / 重试 / 发送中', outcomes: '部分成功 / 结果未知', weight: '调度权重', rateLimit: '分片TPS上限', socketRate: 'Socket发出/分钟', responseRate: '响应完成/分钟', schedulerEnabled: '公平调度已启用', schedulerDisabled: '公平调度未启用', campaignLoadFailed: '活动容量数据刷新失败' },
   rabbitmq: {
     title: 'RabbitMQ配置',
     status: '连接状态',

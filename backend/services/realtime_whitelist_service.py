@@ -11,7 +11,7 @@ from typing import Optional
 import duckdb
 import pandas as pd
 
-from database import get_connection
+from database import get_connection, write_transaction
 from services import ingestion_job_service, operations_service, sms_task_service, settings_service
 
 logger = logging.getLogger(__name__)
@@ -234,8 +234,7 @@ def get_index_status(campaign: dict) -> dict:
 
 def create_version(campaign_id: int, source_filename: str, source_path: str,
                    source_hash: str) -> tuple[dict, bool]:
-    conn = get_connection()
-    try:
+    def write(conn):
         existing = conn.execute(
             "SELECT * FROM realtime_whitelist_versions WHERE campaign_id=? AND source_hash=?",
             (campaign_id, source_hash),
@@ -248,7 +247,6 @@ def create_version(campaign_id: int, source_filename: str, source_path: str,
                    error_detail='',ready_at=NULL,retired_at=NULL WHERE id=?""",
                 (os.path.basename(source_filename), os.path.abspath(source_path), existing["id"]),
             )
-            conn.commit()
             row = conn.execute("SELECT * FROM realtime_whitelist_versions WHERE id=?", (existing["id"],)).fetchone()
             return dict(row), False
         version_no = conn.execute(
@@ -261,10 +259,9 @@ def create_version(campaign_id: int, source_filename: str, source_path: str,
                VALUES (?,?,?,?,?,'building') RETURNING *""",
             (campaign_id, int(version_no), os.path.basename(source_filename), os.path.abspath(source_path), source_hash),
         ).fetchone()
-        conn.commit()
         return dict(row), False
-    finally:
-        conn.close()
+
+    return write_transaction(write, operation="whitelist.version.create")
 
 
 def _set_status(version_id: int, status: str, **fields) -> None:
@@ -274,12 +271,10 @@ def _set_status(version_id: int, status: str, **fields) -> None:
         assignments.append(f"{key}=?")
         values.append(value)
     values.append(version_id)
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(f"UPDATE realtime_whitelist_versions SET {','.join(assignments)} WHERE id=?", values)
-        conn.commit()
-    finally:
-        conn.close()
+
+    write_transaction(write, operation="whitelist.version.status")
 
 
 def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
@@ -333,12 +328,15 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
                 version["campaign_id"], version_id, source_path,
             )
             return False
-        conn = get_connection()
-        try:
-            conn.execute("UPDATE realtime_whitelist_versions SET source_path=? WHERE id=?", (candidate, version_id))
-            conn.commit()
-        finally:
-            conn.close()
+        write_transaction(
+            lambda conn: conn.execute(
+                "UPDATE realtime_whitelist_versions SET source_path=? WHERE id=?",
+                (candidate, version_id),
+            ),
+            attempts=3,
+            operation="whitelist.version.restore_source",
+            base_delay=0.1,
+        )
     if version.get("status") == "building":
         return True
     _set_status(
@@ -358,14 +356,73 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
     return True
 
 
-def _is_repairable_error(error) -> bool:
+def is_transient_database_error(error) -> bool:
+    """Return True for short-lived DuckDB concurrency/lock failures.
+
+    These errors describe contention in the application database, not damage
+    to a whitelist index.  Callers must retry the current operation instead of
+    rebuilding an otherwise unchanged multi-million-row whitelist.
+    """
     message = str(error or "").lower()
     return any(marker in message for marker in (
-        "write-write conflict", "transactioncontext", "transaction conflict",
-        "database is locked", "could not set lock", "conflicting lock",
+        "write-write conflict",
+        "transactioncontext",
+        "transaction conflict",
+        "database is locked",
+        "could not set lock",
+        "conflicting lock",
+        "write lock timeout",
+        "lock timeout",
+    ))
+
+
+def _is_repairable_error(error) -> bool:
+    """Return True only for index/storage failures that justify a rebuild."""
+    message = str(error or "").lower()
+    return any(marker in message for marker in (
         "cannot read whitelist index", "cannot read active whitelist index",
         "catalog error", "io error", "corrupt",
     ))
+
+
+def recover_transient_failure(version_id: int) -> str:
+    """Recover a failed version after a transient database conflict.
+
+    If the index file was fully materialized before the metadata transaction
+    conflicted, validate it and restore the version to ``ready``.  If no valid
+    index exists, put the version back into ``building`` so the normal build
+    worker retries the incomplete build.  Return ``ready`` or ``building``;
+    return an empty string when the version cannot be recovered.
+    """
+    version = get_version(version_id)
+    if not version or version.get("status") != "failed":
+        return ""
+    index_path = version.get("index_path") or ""
+    if index_path and os.path.isfile(index_path):
+        index = None
+        try:
+            index = duckdb.connect(index_path, read_only=True)
+            index.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
+            _set_status(version_id, "ready", error_detail="")
+            logger.warning(
+                "Realtime whitelist transient failure recovered campaign=%s version=%s using existing index",
+                version["campaign_id"], version_id,
+            )
+            return "ready"
+        except Exception:
+            logger.info(
+                "Existing whitelist index is not usable after transient failure campaign=%s version=%s",
+                version["campaign_id"], version_id, exc_info=True,
+            )
+        finally:
+            if index:
+                index.close()
+    _set_status(version_id, "building", error_detail="")
+    logger.warning(
+        "Realtime whitelist transient failure queued for build retry campaign=%s version=%s",
+        version["campaign_id"], version_id,
+    )
+    return "building"
 
 
 def repair_active_failed(limit: int = 1) -> int:
@@ -387,6 +444,13 @@ def repair_active_failed(limit: int = 1) -> int:
         conn.close()
     repaired = 0
     for row in rows:
+        if is_transient_database_error(row["error_detail"]):
+            try:
+                if recover_transient_failure(row["id"]):
+                    repaired += 1
+            except Exception:
+                logger.exception("Unable to recover transient whitelist failure version=%s", row["id"])
+            continue
         if not _is_repairable_error(row["error_detail"]):
             continue
         try:
@@ -600,8 +664,7 @@ def build_version(version_id: int) -> dict:
         if os.path.exists(final_path):
             os.unlink(final_path)
         os.replace(temp_path, final_path)
-        conn = get_connection()
-        try:
+        def write(conn):
             conn.execute(
                 """UPDATE realtime_whitelist_versions SET status='ready',row_count=?,normalized_count=?,
                    index_path=?,error_detail='',ready_at=CAST(CURRENT_TIMESTAMP AS VARCHAR) WHERE id=?""",
@@ -623,9 +686,14 @@ def build_version(version_id: int) -> dict:
                        customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (version_id, version["source_filename"], version["source_path"], int(rows), version["campaign_id"]),
                 )
-            conn.commit()
-        finally:
-            conn.close()
+            return True
+
+        write_transaction(
+            write,
+            attempts=3,
+            operation="whitelist.version.ready",
+            base_delay=0.1,
+        )
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _metrics_observe("realtime_whitelist_index_build_seconds", elapsed_ms / 1000.0,
                          {"campaign_id": version["campaign_id"]})
@@ -719,12 +787,15 @@ def migrate_legacy_versions(limit: int = 1) -> int:
             )
             if os.path.abspath(source_path) != os.path.abspath(stable_path) and not os.path.isfile(stable_path):
                 shutil.copy2(source_path, stable_path)
-            conn = get_connection()
-            try:
-                conn.execute("UPDATE realtime_whitelist_versions SET source_path=? WHERE id=?", (stable_path, version["id"]))
-                conn.commit()
-            finally:
-                conn.close()
+            write_transaction(
+                lambda conn: conn.execute(
+                    "UPDATE realtime_whitelist_versions SET source_path=? WHERE id=?",
+                    (stable_path, version["id"]),
+                ),
+                attempts=3,
+                operation="whitelist.version.migrate_source",
+                base_delay=0.1,
+            )
             migrated += 1
             logger.info("Realtime legacy whitelist migration queued campaign=%s version=%s", row["id"], version["id"])
         except Exception:
@@ -813,29 +884,23 @@ def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
     existing = get_version_by_hash(campaign_id, source_hash)
     if existing and existing["status"] in ("building", "ready"):
         if existing["status"] == "ready":
-            conn = get_connection()
-            try:
+            def write(conn):
                 conn.execute(
                     "UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (existing["id"], existing["source_filename"], existing["source_path"], existing["row_count"], campaign_id),
                 )
-                conn.commit()
-            finally:
-                conn.close()
+            write_transaction(write, operation="whitelist.version.activate")
         return {**campaign, "success": True, "whitelist_version_id": existing["id"],
                 "whitelist_status": existing["status"], "row_count": existing["row_count"]}
     version, _duplicate = create_version(campaign_id, original_filename, file_path, source_hash)
     source_path = os.path.join(source_dir, f"whitelist-v{int(version['version_no']):06d}{os.path.splitext(original_filename)[1].lower()}")
     shutil.copy2(file_path, source_path)
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute("UPDATE realtime_whitelist_versions SET source_path=?,row_count=? WHERE id=?",
                      (source_path, source_rows, version["id"]))
         conn.execute("UPDATE realtime_campaigns SET customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                      (original_filename, source_path, source_rows, campaign_id))
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(write, operation="whitelist.upload")
     logger.info("Realtime whitelist queued campaign=%s version=%s file=%s", campaign_id, version["id"], os.path.basename(original_filename))
     return {**campaign, "success": True, "whitelist_version_id": version["id"],
             "whitelist_status": "building", "row_count": source_rows, "customer_list_path": source_path,

@@ -1,10 +1,17 @@
-from database import get_connection
+from database import get_connection, read_transaction, write_transaction
 from models.smpp import SmppConfigCreate, SmppConfigUpdate
 from typing import List, Optional
 import asyncio
 import logging
+import threading
+import time
 
 logger = logging.getLogger(__name__)
+
+_STATS_CACHE = None
+_STATS_CACHE_AT = 0.0
+_STATS_CACHE_TTL = 2.0
+_STATS_CACHE_LOCK = threading.Lock()
 
 
 def _invalidate_gateway_config_cache() -> None:
@@ -29,52 +36,56 @@ def _masked(row) -> dict:
 
 
 def get_all_configs() -> list:
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM smpp_configs ORDER BY updated_at DESC").fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM smpp_configs ORDER BY updated_at DESC"
+        ).fetchall(),
+        operation="smpp.configs.list",
+    )
     return [_masked(r) for r in rows]
 
 
 def get_config(config_id: int) -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM smpp_configs WHERE id=?", (config_id,)
+        ).fetchone(),
+        operation="smpp.config.get",
+    )
     return _masked(row) if row else None
 
 
 def _get_config_row(config_id: int) -> Optional[dict]:
     """Raw config row including the real password (never exposed via API)."""
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM smpp_configs WHERE id=?", (config_id,)
+        ).fetchone(),
+        operation="smpp.config.raw_get",
+    )
     return dict(row) if row else None
 
 
 def create_config(data: SmppConfigCreate) -> dict:
-    conn = get_connection()
-    cursor = conn.execute(
-        """INSERT INTO smpp_configs (name,host,port,system_id,password,source_addr,
-           bind_type,address_ton,address_npi,data_coding,pool_size,window_size,enquire_interval,timeout,
-           tps,priority,reconnect_max_seconds,delivery_receipt_mode)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (data.name, data.host, data.port, data.system_id, data.password, data.source_addr,
-         data.bind_type, data.address_ton, data.address_npi, data.data_coding,
-         data.pool_size, data.window_size, data.enquire_interval, data.timeout, data.tps, data.priority, data.reconnect_max_seconds, data.delivery_receipt_mode)
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone()
-    conn.close()
+    def write(conn):
+        cursor = conn.execute(
+            """INSERT INTO smpp_configs (name,host,port,system_id,password,source_addr,
+               bind_type,address_ton,address_npi,data_coding,pool_size,window_size,enquire_interval,timeout,
+               tps,priority,reconnect_max_seconds,delivery_receipt_mode)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (data.name, data.host, data.port, data.system_id, data.password, data.source_addr,
+             data.bind_type, data.address_ton, data.address_npi, data.data_coding,
+             data.pool_size, data.window_size, data.enquire_interval, data.timeout, data.tps,
+             data.priority, data.reconnect_max_seconds, data.delivery_receipt_mode),
+        )
+        return dict(conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+    row = write_transaction(write, operation="smpp.config.create")
     _invalidate_gateway_config_cache()
     return _masked(row)
 
 
 def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
-    conn = get_connection()
-    existing = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
-    if not existing:
-        conn.close()
-        return None
-
     fields = {}
     for field in ["name", "host", "port", "system_id", "password", "source_addr",
                    "bind_type", "address_ton", "address_npi", "data_coding",
@@ -87,36 +98,62 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
                 continue
             fields[field] = val
 
-    if not fields:
-        conn.close()
-        return _masked(existing)
+    def write(conn):
+        existing = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
+        if not existing:
+            return None
+        if not fields:
+            return dict(existing)
 
-    fields["updated_at"] = "datetime('now','localtime')"
-    set_clause = ", ".join(
-        f"{k}=?" if k != "updated_at" else f"{k}=datetime('now','localtime')"
-        for k in fields
-    )
-    values = [v for k, v in fields.items() if k != "updated_at"]
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(
+            f"UPDATE smpp_configs SET {set_clause}, updated_at=datetime('now','localtime') WHERE id=?",
+            (*fields.values(), config_id),
+        )
+        row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
+        return dict(row)
 
-    conn.execute(f"UPDATE smpp_configs SET {set_clause} WHERE id=?", (*values, config_id))
-    conn.commit()
-    row = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
-    conn.close()
+    row = write_transaction(write, operation="smpp.config.update")
+    if row is None:
+        return None
     _invalidate_gateway_config_cache()
     return _masked(row)
 
 
 def delete_config(config_id: int) -> bool:
-    conn = get_connection()
-    cursor = conn.execute("DELETE FROM smpp_configs WHERE id=?", (config_id,))
-    deleted = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
+    def write(conn):
+        exists = conn.execute("SELECT 1 FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
+        if not exists:
+            return False
+        conn.execute("DELETE FROM smpp_configs WHERE id=?", (config_id,))
+        return True
+
+    deleted = write_transaction(write, operation="smpp.config.delete")
     _invalidate_gateway_config_cache()
     return deleted
 
 
 def get_config_stats() -> dict:
+    """Return a short-lived snapshot for the Web capacity page.
+
+    The page polls frequently, while each uncached request performs several
+    aggregate scans over ``sms_tasks``. A two-second cache coalesces refreshes
+    without changing operational semantics and keeps reads from competing
+    with the SMS write path unnecessarily.
+    """
+    global _STATS_CACHE, _STATS_CACHE_AT
+    now = time.monotonic()
+    with _STATS_CACHE_LOCK:
+        if _STATS_CACHE is not None and now - _STATS_CACHE_AT < _STATS_CACHE_TTL:
+            return _STATS_CACHE
+    result = _get_config_stats()
+    with _STATS_CACHE_LOCK:
+        _STATS_CACHE = result
+        _STATS_CACHE_AT = time.monotonic()
+    return result
+
+
+def _get_config_stats() -> dict:
     """Per-SMSC processing statistics based on the sms_tasks table.
 
     Queue attribution mirrors the gateway routing rules:
@@ -128,6 +165,8 @@ def get_config_stats() -> dict:
     """
     conn = get_connection()
     try:
+        from services import metrics_service
+
         rows = conn.execute("SELECT * FROM smpp_configs ORDER BY priority,id").fetchall()
         configs = [dict(r) for r in rows]
         enabled_ids = [c["id"] for c in configs if c.get("enabled")]
@@ -162,6 +201,16 @@ def get_config_stats() -> dict:
             ).fetchone()
             return int(row["parts"] or 0)
 
+        def _transport_count(event_name: str, cfg_id: int, pool_size: int, result=None) -> int:
+            """Read transport events without adding a DuckDB hot-path query."""
+            total = 0.0
+            for slot in range(1, max(1, int(pool_size or 1)) + 1):
+                labels = {"config_id": cfg_id, "slot": slot}
+                if result is not None:
+                    labels["result"] = result
+                total += metrics_service.rolling_count(event_name, labels, 60.0)
+            return int(round(total))
+
         stats = []
         for cfg in configs:
             cfg_id = cfg["id"]
@@ -183,6 +232,16 @@ def get_config_stats() -> dict:
                 "status='failed' AND CAST(updated_at AS TIMESTAMP WITH TIME ZONE) >= CURRENT_TIMESTAMP - INTERVAL '60 minutes'",
             )
             terminal_60m = delivered_60m + failed_60m
+            send_message_1m = _transport_count(
+                "marketing_copilot_smpp_submit_sm_sent", cfg_id, cfg.get("pool_size", 1),
+            )
+            submit_sm_resp_success_1m = _transport_count(
+                "marketing_copilot_smpp_submit_sm_resp", cfg_id, cfg.get("pool_size", 1), "success",
+            )
+            submit_sm_resp_failed_1m = _transport_count(
+                "marketing_copilot_smpp_submit_sm_resp", cfg_id, cfg.get("pool_size", 1), "failure",
+            )
+            submit_sm_resp_1m = submit_sm_resp_success_1m + submit_sm_resp_failed_1m
             stats.append({
                 "config_id": cfg_id,
                 "name": cfg.get("name", ""),
@@ -203,6 +262,15 @@ def get_config_stats() -> dict:
                 "submitted_parts_5m": submitted_parts_5m,
                 "submitted_parts_60m": submitted_parts_60m,
                 "submit_sm_tps_1m": round(submitted_parts_1m / 60.0, 2),
+                # Transport counters are independent from the durable task
+                # state.  They expose where the current minute is spent:
+                # socket send versus submit_sm_resp completion.
+                "send_message_1m": send_message_1m,
+                "send_message_tps_1m": round(send_message_1m / 60.0, 2),
+                "submit_sm_resp_1m": submit_sm_resp_1m,
+                "submit_sm_resp_success_1m": submit_sm_resp_success_1m,
+                "submit_sm_resp_failed_1m": submit_sm_resp_failed_1m,
+                "submit_sm_resp_tps_1m": round(submit_sm_resp_1m / 60.0, 2),
                 "delivered_60m": delivered_60m,
                 "failed_60m": failed_60m,
                 "failure_rate_60m": round(failed_60m / terminal_60m, 4) if terminal_60m else 0.0,
@@ -240,6 +308,12 @@ def get_config_stats() -> dict:
             "submitted_parts_5m": sum(item["submitted_parts_5m"] for item in stats),
             "submitted_parts_60m": sum(item["submitted_parts_60m"] for item in stats),
             "submit_sm_tps_1m": round(sum(item["submitted_parts_1m"] for item in stats) / 60.0, 2),
+            "send_message_1m": sum(item["send_message_1m"] for item in stats),
+            "send_message_tps_1m": round(sum(item["send_message_1m"] for item in stats) / 60.0, 2),
+            "submit_sm_resp_1m": sum(item["submit_sm_resp_1m"] for item in stats),
+            "submit_sm_resp_success_1m": sum(item["submit_sm_resp_success_1m"] for item in stats),
+            "submit_sm_resp_failed_1m": sum(item["submit_sm_resp_failed_1m"] for item in stats),
+            "submit_sm_resp_tps_1m": round(sum(item["submit_sm_resp_1m"] for item in stats) / 60.0, 2),
             "delivered_60m": sum(item["delivered_60m"] for item in stats),
             "failed_60m": sum(item["failed_60m"] for item in stats),
             "today_submitted": sum(item["today_submitted"] for item in stats),

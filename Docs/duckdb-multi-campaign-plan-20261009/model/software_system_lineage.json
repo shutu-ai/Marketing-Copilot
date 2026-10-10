@@ -1,0 +1,360 @@
+{
+  "components": [
+    {
+      "id": "SWL-001",
+      "name": "原子可靠写入与发送恢复",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "显式短事务、结果持久日志、attempt fencing和未知隔离",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "capability_ids": [
+        "CAP-101"
+      ],
+      "solution_element_ids": [
+        "ELM-001"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-001",
+        "TST-002",
+        "TST-009",
+        "TST-015",
+        "TST-016",
+        "TST-017",
+        "TST-018",
+        "TST-020"
+      ]
+    },
+    {
+      "id": "SWL-002",
+      "name": "活动发送公平和有条件保底",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "分片成本DRR、保底准入与闲置借用",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-002"
+      ],
+      "capability_ids": [
+        "CAP-102"
+      ],
+      "solution_element_ids": [
+        "ELM-002"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "test_ids": [
+        "TST-003",
+        "TST-004",
+        "TST-005",
+        "TST-011",
+        "TST-013",
+        "TST-014",
+        "TST-019"
+      ]
+    },
+    {
+      "id": "SWL-003",
+      "name": "文件处理及白名单资源隔离",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "公平扫描、原子预留、并发上限、可恢复chunk及专用白名单线程",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-003"
+      ],
+      "capability_ids": [
+        "CAP-103"
+      ],
+      "solution_element_ids": [
+        "ELM-003"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "test_ids": [
+        "TST-006",
+        "TST-007",
+        "TST-020"
+      ]
+    },
+    {
+      "id": "SWL-004",
+      "name": "准入和局部背压",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "活动与route信用联动，局部暂停和全局危险水位",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "test_ids": [
+        "TST-005",
+        "TST-006",
+        "TST-008",
+        "TST-011",
+        "TST-014",
+        "TST-017",
+        "TST-019",
+        "TST-020"
+      ]
+    },
+    {
+      "id": "SWL-005",
+      "name": "Web读写健壮性",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "写命令幂等/结果查询、轻读缓存、重任务后台化",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-005"
+      ],
+      "capability_ids": [
+        "CAP-105"
+      ],
+      "solution_element_ids": [
+        "ELM-005"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "test_ids": [
+        "TST-010",
+        "TST-013"
+      ]
+    },
+    {
+      "id": "SWL-006",
+      "name": "各活动观测及运维恢复",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "socket/resp/accepted分离，队列最老年龄和完整未完成工作量",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-006"
+      ],
+      "capability_ids": [
+        "CAP-106"
+      ],
+      "solution_element_ids": [
+        "ELM-006"
+      ],
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-011",
+        "TST-013"
+      ]
+    },
+    {
+      "id": "SWL-007",
+      "name": "长期运行与升级回退",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "恢复先重放；副本故障测试、离线依赖验证及24/72h浸泡",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "capability_ids": [
+        "CAP-107"
+      ],
+      "solution_element_ids": [
+        "ELM-007"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-002",
+        "TST-009",
+        "TST-011",
+        "TST-012",
+        "TST-015",
+        "TST-017",
+        "TST-018"
+      ]
+    },
+    {
+      "id": "SWL-008",
+      "name": "保留DuckDB和短信业务语义",
+      "current_scope": false,
+      "actors_use_cases": [
+        "运营活动保障",
+        "后台持续处理及运维恢复"
+      ],
+      "module_responsibility": "单主进程、禁盲目重发、accepted不冒充DLR、任务/PDU窗口单位明确",
+      "interface_contracts": [
+        "对应主文第4–10节合同；新增API不视为现有接口"
+      ],
+      "data_ownership": "业务主库由单进程管理；writer自有连接；白名单独立版本文件；发送结果日志独立持久接收",
+      "state_consistency": "短显式事务、token fencing、事件幂等；网络与数据库非跨系统原子",
+      "authorization": "延续现有登录角色权限；配置/回退/未知重发需授权，不记录凭据",
+      "failure_error_behavior": "有界重试；毒记录可追踪隔离；未知不盲目重发；无静默丢弃",
+      "deployment": "SLES12SP5单Uvicorn进程；本次未部署",
+      "scaling": "按实测容量准入；不扩同一主库多进程写入",
+      "observability": "campaign/type/config有界聚合，socket/resp/commit及最老年龄",
+      "backup_recovery": "停机一致副本或受支持检查点备份，保留WAL和日志；不回退数据库再重发",
+      "operational_owner": "应用研发与运维",
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "test_ids": [
+        "TST-004",
+        "TST-009",
+        "TST-012",
+        "TST-014",
+        "TST-015",
+        "TST-016",
+        "TST-020"
+      ]
+    }
+  ]
+}

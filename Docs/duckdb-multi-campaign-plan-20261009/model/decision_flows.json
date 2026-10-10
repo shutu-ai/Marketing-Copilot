@@ -1,0 +1,185 @@
+{
+  "flows": [
+    {
+      "id": "DFL-001",
+      "name": "发送准入",
+      "actor": "dispatcher",
+      "trigger": "有待发任务",
+      "decision": "按活动/route/日志信用及分片配额准入",
+      "required_inputs": [
+        "活动标识、版本/token、资源实测与队列最老年龄"
+      ],
+      "produced_action": "领取并发出或显式延后",
+      "outcome": "有条件保障且不制造本地失败重试",
+      "failure_consequence": "超额则局部暂停或拒绝承诺",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-009"
+      ],
+      "test_ids": [
+        "TST-003",
+        "TST-004",
+        "TST-005",
+        "TST-011",
+        "TST-013",
+        "TST-014",
+        "TST-019",
+        "TST-006",
+        "TST-008",
+        "TST-017",
+        "TST-020"
+      ]
+    },
+    {
+      "id": "DFL-002",
+      "name": "响应恢复",
+      "actor": "结果处理与运维",
+      "trigger": "响应到达或崩溃恢复",
+      "decision": "token/part/source证据判定",
+      "required_inputs": [
+        "活动标识、版本/token、资源实测与队列最老年龄"
+      ],
+      "produced_action": "持久接收、幂等补库、隔离未知",
+      "outcome": "不丢已接收结果、不盲目重发",
+      "failure_consequence": "磁盘满停止新发、未知需授权",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-008"
+      ],
+      "test_ids": [
+        "TST-001",
+        "TST-002",
+        "TST-009",
+        "TST-015",
+        "TST-016",
+        "TST-017",
+        "TST-018",
+        "TST-020",
+        "TST-011",
+        "TST-012",
+        "TST-004",
+        "TST-014"
+      ]
+    },
+    {
+      "id": "DFL-003",
+      "name": "文件接收",
+      "actor": "扫描/入库线程",
+      "trigger": "当前业务窗口文件",
+      "decision": "文件名过滤、容量预留、活动公平轮次",
+      "required_inputs": [
+        "活动标识、版本/token、资源实测与队列最老年龄"
+      ],
+      "produced_action": "有界扫描/处理/检查点让出",
+      "outcome": "小活动可获得服务",
+      "failure_consequence": "单活动失败隔离、全局危险保护结果",
+      "requirement_ids": [
+        "REQ-003",
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-103",
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-003",
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012",
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "test_ids": [
+        "TST-006",
+        "TST-007",
+        "TST-020",
+        "TST-005",
+        "TST-008",
+        "TST-011",
+        "TST-014",
+        "TST-017",
+        "TST-019"
+      ]
+    },
+    {
+      "id": "DFL-004",
+      "name": "Web与运营",
+      "actor": "授权运营人员",
+      "trigger": "查询或修改",
+      "decision": "轻读快照/幂等命令/资源审批",
+      "required_inputs": [
+        "活动标识、版本/token、资源实测与队列最老年龄"
+      ],
+      "produced_action": "返回数据时效或command_id/忙状态",
+      "outcome": "可查询超时后的真实结果",
+      "failure_consequence": "不把不确定提交描述成成功或失败",
+      "requirement_ids": [
+        "REQ-005",
+        "REQ-006"
+      ],
+      "capability_ids": [
+        "CAP-105",
+        "CAP-106"
+      ],
+      "solution_element_ids": [
+        "ELM-005",
+        "ELM-006"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013",
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-010",
+        "TST-013",
+        "TST-011"
+      ]
+    }
+  ]
+}

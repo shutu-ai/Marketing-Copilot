@@ -1,0 +1,232 @@
+{
+  "status": "PASS",
+  "gate_stage": "final",
+  "context": {
+    "project_stage": "DISCOVERY",
+    "orientation": "ENGINEERING",
+    "active_domains": [
+      "software_system"
+    ],
+    "output_mode": "md"
+  },
+  "required_by_policy": {
+    "material_processing_receipts": true,
+    "solution_elements": true,
+    "acceptance_tests": true,
+    "implementation_trace": true,
+    "architecture_decisions": true,
+    "nfr_registry": true,
+    "delivery_scope": true,
+    "decision_flows": true,
+    "canonical_consistency": true,
+    "value_hypotheses": false,
+    "integration_contracts": false,
+    "active_domain_lineages": [
+      "software_system"
+    ],
+    "artifact_handoff": false,
+    "presentation_design_spec": false,
+    "document_design_spec": false,
+    "dashboard_ui_mockup_coverage": false,
+    "artifact_render_receipts": false,
+    "artifact_form_quality": false,
+    "semantic_critic": true
+  },
+  "failed_gates": [],
+  "gates": {
+    "solution_context": {
+      "exit_code": 0,
+      "result": {
+        "active_domains": [
+          "software_system"
+        ],
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "material_completeness": {
+      "exit_code": 0,
+      "result": {
+        "total_materials": 17,
+        "errors": [],
+        "unresolved_count": 0,
+        "unresolved": []
+      },
+      "stderr": ""
+    },
+    "material_processing_receipts": {
+      "exit_code": 0,
+      "result": {
+        "receipts": 17,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "evidence_ledger": {
+      "exit_code": 0,
+      "result": {
+        "evidence_items": 17,
+        "materials": 17,
+        "receipt_provenance_checked": true,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "requirements": {
+      "exit_code": 0,
+      "result": {
+        "requirements": 8,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "requirement_coverage": {
+      "exit_code": 0,
+      "result": {
+        "requirements": 8,
+        "accounted": 8,
+        "accounted_pct": 100.0,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "capability_evidence": {
+      "exit_code": 0,
+      "result": {
+        "capabilities": 16,
+        "domain": "software_system",
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "solution_elements": {
+      "exit_code": 0,
+      "result": {
+        "elements": 8,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "acceptance_tests": {
+      "exit_code": 0,
+      "result": {
+        "tests": 20,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "implementation_trace": {
+      "exit_code": 0,
+      "result": {
+        "items": 8,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "architecture_decisions": {
+      "exit_code": 0,
+      "result": {
+        "decisions": 6,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "nfr_registry": {
+      "exit_code": 0,
+      "result": {
+        "nfrs": 7,
+        "categories": [
+          "OBSERVABILITY",
+          "OPERABILITY",
+          "PERFORMANCE",
+          "RECOVERABILITY",
+          "RELIABILITY",
+          "SCALABILITY",
+          "SECURITY"
+        ],
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "delivery_scope": {
+      "exit_code": 0,
+      "result": {
+        "scope_items": 8,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "decision_flows": {
+      "exit_code": 0,
+      "result": {
+        "flows": 4,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "software_system_engineering_lineage": {
+      "exit_code": 0,
+      "result": {
+        "errors": [],
+        "warnings": [],
+        "count": 8
+      },
+      "stderr": ""
+    },
+    "cross_ledger_lint": {
+      "exit_code": 0,
+      "result": {
+        "errors": [],
+        "warnings": [],
+        "counts": {
+          "requirements": 8,
+          "capabilities": 16,
+          "elements": 8,
+          "tests": 20,
+          "implementations": 8,
+          "decisions": 6,
+          "nfrs": 7,
+          "integrations": 0,
+          "values": 0,
+          "delivery_scope_items": 8,
+          "decision_flows": 4
+        }
+      },
+      "stderr": ""
+    },
+    "canonical_consistency": {
+      "exit_code": 0,
+      "result": {
+        "claims": 8,
+        "canonical_sha256": "7d811727ffe55ae64c003f744728165c3473e7cf4d304b8bda304f72015a9e9e",
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    },
+    "semantic_critic": {
+      "exit_code": 0,
+      "result": {
+        "findings": 8,
+        "revisions": 3,
+        "errors": [],
+        "warnings": []
+      },
+      "stderr": ""
+    }
+  },
+  "finalization_rule": "PASS means evidence/material/requirement/core architecture and context-required domain/value/integration gates are satisfied. final also requires critic + semantic/form handoff, target design specifications and Dashboard UI coverage when applicable; postrender additionally verifies semantic fidelity, renderer tier, typed visuals, complete page-by-page inspection, document/presentation form and outcome-first content separation."
+}

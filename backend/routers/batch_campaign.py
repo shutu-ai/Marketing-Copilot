@@ -2,6 +2,7 @@ import os
 import tempfile
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
+from database import is_transient_write_error
 from services import batch_campaign_service
 
 router = APIRouter(prefix="/api/batch-campaigns", tags=["Batch Campaign"])
@@ -113,4 +114,10 @@ def upload_customer_list(campaign_id: int, file: UploadFile = File(...)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        if is_transient_write_error(e):
+            raise HTTPException(
+                status_code=503,
+                detail="当前数据库写入繁忙，请稍后重试",
+                headers={"Retry-After": "1"},
+            ) from e
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")

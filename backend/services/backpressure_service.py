@@ -5,7 +5,7 @@ import shutil
 import threading
 import time
 
-from database import get_connection, get_database_file
+from database import get_database_file, read_transaction
 
 
 TASK_HIGH = max(1000, int(os.environ.get("MC_BATCH_INGEST_HIGH_WATERMARK", "50000")))
@@ -19,8 +19,10 @@ DISK_LOW = max(40.0, min(DISK_HIGH, float(os.environ.get("MC_DISK_LOW_WATERMARK_
 MIN_FREE_BYTES = max(0, int(float(os.environ.get("MC_DISK_MIN_FREE_GB", "1")) * 1024 ** 3))
 
 _lock = threading.Lock()
-_paused = {"tasks": False, "writes": False, "chunks": False, "disk": False}
+_paused = {"tasks": False, "writes": False, "chunks": False, "disk": False,
+           "results": False}
 _depth_cache = {"at": 0.0, "database": "", "tasks": 0, "chunks": 0}
+_disk_cache = {"at": 0.0, "database": "", "value": None}
 
 
 def _database_depths() -> tuple[int, int]:
@@ -29,17 +31,18 @@ def _database_depths() -> tuple[int, int]:
     with _lock:
         if _depth_cache["database"] == database_path and now - _depth_cache["at"] < 1.0:
             return int(_depth_cache["tasks"]), int(_depth_cache["chunks"])
-    conn = get_connection()
-    try:
-        tasks = conn.execute(
-            """SELECT COUNT(*) count FROM sms_tasks
-               WHERE status IN ('queued','retrying','sending')"""
-        ).fetchone()["count"]
-        chunks = conn.execute(
-            "SELECT COUNT(*) count FROM ingestion_chunks WHERE status IN ('pending','failed')"
-        ).fetchone()["count"]
-    finally:
-        conn.close()
+    tasks, chunks = read_transaction(
+        lambda conn: (
+            conn.execute(
+                """SELECT COUNT(*) count FROM sms_tasks
+                   WHERE status IN ('queued','retrying','sending')"""
+            ).fetchone()["count"],
+            conn.execute(
+                "SELECT COUNT(*) count FROM ingestion_chunks WHERE status IN ('pending','failed')"
+            ).fetchone()["count"],
+        ),
+        operation="backpressure.depths",
+    )
     with _lock:
         _depth_cache.update({"at": now, "database": database_path,
                              "tasks": int(tasks), "chunks": int(chunks)})
@@ -56,9 +59,17 @@ def _chunk_depth() -> int:
 
 def _disk_state() -> dict:
     target = os.path.dirname(os.path.abspath(get_database_file())) or os.getcwd()
+    now = time.monotonic()
+    with _lock:
+        if (_disk_cache["database"] == target and _disk_cache["value"] is not None
+                and now - _disk_cache["at"] < 1.0):
+            return dict(_disk_cache["value"])
     usage = shutil.disk_usage(target)
     used_pct = (usage.used / usage.total * 100.0) if usage.total else 100.0
-    return {"path": target, "used_pct": round(used_pct, 2), "free_bytes": usage.free}
+    value = {"path": target, "used_pct": round(used_pct, 2), "free_bytes": usage.free}
+    with _lock:
+        _disk_cache.update({"at": now, "database": target, "value": value})
+    return dict(value)
 
 
 def snapshot(include_task_depth: bool = True) -> dict:
@@ -73,6 +84,10 @@ def snapshot(include_task_depth: bool = True) -> dict:
         "write_depth": int(writes["queue_depth"]),
         "write_depths": writes.get("queue_depths", {}),
         "disk": disk,
+        "result_journal": writes.get("journal", {}),
+        "write_retry_depth": int(writes.get("retry_depth", 0)),
+        "write_quarantined": int(writes.get("quarantined", 0)),
+        "write_oldest_seconds": float(writes.get("pending_oldest_seconds", 0.0)),
     }
     with _lock:
         values["paused"] = dict(_paused)
@@ -88,6 +103,11 @@ def reasons(producing_chunks: bool = False) -> tuple[list[str], dict]:
         )
         _paused["writes"] = (
             state["write_depth"] > (WRITE_LOW if _paused["writes"] else WRITE_HIGH)
+        )
+        journal = state.get("result_journal", {})
+        _paused["results"] = (
+            not journal.get("healthy", True)
+            or int(state.get("write_quarantined", 0)) > 0
         )
         if producing_chunks:
             _paused["chunks"] = (
@@ -113,3 +133,15 @@ def wait_for_ingestion(stop_event=None, producing_chunks: bool = False,
         if stop_event is not None and stop_event.is_set():
             return False
         time.sleep(max(0.05, interval))
+
+
+def wait_for_delivery(stop_event=None, interval: float = 0.05) -> bool:
+    """Pause new claims while preserving capacity to drain received results."""
+    while True:
+        active, _state = reasons(producing_chunks=False)
+        blocking = [reason for reason in active if reason in {"writes", "disk", "results"}]
+        if not blocking:
+            return stop_event is None or not stop_event.is_set()
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(max(0.02, interval))

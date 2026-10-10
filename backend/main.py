@@ -3,13 +3,21 @@ import os
 import threading
 import logging
 
+import duckdb
+
 sys.path.insert(0, os.path.dirname(__file__))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from database import init_db
+from database import (
+    init_db,
+    is_database_read_error,
+    is_transient_write_error,
+    read_transaction,
+)
 from auth import auth_middleware
 from services import update_service
 from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router, users as users_router
@@ -19,6 +27,100 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Marketing Copilot API", version=update_service.version_info().get("version", "1.2.0"))
+
+
+def _smpp_unavailable_status() -> dict:
+    """Keep health/capacity responses usable while the DB is temporarily down."""
+    return {
+        "state": "unknown",
+        "connected": False,
+        "config_id": None,
+        "active_config_id": None,
+        "enabled_configs": None,
+        "pools": [],
+        "last_error": "DATABASE_READ_UNAVAILABLE",
+    }
+
+
+def _database_busy_response(request: Request, exc: BaseException) -> JSONResponse:
+    logger.warning(
+        "Database write contention request=%s method=%s error=%s",
+        request.url.path, request.method, exc,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "当前数据库写入繁忙，请稍后重试",
+            "code": "DATABASE_WRITE_BUSY",
+            "retryable": True,
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+@app.exception_handler(TimeoutError)
+async def handle_timeout(request: Request, exc: TimeoutError):
+    if is_transient_write_error(exc):
+        return _database_busy_response(request, exc)
+    logger.warning("Request timed out path=%s error=%s", request.url.path, exc)
+    return JSONResponse(
+        status_code=504,
+        content={
+            "detail": "请求处理超时，请稍后重试",
+            "code": "REQUEST_TIMEOUT",
+            "retryable": True,
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+@app.exception_handler(duckdb.TransactionException)
+async def handle_transaction_conflict(request: Request, exc: duckdb.TransactionException):
+    if is_transient_write_error(exc):
+        return _database_busy_response(request, exc)
+    logger.exception("Unhandled DuckDB transaction error path=%s", request.url.path)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "数据库事务暂时不可用，请稍后重试",
+            "code": "DATABASE_TRANSACTION_UNAVAILABLE",
+            "retryable": True,
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+@app.exception_handler(duckdb.IOException)
+async def handle_database_io_error(request: Request, exc: duckdb.IOException):
+    logger.warning(
+        "Database read I/O unavailable request=%s method=%s error=%s",
+        request.url.path, request.method, exc,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Database temporarily unavailable; please retry.",
+            "code": "DATABASE_READ_UNAVAILABLE",
+            "retryable": True,
+        },
+        headers={"Retry-After": "1"},
+    )
+
+
+_DUCKDB_ERROR = getattr(duckdb, "Error", None)
+if _DUCKDB_ERROR is not None:
+    @app.exception_handler(_DUCKDB_ERROR)
+    async def handle_database_error(request: Request, exc):
+        logger.exception("Unhandled DuckDB error path=%s", request.url.path)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Database temporarily unavailable; please retry.",
+                "code": "DATABASE_UNAVAILABLE",
+                "retryable": True,
+            },
+            headers={"Retry-After": "1"},
+        )
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,34 +194,62 @@ def shutdown():
     from services.task_worker import stop_worker
     from services.activity_scheduler import stop_scheduler
     from services.sms_write_buffer import stop as stop_sms_write_buffer
-    stop_scheduler()
-    stop_worker()
-    stop_sms_write_buffer()
-    release_instance_lock()
+    # Stop producers first, then disconnect SMPP/stop claims, and only then
+    # drain the durable result buffer.  A failure in one stage must not skip
+    # the remaining cleanup or leave the instance lock behind.
+    for name, stop in (
+        ("activity scheduler", stop_scheduler),
+        ("SMS workers", stop_worker),
+        ("SMS result buffer", stop_sms_write_buffer),
+    ):
+        try:
+            stop()
+        except Exception:
+            logger.exception("Shutdown stage failed: %s", name)
+    try:
+        release_instance_lock()
+    except Exception:
+        logger.exception("Failed to release instance lock during shutdown")
 
 
 @app.get("/api/health")
 def health():
     db_ok = False
     try:
-        from database import get_connection
-        conn = get_connection()
-        conn.execute("SELECT 1")
+        read_transaction(
+            lambda conn: conn.execute("SELECT 1"),
+            operation="health",
+        )
         db_ok = True
     except Exception:
         pass
     from services.smpp_gateway import gateway
+    try:
+        smpp = gateway.status()
+    except Exception as exc:
+        if not is_database_read_error(exc):
+            raise
+        logger.warning("Health SMPP status unavailable: %s", exc)
+        smpp = _smpp_unavailable_status()
     return {"status": "ok" if db_ok else "degraded", "service": "Marketing Copilot",
-            "database": "connected" if db_ok else "disconnected", "smpp": gateway.status()}
+            "database": "connected" if db_ok else "disconnected", "smpp": smpp}
 
 
 @app.get("/api/ready")
 def ready():
-    from database import get_connection
     try:
-        conn = get_connection(); conn.execute("SELECT 1"); conn.close()
+        read_transaction(
+            lambda conn: conn.execute("SELECT 1"),
+            operation="ready",
+        )
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
+        if not is_database_read_error(exc):
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail="database temporarily unavailable; please retry",
+            headers={"Retry-After": "1"},
+        ) from exc
     return {"status": "ready", "version": update_service.version_info().get("version", "1.2.0")}
 
 

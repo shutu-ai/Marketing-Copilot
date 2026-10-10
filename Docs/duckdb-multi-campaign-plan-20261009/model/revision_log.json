@@ -1,0 +1,48 @@
+{
+  "revisions": [
+    {
+      "id": "REV-001",
+      "finding_ids": [
+        "CRIT-001",
+        "CRIT-002",
+        "CRIT-003"
+      ],
+      "summary": "依据独立只读审计补设计正确性边界；代码缺陷仍待实施，不声称已修复",
+      "changed_artifacts": [
+        "Solution_Final.md",
+        "model/acceptance_tests.json"
+      ],
+      "notes": "无远端变更/代码实现；独立复审中"
+    },
+    {
+      "id": "REV-002",
+      "finding_ids": [
+        "CRIT-004",
+        "CRIT-005",
+        "CRIT-006",
+        "CRIT-007"
+      ],
+      "summary": "依据独立设计复审补齐恢复/公平容量/SLO/ACK/schema协议，删除矛盾的旧停机摘要",
+      "changed_artifacts": [
+        "Solution_Final.md",
+        "04_Target_Architecture.md",
+        "05_Data_and_Interfaces.md",
+        "12_Validation_and_Acceptance.md",
+        "model/acceptance_tests.json"
+      ],
+      "notes": "设计闭环，未修复代码、未部署；硬件/真实到达率等实测缺口保留。"
+    },
+    {
+      "id": "REV-003",
+      "finding_ids": [
+        "CRIT-008"
+      ],
+      "summary": "采纳最终只读复审的非阻断诊断措辞修订；独立review判定研究方案无剩余设计阻断",
+      "changed_artifacts": [
+        "Solution_Final.md",
+        "06_NFR_and_Operations.md"
+      ],
+      "notes": "代码实现/线上容量验收仍未执行。"
+    }
+  ]
+}

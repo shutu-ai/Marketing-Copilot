@@ -1,10 +1,9 @@
 from datetime import datetime, timedelta
-from database import get_connection
+
+from database import read_transaction
 
 
-def get_stats() -> dict:
-    conn = get_connection()
-
+def _get_stats(conn) -> dict:
     # Batch campaign stats
     total_batch = conn.execute("SELECT COUNT(*) AS cnt FROM batch_campaigns").fetchone()
     batch_in_progress = conn.execute(
@@ -14,8 +13,6 @@ def get_stats() -> dict:
         "SELECT COUNT(*) AS cnt FROM realtime_campaigns WHERE status='in_progress'"
     ).fetchone()
     ended = conn.execute("SELECT COUNT(*) AS cnt FROM batch_campaigns WHERE status='ended'").fetchone()
-
-    # Count actual delivered SMS tasks across both batch and realtime campaigns.
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
     today_sent = conn.execute(
@@ -25,14 +22,8 @@ def get_stats() -> dict:
              AND CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE)=CAST(? AS DATE)""",
         (today_str,)
     ).fetchone()
-
-    # SMS content campaigns count
     sms_count = conn.execute("SELECT COUNT(*) AS cnt FROM campaigns").fetchone()
-
-    # Realtime files processed today
-    rt_campaigns = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM realtime_campaigns"
-    ).fetchone()
+    rt_campaigns = conn.execute("SELECT COUNT(*) AS cnt FROM realtime_campaigns").fetchone()
     rt_files = conn.execute(
         """SELECT COALESCE(COUNT(*),0) AS file_count,
                   COALESCE(SUM(total_msisdn),0) AS total_msisdn,
@@ -41,12 +32,10 @@ def get_stats() -> dict:
            WHERE CAST(created_at AS DATE)=CAST(? AS DATE)""",
         (today_str,),
     ).fetchone()
-
     trend_start = (now - timedelta(days=6)).strftime("%Y-%m-%d")
     trend_rows = conn.execute(
         """SELECT strftime(CAST(COALESCE(delivered_at, submitted_at, updated_at) AS DATE), '%Y-%m-%d') AS stats_date,
-                  COUNT(*) AS sent_count,
-                  0 AS conversion_count
+                  COUNT(*) AS sent_count, 0 AS conversion_count
            FROM sms_tasks
            WHERE status IN ('delivered','accepted')
              AND COALESCE(delivered_at, submitted_at, updated_at) IS NOT NULL
@@ -59,7 +48,9 @@ def get_stats() -> dict:
     daily_trend = []
     for offset in range(6, -1, -1):
         day = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
-        daily_trend.append(trend_map.get(day, {"stats_date": day, "sent_count": 0, "conversion_count": 0}))
+        daily_trend.append(trend_map.get(day, {
+            "stats_date": day, "sent_count": 0, "conversion_count": 0,
+        }))
     exception_rows = conn.execute("""SELECT id,category,severity,code,message,created_at FROM system_events
         WHERE resolved=0 AND CAST(created_at AS DATE)=CAST(? AS DATE)
         ORDER BY CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
@@ -69,7 +60,6 @@ def get_stats() -> dict:
            WHERE resolved=0 AND CAST(created_at AS DATE)=CAST(? AS DATE)""",
         (today_str,),
     ).fetchone()
-    conn.close()
     rt = dict(rt_files) if rt_files else {"file_count": 0, "total_msisdn": 0, "total_matched": 0}
     batch_in_progress_count = batch_in_progress["cnt"] if batch_in_progress else 0
     realtime_in_progress_count = realtime_in_progress["cnt"] if realtime_in_progress else 0
@@ -89,3 +79,7 @@ def get_stats() -> dict:
         "today_open_exception_count": exception_count["cnt"] if exception_count else 0,
         "today_recent_exceptions": [dict(row) for row in exception_rows],
     }
+
+
+def get_stats() -> dict:
+    return read_transaction(_get_stats, operation="dashboard.stats")

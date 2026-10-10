@@ -1,0 +1,288 @@
+{
+  "scope_items": [
+    {
+      "id": "SCP-001",
+      "name": "原子可靠写入与发送恢复",
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-001"
+      ],
+      "target_capability_ids": [
+        "CAP-101"
+      ],
+      "target_solution_element_ids": [
+        "ELM-001"
+      ],
+      "phase": "A：可靠性",
+      "change_or_gap": "显式短事务、结果持久日志、attempt fencing和未知隔离",
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-001",
+        "TST-002",
+        "TST-009",
+        "TST-015",
+        "TST-016",
+        "TST-017",
+        "TST-018",
+        "TST-020"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-002",
+      "name": "活动发送公平和有条件保底",
+      "requirement_ids": [
+        "REQ-002"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-002"
+      ],
+      "target_capability_ids": [
+        "CAP-102"
+      ],
+      "target_solution_element_ids": [
+        "ELM-002"
+      ],
+      "phase": "B：公平发送",
+      "change_or_gap": "分片成本DRR、保底准入与闲置借用",
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "test_ids": [
+        "TST-003",
+        "TST-004",
+        "TST-005",
+        "TST-011",
+        "TST-013",
+        "TST-014",
+        "TST-019"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-003",
+      "name": "文件处理及白名单资源隔离",
+      "requirement_ids": [
+        "REQ-003"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-003"
+      ],
+      "target_capability_ids": [
+        "CAP-103"
+      ],
+      "target_solution_element_ids": [
+        "ELM-003"
+      ],
+      "phase": "C：入库隔离",
+      "change_or_gap": "公平扫描、原子预留、并发上限、可恢复chunk及专用白名单线程",
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "test_ids": [
+        "TST-006",
+        "TST-007",
+        "TST-020"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-004",
+      "name": "准入和局部背压",
+      "requirement_ids": [
+        "REQ-004"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-004"
+      ],
+      "target_capability_ids": [
+        "CAP-104"
+      ],
+      "target_solution_element_ids": [
+        "ELM-004"
+      ],
+      "phase": "B/C：容量准入",
+      "change_or_gap": "活动与route信用联动，局部暂停和全局危险水位",
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "test_ids": [
+        "TST-005",
+        "TST-006",
+        "TST-008",
+        "TST-011",
+        "TST-014",
+        "TST-017",
+        "TST-019",
+        "TST-020"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-005",
+      "name": "Web读写健壮性",
+      "requirement_ids": [
+        "REQ-005"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-005"
+      ],
+      "target_capability_ids": [
+        "CAP-105"
+      ],
+      "target_solution_element_ids": [
+        "ELM-005"
+      ],
+      "phase": "D：Web保护",
+      "change_or_gap": "写命令幂等/结果查询、轻读缓存、重任务后台化",
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "test_ids": [
+        "TST-010",
+        "TST-013"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-006",
+      "name": "各活动观测及运维恢复",
+      "requirement_ids": [
+        "REQ-006"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-006"
+      ],
+      "target_capability_ids": [
+        "CAP-106"
+      ],
+      "target_solution_element_ids": [
+        "ELM-006"
+      ],
+      "phase": "B/D：可观测性",
+      "change_or_gap": "socket/resp/accepted分离，队列最老年龄和完整未完成工作量",
+      "evidence_ids": [
+        "EVD-010",
+        "EVD-011",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-011",
+        "TST-013"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-007",
+      "name": "长期运行与升级回退",
+      "requirement_ids": [
+        "REQ-007"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-007"
+      ],
+      "target_capability_ids": [
+        "CAP-107"
+      ],
+      "target_solution_element_ids": [
+        "ELM-007"
+      ],
+      "phase": "A/D：恢复和发布",
+      "change_or_gap": "恢复先重放；副本故障测试、离线依赖验证及24/72h浸泡",
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017"
+      ],
+      "test_ids": [
+        "TST-002",
+        "TST-009",
+        "TST-011",
+        "TST-012",
+        "TST-015",
+        "TST-017",
+        "TST-018"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    },
+    {
+      "id": "SCP-008",
+      "name": "保留DuckDB和短信业务语义",
+      "requirement_ids": [
+        "REQ-008"
+      ],
+      "as_is_state": "PARTIAL",
+      "target_commitment": "NEXT_PHASE",
+      "current_capability_ids": [
+        "CAP-008"
+      ],
+      "target_capability_ids": [
+        "CAP-108"
+      ],
+      "target_solution_element_ids": [
+        "ELM-008"
+      ],
+      "phase": "全阶段：兼容边界",
+      "change_or_gap": "单主进程、禁盲目重发、accepted不冒充DLR、任务/PDU窗口单位明确",
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-008",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "test_ids": [
+        "TST-004",
+        "TST-009",
+        "TST-012",
+        "TST-014",
+        "TST-015",
+        "TST-016",
+        "TST-020"
+      ],
+      "owner": "研发/运维",
+      "notes": "本次仅文档；NEXT_PHASE不代表用户已授权实施。"
+    }
+  ]
+}

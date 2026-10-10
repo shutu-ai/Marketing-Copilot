@@ -32,7 +32,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 NAME="marketing-copilot-sles12sp5-system-python-$VERSION"
 STAGE="$WORK/$NAME"
-mkdir -p "$STAGE/backend" "$STAGE/frontend" "$STAGE/offline"
+mkdir -p "$STAGE/backend" "$STAGE/frontend" "$STAGE/offline" "$STAGE/bin"
 tar -xzf "$WHEELHOUSE" -C "$WORK"
 SOURCE_WHEEL_DIR=$(find "$WORK" -path '*/wheels/app' -type d -print -quit)
 [ -n "$SOURCE_WHEEL_DIR" ] || { echo 'Application wheel directory is missing from wheelhouse.' >&2; exit 1; }
@@ -47,6 +47,17 @@ tar -C "$ROOT/backend" \
 cp -a "$ROOT/frontend/dist" "$STAGE/frontend/"
 cp -a "$SOURCE_WHEEL_DIR" "$STAGE/offline/wheels"
 cp "$ROOT/backend/requirements.txt" "$STAGE/offline/requirements.txt"
+# DuckDB may auto-load core_functions while opening/replaying a WAL. Keep the
+# matching signed extension inside the offline package so a fresh venv never
+# depends on internet access or a previous user's ~/.duckdb cache.
+DUCKDB_VERSION=$(awk -F'==' '$1 == "duckdb" { print $2; exit }' "$ROOT/backend/requirements.txt")
+CORE_FUNCTIONS_EXTENSION="$ROOT/cache/duckdb-extensions/$DUCKDB_VERSION/linux_amd64_gcc4/core_functions.duckdb_extension"
+[ -f "$CORE_FUNCTIONS_EXTENSION" ] || {
+  echo "Matching offline DuckDB core_functions extension was not found: $CORE_FUNCTIONS_EXTENSION" >&2
+  exit 1
+}
+mkdir -p "$STAGE/offline/extensions/$DUCKDB_VERSION/linux_amd64_gcc4"
+cp "$CORE_FUNCTIONS_EXTENSION" "$STAGE/offline/extensions/$DUCKDB_VERSION/linux_amd64_gcc4/"
 # Deployment text files must use Unix line endings. The repository may be
 # checked out on Windows before the package is built in WSL/Linux.
 normalize_text() { tr -d '\r' < "$1" > "$2"; }
@@ -54,6 +65,9 @@ normalize_text "$ROOT/deploy/marketing-copilot.single-dir.env.example" "$STAGE/m
 normalize_text "$ROOT/deploy/run-system-python-manual.sh" "$STAGE/run.sh"
 normalize_text "$ROOT/deploy/README-system-python-manual.md" "$STAGE/README.md"
 chmod 0755 "$STAGE/run.sh"
+normalize_text "$ROOT/backend/tools/mcctl.py" "$STAGE/bin/mcctl.py"
+normalize_text "$ROOT/deploy/marketing-copilot-cli" "$STAGE/bin/marketing-copilot-cli"
+chmod 0755 "$STAGE/bin/marketing-copilot-cli"
 # Version metadata for the online-update feature.
 GIT_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
 if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then

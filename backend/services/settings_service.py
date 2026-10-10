@@ -1,4 +1,4 @@
-from database import get_connection
+from database import get_connection, read_transaction, write_transaction
 
 RETENTION_SETTING_DEFAULTS = {
     "sms_task_retention_days": "3",
@@ -14,9 +14,12 @@ RETENTION_SETTING_DEFAULTS = {
 
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = get_connection()
-    row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT value FROM app_settings WHERE key=?", (key,)
+        ).fetchone(),
+        operation="settings.get",
+    )
     return row["value"] if row else default
 
 
@@ -27,13 +30,13 @@ def set_setting(key: str, value: str) -> dict:
     if key == "detail_logging":
         from services.runtime_service import normalize_detail_logging, set_detail_logging
         value = normalize_detail_logging(value)
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=?",
-        (key, value, value)
-    )
-    conn.commit()
-    conn.close()
+    def write(conn):
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=?",
+            (key, value, value),
+        )
+
+    write_transaction(write, operation="setting.update")
     if key == "log_level":
         set_log_level(value)
     elif key == "detail_logging":
@@ -42,7 +45,8 @@ def set_setting(key: str, value: str) -> dict:
 
 
 def get_all() -> list:
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM app_settings ORDER BY key").fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute("SELECT * FROM app_settings ORDER BY key").fetchall(),
+        operation="settings.list",
+    )
     return [dict(r) for r in rows]

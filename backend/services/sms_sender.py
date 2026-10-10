@@ -84,7 +84,7 @@ def process_message(routing_key: str, message: dict):
         if is_dev:
             sms_task_service.mark_submitted(
                 task["id"], [f"DEV-{task['id']}"], "optional",
-                submit_sm_parts=1, wait=False,
+                submit_sm_parts=1, claim_token=task.get("claim_token", ""), wait=False,
             )
             sms_success = True
         else:
@@ -116,6 +116,9 @@ def _send_sms_via_smpp(task: dict) -> bool:
             task.get("_delivery_receipt_mode", "optional"),
             transport_smpp_config_id=task.get("_transport_smpp_config_id"),
             submit_sm_parts=task.get("_submit_sm_parts"),
+            claim_token=task.get("claim_token", ""),
+            attempt_token=task.get("_attempt_token", ""),
+            source_namespace=task.get("_source_namespace", ""),
             wait=False,
         )
         return True

@@ -1,0 +1,425 @@
+{
+  "decisions": [
+    {
+      "id": "DEC-001",
+      "title": "保留单进程共享资源，采用公平调度而非每活动一套进程/写库",
+      "status": "PROPOSED",
+      "decision": "DEC-001：保留单进程共享资源，采用公平调度而非每活动一套进程/写库。理由是现有DuckDB文件与资源共享；代价是共享引擎故障域仍存在。",
+      "drivers": [
+        "当前DuckDB模式、正确性先于吞吐、可量化多活动能力"
+      ],
+      "options": [
+        {
+          "name": "保留单进程共享资源，采用公平调度而非每活动一套进程/写库",
+          "pros": [
+            "符合本次范围并可分阶段验证"
+          ],
+          "cons": [
+            "需要显式实现和回归"
+          ],
+          "selected": true
+        },
+        {
+          "name": "迁移数据库后才处理问题",
+          "pros": [
+            "改动局部或实现简单"
+          ],
+          "cons": [
+            "不能完整解决当前可靠性与资源公平"
+          ],
+          "selected": false
+        }
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-102",
+        "CAP-103",
+        "CAP-104",
+        "CAP-105",
+        "CAP-106",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-002",
+        "ELM-003",
+        "ELM-004",
+        "ELM-005",
+        "ELM-006",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-016"
+      ],
+      "consequences": [
+        "须通过对应阶段验收才发布；不能宣称永不卡死"
+      ],
+      "revisit_trigger": "实测瓶颈、恢复语义或容量需求不再符合假设",
+      "owner": "研发负责人"
+    },
+    {
+      "id": "DEC-002",
+      "title": "先补短事务和结果恢复，再集中写协调",
+      "status": "PROPOSED",
+      "decision": "DEC-002：先补短事务和结果恢复，再集中写协调。直接一次替换全部写接口风险较大；迁移期绕行路径必须有指标。",
+      "drivers": [
+        "当前DuckDB模式、正确性先于吞吐、可量化多活动能力"
+      ],
+      "options": [
+        {
+          "name": "先补短事务和结果恢复，再集中写协调",
+          "pros": [
+            "符合本次范围并可分阶段验证"
+          ],
+          "cons": [
+            "需要显式实现和回归"
+          ],
+          "selected": true
+        },
+        {
+          "name": "仅增加worker与重试",
+          "pros": [
+            "改动局部或实现简单"
+          ],
+          "cons": [
+            "不能完整解决当前可靠性与资源公平"
+          ],
+          "selected": false
+        }
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-102",
+        "CAP-103",
+        "CAP-104",
+        "CAP-105",
+        "CAP-106",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-002",
+        "ELM-003",
+        "ELM-004",
+        "ELM-005",
+        "ELM-006",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-016"
+      ],
+      "consequences": [
+        "须通过对应阶段验收才发布；不能宣称永不卡死"
+      ],
+      "revisit_trigger": "实测瓶颈、恢复语义或容量需求不再符合假设",
+      "owner": "研发负责人"
+    },
+    {
+      "id": "DEC-003",
+      "title": "用分片成本DRR，限速/保底按实测预算",
+      "status": "PROPOSED",
+      "decision": "DEC-003：用分片成本DRR，限速/保底按实测预算。平均每任务一票会让长短信多占容量；过多固定限速会浪费闲置份额。",
+      "drivers": [
+        "当前DuckDB模式、正确性先于吞吐、可量化多活动能力"
+      ],
+      "options": [
+        {
+          "name": "用分片成本DRR，限速/保底按实测预算",
+          "pros": [
+            "符合本次范围并可分阶段验证"
+          ],
+          "cons": [
+            "需要显式实现和回归"
+          ],
+          "selected": true
+        },
+        {
+          "name": "按任务数平均分配",
+          "pros": [
+            "改动局部或实现简单"
+          ],
+          "cons": [
+            "不能完整解决当前可靠性与资源公平"
+          ],
+          "selected": false
+        }
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-102",
+        "CAP-103",
+        "CAP-104",
+        "CAP-105",
+        "CAP-106",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-002",
+        "ELM-003",
+        "ELM-004",
+        "ELM-005",
+        "ELM-006",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-016"
+      ],
+      "consequences": [
+        "须通过对应阶段验收才发布；不能宣称永不卡死"
+      ],
+      "revisit_trigger": "实测瓶颈、恢复语义或容量需求不再符合假设",
+      "owner": "研发负责人"
+    },
+    {
+      "id": "DEC-004",
+      "title": "白名单专用线程默认串行",
+      "status": "PROPOSED",
+      "decision": "DEC-004：白名单专用线程默认串行。并行2为未来有条件选项，不能把多库memory_limit相加后仍称内存有界。",
+      "drivers": [
+        "当前DuckDB模式、正确性先于吞吐、可量化多活动能力"
+      ],
+      "options": [
+        {
+          "name": "白名单专用线程默认串行",
+          "pros": [
+            "符合本次范围并可分阶段验证"
+          ],
+          "cons": [
+            "需要显式实现和回归"
+          ],
+          "selected": true
+        },
+        {
+          "name": "无限队列吞吐优先",
+          "pros": [
+            "改动局部或实现简单"
+          ],
+          "cons": [
+            "不能完整解决当前可靠性与资源公平"
+          ],
+          "selected": false
+        }
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-102",
+        "CAP-103",
+        "CAP-104",
+        "CAP-105",
+        "CAP-106",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-002",
+        "ELM-003",
+        "ELM-004",
+        "ELM-005",
+        "ELM-006",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-016"
+      ],
+      "consequences": [
+        "须通过对应阶段验收才发布；不能宣称永不卡死"
+      ],
+      "revisit_trigger": "实测瓶颈、恢复语义或容量需求不再符合假设",
+      "owner": "研发负责人"
+    },
+    {
+      "id": "DEC-005",
+      "title": "保留真实成功resp作为accepted依据，并增加日志",
+      "status": "PROPOSED",
+      "decision": "DEC-005：保留真实成功resp作为accepted依据，并增加日志。仅“默认成功、失败回写”会使超时/崩溃的不确定状态混入成功统计。",
+      "drivers": [
+        "当前DuckDB模式、正确性先于吞吐、可量化多活动能力"
+      ],
+      "options": [
+        {
+          "name": "保留真实成功resp作为accepted依据，并增加日志",
+          "pros": [
+            "符合本次范围并可分阶段验证"
+          ],
+          "cons": [
+            "需要显式实现和回归"
+          ],
+          "selected": true
+        },
+        {
+          "name": "主库同步写每条响应",
+          "pros": [
+            "改动局部或实现简单"
+          ],
+          "cons": [
+            "不能完整解决当前可靠性与资源公平"
+          ],
+          "selected": false
+        }
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-102",
+        "CAP-103",
+        "CAP-104",
+        "CAP-105",
+        "CAP-106",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-002",
+        "ELM-003",
+        "ELM-004",
+        "ELM-005",
+        "ELM-006",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-016"
+      ],
+      "consequences": [
+        "须通过对应阶段验收才发布；不能宣称永不卡死"
+      ],
+      "revisit_trigger": "实测瓶颈、恢复语义或容量需求不再符合假设",
+      "owner": "研发负责人"
+    },
+    {
+      "id": "DEC-006",
+      "title": "同一DuckDB热库保留业务去重约束，先减少历史扫描/小事务和重试循环",
+      "status": "PROPOSED",
+      "decision": "DEC-006：同一DuckDB热库保留业务去重约束，先减少历史扫描/小事务和重试循环。拆campaign独立业务库暂缓，避免跨活动配置/清单/报表迁移。",
+      "drivers": [
+        "当前DuckDB模式、正确性先于吞吐、可量化多活动能力"
+      ],
+      "options": [
+        {
+          "name": "同一DuckDB热库保留业务去重约束，先减少历史扫描/小事务和重试循环",
+          "pros": [
+            "符合本次范围并可分阶段验证"
+          ],
+          "cons": [
+            "需要显式实现和回归"
+          ],
+          "selected": true
+        },
+        {
+          "name": "直接提高所有并发",
+          "pros": [
+            "改动局部或实现简单"
+          ],
+          "cons": [
+            "不能完整解决当前可靠性与资源公平"
+          ],
+          "selected": false
+        }
+      ],
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-102",
+        "CAP-103",
+        "CAP-104",
+        "CAP-105",
+        "CAP-106",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-002",
+        "ELM-003",
+        "ELM-004",
+        "ELM-005",
+        "ELM-006",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-016"
+      ],
+      "consequences": [
+        "须通过对应阶段验收才发布；不能宣称永不卡死"
+      ],
+      "revisit_trigger": "实测瓶颈、恢复语义或容量需求不再符合假设",
+      "owner": "研发负责人"
+    }
+  ]
+}
+

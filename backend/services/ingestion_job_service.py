@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
-from database import get_connection
+from database import get_connection, write_transaction
 
 
 DEFAULT_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_CHUNK_LEASE_SECONDS", "300")))
@@ -35,22 +35,41 @@ def get_file(campaign_type: str, campaign_id: int, filename: str) -> Optional[di
 def register_file(campaign_type: str, campaign_id: int, filename: str, file_path: str,
                   total_rows: int = 0, chunk_size: int = 5000,
                   chunks: Optional[Iterable[dict]] = None, reset: bool = False,
-                  whitelist_version_id: Optional[int] = None) -> tuple[int, bool]:
+                  whitelist_version_id: Optional[int] = None,
+                  reservation_token: str = "") -> tuple[int, bool]:
     """Register by stable business identity; a renamed file is a new manifest."""
     safe_filename = os.path.basename(filename)
     absolute_path = os.path.abspath(file_path) if file_path else ""
     file_size = os.path.getsize(absolute_path) if absolute_path and os.path.isfile(absolute_path) else 0
-    conn = get_connection()
-    try:
+    def write(conn):
+        if reservation_token:
+            reservation = conn.execute(
+                """SELECT token FROM realtime_inbox_reservations
+                   WHERE token=? AND campaign_id=? AND filename=?
+                     AND TRY_CAST(expires_at AS TIMESTAMPTZ)>CURRENT_TIMESTAMP""",
+                (reservation_token, int(campaign_id), safe_filename),
+            ).fetchone()
+            if not reservation:
+                raise RuntimeError("realtime inbox capacity reservation is missing or expired")
         existing = conn.execute(
             """SELECT * FROM ingestion_files
                WHERE campaign_type=? AND campaign_id=? AND filename=?""",
             (campaign_type, campaign_id, safe_filename),
         ).fetchone()
         if existing and existing["status"] == "completed" and not reset:
+            if reservation_token:
+                conn.execute(
+                    "DELETE FROM realtime_inbox_reservations WHERE token=?",
+                    (reservation_token,),
+                )
             return existing["id"], True
         if existing and not reset and existing["file_path"] == absolute_path \
                 and int(existing.get("file_size", 0) or 0) == file_size:
+            if reservation_token:
+                conn.execute(
+                    "DELETE FROM realtime_inbox_reservations WHERE token=?",
+                    (reservation_token,),
+                )
             return existing["id"], False
         if existing:
             file_id = existing["id"]
@@ -88,50 +107,195 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
                 "UPDATE ingestion_files SET total_chunks=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (len(chunk_rows), file_id),
             )
-        conn.commit()
+        if reservation_token:
+            conn.execute(
+                "DELETE FROM realtime_inbox_reservations WHERE token=?",
+                (reservation_token,),
+            )
         return file_id, False
-    finally:
-        conn.close()
+
+    return write_transaction(write, operation="ingestion_file.register")
+
+
+def reserve_realtime_capacity(campaign_id: int, filename: str, file_size: int,
+                              max_campaign_files: int, max_total_files: int,
+                              max_total_bytes: int, source: str = "") -> dict:
+    """Atomically reserve one realtime inbox slot across every intake path."""
+    token = uuid.uuid4().hex
+    safe_filename = os.path.basename(filename)
+    file_size = max(0, int(file_size or 0))
+
+    def reserve(conn):
+        conn.execute(
+            """DELETE FROM realtime_inbox_reservations
+               WHERE TRY_CAST(expires_at AS TIMESTAMPTZ)<=CURRENT_TIMESTAMP"""
+        )
+        existing = conn.execute(
+            """SELECT id FROM ingestion_files
+               WHERE campaign_type='realtime' AND campaign_id=? AND filename=?""",
+            (int(campaign_id), safe_filename),
+        ).fetchone()
+        if existing:
+            return {"ok": False, "duplicate": True, "reason": "file is already registered"}
+        reserved = conn.execute(
+            """SELECT token FROM realtime_inbox_reservations
+               WHERE campaign_id=? AND filename=?""",
+            (int(campaign_id), safe_filename),
+        ).fetchone()
+        if reserved:
+            return {"ok": False, "duplicate": True, "reason": "file is already reserved"}
+        active = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN campaign_id=? THEN 1 ELSE 0 END) campaign_count,
+                 COUNT(*) total_count,COALESCE(SUM(file_size),0) total_bytes
+               FROM ingestion_files
+               WHERE campaign_type='realtime'
+                 AND status IN ('pending','processing','retrying')""",
+            (int(campaign_id),),
+        ).fetchone()
+        reservations = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN campaign_id=? THEN 1 ELSE 0 END) campaign_count,
+                 COUNT(*) total_count,COALESCE(SUM(file_size),0) total_bytes
+               FROM realtime_inbox_reservations""",
+            (int(campaign_id),),
+        ).fetchone()
+        policy = conn.execute(
+            """SELECT max_pending_tasks,max_ingest_files
+               FROM campaign_capacity_policies
+               WHERE campaign_type='realtime' AND campaign_id=? AND enabled=1""",
+            (int(campaign_id),),
+        ).fetchone()
+        effective_campaign_files = int(max_campaign_files)
+        if policy and policy["max_ingest_files"] is not None:
+            effective_campaign_files = min(
+                effective_campaign_files, max(1, int(policy["max_ingest_files"]))
+            )
+        if policy and policy["max_pending_tasks"] is not None:
+            pending_tasks = conn.execute(
+                """SELECT COUNT(*) count FROM sms_tasks
+                   WHERE campaign_type='realtime' AND campaign_id=?
+                     AND status IN ('queued','retrying','sending')""",
+                (int(campaign_id),),
+            ).fetchone()["count"]
+            if int(pending_tasks or 0) >= int(policy["max_pending_tasks"]):
+                return {"ok": False, "duplicate": False,
+                        "reason": "campaign pending SMS task limit reached"}
+        campaign_count = int(active["campaign_count"] or 0) + int(reservations["campaign_count"] or 0)
+        total_count = int(active["total_count"] or 0) + int(reservations["total_count"] or 0)
+        total_bytes = int(active["total_bytes"] or 0) + int(reservations["total_bytes"] or 0)
+        if campaign_count >= effective_campaign_files:
+            return {"ok": False, "duplicate": False,
+                    "reason": "campaign realtime inbox pending limit reached"}
+        if total_count >= int(max_total_files):
+            return {"ok": False, "duplicate": False,
+                    "reason": "global realtime inbox pending limit reached"}
+        if total_bytes + file_size > int(max_total_bytes):
+            return {"ok": False, "duplicate": False,
+                    "reason": "global realtime inbox byte limit reached"}
+        conn.execute(
+            """INSERT INTO realtime_inbox_reservations
+               (token,campaign_id,filename,file_size,source,expires_at)
+               VALUES (?,?,?,?,?,CAST(CURRENT_TIMESTAMP + INTERVAL '10 minutes' AS VARCHAR))""",
+            (token, int(campaign_id), safe_filename, file_size, str(source or "")),
+        )
+        return {"ok": True, "duplicate": False, "reason": "", "token": token}
+
+    return write_transaction(reserve, operation="realtime_inbox.reserve")
+
+
+def release_realtime_capacity(token: str) -> None:
+    if not token:
+        return
+    write_transaction(
+        lambda conn: conn.execute(
+            "DELETE FROM realtime_inbox_reservations WHERE token=?", (str(token),)
+        ),
+        operation="realtime_inbox.release",
+    )
 
 
 def claim_file(campaign_type: str = "realtime", worker_id: str = "",
-               lease_seconds: int = FILE_LEASE_SECONDS) -> Optional[dict]:
-    """Atomically lease one pending ingestion file for a single worker."""
+               lease_seconds: int = FILE_LEASE_SECONDS,
+               campaign_id: Optional[int] = None) -> Optional[dict]:
+    """Atomically lease one pending ingestion file for a single worker.
+
+    ``campaign_id`` is optional for backward compatibility.  Realtime workers
+    use it to claim from one campaign selected by their round-robin scheduler;
+    other callers retain the original global queue behavior.
+    """
     token = uuid.uuid4().hex
     worker_id = worker_id or f"realtime-ingestion-{os.getpid()}"
-    lease_until = (datetime.now() + timedelta(seconds=max(30, lease_seconds))).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
     try:
+        campaign_clause = "" if campaign_id is None else " AND campaign_id=?"
+        select_params = [campaign_type]
+        if campaign_id is not None:
+            select_params.append(int(campaign_id))
         row = conn.execute(
             """SELECT id FROM ingestion_files
                WHERE campaign_type=? AND status IN ('pending','retrying')
                  AND """ + _RETRY_DUE_SQL + """
+                 """ + campaign_clause + """
                  AND (campaign_type<>'realtime' OR EXISTS (
                       SELECT 1 FROM realtime_campaigns c
                       WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
                  ))
                -- Realtime filenames carry a fixed-width YYYYMMDDHHMMSS token,
                -- so lexical order is chronological for the watched files.
-               ORDER BY CASE WHEN campaign_type='realtime' THEN filename ELSE created_at END,id LIMIT 1""", (campaign_type,)
+               ORDER BY CASE WHEN campaign_type='realtime' THEN filename ELSE created_at END,id LIMIT 1""", select_params
         ).fetchone()
         if not row:
             return None
+        claim_params = [worker_id, token, max(30, lease_seconds), row["id"]]
+        if campaign_id is not None:
+            claim_params.append(int(campaign_id))
         claimed = conn.execute(
             """UPDATE ingestion_files SET status='processing',worker_id=?,lease_token=?,
-               lease_expires_at=?,processing_started_at=COALESCE(processing_started_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
+               lease_expires_at=CAST(CURRENT_TIMESTAMP+(? * INTERVAL '1 second') AS VARCHAR),
+               processing_started_at=COALESCE(processing_started_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
                last_progress_at=CURRENT_TIMESTAMP,processing_phase='queued',updated_at=CURRENT_TIMESTAMP
                WHERE id=? AND status IN ('pending','retrying')
                  AND """ + _RETRY_DUE_SQL + """
+                 """ + (" AND campaign_id=?" if campaign_id is not None else "") + """
                  AND (campaign_type<>'realtime' OR EXISTS (
                       SELECT 1 FROM realtime_campaigns c
                       WHERE c.id=ingestion_files.campaign_id AND c.status='in_progress'
                  ))
-               RETURNING *""", (worker_id, token, lease_until, row["id"]),
+               RETURNING *""", claim_params,
         ).fetchone()
         if claimed:
             conn.commit()
             return dict(claimed)
         return None
+    finally:
+        conn.close()
+
+
+def pending_campaign_ids(campaign_type: str = "realtime") -> list[int]:
+    """Return active campaigns that currently have a claimable file.
+
+    This is intentionally a small read-only query.  The caller chooses the
+    next campaign and then calls ``claim_file(..., campaign_id=...)`` so the
+    actual lease remains an atomic UPDATE transaction.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT f.campaign_id
+               FROM ingestion_files f
+               WHERE f.campaign_type=?
+                 AND f.campaign_id IS NOT NULL
+                 AND f.status IN ('pending','retrying')
+                 AND """ + _RETRY_DUE_SQL + """
+                 AND (f.campaign_type<>'realtime' OR EXISTS (
+                      SELECT 1 FROM realtime_campaigns c
+                      WHERE c.id=f.campaign_id AND c.status='in_progress'
+                 ))
+               ORDER BY f.campaign_id""",
+            (campaign_type,),
+        ).fetchall()
+        return [int(row["campaign_id"]) for row in rows]
     finally:
         conn.close()
 

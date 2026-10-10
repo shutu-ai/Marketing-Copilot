@@ -1,6 +1,6 @@
 import os
-import threading
 import logging
+import threading
 import time
 
 import duckdb
@@ -10,9 +10,210 @@ logger = logging.getLogger(__name__)
 # Serialize mutations, but allow independent read connections to run while the
 # SMS writer is committing. Every WrappedConnection is still protected against
 # simultaneous use by multiple Python threads.
-_write_lock = threading.Lock()
+#
+# The lock is re-entrant because a writer transaction holds it across all of
+# its statements and commit/rollback.  Locking only one execute() at a time
+# allowed two transactions to interleave and made DuckDB's optimistic
+# write-write conflicts much more likely.
+_write_lock = threading.RLock()
+_write_state_lock = threading.Lock()
+_write_holder = {
+    "thread_id": None,
+    "operation": "",
+    "acquired_at": 0.0,
+}
+
+try:
+    _WRITE_LOCK_TIMEOUT_SECONDS = max(
+        0.5, float(os.environ.get("MC_DUCKDB_WRITE_LOCK_TIMEOUT_SECONDS", "5"))
+    )
+except (TypeError, ValueError):
+    _WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+
+try:
+    _READ_RETRIES = max(1, min(5, int(os.environ.get("MC_DUCKDB_READ_RETRIES", "2"))))
+except (TypeError, ValueError):
+    _READ_RETRIES = 2
+
+try:
+    _READ_RETRY_DELAY_SECONDS = max(
+        0.0, float(os.environ.get("MC_DUCKDB_READ_RETRY_DELAY_MS", "50")) / 1000.0
+    )
+except (TypeError, ValueError):
+    _READ_RETRY_DELAY_SECONDS = 0.05
 
 _READ_ONLY_STATEMENTS = {"SELECT", "EXPLAIN", "DESCRIBE", "SHOW"}
+
+
+def is_transient_write_error(error: BaseException) -> bool:
+    """Return whether *error* is safe to retry as a whole write transaction.
+
+    DuckDB can surface contention as either the Python-side writer-gate
+    timeout or a transaction conflict.  Keep this predicate in one place so
+    HTTP handlers, upload services and background workers classify the same
+    failures consistently.  We deliberately do not classify arbitrary
+    ``TimeoutError`` instances (for example a whitelist build timeout) as a
+    database failure.
+    """
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            text = str(current).lower()
+            if "duckdb write lock timeout" in text or "database write lock" in text:
+                return True
+        if isinstance(current, duckdb.TransactionException):
+            text = str(current).lower()
+            if any(marker in text for marker in (
+                "write-write conflict",
+                "transaction conflict",
+                "transactioncontext error",
+                "write conflict",
+            )):
+                return True
+        text = str(current).lower()
+        if any(marker in text for marker in (
+            "could not set lock on file",
+            "database is locked",
+            "database busy",
+            "write-write conflict",
+            "transaction conflict",
+        )):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_transient_read_error(error: BaseException) -> bool:
+    """Return whether a read may succeed after the database settles.
+
+    Read failures are kept separate from write conflicts.  A malformed SQL
+    statement must not be retried, while a short-lived file/WAL/lock problem
+    should get a bounded retry and a stable retryable HTTP response.
+    """
+    seen = set()
+    current = error
+    io_error = getattr(duckdb, "IOException", None)
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if io_error is not None and isinstance(current, io_error):
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in (
+            "could not set lock on file",
+            "conflicting lock is held",
+            "database is locked",
+            "database busy",
+            "could not open file",
+            "i/o error",
+            "io error",
+            "input/output error",
+            "failure while replaying wal",
+            "wal file",
+            "extension",
+        )):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_database_read_error(error: BaseException) -> bool:
+    """Classify DuckDB failures that should be exposed as read unavailability."""
+    if is_transient_read_error(error):
+        return True
+    duckdb_error = getattr(duckdb, "Error", None)
+    if duckdb_error is not None and isinstance(error, duckdb_error):
+        return True
+    return False
+
+
+def read_transaction(callback, attempts: int = None, operation: str = "read",
+                     base_delay: float = None):
+    """Run a short read operation with guaranteed connection cleanup.
+
+    ``callback`` must fully materialize any rows it returns before returning;
+    the connection is closed before this helper returns.  Retrying the whole
+    read avoids returning a partial composite response after a transient file
+    or WAL error.
+    """
+    attempts = _READ_RETRIES if attempts is None else max(1, min(5, int(attempts)))
+    delay = _READ_RETRY_DELAY_SECONDS if base_delay is None else max(0.0, float(base_delay))
+    for attempt in range(1, attempts + 1):
+        conn = None
+        try:
+            conn = get_connection()
+            result = callback(conn)
+            return result
+        except BaseException as exc:
+            if not is_transient_read_error(exc) or attempt >= attempts:
+                raise
+            _inc_database_metric(
+                "marketing_copilot_database_read_retries_total",
+                labels={"operation": operation},
+            )
+            logger.warning(
+                "DuckDB read temporarily unavailable; retrying operation=%s attempt=%s/%s",
+                operation, attempt + 1, attempts,
+            )
+            time.sleep(delay * attempt)
+        finally:
+            if conn is not None:
+                conn.close()
+    raise RuntimeError(f"DuckDB read did not complete: {operation}")
+
+
+def write_busy_message(error: BaseException) -> str:
+    """Stable user-facing message for transient DuckDB write contention."""
+    if is_transient_write_error(error):
+        return "当前数据库写入繁忙，请稍后重试"
+    return "数据库写入失败，请联系管理员"
+
+
+def write_transaction(callback, attempts: int = 3, operation: str = "write",
+                      lock_timeout=None, base_delay: float = 0.05):
+    """Run a complete short write transaction with bounded retry.
+
+    The callback must not call ``commit`` or ``close``.  Retrying the whole
+    transaction is important: after a DuckDB write-write conflict, replaying
+    only the failed statement can leave earlier statements from the logical
+    operation missing or partially committed.
+    """
+    attempts = max(1, min(5, int(attempts or 1)))
+    for attempt in range(1, attempts + 1):
+        conn = None
+        try:
+            # Connection acquisition can itself fail while DuckDB is replaying
+            # a WAL or another process briefly owns the file lock. Keep it
+            # inside the retry scope so Web writes do not fail before the
+            # transaction retry policy gets a chance to run.
+            conn = get_connection()
+            conn.write_lock_timeout = lock_timeout
+            conn.execute("BEGIN TRANSACTION")
+            result = callback(conn)
+            conn.commit()
+            return result
+        except BaseException as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    logger.debug("DuckDB rollback failed after write error", exc_info=True)
+            if not is_transient_write_error(exc) or attempt >= attempts:
+                raise
+            _inc_database_metric(
+                "marketing_copilot_database_write_transaction_retries_total",
+                labels={"operation": operation},
+            )
+            logger.warning(
+                "DuckDB write transaction busy; retrying operation=%s attempt=%s/%s",
+                operation, attempt + 1, attempts,
+            )
+            time.sleep(max(0.0, float(base_delay)) * attempt)
+        finally:
+            if conn is not None:
+                conn.close()
+    raise RuntimeError(f"DuckDB write transaction did not complete: {operation}")
 
 
 def _is_read_only_statement(sql: str) -> bool:
@@ -23,7 +224,61 @@ def _is_read_only_statement(sql: str) -> bool:
             return True
         statement = remainder.lstrip()
     first_token = statement.split(None, 1)[0].upper() if statement else ""
-    return first_token in _READ_ONLY_STATEMENTS
+    if first_token in _READ_ONLY_STATEMENTS:
+        return True
+    if first_token != "WITH":
+        return False
+
+    # A read-only CTE starts with WITH but is still safe to run while another
+    # connection owns the application writer gate.  Do not use a substring
+    # check: SELECT commonly appears inside CTE bodies, and a write CTE must
+    # remain serialized.  This small scanner only considers SQL keywords
+    # outside quoted strings and nested parentheses.
+    depth = 0
+    quote = None
+    token = []
+    top_level_keyword = None
+    nested_write = False
+    write_keywords = {"INSERT", "UPDATE", "DELETE", "MERGE", "COPY"}
+
+    def flush_token():
+        nonlocal top_level_keyword, nested_write
+        if not token:
+            return
+        word = "".join(token).upper()
+        token.clear()
+        if word in write_keywords:
+            if depth == 0:
+                top_level_keyword = word
+            else:
+                nested_write = True
+        elif word == "SELECT" and depth == 0 and top_level_keyword is None:
+            top_level_keyword = word
+
+    for char in statement:
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"', "`"):
+            flush_token()
+            quote = char
+            continue
+        if char == "(":
+            flush_token()
+            depth += 1
+            continue
+        if char == ")":
+            flush_token()
+            depth = max(0, depth - 1)
+            continue
+        if char.isalpha() or char == "_":
+            token.append(char)
+        else:
+            flush_token()
+
+    flush_token()
+    return top_level_keyword == "SELECT" and not nested_write
 
 
 def _observe_database_metric(name: str, value: float, labels=None) -> None:
@@ -33,6 +288,79 @@ def _observe_database_metric(name: str, value: float, labels=None) -> None:
     except Exception:
         # Database operations must not fail because runtime metrics are down.
         pass
+
+
+def _inc_database_metric(name: str, amount: int = 1, labels=None) -> None:
+    try:
+        from services import metrics_service
+        metrics_service.inc(name, amount=amount, labels=labels)
+    except Exception:
+        pass
+
+
+def _acquire_write_lock(operation: str, timeout=None) -> float:
+    timeout = _WRITE_LOCK_TIMEOUT_SECONDS if timeout is None else max(0.0, timeout)
+    started = time.perf_counter()
+    acquired = _write_lock.acquire(timeout=timeout)
+    waited = time.perf_counter() - started
+    if not acquired:
+        holder = write_lock_status()
+        _inc_database_metric(
+            "marketing_copilot_database_write_lock_timeouts_total",
+            labels={"operation": operation},
+        )
+        raise TimeoutError(
+            f"DuckDB write lock timeout after {timeout:.1f}s "
+            f"during {operation}; holder={holder['operation'] or 'unknown'} "
+            f"holder_age={holder['age_seconds']:.3f}s "
+            f"holder_thread={holder['thread_id'] or 'unknown'}"
+        )
+    with _write_state_lock:
+        _write_holder.update({
+            "thread_id": threading.get_ident(),
+            "operation": str(operation),
+            "acquired_at": time.monotonic(),
+        })
+    return waited
+
+
+def _update_write_holder(operation: str) -> None:
+    with _write_state_lock:
+        if _write_holder["thread_id"] == threading.get_ident():
+            _write_holder["operation"] = str(operation)
+
+
+def _clear_write_holder() -> None:
+    with _write_state_lock:
+        if _write_holder["thread_id"] == threading.get_ident():
+            _write_holder.update({"thread_id": None, "operation": "", "acquired_at": 0.0})
+
+
+def write_lock_status() -> dict:
+    """Return non-sensitive diagnostics for the process-wide writer gate."""
+    with _write_state_lock:
+        thread_id = _write_holder["thread_id"]
+        operation = _write_holder["operation"]
+        acquired_at = _write_holder["acquired_at"]
+    age = max(0.0, time.monotonic() - acquired_at) if acquired_at else 0.0
+    return {
+        "held": bool(thread_id),
+        "thread_id": thread_id,
+        "operation": operation,
+        "age_seconds": round(age, 3),
+    }
+
+
+def duckdb_connection_config() -> dict:
+    """Return offline-safe DuckDB settings for the application database."""
+    extension_directory = os.environ.get("MC_DUCKDB_EXTENSION_DIR", "").strip()
+    if not extension_directory:
+        extension_directory = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "offline", "extensions"
+        )
+    if os.path.isdir(extension_directory):
+        return {"extension_directory": extension_directory}
+    return {}
 
 DATABASE_FILE = os.environ.get(
     "DUCKDB_PATH",
@@ -117,6 +445,32 @@ class WrappedConnection:
         self.conn = conn
         self._last_sql = ""
         self._connection_lock = threading.RLock()
+        self._write_lock_held = False
+        self.write_lock_timeout = None
+
+    def _ensure_write_lock(self, operation: str) -> float:
+        if self._write_lock_held:
+            _update_write_holder(operation)
+            return 0.0
+        waited = _acquire_write_lock(operation, self.write_lock_timeout)
+        self._write_lock_held = True
+        return waited
+
+    def _release_write_lock(self) -> None:
+        if self._write_lock_held:
+            self._write_lock_held = False
+            _clear_write_holder()
+            _write_lock.release()
+
+    def _rollback_underlying(self) -> None:
+        """Rollback without masking the original DuckDB exception."""
+        try:
+            self.conn.rollback()
+        except Exception:
+            # DuckDB can report "no transaction is active" after an auto-
+            # committed DDL or a failed statement.  The application-level
+            # writer gate still must be released in that case.
+            logger.debug("DuckDB rollback was not active", exc_info=True)
 
     def execute(self, sql, params=None):
         sql = sql.replace("datetime('now','localtime')", "CURRENT_TIMESTAMP")
@@ -125,9 +479,7 @@ class WrappedConnection:
         write_wait = 0.0
         with self._connection_lock:
             if not read_only:
-                wait_started = time.perf_counter()
-                _write_lock.acquire()
-                write_wait = time.perf_counter() - wait_started
+                write_wait = self._ensure_write_lock("execute")
             execution_started = time.perf_counter()
             try:
                 if params is not None:
@@ -136,10 +488,18 @@ class WrappedConnection:
                     self.conn.execute(sql, params)
                 else:
                     self.conn.execute(sql)
+            except BaseException:
+                if not read_only:
+                    self._rollback_underlying()
+                    self._release_write_lock()
+                else:
+                    # A failed read connection is no longer safe to reuse.
+                    # Close it here as a last line of defence for legacy
+                    # callers that predate the read_transaction helper.
+                    self.close()
+                raise
             finally:
                 execution_seconds = time.perf_counter() - execution_started
-                if not read_only:
-                    _write_lock.release()
         kind = "read" if read_only else "write"
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
@@ -155,15 +515,16 @@ class WrappedConnection:
         sql = sql.replace("datetime('now','localtime')", "CURRENT_TIMESTAMP")
         self._last_sql = sql
         with self._connection_lock:
-            wait_started = time.perf_counter()
-            _write_lock.acquire()
-            write_wait = time.perf_counter() - wait_started
+            write_wait = self._ensure_write_lock("executemany")
             execution_started = time.perf_counter()
             try:
                 self.conn.executemany(sql, rows)
+            except BaseException:
+                self._rollback_underlying()
+                self._release_write_lock()
+                raise
             finally:
                 execution_seconds = time.perf_counter() - execution_started
-                _write_lock.release()
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": "write"},
@@ -174,16 +535,24 @@ class WrappedConnection:
         return self
 
     def fetchone(self):
-        with self._connection_lock:
-            row = self.conn.fetchone()
+        try:
+            with self._connection_lock:
+                row = self.conn.fetchone()
+        except BaseException:
+            self.close()
+            raise
         if row is None:
             return None
         cols = [desc[0] for desc in self.conn.description] if self.conn.description else []
         return DuckRow(cols, list(row))
 
     def fetchall(self):
-        with self._connection_lock:
-            rows = self.conn.fetchall()
+        try:
+            with self._connection_lock:
+                rows = self.conn.fetchall()
+        except BaseException:
+            self.close()
+            raise
         if not rows:
             return []
         cols = [desc[0] for desc in self.conn.description] if self.conn.description else []
@@ -219,15 +588,16 @@ class WrappedConnection:
 
     def commit(self):
         with self._connection_lock:
-            wait_started = time.perf_counter()
-            _write_lock.acquire()
-            write_wait = time.perf_counter() - wait_started
+            write_wait = self._ensure_write_lock("commit")
             execution_started = time.perf_counter()
             try:
                 self.conn.commit()
+            except BaseException:
+                self._rollback_underlying()
+                raise
             finally:
                 execution_seconds = time.perf_counter() - execution_started
-                _write_lock.release()
+                self._release_write_lock()
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": "commit"},
@@ -236,16 +606,51 @@ class WrappedConnection:
             "marketing_copilot_database_write_lock_wait_seconds", write_wait,
         )
 
+    def rollback(self):
+        with self._connection_lock:
+            started = time.perf_counter()
+            try:
+                self._rollback_underlying()
+            finally:
+                self._release_write_lock()
+            _observe_database_metric(
+                "marketing_copilot_database_rollback_seconds",
+                time.perf_counter() - started,
+            )
+
     def close(self):
         try:
             with self._connection_lock:
+                if self._write_lock_held:
+                    self._rollback_underlying()
+                    self._release_write_lock()
                 self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None and self._write_lock_held:
+            self.rollback()
+        self.close()
+        return False
+
+    def __del__(self):
+        # A number of legacy service functions predate context-manager use.
+        # Make an uncaught exception unable to strand the process-wide writer
+        # gate until an arbitrary future garbage-collection cycle.
+        try:
+            self.close()
         except Exception:
             pass
 
 
 def get_connection():
-    return WrappedConnection(duckdb.connect(DATABASE_FILE))
+    return WrappedConnection(
+        duckdb.connect(DATABASE_FILE, config=duckdb_connection_config())
+    )
 
 
 def reconnect(path: str = None):
@@ -490,6 +895,7 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS delivery_receipts (
             id INTEGER DEFAULT nextval('seq_delivery_receipts') PRIMARY KEY,
             task_id INTEGER,
+            source_namespace TEXT NOT NULL DEFAULT 'legacy',
             smsc_message_id TEXT NOT NULL DEFAULT '',
             message_state TEXT NOT NULL DEFAULT '',
             raw_receipt TEXT NOT NULL DEFAULT '',
@@ -499,6 +905,73 @@ def init_db():
             smsc_message_id TEXT PRIMARY KEY,
             task_id INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
+        """CREATE TABLE IF NOT EXISTS sms_message_bindings_v2 (
+            source_namespace TEXT NOT NULL,
+            smsc_message_id TEXT NOT NULL,
+            task_id BIGINT NOT NULL,
+            attempt_token TEXT NOT NULL DEFAULT '',
+            part_no INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            PRIMARY KEY(source_namespace,smsc_message_id,task_id,attempt_token,part_no)
+        )""",
+        """CREATE TABLE IF NOT EXISTS sms_send_attempts (
+            attempt_token TEXT PRIMARY KEY,
+            task_id BIGINT NOT NULL,
+            claim_token TEXT NOT NULL DEFAULT '',
+            source_namespace TEXT NOT NULL DEFAULT '',
+            smpp_config_id INTEGER,
+            slot INTEGER,
+            planned_parts INTEGER NOT NULL DEFAULT 0,
+            accepted_parts INTEGER NOT NULL DEFAULT 0,
+            failed_parts INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'intent',
+            lease_until TEXT,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
+        """CREATE TABLE IF NOT EXISTS sms_send_parts (
+            attempt_token TEXT NOT NULL,
+            part_no INTEGER NOT NULL,
+            sequence BIGINT,
+            connection_generation TEXT NOT NULL DEFAULT '',
+            source_namespace TEXT NOT NULL DEFAULT '',
+            response_status INTEGER,
+            smsc_message_id TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'planned',
+            sent_at TEXT,
+            responded_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            PRIMARY KEY(attempt_token,part_no)
+        )""",
+        """CREATE TABLE IF NOT EXISTS sms_result_events (
+            event_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            task_id BIGINT,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
+        """CREATE TABLE IF NOT EXISTS campaign_capacity_policies (
+            campaign_type TEXT NOT NULL,
+            campaign_id BIGINT NOT NULL,
+            weight DOUBLE NOT NULL DEFAULT 1.0,
+            min_parts_tps DOUBLE NOT NULL DEFAULT 0,
+            max_parts_tps DOUBLE,
+            max_outstanding_parts BIGINT,
+            max_pending_tasks BIGINT,
+            max_ingest_files INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            PRIMARY KEY(campaign_type,campaign_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS realtime_inbox_reservations (
+            token TEXT PRIMARY KEY,
+            campaign_id BIGINT NOT NULL,
+            filename TEXT NOT NULL,
+            file_size BIGINT NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT '',
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            UNIQUE(campaign_id,filename)
         )""",
         """CREATE TABLE IF NOT EXISTS processed_files (
             id INTEGER DEFAULT nextval('seq_processed_files') PRIMARY KEY,
@@ -740,6 +1213,7 @@ def init_db():
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS transport_smpp_config_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS submit_sm_parts INTEGER DEFAULT 0",
+        "ALTER TABLE delivery_receipts ADD COLUMN IF NOT EXISTS source_namespace TEXT DEFAULT 'legacy'",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS window_size INTEGER DEFAULT 10",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS task_count INTEGER DEFAULT 0",
@@ -849,7 +1323,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_status ON sms_tasks(status, next_attempt_at)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_campaign ON sms_tasks(campaign_type, campaign_id)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_date ON sms_tasks(campaign_type, task_date, status, next_attempt_at)",
-        "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(smsc_message_id)",
+        "DROP INDEX IF EXISTS idx_delivery_message_id",
+        "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(source_namespace,smsc_message_id)",
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_created ON sms_tasks(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_keyset ON sms_tasks(id)",
@@ -861,9 +1336,16 @@ def init_db():
         # tasks (simulator restarts its counter, some SMSCs recycle ids), so
         # the same (message_id, state) must be allowed on different tasks.
         "DROP INDEX IF EXISTS idx_receipt_unique",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique ON delivery_receipts(task_id,smsc_message_id,message_state)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique ON delivery_receipts(source_namespace,task_id,smsc_message_id,message_state)",
         "CREATE INDEX IF NOT EXISTS idx_receipt_task ON delivery_receipts(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_msg_task ON sms_task_message_ids(task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_binding_lookup ON sms_message_bindings_v2(source_namespace,smsc_message_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_binding_task ON sms_message_bindings_v2(task_id,attempt_token)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_attempt_task ON sms_send_attempts(task_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_attempt_state ON sms_send_attempts(state,lease_until)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_parts_state ON sms_send_parts(attempt_token,state)",
+        "CREATE INDEX IF NOT EXISTS idx_capacity_policy_enabled ON campaign_capacity_policies(enabled,campaign_type,campaign_id)",
+        "CREATE INDEX IF NOT EXISTS idx_realtime_reservation_expiry ON realtime_inbox_reservations(expires_at,campaign_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_task_event_batches_campaign ON task_event_batches(campaign_type,campaign_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ingestion_chunks_status ON ingestion_chunks(status,lease_expires_at,id)",
@@ -884,15 +1366,29 @@ def init_db():
             pass
 
     try:
-        conn.execute(
-            """INSERT OR IGNORE INTO sms_task_message_ids (smsc_message_id, task_id)
-               SELECT mid, id FROM (
-                   SELECT id, unnest(from_json(smsc_message_ids, '["VARCHAR"]')) AS mid
-                   FROM sms_tasks
-                   WHERE smsc_message_ids IS NOT NULL AND smsc_message_ids <> '[]'
-               )
-               WHERE mid IS NOT NULL AND mid <> ''"""
-        )
+        marker = conn.execute(
+            "SELECT value FROM app_settings WHERE key=?",
+            ("sms_task_message_ids_backfill_v1",),
+        ).fetchone()
+        if not marker:
+            conn.execute(
+                """INSERT INTO sms_task_message_ids (smsc_message_id, task_id)
+                   SELECT mid, id FROM (
+                       SELECT id, unnest(from_json(smsc_message_ids, '["VARCHAR"]')) AS mid
+                       FROM sms_tasks
+                       WHERE smsc_message_ids IS NOT NULL
+                         AND smsc_message_ids <> '[]'
+                         AND json_valid(smsc_message_ids)
+                   )
+                   WHERE mid IS NOT NULL AND mid <> ''
+                   ON CONFLICT (smsc_message_id) DO NOTHING"""
+            )
+            conn.execute(
+                """INSERT INTO app_settings (key, value) VALUES (?, ?)
+                   ON CONFLICT (key) DO UPDATE SET value=excluded.value""",
+                ("sms_task_message_ids_backfill_v1", "completed"),
+            )
+            logger.info("[DB] Completed sms_task_message_ids backfill")
     except Exception as e:
         logger.warning("[DB] Skipping sms_task_message_ids backfill: %s", e)
 

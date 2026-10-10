@@ -1,0 +1,640 @@
+{
+  "tests": [
+    {
+      "id": "TST-001",
+      "name": "claim或结果批次第二步失败",
+      "test_type": "FAULT_INJECTION",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001"
+      ],
+      "capability_ids": [
+        "CAP-101"
+      ],
+      "solution_element_ids": [
+        "ELM-001"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "acceptance_criteria": [
+        "所有同一逻辑事务更新回滚；整笔重放后统计只加一次；应用写锁释放"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-002",
+      "name": "临时锁忙/永久毒记录/三次失败",
+      "test_type": "FAULT_INJECTION",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-007"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-107"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-007"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "结果仍在重试或持久日志；无静默丢弃；毒记录不阻塞全部活动；恢复后无重复计数"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-003",
+      "name": "100:1 大小活动、2/4/8活动持续有任务",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002"
+      ],
+      "capability_ids": [
+        "CAP-102"
+      ],
+      "solution_element_ids": [
+        "ELM-002"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011"
+      ],
+      "acceptance_criteria": [
+        "在准入通过时，新活动首次发出目标≤5秒；120秒窗口分片份额偏差≤10%（排除启动、无工作、故障段并记录原因）"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-004",
+      "name": "同权活动1片与5片；长片任务",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-001",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "按分片份额公平，业务任务数不同属预期；没有长期饿死；不改变编码/UDH"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-005",
+      "name": "单活动单中心拥塞、另一个中心健康",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-009"
+      ],
+      "acceptance_criteria": [
+        "拥塞route领取停止，健康route持续发出；queue full正常容量等待不循环重试写库"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-006",
+      "name": "一个目录海量历史文件/迟到当天文件、local+SFTP+上传竞争",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-003",
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-103",
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-003",
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012",
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "acceptance_criteria": [
+        "历史先过滤、迟到文件不漏；reservation严格有界；小目录单轮服务目标≤5秒或明确IO超时原因"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-007",
+      "name": "4个长文件后小活动到达、白名单构建/失败/切换",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-003"
+      ],
+      "capability_ids": [
+        "CAP-103"
+      ],
+      "solution_element_ids": [
+        "ELM-003"
+      ],
+      "evidence_ids": [
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012"
+      ],
+      "acceptance_criteria": [
+        "worker机会有界；受控chunk让出后小文件等待目标≤30秒；索引版本不串活动、在用版本不删"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-008",
+      "name": "局部任务/文件超额与全局磁盘满",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-003",
+        "EVD-008",
+        "EVD-009"
+      ],
+      "acceptance_criteria": [
+        "局部暂停仅影响该活动；全局危险停止新准入/新发但控制/已发结果处理继续；界面说明原因与恢复条件"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-009",
+      "name": "intent/部分分片/resp/落日志/主库commit各边界崩溃",
+      "test_type": "FAULT_INJECTION",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-008"
+      ],
+      "acceptance_criteria": [
+        "已确认成功只补库；未知状态隔离；重放幂等；旧token/晚响应不覆盖新attempt；不宣称exactly-once"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-010",
+      "name": "满负载同时编辑活动/上传/读取运营页面",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-005"
+      ],
+      "capability_ids": [
+        "CAP-105"
+      ],
+      "solution_element_ids": [
+        "ELM-005"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-009",
+        "EVD-013"
+      ],
+      "acceptance_criteria": [
+        "Web轻读写目标p95≤2秒，超时/503比例≤0.1%；导入显示后台进度；超时命令结果可查询"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-011",
+      "name": "24小时并发持续负载与周期爆发",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-004",
+        "REQ-006",
+        "REQ-007"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-104",
+        "CAP-106",
+        "CAP-107"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-004",
+        "ELM-006",
+        "ELM-007"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-009",
+        "EVD-010",
+        "EVD-017",
+        "EVD-004",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "准入负载下无持续增长积压；最老等待满足策略；内存不持续增长；未知/错误可解释；再执行72小时扩展观察"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-012",
+      "name": "启动WAL/扩展离线、优雅停机超预算和升级回退",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-004",
+        "EVD-010",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-017",
+        "EVD-001",
+        "EVD-008"
+      ],
+      "acceptance_criteria": [
+        "副本恢复通过；未落库日志可重放；旧版本不会盲目重发；健康检查覆盖恢复/写线程就绪"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-013",
+      "name": "优化前后同负载A/B，供给始终充足",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-005",
+        "REQ-006"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-105",
+        "CAP-106"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-005",
+        "ELM-006"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-001",
+        "EVD-009",
+        "EVD-013",
+        "EVD-010",
+        "EVD-017"
+      ],
+      "acceptance_criteria": [
+        "实际socket分片吞吐不低于基线95%；p95公平等待与Web改善；低队列时不要求达到上限；3×30分钟交替测量"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-014",
+      "name": "资源准入配置、借用、暂停/恢复和权限",
+      "test_type": "SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-004",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-104",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-004",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-009",
+        "EVD-001",
+        "EVD-010",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "超额保底拒绝或明确降级；借用归还≤5秒目标；非授权请求拒绝，审计记录无秘密"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-015",
+      "name": "旧token回调、仍活跃attempt超5分钟、部分成功后0x58",
+      "test_type": "FAULT_INJECTION",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-007",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-107",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-007",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016",
+        "EVD-008"
+      ],
+      "acceptance_criteria": [
+        "旧回调不改新attempt；活跃不回收；已接受片不自动重发；partial/unknown证据可追踪"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-016",
+      "name": "两中心相同message-id、同中心ID重用、迟到/重复DLR",
+      "test_type": "FAULT_INJECTION",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-008",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "来源隔离；歧义隔离而非覆盖；幂等且无串任务；持久接收前不确认DLR"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-017",
+      "name": "历史失败后flush、毒记录隔离、持久日志磁盘满",
+      "test_type": "FAULT_INJECTION",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-004",
+        "REQ-007"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-104",
+        "CAP-107"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-004",
+        "ELM-007"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-003",
+        "EVD-008",
+        "EVD-009",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "barrier包含前序失败；无静默成功；容量不足保护已发结果，接收确认边界可验证"
+      ],
+      "notes": "建议验收标准，需批准与基线校准；非当前已通过结果。"
+    },
+    {
+      "id": "TST-018",
+      "name": "flush后迟到DLR、乱序日志、段CRC损坏、恢复未完成",
+      "test_type": "FAULT_AND_SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-007"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-107"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-007"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-014",
+        "EVD-015",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "接收截止后再最终屏障；不跨未settle水位；损坏隔离停止发送；恢复门禁前零新attempt"
+      ],
+      "notes": "复审新增的未来验收；SLO以最大不可抢占工作量和输入边界为条件。"
+    },
+    {
+      "id": "TST-019",
+      "name": "两route分别准入但共享writer合计超载、不同保底和多route活动",
+      "test_type": "FAULT_AND_SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-002",
+        "REQ-004"
+      ],
+      "capability_ids": [
+        "CAP-102",
+        "CAP-104"
+      ],
+      "solution_element_ids": [
+        "ELM-002",
+        "ELM-004"
+      ],
+      "evidence_ids": [
+        "EVD-002",
+        "EVD-003",
+        "EVD-008",
+        "EVD-011",
+        "EVD-009"
+      ],
+      "acceptance_criteria": [
+        "全局拒绝超额；先保底再DRR；活动份额不重复；最长合法multipart能获得信用"
+      ],
+      "notes": "复审新增的未来验收；SLO以最大不可抢占工作量和输入边界为条件。"
+    },
+    {
+      "id": "TST-020",
+      "name": "DLR延迟/重复/旧连接generation、大任务/不可中断文件",
+      "test_type": "FAULT_AND_SYSTEM_ACCEPTANCE",
+      "scope": "TARGET_NOT_EXECUTED",
+      "requirement_ids": [
+        "REQ-001",
+        "REQ-003",
+        "REQ-004",
+        "REQ-008"
+      ],
+      "capability_ids": [
+        "CAP-101",
+        "CAP-103",
+        "CAP-104",
+        "CAP-108"
+      ],
+      "solution_element_ids": [
+        "ELM-001",
+        "ELM-003",
+        "ELM-004",
+        "ELM-008"
+      ],
+      "evidence_ids": [
+        "EVD-001",
+        "EVD-002",
+        "EVD-004",
+        "EVD-010",
+        "EVD-017",
+        "EVD-005",
+        "EVD-006",
+        "EVD-007",
+        "EVD-012",
+        "EVD-003",
+        "EVD-008",
+        "EVD-009",
+        "EVD-016"
+      ],
+      "acceptance_criteria": [
+        "submit与DLR额度独立；ACK串行且不写新连接；不可抢占超过SLO则明确降级，不假报≤5/30秒"
+      ],
+      "notes": "复审新增的未来验收；SLO以最大不可抢占工作量和输入边界为条件。"
+    }
+  ]
+}

@@ -2,7 +2,7 @@ import json
 import logging
 import threading
 from typing import Optional, Callable
-from database import get_connection
+from database import read_transaction, write_transaction
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -14,36 +14,42 @@ _consumer_running = False
 
 
 def get_config() -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM rabbitmq_configs ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM rabbitmq_configs ORDER BY id DESC LIMIT 1"
+        ).fetchone(),
+        operation="rabbitmq.config.get",
+    )
     return dict(row) if row else None
 
 
 def save_config(data: dict) -> dict:
-    conn = get_connection()
-    existing = conn.execute("SELECT id FROM rabbitmq_configs ORDER BY id DESC LIMIT 1").fetchone()
+    def write(conn):
+        existing = conn.execute(
+            "SELECT id FROM rabbitmq_configs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
 
-    if existing:
-        set_clause = ", ".join(f"{k}=?" for k in data if k != "enabled")
-        if "enabled" in data:
-            set_clause += ", enabled=?"
-        conn.execute(
-            f"UPDATE rabbitmq_configs SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            [v for k, v in data.items()] + [existing["id"]]
-        )
-    else:
-        fields = ", ".join(data.keys())
-        placeholders = ", ".join(["?"] * len(data))
-        conn.execute(
-            f"INSERT INTO rabbitmq_configs ({fields}) VALUES ({placeholders})",
-            list(data.values())
-        )
+        if existing:
+            assignments = [f"{k}=?" for k in data]
+            set_clause = ", ".join(assignments)
+            conn.execute(
+                f"UPDATE rabbitmq_configs SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                [v for k, v in data.items()] + [existing["id"]],
+            )
+        else:
+            fields = ", ".join(data.keys())
+            placeholders = ", ".join(["?"] * len(data))
+            conn.execute(
+                f"INSERT INTO rabbitmq_configs ({fields}) VALUES ({placeholders})",
+                list(data.values()),
+            )
 
-    conn.commit()
-    row = conn.execute("SELECT * FROM rabbitmq_configs ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    return dict(row)
+        row = conn.execute(
+            "SELECT * FROM rabbitmq_configs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row)
+
+    return write_transaction(write, operation="rabbitmq.config.save")
 
 
 def _connect():

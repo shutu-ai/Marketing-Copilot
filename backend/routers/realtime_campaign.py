@@ -6,6 +6,7 @@ import tempfile
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 
 from fastapi.responses import FileResponse
+from database import is_transient_write_error
 
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate, SftpConnectionTest
 
@@ -189,8 +190,15 @@ def upload_customer_list(campaign_id: int, file: UploadFile = File(...)):
 
         return realtime_campaign_service.public_campaign(result)
 
+    except HTTPException:
+        raise
     except Exception as e:
-
+        if is_transient_write_error(e):
+            raise HTTPException(
+                status_code=503,
+                detail="当前数据库写入繁忙，请稍后重试",
+                headers={"Retry-After": "1"},
+            ) from e
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 
@@ -249,9 +257,18 @@ def list_files(campaign_id: int, page: int = 1, page_size: int = Query(50, le=20
 
 @router.get("/{campaign_id}/watch-files")
 
-def watch_files(campaign_id: int, page: int = 1, page_size: int = Query(50, le=200)):
+def watch_files(
+    campaign_id: int,
+    page: int = 1,
+    page_size: int = Query(50, le=200),
+    extension: str = "csv",
+    status: str = "",
+    reason: str = "",
+):
 
-    return realtime_campaign_service.get_realtime_watch_files(campaign_id, page, page_size)
+    return realtime_campaign_service.get_realtime_watch_files(
+        campaign_id, page, page_size, extension=extension, status=status, reason=reason
+    )
 
 
 @router.get("/{campaign_id}/sent-records")

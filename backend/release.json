@@ -1,0 +1,9 @@
+{
+  "name": "Marketing Copilot",
+  "version": "20261009-web-db-robustness",
+  "build_time": "2026-10-09T11:27:21+03:00",
+  "builder": "direct-source-sync",
+  "git_sha": "7986e9d-dirty",
+  "python_runtime": "/opt/marketing-copilot/python/bin/python3.11",
+  "python_version": "3.11.5"
+}

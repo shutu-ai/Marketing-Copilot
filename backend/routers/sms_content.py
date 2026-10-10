@@ -106,6 +106,8 @@ def create_template(data: SmsTemplateCreate):
         return sms_content_service.create_template(data)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(503, "当前数据库写入繁忙，请稍后重试") from exc
 
 
 @router.post("/templates/validate")
@@ -120,7 +122,10 @@ def template_versions(template_id: int, page: int = 1, page_size: int = Query(50
 
 @router.post("/templates/{template_id}/restore")
 def restore_template(template_id: int, body: TemplateRestoreRequest):
-    template = sms_content_service.restore_template_version(template_id, body.version_no)
+    try:
+        template = sms_content_service.restore_template_version(template_id, body.version_no)
+    except TimeoutError as exc:
+        raise HTTPException(503, "当前数据库写入繁忙，请稍后重试") from exc
     if not template:
         raise HTTPException(404, "Template or version not found")
     return template
@@ -132,6 +137,8 @@ def update_template(template_id: int, data: SmsTemplateUpdate):
         template = sms_content_service.update_template(template_id, data)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(503, "当前数据库写入繁忙，请稍后重试") from exc
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     return template

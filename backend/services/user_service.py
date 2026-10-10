@@ -11,6 +11,7 @@ import re
 from datetime import datetime
 
 from auth import ROLES, admin_credentials, hash_password, verify_password
+from database import write_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -27,33 +28,33 @@ def _public(user: dict) -> dict:
 
 def bootstrap_admin() -> None:
     """Create the initial admin from env credentials when no users exist yet."""
-    from database import get_connection
+    username, password = admin_credentials()
 
-    conn = get_connection()
-    try:
+    def write(conn):
         count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         if count:
-            return
-        username, password = admin_credentials()
+            return False
         conn.execute(
             "INSERT INTO users (username, password_hash, role, display_name, enabled) VALUES (?, ?, 'admin', ?, 1)",
             (username, hash_password(password), username),
         )
-        conn.commit()
+        return True
+
+    created = write_transaction(write, operation="user.bootstrap")
+    if created:
         logger.warning("bootstrapped initial admin user %r from environment", username)
-    finally:
-        conn.close()
 
 
 def get_user_by_username(username: str):
-    from database import get_connection
+    from database import read_transaction
 
-    conn = get_connection()
-    try:
-        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM users WHERE username=?", (username,)
+        ).fetchone(),
+        operation="user.by_username",
+    )
+    return dict(row) if row else None
 
 
 def get_role(username: str) -> str:
@@ -67,28 +68,27 @@ def authenticate(username: str, password: str):
         return None
     if not verify_password(password, user.get("password_hash", "")):
         return None
-    from database import get_connection
-
-    conn = get_connection()
-    try:
-        conn.execute("UPDATE users SET last_login_at=?, updated_at=? WHERE id=?", (_now(), _now(), user["id"]))
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(
+        lambda conn: conn.execute(
+            "UPDATE users SET last_login_at=?, updated_at=? WHERE id=?",
+            (_now(), _now(), user["id"]),
+        ),
+        attempts=2,
+        operation="user.login",
+    )
     return _public(user)
 
 
 def list_users() -> list:
-    from database import get_connection
+    from database import read_transaction
 
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM users ORDER BY id"
-        ).fetchall()
-        return [_public(dict(r)) for r in rows]
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="user.list",
+    )
+    return [_public(dict(r)) for r in rows]
 
 
 def _validate(username: str, password: str, role: str, display_name: str) -> None:
@@ -106,10 +106,7 @@ def create_user(username: str, password: str, role: str, display_name: str = "",
     username = (username or "").strip().lower()
     display_name = (display_name or "").strip()
     _validate(username, password, role, display_name)
-    from database import get_connection
-
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
         if row:
             raise ValueError("username already exists")
@@ -117,11 +114,10 @@ def create_user(username: str, password: str, role: str, display_name: str = "",
             "INSERT INTO users (username, password_hash, display_name, role, enabled) VALUES (?, ?, ?, ?, ?)",
             (username, hash_password(password), display_name, role, 1 if enabled else 0),
         )
-        conn.commit()
         created = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
         return _public(dict(created))
-    finally:
-        conn.close()
+
+    return write_transaction(write, operation="user.create")
 
 
 def _admin_count(conn, exclude_id: int = None) -> int:
@@ -141,10 +137,7 @@ def update_user(
     enabled: bool = None,
     password: str = None,
 ) -> dict:
-    from database import get_connection
-
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not row:
             raise LookupError("user not found")
@@ -174,18 +167,14 @@ def update_user(
         values.append(_now())
         values.append(user_id)
         conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id=?", tuple(values))
-        conn.commit()
         updated = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         return _public(dict(updated))
-    finally:
-        conn.close()
+
+    return write_transaction(write, operation="user.update")
 
 
 def delete_user(user_id: int, operator_username: str = None) -> None:
-    from database import get_connection
-
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not row:
             raise LookupError("user not found")
@@ -196,16 +185,12 @@ def delete_user(user_id: int, operator_username: str = None) -> None:
             if _admin_count(conn, exclude_id=user_id) == 0:
                 raise ValueError("cannot delete the last enabled admin")
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
-        conn.commit()
-    finally:
-        conn.close()
+
+    write_transaction(write, operation="user.delete")
 
 
 def change_own_password(username: str, old_password: str, new_password: str) -> None:
-    from database import get_connection
-
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
         if not row:
             raise LookupError("user not found")
@@ -218,6 +203,5 @@ def change_own_password(username: str, old_password: str, new_password: str) -> 
             "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
             (hash_password(new_password), _now(), user["id"]),
         )
-        conn.commit()
-    finally:
-        conn.close()
+
+    write_transaction(write, operation="user.password")

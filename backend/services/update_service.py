@@ -494,6 +494,8 @@ def apply_update(upload_id: str, force: bool = False, operator: str = "system") 
     ]
     if (project_root() / "offline").exists():
         trees.append(("offline", project_root() / "offline", payload / "offline"))
+    if (project_root() / "bin").exists():
+        trees.append(("bin", project_root() / "bin", payload / "bin"))
     for label, source, _new in trees:
         _copy_tree(source, backup_root / label)
 

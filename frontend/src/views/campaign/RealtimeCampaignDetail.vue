@@ -161,6 +161,46 @@
           </div>
         </el-tab-pane>
         <el-tab-pane :label="$t('campaign.currentWatchFiles')" name="watch-files">
+          <div class="watch-file-filters">
+            <el-input
+              v-model="watchFileFilters.extension"
+              clearable
+              class="watch-file-filter-extension"
+              :placeholder="$t('campaign.watchFileExtensionPlaceholder')"
+              @keyup.enter="applyWatchFileFilters"
+            >
+              <template #prepend>{{ $t('campaign.watchFileExtension') }}</template>
+            </el-input>
+            <el-select
+              v-model="watchFileFilters.status"
+              clearable
+              class="watch-file-filter-status"
+              :placeholder="$t('campaign.watchFileStatusPlaceholder')"
+              @change="applyWatchFileFilters"
+            >
+              <el-option :label="$t('monitor.status_pending')" value="pending" />
+              <el-option :label="$t('monitor.status_processed')" value="processed" />
+              <el-option :label="$t('monitor.status_ignored')" value="ignored" />
+            </el-select>
+            <el-input
+              v-model="watchFileFilters.reason"
+              clearable
+              class="watch-file-filter-reason"
+              :placeholder="$t('campaign.watchFileReasonPlaceholder')"
+              @keyup.enter="applyWatchFileFilters"
+            >
+              <template #prepend>{{ $t('campaign.watchFileReason') }}</template>
+            </el-input>
+            <el-button type="primary" @click="applyWatchFileFilters">
+              {{ $t('common.search') }}
+            </el-button>
+          </div>
+          <div v-if="watchFilesError" class="watch-files-error">
+            <span>{{ $t('campaign.watchFileLoadFailed') }}</span>
+            <el-button link type="primary" @click="loadWatchFiles(false)">
+              {{ $t('campaign.watchFileRetry') }}
+            </el-button>
+          </div>
           <el-table :data="watchFiles" stripe style="width: 100%" v-loading="watchFilesLoading">
             <el-table-column prop="filename" :label="$t('campaign.filename')" min-width="220" />
             <el-table-column :label="$t('common.status')" width="130">
@@ -217,6 +257,8 @@ const sentRecordsLoading = ref(false)
 const watchFiles = ref<any[]>([])
 const watchFilesTotal = ref(0)
 const watchFilesLoading = ref(false)
+const watchFilesError = ref(false)
+let watchFilesRequestId = 0
 const activeTab = ref('received')
 const stats = reactive({
   file_count: 0,
@@ -267,6 +309,7 @@ const sentRecordsPageSize = ref(Number(localStorage.getItem(SENT_RECORDS_PAGE_SI
 const WATCH_FILES_PAGE_SIZE_KEY = 'mc.realtime-watch-files.page-size'
 const watchFilesPage = ref(1)
 const watchFilesPageSize = ref(Number(localStorage.getItem(WATCH_FILES_PAGE_SIZE_KEY)) || 25)
+const watchFileFilters = reactive({ extension: 'csv', status: '', reason: '' })
 
 function handleReceivedSizeChange(size: number) {
   receivedPageSize.value = size
@@ -301,6 +344,11 @@ function handleWatchFilesSizeChange(size: number) {
 
 function handleWatchFilesCurrentChange(page: number) {
   watchFilesPage.value = page
+  void loadWatchFiles(false)
+}
+
+function applyWatchFileFilters() {
+  watchFilesPage.value = 1
   void loadWatchFiles(false)
 }
 
@@ -340,17 +388,26 @@ function watchStatusLabel(row: any) {
 }
 
 async function loadWatchFiles(reset = true) {
+  const requestId = ++watchFilesRequestId
   watchFilesLoading.value = true
+  watchFilesError.value = false
   try {
     if (reset) watchFilesPage.value = 1
     const wr = await rtApi.getRealtimeWatchFiles(Number(route.params.id), {
       page: watchFilesPage.value,
       page_size: watchFilesPageSize.value,
+      extension: watchFileFilters.extension.trim(),
+      status: watchFileFilters.status,
+      reason: watchFileFilters.reason.trim(),
     })
+    if (requestId !== watchFilesRequestId) return
     watchFiles.value = asArray(wr.data)
     watchFilesTotal.value = wr.data.total ?? watchFiles.value.length
-  } catch { /* ignore */ }
-  watchFilesLoading.value = false
+  } catch {
+    if (requestId === watchFilesRequestId) watchFilesError.value = true
+  } finally {
+    if (requestId === watchFilesRequestId) watchFilesLoading.value = false
+  }
 }
 
 async function loadReceivedData(reset = true) {
@@ -433,6 +490,25 @@ watch(activeTab, (tab) => {
   right: 8px;
   z-index: 2;
 }
+.watch-file-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+  padding-right: 96px;
+}
+.watch-file-filter-extension { width: 190px; }
+.watch-file-filter-status { width: 170px; }
+.watch-file-filter-reason { flex: 1 1 260px; min-width: 220px; }
+.watch-files-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: var(--el-color-danger);
+  font-size: 13px;
+}
 .summary-row {
   display: flex; flex-wrap: wrap;
   gap: 8px;
@@ -477,5 +553,11 @@ watch(activeTab, (tab) => {
   display: flex;
   justify-content: flex-end;
   margin-top: 12px;
+}
+@media (max-width: 768px) {
+  .watch-file-filters { padding-right: 0; }
+  .watch-file-filter-extension,
+  .watch-file-filter-status,
+  .watch-file-filter-reason { width: 100%; min-width: 0; }
 }
 </style>

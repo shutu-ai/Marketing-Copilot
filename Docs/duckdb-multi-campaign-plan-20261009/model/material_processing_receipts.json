@@ -1,0 +1,245 @@
+{
+  "receipts": [
+    {
+      "id": "MPR-001",
+      "material_id": "MAT-001",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-001"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-002",
+      "material_id": "MAT-002",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-002"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-003",
+      "material_id": "MAT-003",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-003"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-004",
+      "material_id": "MAT-004",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-004"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-005",
+      "material_id": "MAT-005",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-005"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-006",
+      "material_id": "MAT-006",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-006"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-007",
+      "material_id": "MAT-007",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-007"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-008",
+      "material_id": "MAT-008",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-008"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-009",
+      "material_id": "MAT-009",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-009"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-010",
+      "material_id": "MAT-010",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-010"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-011",
+      "material_id": "MAT-011",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-011"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-012",
+      "material_id": "MAT-012",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-012"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-013",
+      "material_id": "MAT-013",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-013"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-014",
+      "material_id": "MAT-014",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-014"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-015",
+      "material_id": "MAT-015",
+      "processor": "main agent",
+      "route": "CodeGraph_then_scoped_read",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-015"
+      ],
+      "unresolved_items": [],
+      "warnings": [
+        "未重采远端现状，不能归因本次线上容量"
+      ],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-016",
+      "material_id": "MAT-016",
+      "processor": "main agent",
+      "route": "official_versioned_docs",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-016"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    },
+    {
+      "id": "MPR-017",
+      "material_id": "MAT-017",
+      "processor": "Kuhn independent reviewer",
+      "route": "independent_read_only_review",
+      "result_state": "PROCESSED_LOCAL",
+      "coverage": 1,
+      "evidence_ids": [
+        "EVD-017"
+      ],
+      "unresolved_items": [],
+      "warnings": [],
+      "notes": "coverage=1只针对manifest声明的摘录/符号范围；未声明覆盖全部文件。"
+    }
+  ]
+}
+

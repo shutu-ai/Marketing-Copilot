@@ -1,0 +1,11 @@
+{
+  "project_stage": "DISCOVERY",
+  "orientation": "ENGINEERING",
+  "interaction_mode": "AUTO",
+  "primary_domain": "software_system",
+  "secondary_domains": [],
+  "output_mode": "md",
+  "domain_confidence": 1,
+  "notes": "DuckDB1.2本地代码证据充分，但无本轮远端容量实测；研究文档交付，不实施。"
+}
+

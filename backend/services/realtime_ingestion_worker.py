@@ -1,4 +1,4 @@
-"""Single-worker realtime file ingestion loop."""
+"""Concurrent, lease-based realtime file ingestion workers."""
 
 import logging
 import os
@@ -9,15 +9,28 @@ from datetime import datetime, timedelta
 
 from database import get_connection
 from services import ingestion_job_service, operations_service, realtime_campaign_service, realtime_whitelist_service
+from services import realtime_ingestion_state
 from services import realtime_ingestion_retry_service as retry_service
 
 logger = logging.getLogger(__name__)
 _stop = threading.Event()
 _thread = None
+_threads = []
+_maintenance_thread = None
+_claim_lock = threading.Lock()
+_maintenance_lock = threading.Lock()
+_campaign_cursor = 0
 _last_expiry_sweep_date = None
 _last_inactive_campaign_sweep_at = 0.0
 _INACTIVE_CAMPAIGN_SWEEP_INTERVAL_SECONDS = 5.0
-WORKER_ID = "realtime-ingestion-1"
+_last_lease_recovery_at = 0.0
+
+
+def _configured_worker_count() -> int:
+    try:
+        return max(1, min(16, int(os.environ.get("MC_REALTIME_INGEST_WORKERS", "1"))))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _processed_id(campaign_id: int, filename: str):
@@ -157,11 +170,16 @@ def _discard_inactive_campaign_files() -> None:
     )
 
 
-def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str):
-    ingestion_job_service.expire_file(job["id"], reason, include_processing=True)
+def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str, worker_id: str):
     processed_id = _processed_id(campaign["id"], job["filename"])
-    if processed_id:
-        operations_service.finish_file(processed_id, "failed", "", error=reason)
+    if job.get("lease_token"):
+        realtime_ingestion_state.transition(
+            job["id"], processed_id, job["lease_token"], "failed", error_class="EXPIRED_FILE", error=reason,
+        )
+    else:
+        ingestion_job_service.expire_file(job["id"], reason, include_processing=True)
+        if processed_id:
+            operations_service.finish_file(processed_id, "failed", "", error=reason)
     file_path = job.get("file_path", "")
     try:
         if file_path and os.path.isfile(file_path):
@@ -174,7 +192,7 @@ def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str):
     realtime_campaign_service.finalize_daily_tasks()
     logger.info(
         "Realtime expired queued file discarded campaign=%s file=%s reason=%s worker_id=%s",
-        campaign["id"], job["filename"], reason, WORKER_ID,
+        campaign["id"], job["filename"], reason, worker_id,
     )
 
 
@@ -223,60 +241,99 @@ def _cleanup_orphaned_intermediate_files():
         logger.info("Realtime orphaned intermediate files removed count=%s", removed)
 
 
-def _mark_retry(processed_id, decision, error, retry_count):
+def _mark_retry(job: dict, processed_id, decision, error, retry_count, worker_id: str):
     delay = retry_service.delay_for(decision, retry_count)
     next_retry = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
-    ingestion_job_service.schedule_retry(
-        _current_file_id, decision.error_class, error, delay,
-        allow_unbounded=decision.error_class in {"WAITING_DEPENDENCY", "RESOURCE_LIMIT"},
+    realtime_ingestion_state.transition(
+        job["id"], processed_id, job.get("lease_token", ""), "retrying",
+        error_class=decision.error_class, error=error, delay=delay,
     )
-    if processed_id:
-        operations_service.mark_file_retry(processed_id, decision.error_class, error, next_retry)
     logger.warning(
         "Realtime file retrying campaign=%s file=%s error_class=%s retry_count=%s next_retry_at=%s error=%s",
-        _current_campaign_id, _current_filename, decision.error_class, retry_count + 1, next_retry, str(error)[:500],
+        job["campaign_id"], job["filename"], decision.error_class, retry_count + 1, next_retry, str(error)[:500],
     )
 
 
-def _quarantine(job: dict, processed_id, decision, error, target_path=None):
+def _quarantine(job: dict, processed_id, decision, error, campaign_dir: str, worker_id: str, target_path=None):
+    realtime_ingestion_state.check_owned(job["id"], job.get("lease_token", ""))
     path = job.get("file_path", "")
     target = target_path or path
     if path and decision.quarantine:
         try:
-            target = operations_service.quarantine(path, _campaign_dir, job["filename"])
+            target = operations_service.quarantine(path, campaign_dir, job["filename"])
         except OSError:
             pass
-    ingestion_job_service.fail_file(job["id"], decision.error_class, str(error), "quarantined" if decision.quarantine else "failed")
-    if processed_id:
-        operations_service.finish_file(processed_id, "quarantined" if decision.quarantine else "failed", target, error=error)
+    realtime_ingestion_state.transition(
+        job["id"], processed_id, job.get("lease_token", ""), "quarantined" if decision.quarantine else "failed",
+        error_class=decision.error_class, error=error, path=target,
+    )
     operations_service.event(
         "realtime_ingestion", decision.error_class, str(error),
-        severity="error", context={"campaign_id": _current_campaign_id, "filename": _current_filename},
+        severity="error", context={
+            "campaign_id": job["campaign_id"],
+            "filename": job["filename"],
+            "worker_id": worker_id,
+        },
     )
     logger.error(
         "Realtime file failed campaign=%s file=%s phase=%s error_class=%s error=%s",
-        _current_campaign_id, _current_filename, job.get("processing_phase", ""), decision.error_class, str(error)[:1000],
+        job["campaign_id"], job["filename"], job.get("processing_phase", ""), decision.error_class, str(error)[:1000],
     )
 
 
-def process_once() -> bool:
-    global _current_file_id, _current_campaign_id, _current_filename, _campaign_dir
-    global _last_expiry_sweep_date, _last_inactive_campaign_sweep_at
-    today = datetime.now().date()
-    if _last_expiry_sweep_date != today:
-        _discard_expired_queued_files()
-        _last_expiry_sweep_date = today
-    now_monotonic = time.monotonic()
-    if now_monotonic - _last_inactive_campaign_sweep_at >= _INACTIVE_CAMPAIGN_SWEEP_INTERVAL_SECONDS:
-        _discard_inactive_campaign_files()
-        _last_inactive_campaign_sweep_at = now_monotonic
-    job = ingestion_job_service.claim_file("realtime", WORKER_ID)
+def _claim_realtime_file(worker_id: str):
+    """Claim one file using campaign-level round-robin scheduling.
+
+    The worker pool remains shared, but a campaign with a large backlog cannot
+    monopolize the global filename-ordered queue.  The claim transaction is
+    still serialized locally to avoid DuckDB workers racing on the same queue.
+    """
+    global _campaign_cursor
+    with _claim_lock:
+        campaign_ids = ingestion_job_service.pending_campaign_ids("realtime")
+        if not campaign_ids:
+            return None
+        start = _campaign_cursor % len(campaign_ids)
+        for offset in range(len(campaign_ids)):
+            position = (start + offset) % len(campaign_ids)
+            campaign_id = campaign_ids[position]
+            job = ingestion_job_service.claim_file(
+                "realtime", worker_id, campaign_id=campaign_id,
+            )
+            if job:
+                _campaign_cursor = (position + 1) % len(campaign_ids)
+                return job
+        # Another local caller may have claimed the candidates between the
+        # discovery query and the conditional UPDATE.  Advance the cursor so
+        # the next pass does not repeatedly retry the same campaign.
+        _campaign_cursor = (start + 1) % len(campaign_ids)
+        return None
+
+
+def process_once(worker_id: str) -> bool:
+    # DuckDB claim is a short UPDATE transaction. Serialize only this local
+    # claim step so multiple ingestion workers do not race on the same queue
+    # head; file parsing and whitelist matching remain concurrent.
+    job = _claim_realtime_file(worker_id)
     if not job:
         return False
-    _current_file_id = job["id"]
-    _current_campaign_id = job["campaign_id"]
-    _current_filename = job["filename"]
-    _campaign_dir = ""
+    with realtime_ingestion_state.FileLease(job["id"], job.get("lease_token", "")):
+        try:
+            return _process_claimed_file(job, worker_id)
+        except realtime_ingestion_state.LeaseLost:
+            logger.warning("Realtime file ownership lost file_id=%s worker_id=%s", job["id"], worker_id)
+            return True
+        except Exception:
+            # If even the terminal/retry transaction failed, retain the input.
+            # Stop renewing this lease; runtime maintenance will recover it.
+            logger.exception("Realtime file recovery deferred until lease expiry file_id=%s", job["id"])
+            return True
+
+
+def _process_claimed_file(job, worker_id):
+    campaign_id = job["campaign_id"]
+    filename = job["filename"]
+    campaign_dir = ""
     processed_id = None
     started = time.monotonic()
     try:
@@ -288,7 +345,7 @@ def process_once() -> bool:
         if not campaign_row:
             raise ValueError("campaign not found")
         campaign = dict(campaign_row)
-        _campaign_dir = campaign.get("campaign_dir", "")
+        campaign_dir = campaign.get("campaign_dir", "")
         file_time = realtime_campaign_service._watch_file_timestamp(
             job["filename"], campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_",
         )
@@ -298,21 +355,26 @@ def process_once() -> bool:
         if file_time and file_time.date() != datetime.now().date():
             expired_reason = "file timestamp is outside the current day"
         if expired_reason:
-            _discard_claimed_expired_file(job, campaign, expired_reason)
+            _discard_claimed_expired_file(job, campaign, expired_reason, worker_id)
             return True
         result = realtime_campaign_service.receive_file(
             campaign["id"], job["file_path"], job["filename"],
             ingestion_file_id=job["id"],
-            whitelist_version_id=job.get("whitelist_version_id"), worker_id=WORKER_ID,
+            whitelist_version_id=job.get("whitelist_version_id"), worker_id=worker_id,
+            lease_token=job.get("lease_token", ""),
         )
         processed_id = _processed_id(campaign["id"], job["filename"])
         if result.get("status") == "expired":
             _discard_claimed_expired_file(
-                job, campaign, result.get("message", "daily send window ended"),
+                job, campaign, result.get("message", "daily send window ended"), worker_id,
             )
             return True
         if result.get("success"):
-            ingestion_job_service.complete_file(job["id"])
+            # receive_file commits both final states. Duplicate-file detection
+            # has no chunk work, so it only needs the fenced file transition.
+            if result.get("duplicate_file"):
+                # Do not zero the original completed file's row/task totals.
+                realtime_ingestion_state.transition(job["id"], None, job.get("lease_token", ""), "completed")
             elapsed_ms = int((time.monotonic() - started) * 1000)
             from services import metrics_service
             metrics_service.observe("realtime_file_processing_seconds", elapsed_ms / 1000.0,
@@ -320,7 +382,7 @@ def process_once() -> bool:
             logger.info(
                 "Realtime file completed campaign=%s file=%s elapsed_ms=%s tasks_created=%s whitelist_version=%s worker_id=%s",
                 campaign["id"], job["filename"], elapsed_ms, result.get("task_result", {}).get("created", 0),
-                job.get("whitelist_version_id") or "", WORKER_ID,
+                job.get("whitelist_version_id") or "", worker_id,
             )
             return True
         decision = retry_service.classify(result.get("message", ""), result.get("status", ""))
@@ -336,55 +398,91 @@ def process_once() -> bool:
             decision.error_class in {"WAITING_DEPENDENCY", "RESOURCE_LIMIT"}
             or current_retry < int(job.get("max_retry_count", retry_service.MAX_RETRIES) or retry_service.MAX_RETRIES)
         ):
-            _mark_retry(processed_id, decision, result.get("message", "unknown"), current_retry)
+            _mark_retry(job, processed_id, decision, result.get("message", "unknown"), current_retry, worker_id)
         else:
-            _quarantine(job, processed_id, decision, result.get("message", "unknown"), result.get("quarantine_path"))
+            _quarantine(job, processed_id, decision, result.get("message", "unknown"), campaign_dir, worker_id,
+                        result.get("quarantine_path"))
         return True
+    except realtime_ingestion_state.LeaseLost:
+        raise
     except Exception as exc:
         from services import metrics_service
         metrics_service.observe("realtime_file_processing_seconds", (time.monotonic() - started),
-                                {"campaign_id": _current_campaign_id, "result": "failed"})
+                                {"campaign_id": campaign_id, "result": "failed"})
         metrics_service.inc("realtime_file_processing_errors_total",
-                            labels={"campaign_id": _current_campaign_id, "error_class": retry_service.classify(exc).error_class})
-        processed_id = processed_id or _processed_id(_current_campaign_id, _current_filename)
+                            labels={"campaign_id": campaign_id, "error_class": retry_service.classify(exc).error_class})
+        processed_id = processed_id or _processed_id(campaign_id, filename)
         decision = retry_service.classify(exc)
         current_retry = int(job.get("retry_count", 0) or 0)
         if decision.retryable and (
             decision.error_class in {"WAITING_DEPENDENCY", "RESOURCE_LIMIT"}
             or current_retry < int(job.get("max_retry_count", retry_service.MAX_RETRIES) or retry_service.MAX_RETRIES)
         ):
-            _mark_retry(processed_id, decision, exc, current_retry)
+            _mark_retry(job, processed_id, decision, exc, current_retry, worker_id)
         else:
-            _quarantine(job, processed_id, decision, exc)
+            _quarantine(job, processed_id, decision, exc, campaign_dir, worker_id)
         return True
 
 
-def _run():
-    ingestion_job_service.recover_expired_files()
+def _run_maintenance():
+    """Run shared housekeeping once, without racing other ingestion workers."""
+    global _last_expiry_sweep_date, _last_inactive_campaign_sweep_at, _last_lease_recovery_at
+    if not _maintenance_lock.acquire(blocking=False):
+        return
+    try:
+        today = datetime.now().date()
+        if _last_expiry_sweep_date != today:
+            _discard_expired_queued_files()
+            _last_expiry_sweep_date = today
+        now_monotonic = time.monotonic()
+        if now_monotonic - _last_lease_recovery_at >= 30:
+            recovered = realtime_ingestion_state.recover_expired_files()
+            _last_lease_recovery_at = now_monotonic
+            if recovered:
+                logger.warning("Realtime expired file leases recovered count=%s", recovered)
+        if now_monotonic - _last_inactive_campaign_sweep_at >= _INACTIVE_CAMPAIGN_SWEEP_INTERVAL_SECONDS:
+            _discard_inactive_campaign_files()
+            _last_inactive_campaign_sweep_at = now_monotonic
+        # Only one worker may maintain/build whitelist indexes at a time.
+        realtime_whitelist_service.migrate_legacy_versions(limit=1)
+        realtime_whitelist_service.repair_active_binding(limit=10)
+        realtime_whitelist_service.repair_active_failed(limit=1)
+        realtime_whitelist_service.build_pending(limit=1)
+    finally:
+        _maintenance_lock.release()
+
+
+def _run(worker_index: int):
+    worker_id = f"realtime-ingestion-{worker_index}"
     while not _stop.wait(0.5):
         try:
             from services import metrics_service
             metrics_service.set_gauge("realtime_ingestion_worker_last_progress_timestamp", time.time())
-            # Index construction is also persisted and resumable at the version
-            # level; keeping it in this dedicated worker prevents scheduler ticks
-            # from being held by a multi-million-row whitelist.
-            realtime_whitelist_service.migrate_legacy_versions(limit=1)
-            realtime_whitelist_service.repair_active_binding(limit=10)
-            realtime_whitelist_service.repair_active_failed(limit=1)
-            realtime_whitelist_service.build_pending(limit=1)
-            if not process_once():
+            if not process_once(worker_id):
                 continue
             metrics_service.set_gauge("realtime_ingestion_worker_last_progress_timestamp", time.time())
         except Exception:
-            logger.exception("Realtime ingestion worker iteration failed")
+            logger.exception("Realtime ingestion worker iteration failed worker_id=%s", worker_id)
+
+
+def _maintenance_run():
+    """Keep whitelist builds and repair work off file-processing workers."""
+    while not _stop.is_set():
+        try:
+            _run_maintenance()
+        except Exception:
+            logger.exception("Realtime ingestion maintenance iteration failed")
+        if _stop.wait(1.0):
+            break
 
 
 def start_worker():
-    global _thread, _last_expiry_sweep_date, _last_inactive_campaign_sweep_at
-    if _thread and _thread.is_alive():
+    global _thread, _threads, _maintenance_thread, _campaign_cursor
+    global _last_expiry_sweep_date, _last_inactive_campaign_sweep_at
+    if any(thread.is_alive() for thread in _threads):
         return
     try:
-        ingestion_job_service.recover_expired_files()
+        realtime_ingestion_state.recover_expired_files()
         _discard_expired_queued_files(include_processing=True)
         _discard_inactive_campaign_files()
         realtime_campaign_service.cleanup_closed_window_ingestion_files(include_processing=True)
@@ -396,25 +494,47 @@ def start_worker():
     except Exception:
         logger.exception("Realtime expired-file startup cleanup failed")
     _stop.clear()
-    _thread = threading.Thread(target=_run, name="realtime-ingestion-worker", daemon=True)
-    _thread.start()
-    logger.info("Realtime ingestion worker started concurrency=1")
+    _campaign_cursor = 0
+    worker_count = _configured_worker_count()
+    _threads = [
+        threading.Thread(
+            target=_run,
+            args=(index,),
+            name=f"realtime-ingestion-worker-{index}",
+            daemon=True,
+        )
+        for index in range(1, worker_count + 1)
+    ]
+    for thread in _threads:
+        thread.start()
+    _maintenance_thread = threading.Thread(
+        target=_maintenance_run,
+        name="realtime-ingestion-maintenance",
+        daemon=True,
+    )
+    _maintenance_thread.start()
+    _thread = _threads[0] if _threads else None
+    logger.info("Realtime ingestion worker started concurrency=%s", worker_count)
 
 
 def stop_worker():
+    global _threads, _maintenance_thread
     _stop.set()
-    thread = _thread
-    if thread and thread.is_alive():
-        thread.join(timeout=2)
+    for thread in _threads:
+        if thread.is_alive():
+            thread.join(timeout=2)
+    if _maintenance_thread and _maintenance_thread.is_alive():
+        _maintenance_thread.join(timeout=2)
+    _maintenance_thread = None
+    _threads = []
     logger.info("Realtime ingestion worker stopped")
 
 
 def worker_status() -> dict:
-    thread = _thread
-    return {"running": bool(thread and thread.is_alive()), "worker_id": WORKER_ID}
-
-
-_current_file_id = None
-_current_campaign_id = None
-_current_filename = ""
-_campaign_dir = ""
+    running = [thread for thread in _threads if thread.is_alive()]
+    return {
+        "running": len(running),
+        "configured": _configured_worker_count(),
+        "worker_ids": [thread.name for thread in running],
+        "maintenance_alive": bool(_maintenance_thread and _maintenance_thread.is_alive()),
+    }

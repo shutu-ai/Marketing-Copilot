@@ -1,13 +1,112 @@
 import hashlib
 import json
+import logging
 import os
+import queue
 import shutil
+import threading
+import time
 from datetime import datetime
 
-from database import get_connection
+from database import get_connection, write_transaction
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 MAX_FILE_BYTES = int(os.environ.get("MC_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+
+_AUDIT_QUEUE_CAPACITY = max(
+    100,
+    min(10000, int(os.environ.get("MC_AUDIT_QUEUE_CAPACITY", "1000"))),
+)
+_AUDIT_RETRIES = 3
+_audit_queue = queue.Queue(maxsize=_AUDIT_QUEUE_CAPACITY)
+_audit_thread = None
+_audit_start_lock = threading.Lock()
+
+
+def _audit_worker() -> None:
+    while True:
+        try:
+            item = _audit_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            action, resource, resource_id, detail, username, ip_address = item
+            last_error = None
+            for attempt in range(1, _AUDIT_RETRIES + 1):
+                try:
+                    audit(
+                        action, resource, resource_id, detail,
+                        username=username, ip_address=ip_address,
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < _AUDIT_RETRIES:
+                        time.sleep(0.1 * attempt)
+            if last_error is not None:
+                logger.error(
+                    "Deferred audit write failed action=%s resource=%s id=%s error=%s",
+                    action, resource, resource_id, last_error,
+                )
+        finally:
+            _audit_queue.task_done()
+            try:
+                from services import metrics_service
+                metrics_service.set_gauge(
+                    "marketing_copilot_audit_queue_depth", _audit_queue.qsize(),
+                )
+            except Exception:
+                pass
+
+
+def _start_audit_worker() -> None:
+    global _audit_thread
+    with _audit_start_lock:
+        if _audit_thread and _audit_thread.is_alive():
+            return
+        _audit_thread = threading.Thread(
+            target=_audit_worker,
+            name="audit-write-buffer",
+            daemon=True,
+        )
+        _audit_thread.start()
+
+
+def audit_async(action: str, resource: str = "", resource_id="", detail=None,
+                username: str = "system", ip_address: str = "") -> bool:
+    """Queue an audit record without blocking the business request.
+
+    Audit records are eventually written by one bounded worker.  This is used
+    after a business transaction has already committed, so a temporary DuckDB
+    writer backlog must not turn a successful save into an HTTP 500 response.
+    """
+    _start_audit_worker()
+    item = (action, resource, resource_id, detail, username, ip_address)
+    try:
+        _audit_queue.put_nowait(item)
+    except queue.Full:
+        logger.error(
+            "Audit queue full; dropping deferred audit action=%s resource=%s id=%s",
+            action, resource, resource_id,
+        )
+        try:
+            from services import metrics_service
+            metrics_service.inc("marketing_copilot_audit_dropped_total")
+        except Exception:
+            pass
+        return False
+    try:
+        from services import metrics_service
+        metrics_service.inc("marketing_copilot_audit_enqueued_total")
+        metrics_service.set_gauge(
+            "marketing_copilot_audit_queue_depth", _audit_queue.qsize(),
+        )
+    except Exception:
+        pass
+    return True
 
 
 def file_digest(path: str) -> str:
@@ -26,68 +125,63 @@ def register_file(campaign_type: str, campaign_id: int, path: str, filename: str
         raise ValueError("unsupported file type")
     digest = file_digest(path)
     safe_filename = os.path.basename(filename)
-    conn = get_connection()
-    existing = conn.execute(
-        "SELECT id, status FROM processed_files WHERE campaign_type=? AND campaign_id=? AND filename=?",
-        (campaign_type, campaign_id, safe_filename)).fetchone()
-    if existing:
-        if existing["status"] != "completed":
-            conn.execute(
-                """UPDATE processed_files
-                   SET file_hash=?, file_path=?, file_size=?, status='validating', error_detail='',
-                       completed_at=NULL
-                   WHERE id=?""",
-                (digest, os.path.abspath(path), os.path.getsize(path), existing["id"]),
-            )
-            conn.commit()
-            conn.close()
-            return existing["id"], False
-        conn.close()
-        return existing["id"], True
-    try:
-        cursor = conn.execute(
+    def write(conn):
+        existing = conn.execute(
+            "SELECT id, status FROM processed_files WHERE campaign_type=? AND campaign_id=? AND filename=?",
+            (campaign_type, campaign_id, safe_filename),
+        ).fetchone()
+        if existing:
+            if existing["status"] != "completed":
+                conn.execute(
+                    """UPDATE processed_files
+                       SET file_hash=?, file_path=?, file_size=?, status='validating', error_detail='',
+                           completed_at=NULL
+                       WHERE id=?""",
+                    (digest, os.path.abspath(path), os.path.getsize(path), existing["id"]),
+                )
+                return existing["id"], False
+            return existing["id"], True
+
+        conn.execute(
             """INSERT INTO processed_files
                (campaign_type,campaign_id,filename,file_hash,file_path,file_size,status)
-               VALUES (?,?,?,?,?,?,'validating')""",
-            (campaign_type, campaign_id, safe_filename, digest, os.path.abspath(path), os.path.getsize(path)))
-    except Exception as exc:
-        if "duplicate" not in str(exc).lower() and "unique" not in str(exc).lower():
-            conn.close()
-            raise
+               VALUES (?,?,?,?,?,?, 'validating')
+               ON CONFLICT (campaign_type,campaign_id,filename) DO NOTHING""",
+            (campaign_type, campaign_id, safe_filename, digest,
+             os.path.abspath(path), os.path.getsize(path)),
+        )
         existing = conn.execute(
-            "SELECT id FROM processed_files WHERE campaign_type=? AND campaign_id=? AND filename=?",
-            (campaign_type, campaign_id, safe_filename)).fetchone()
-        conn.close()
-        if existing:
-            return existing["id"], True
-        raise
-    conn.commit()
-    result = cursor.lastrowid
-    conn.close()
-    return result, False
+            "SELECT id, status FROM processed_files WHERE campaign_type=? AND campaign_id=? AND filename=?",
+            (campaign_type, campaign_id, safe_filename),
+        ).fetchone()
+        if not existing:
+            raise RuntimeError("processed file registration did not create a row")
+        return existing["id"], existing["status"] == "completed"
+
+    return write_transaction(write, operation="processed_file.register")
 
 
 def finish_file(file_id: int, status: str, path: str = "", total_rows: int = 0,
                 created_tasks: int = 0, error: str = ""):
-    conn = get_connection()
-    conn.execute(
-        """UPDATE processed_files SET status=?,file_path=?,total_rows=?,created_tasks=?,error_detail=?,
-           processing_phase=?,last_progress_at=CURRENT_TIMESTAMP,
-           completed_at=CASE WHEN ? IN ('completed','failed','quarantined') THEN CAST(CURRENT_TIMESTAMP AS VARCHAR) ELSE completed_at END
-           WHERE id=?""",
-        (status, path, total_rows, created_tasks, str(error)[:4000],
-         "completed" if status == "completed" else ("quarantined" if status == "quarantined" else "failed"),
-         status, file_id))
-    conn.commit()
-    conn.close()
+    def write(conn):
+        conn.execute(
+            """UPDATE processed_files SET status=?,file_path=?,total_rows=?,created_tasks=?,error_detail=?,
+               processing_phase=?,last_progress_at=CURRENT_TIMESTAMP,
+               completed_at=CASE WHEN ? IN ('completed','failed','quarantined') THEN CAST(CURRENT_TIMESTAMP AS VARCHAR) ELSE completed_at END
+               WHERE id=?""",
+            (status, path, total_rows, created_tasks, str(error)[:4000],
+             "completed" if status == "completed" else ("quarantined" if status == "quarantined" else "failed"),
+             status, file_id),
+        )
+
+    write_transaction(write, operation="processed_file.finish")
 
 
 def update_file_progress(file_id: int, phase: str, processed_rows: int = 0,
                          matched_rows: int = 0, chunk_index: int = 0,
                          total_chunks: int = 0, worker_id: str = "",
                          whitelist_version_id=None):
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             """UPDATE processed_files SET processing_phase=?,processed_rows=?,matched_rows=?,
                current_chunk_index=?,total_chunks=?,worker_id=?,last_progress_at=CURRENT_TIMESTAMP,
@@ -96,14 +190,12 @@ def update_file_progress(file_id: int, phase: str, processed_rows: int = 0,
             (phase, int(processed_rows or 0), int(matched_rows or 0), int(chunk_index or 0),
              int(total_chunks or 0), worker_id or "", whitelist_version_id, file_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
+
+    write_transaction(write, attempts=2, operation="processed_file.progress")
 
 
 def mark_file_retry(file_id: int, error_class: str, error: str, next_retry_at=None):
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             """UPDATE processed_files SET status='retrying',retry_count=COALESCE(retry_count,0)+1,
                last_error_class=?,last_error_at=CURRENT_TIMESTAMP,
@@ -112,9 +204,8 @@ def mark_file_retry(file_id: int, error_class: str, error: str, next_retry_at=No
                WHERE id=?""",
             (error_class, next_retry_at, str(error)[:4000], file_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
+
+    write_transaction(write, operation="processed_file.retry")
 
 
 def quarantine(path: str, campaign_dir: str, filename: str) -> str:
@@ -153,29 +244,31 @@ def archive_duplicate(path: str, campaign_dir: str, filename: str) -> str:
 
 
 def event(category: str, code: str, message: str, severity: str = "error", context=None):
-    conn = get_connection()
-    existing = conn.execute(
-        "SELECT id FROM system_events WHERE category=? AND code=? AND resolved=0 LIMIT 1",
-        (category, code),
-    ).fetchone()
-    if not existing:
-        conn.execute("INSERT INTO system_events(category,severity,code,message,context) VALUES (?,?,?,?,?)",
-                     (category, severity, code, str(message)[:2000], json.dumps(context or {}, ensure_ascii=False)))
-    conn.commit()
-    conn.close()
+    def write(conn):
+        existing = conn.execute(
+            "SELECT id FROM system_events WHERE category=? AND code=? AND resolved=0 LIMIT 1",
+            (category, code),
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO system_events(category,severity,code,message,context) VALUES (?,?,?,?,?)",
+                (category, severity, code, str(message)[:2000], json.dumps(context or {}, ensure_ascii=False)),
+            )
+
+    write_transaction(write, operation="system_event.write")
 
 
 def audit(action: str, resource: str = "", resource_id="", detail=None,
           username: str = "system", ip_address: str = ""):
-    conn = get_connection()
-    conn.execute(
-        """INSERT INTO audit_logs(username,action,resource,resource_id,detail,ip_address)
-           VALUES (?,?,?,?,?,?)""",
-        (username, action, resource, str(resource_id or ""),
-         json.dumps(detail or {}, ensure_ascii=False, default=str), ip_address),
-    )
-    conn.commit()
-    conn.close()
+    def write(conn):
+        conn.execute(
+            """INSERT INTO audit_logs(username,action,resource,resource_id,detail,ip_address)
+               VALUES (?,?,?,?,?,?)""",
+            (username, action, resource, str(resource_id or ""),
+             json.dumps(detail or {}, ensure_ascii=False, default=str), ip_address),
+        )
+
+    write_transaction(write, attempts=_AUDIT_RETRIES, operation="audit")
 
 
 def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:

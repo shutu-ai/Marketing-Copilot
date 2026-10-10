@@ -13,12 +13,12 @@ import time
 import duckdb
 import tempfile
 import threading
-from database import get_connection
+from database import get_connection, read_transaction, write_transaction
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
 from services import sms_task_service
 from services import (operations_service, campaign_name_service, ingestion_job_service,
-                      backpressure_service, realtime_whitelist_service)
+                      backpressure_service, realtime_whitelist_service, realtime_ingestion_state)
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -27,6 +27,10 @@ CHUNK_SIZE = 5000  # fallback; the effective value is read from app settings
 MAX_PENDING_FILES_PER_CAMPAIGN = max(1, int(os.environ.get("MC_REALTIME_MAX_PENDING_FILES_PER_CAMPAIGN", "100")))
 MAX_INBOX_FILES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_FILES", "1000")))
 MAX_INBOX_BYTES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_GB", "10")) * 1024 ** 3)
+try:
+    WATCH_RESCAN_SECONDS = max(3.0, float(os.environ.get("MC_REALTIME_WATCH_RESCAN_SECONDS", "30")))
+except (TypeError, ValueError):
+    WATCH_RESCAN_SECONDS = 30.0
 _daily_finalize_lock = threading.Lock()
 _daily_finalize_date = None
 _daily_finalized_windows = set()
@@ -35,6 +39,17 @@ _backpressure_log_lock = threading.Lock()
 _backpressure_log_state = {}
 _watch_skip_log_lock = threading.Lock()
 _watch_skip_log_state = {}
+_watch_scan_lock = threading.Lock()
+_watch_scan_state = {}
+
+
+def _run_campaign_write(operation: str, writer):
+    return write_transaction(
+        writer,
+        attempts=3,
+        operation=f"realtime_campaign.{operation}",
+        base_delay=0.1,
+    )
 
 
 def _realtime_chunk_size() -> int:
@@ -142,21 +157,26 @@ def get_sftp_password(campaign_id: int) -> str:
 
 
 def get_all() -> list:
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM realtime_campaigns ORDER BY created_at DESC").fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_campaigns ORDER BY created_at DESC"
+        ).fetchall(),
+        operation="realtime_campaign.list",
+    )
     return [_enrich(dict(r)) for r in rows]
 
 
 def list_campaigns(page: int = 1, page_size: int = 50) -> dict:
-    conn = get_connection()
-    total = conn.execute("SELECT COUNT(*) cnt FROM realtime_campaigns").fetchone()["cnt"]
-    offset = max(0, page - 1) * page_size
-    rows = conn.execute(
-        "SELECT * FROM realtime_campaigns ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (page_size, offset),
-    ).fetchall()
-    conn.close()
+    def read(conn):
+        total = conn.execute("SELECT COUNT(*) cnt FROM realtime_campaigns").fetchone()["cnt"]
+        offset = max(0, page - 1) * page_size
+        rows = conn.execute(
+            "SELECT * FROM realtime_campaigns ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (page_size, offset),
+        ).fetchall()
+        return total, rows
+
+    total, rows = read_transaction(read, operation="realtime_campaign.list_page")
     return {
         "total": total,
         "page": page,
@@ -166,41 +186,48 @@ def list_campaigns(page: int = 1, page_size: int = 50) -> dict:
 
 
 def get_one(campaign_id: int) -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone(),
+        operation="realtime_campaign.get",
+    )
     return _enrich(dict(row)) if row else None
 
 
 def create(data: RealtimeCampaignCreate) -> dict:
     name = campaign_name_service.ensure_unique_name(data.name)
     if not (data.phone_prefix or "").strip():
-        raise ValueError("\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00")
-    conn = get_connection()
+        raise ValueError("请输入号码前缀")
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
-    cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_source, watch_dir, sftp_host, sftp_port, sftp_username, sftp_password, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, data.use_whitelist if data.use_whitelist is not None else True, data.start_time or "", data.end_time or "",
-         data.send_start_time or "", data.send_end_time or "",
-         _fmt_days(data.send_days), campaign_dir, use_custom_directory,
-         data.watch_source or "local", data.watch_dir or "", data.sftp_host or "", data.sftp_port or 22,
-         data.sftp_username or "", data.sftp_password or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
-         data.phone_prefix or "", data.sms_template_id, data.smpp_config_id)
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()
-    conn.close()
-    campaign = _enrich(dict(row))
 
+    def write(conn):
+        cursor = conn.execute(
+            "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_source, watch_dir, sftp_host, sftp_port, sftp_username, sftp_password, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, data.use_whitelist if data.use_whitelist is not None else True,
+             data.start_time or "", data.end_time or "", data.send_start_time or "",
+             data.send_end_time or "", _fmt_days(data.send_days), campaign_dir,
+             use_custom_directory, data.watch_source or "local", data.watch_dir or "",
+             data.sftp_host or "", data.sftp_port or 22, data.sftp_username or "",
+             data.sftp_password or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
+             data.phone_prefix or "", data.sms_template_id, data.smpp_config_id),
+        )
+        return dict(conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)
+        ).fetchone())
+
+    campaign = _enrich(_run_campaign_write("create", write))
     if not campaign_dir:
         campaign_dir = _ensure_campaign_dir(campaign)
-        conn2 = get_connection()
-        conn2.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign["id"]))
-        conn2.commit()
-        conn2.close()
+        _run_campaign_write(
+            "create.directory",
+            lambda conn: conn.execute(
+                "UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?",
+                (campaign_dir, campaign["id"]),
+            ),
+        )
         campaign["campaign_dir"] = campaign_dir
-
     os.makedirs(os.path.join(campaign_dir, "whitelist"), exist_ok=True)
     os.makedirs(os.path.join(campaign_dir, "received"), exist_ok=True)
     os.makedirs(os.path.join(campaign_dir, "output"), exist_ok=True)
@@ -208,117 +235,159 @@ def create(data: RealtimeCampaignCreate) -> dict:
 
 
 def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
-    conn = get_connection()
-    existing = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
+    probe = get_connection()
+    try:
+        existing = probe.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+    finally:
+        probe.close()
     if not existing:
-        conn.close()
         return None
     existing_dict = dict(existing)
     if data.name is not None and data.name.strip() != (existing_dict.get("name") or "").strip():
         data.name = campaign_name_service.ensure_unique_name(data.name, "realtime", campaign_id)
+
     auto_campaign_dir = ""
-    if data.status == "in_progress" and not (existing_dict.get("campaign_dir") or "").strip() \
-            and not bool(existing_dict.get("use_custom_directory")):
-        # Older campaigns may predate automatic campaign directory creation.
-        # Materialize the default directory before validation so they can be
-        # started after an upgrade without manual database repair.
-        auto_campaign_dir = _ensure_campaign_dir(existing_dict)
-        existing_dict["campaign_dir"] = auto_campaign_dir
+    validation_campaign = dict(existing_dict)
     if data.status == "in_progress":
-        validation_errors = operations_service.validate_campaign("realtime", {**existing_dict, "id": campaign_id})
+        if not (validation_campaign.get("campaign_dir") or "").strip() and not bool(validation_campaign.get("use_custom_directory")):
+            auto_campaign_dir = _ensure_campaign_dir(validation_campaign)
+            validation_campaign["campaign_dir"] = auto_campaign_dir
+        validation_errors = operations_service.validate_campaign(
+            "realtime", {**validation_campaign, "id": campaign_id}
+        )
         if validation_errors:
-            conn.close()
             raise ValueError("; ".join(validation_errors))
-    if data.status == "in_progress" and existing_dict.get("use_whitelist", True) and not existing_dict.get("row_count", 0):
-        conn.close()
-        raise ValueError("No whitelist uploaded — cannot start campaign")
+        if validation_campaign.get("use_whitelist", True) and not validation_campaign.get("row_count", 0):
+            raise ValueError("No whitelist uploaded - cannot start campaign")
     if existing_dict.get("status") != "not_started":
-        only_allowed = all(getattr(data, f, None) is None for f in ["name", "start_time", "campaign_dir"])
+        only_allowed = all(
+            getattr(data, field, None) is None
+            for field in ["name", "start_time", "campaign_dir"]
+        )
         if not only_allowed:
-            conn.close()
-            raise ValueError("Campaign has already started — cannot edit")
+            raise ValueError("Campaign has already started - cannot edit")
+
     fields = {}
     for field in ["name", "use_whitelist", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_source", "watch_dir", "sftp_host", "sftp_port", "sftp_username", "sftp_password", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
-        val = getattr(data, field, None)
-        if val is not None:
-            if field == "sftp_password" and val in ("", "********"):
+        value = getattr(data, field, None)
+        if value is not None:
+            if field == "sftp_password" and value in ("", "********"):
                 continue
-            fields[field] = val
+            fields[field] = value
     if auto_campaign_dir:
         fields["campaign_dir"] = auto_campaign_dir
     if data.send_days is not None:
         fields["send_days"] = _fmt_days(data.send_days)
-
+    if data.use_custom_directory is not None:
+        if data.use_custom_directory:
+            campaign_dir = (data.campaign_dir or "").strip()
+            if not campaign_dir:
+                raise ValueError("Custom campaign directory is required")
+            fields["campaign_dir"] = campaign_dir
+        else:
+            fields["campaign_dir"] = _ensure_campaign_dir({**existing_dict, **fields})
+    if data.use_custom_directory is not None and existing_dict.get("customer_list_path"):
+        new_dir = fields.get("campaign_dir", "")
+        old_dir = (existing_dict.get("campaign_dir") or "").strip()
+        if new_dir and os.path.normcase(os.path.normpath(new_dir)) != os.path.normcase(os.path.normpath(old_dir)):
+            raise ValueError("Cannot change campaign directory after a whitelist has been uploaded")
     new_smpp_id = fields.get("smpp_config_id")
-    if new_smpp_id is not None:
-        smpp = conn.execute(
-            "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (new_smpp_id,)
+
+    def write(conn):
+        current = conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
         ).fetchone()
-        if not smpp:
-            conn.close()
-            raise ValueError("Associated SMPP configuration is missing or disabled")
+        if not current:
+            return None
+        if new_smpp_id is not None:
+            smpp = conn.execute(
+                "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (new_smpp_id,)
+            ).fetchone()
+            if not smpp:
+                raise ValueError("Associated SMPP configuration is missing or disabled")
+        if fields:
+            set_clause = ", ".join(f"{key}=?" for key in fields)
+            conn.execute(
+                f"UPDATE realtime_campaigns SET {set_clause}, updated_at=datetime('now','localtime') WHERE id=?",
+                (*fields.values(), campaign_id),
+            )
+        if new_smpp_id is not None:
+            conn.execute(
+                """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
+                (new_smpp_id, campaign_id),
+            )
+        row = conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
-    if fields:
-        set_clause = ", ".join(f"{k}=?" for k in fields)
-        conn.execute(
-            f"UPDATE realtime_campaigns SET {set_clause}, updated_at=datetime('now','localtime') WHERE id=?",
-            (*fields.values(), campaign_id)
-        )
-        conn.commit()
-
-    if new_smpp_id is not None:
-        # Re-route pending SMS tasks of this campaign to the newly associated SMSC so
-        # queued/retrying messages follow the new configuration instead of the old one.
-        conn.execute(
-            """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
-               WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
-            (new_smpp_id, campaign_id),
-        )
-        conn.commit()
-
-    row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    conn.close()
+    updated = _run_campaign_write("update", write)
+    if updated is None:
+        return None
     sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
-    return _enrich(dict(row))
+    result = _enrich(updated)
+    if data.use_custom_directory is not None:
+        os.makedirs(os.path.join(result["campaign_dir"], "whitelist"), exist_ok=True)
+        os.makedirs(os.path.join(result["campaign_dir"], "received"), exist_ok=True)
+        os.makedirs(os.path.join(result["campaign_dir"], "output"), exist_ok=True)
+    return result
 
 
 def delete(campaign_id: int) -> bool:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    if row:
-        campaign_dir = dict(row).get("campaign_dir", "")
-        if campaign_dir and os.path.isdir(campaign_dir):
-            try:
-                shutil.rmtree(campaign_dir)
-            except Exception:
-                pass
-    conn.execute("DELETE FROM realtime_campaign_files WHERE campaign_id=?", (campaign_id,))
-    conn.execute("DELETE FROM realtime_campaigns WHERE id=?", (campaign_id,))
-    conn.commit()
-    conn.close()
+    probe = get_connection()
+    try:
+        row = probe.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+    finally:
+        probe.close()
+    if not row:
+        return False
+    _run_campaign_write(
+        "delete",
+        lambda conn: (
+            conn.execute("DELETE FROM realtime_campaign_files WHERE campaign_id=?", (campaign_id,)),
+            conn.execute("DELETE FROM realtime_campaigns WHERE id=?", (campaign_id,)),
+        ),
+    )
+    campaign_dir = dict(row).get("campaign_dir", "")
+    if campaign_dir and os.path.isdir(campaign_dir):
+        try:
+            shutil.rmtree(campaign_dir)
+        except Exception:
+            logger.warning("Unable to remove deleted realtime campaign directory=%s", campaign_dir, exc_info=True)
     sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
-    # DuckDB rowcount is not reliable for DELETE; the initial lookup is authoritative.
-    return row is not None
+    return True
 
 
 def copy(campaign_id: int) -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    if not row:
-        conn.close()
+    def write(conn):
+        row = conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        if not row:
+            return None
+        orig = dict(row)
+        cursor = conn.execute(
+            "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (orig["name"] + " (Copy)", orig.get("use_whitelist", True),
+             orig["start_time"], orig["end_time"], orig.get("send_start_time", ""),
+             orig.get("send_end_time", ""), orig.get("send_days", "[]"),
+             orig.get("sms_template_id"), orig.get("smpp_config_id")),
+        )
+        new_row = conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)
+        ).fetchone()
+        return {"original": orig, "campaign": dict(new_row)}
+
+    result = _run_campaign_write("copy", write)
+    if result is None:
         return None
-    orig = dict(row)
-    new_name = orig["name"] + " (Copy)"
-    cursor = conn.execute(
-        "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (new_name, orig.get("use_whitelist", True), orig["start_time"], orig["end_time"],
-         orig.get("send_start_time", ""), orig.get("send_end_time", ""),
-         orig.get("send_days", "[]"), orig.get("sms_template_id"), orig.get("smpp_config_id"))
-    )
-    conn.commit()
-    new_row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)).fetchone()
-    conn.close()
-    new_campaign = _enrich(dict(new_row))
+    orig = result["original"]
+    new_campaign = _enrich(result["campaign"])
     campaign_dir = _ensure_campaign_dir(new_campaign)
     os.makedirs(os.path.join(campaign_dir, "whitelist"), exist_ok=True)
     os.makedirs(os.path.join(campaign_dir, "received"), exist_ok=True)
@@ -330,10 +399,13 @@ def copy(campaign_id: int) -> Optional[dict]:
             src = os.path.join(old_whitelist, fname)
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(campaign_dir, "whitelist", fname))
-    conn2 = get_connection()
-    conn2.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, new_campaign["id"]))
-    conn2.commit()
-    conn2.close()
+    _run_campaign_write(
+        "copy.directory",
+        lambda conn: conn.execute(
+            "UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?",
+            (campaign_dir, new_campaign["id"]),
+        ),
+    )
     new_campaign["campaign_dir"] = campaign_dir
     return new_campaign
 
@@ -348,10 +420,13 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
         os.makedirs(os.path.join(campaign_dir, "whitelist"), exist_ok=True)
         os.makedirs(os.path.join(campaign_dir, "received"), exist_ok=True)
         os.makedirs(os.path.join(campaign_dir, "output"), exist_ok=True)
-        conn = get_connection()
-        conn.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign_id))
-        conn.commit()
-        conn.close()
+        _run_campaign_write(
+            "upload.directory",
+            lambda conn: conn.execute(
+                "UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?",
+                (campaign_dir, campaign_id),
+            ),
+        )
     _ensure_realtime_dirs(campaign_dir)
     result = realtime_whitelist_service.upload(campaign_id, file_path, original_filename)
     if not result.get("success"):
@@ -379,10 +454,13 @@ def queue_file(campaign_id: int, file_path: str, original_filename: str) -> dict
         return {"success": False, "message": reason}
     campaign_dir = campaign.get("campaign_dir") or _ensure_campaign_dir(campaign)
     if not campaign.get("campaign_dir"):
-        conn = get_connection()
-        conn.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign_id))
-        conn.commit()
-        conn.close()
+        _run_campaign_write(
+            "upload.directory",
+            lambda conn: conn.execute(
+                "UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?",
+                (campaign_dir, campaign_id),
+            ),
+        )
     _ensure_realtime_dirs(campaign_dir)
     inbox_dir = os.path.join(campaign_dir, "inbox")
     os.makedirs(inbox_dir, exist_ok=True)
@@ -391,15 +469,30 @@ def queue_file(campaign_id: int, file_path: str, original_filename: str) -> dict
     if os.path.exists(dest):
         return {"success": True, "queued": True, "duplicate_file": True, "filename": safe_name,
                 "message": "file is already queued"}
-    allowed, capacity_reason = _inbox_capacity_available(campaign_id, os.path.getsize(file_path))
-    if not allowed:
-        logger.warning("Realtime inbox backpressure campaign=%s file=%s reason=%s", campaign_id, safe_name, capacity_reason)
-        return {"success": False, "status": "backpressure", "retryable": True, "message": capacity_reason}
-    shutil.move(file_path, dest)
-    file_id, duplicate = ingestion_job_service.register_file(
-        "realtime", campaign_id, safe_name, dest, chunk_size=_realtime_chunk_size(),
-        whitelist_version_id=(realtime_whitelist_service.active_version(campaign_id) or {}).get("id"),
+    reservation = _reserve_inbox_capacity(
+        campaign_id, safe_name, os.path.getsize(file_path), "upload",
     )
+    if not reservation.get("ok"):
+        if reservation.get("duplicate"):
+            return {"success": True, "queued": True, "duplicate_file": True,
+                    "filename": safe_name, "message": reservation["reason"]}
+        logger.warning("Realtime inbox backpressure campaign=%s file=%s reason=%s",
+                       campaign_id, safe_name, reservation["reason"])
+        return {"success": False, "status": "backpressure", "retryable": True,
+                "message": reservation["reason"]}
+    reservation_token = reservation["token"]
+    consumed = False
+    try:
+        shutil.move(file_path, dest)
+        file_id, duplicate = ingestion_job_service.register_file(
+            "realtime", campaign_id, safe_name, dest, chunk_size=_realtime_chunk_size(),
+            whitelist_version_id=(realtime_whitelist_service.active_version(campaign_id) or {}).get("id"),
+            reservation_token=reservation_token,
+        )
+        consumed = True
+    finally:
+        if not consumed:
+            ingestion_job_service.release_realtime_capacity(reservation_token)
     if duplicate:
         duplicate_path = operations_service.archive_duplicate(dest, campaign_dir, safe_name)
         return {"success": True, "queued": False, "duplicate_file": True,
@@ -536,6 +629,15 @@ def _record_inbox_capacity_file(capacity: dict, file_size: int) -> None:
     capacity["total_bytes"] += max(0, int(file_size or 0))
 
 
+def _reserve_inbox_capacity(campaign_id: int, filename: str, file_size: int,
+                            source: str) -> dict:
+    return ingestion_job_service.reserve_realtime_capacity(
+        campaign_id, filename, file_size,
+        MAX_PENDING_FILES_PER_CAMPAIGN, MAX_INBOX_FILES, MAX_INBOX_BYTES,
+        source=source,
+    )
+
+
 def _log_inbox_backpressure(campaign_id: int, rejected: int, reason: str,
                             source: str = "local") -> None:
     """Rate-limit repeated capacity warnings while retaining suppressed counts."""
@@ -572,26 +674,13 @@ def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
 
 
 def _is_transient_whitelist_index_error(error: Exception) -> bool:
-    message = str(error).lower()
-    return any(marker in message for marker in (
-        "write-write conflict",
-        "could not set lock",
-        "conflicting lock",
-        "database is locked",
-        "transaction conflict",
-    ))
+    return realtime_whitelist_service.is_transient_database_error(error)
 
 
 def _is_repairable_whitelist_error(error) -> bool:
     """Identify index failures that can be repaired from the same source file."""
     message = str(error or "").lower()
     return any(marker in message for marker in (
-        "write-write conflict",
-        "transactioncontext",
-        "transaction conflict",
-        "database is locked",
-        "could not set lock",
-        "conflicting lock",
         "cannot read whitelist index",
         "cannot read active whitelist index",
         "catalog error",
@@ -647,10 +736,35 @@ def _open_whitelist_index(path: str):
     raise last_error
 
 
+def _batch_seen_msisdns(conn, normalized, languages, use_whitelist):
+    """One chunk relation/write, retaining first input positions across chunks."""
+    stage = pd.DataFrame({"ordinal": range(len(normalized)), "msisdn": list(normalized)})
+    valid = stage["msisdn"].astype(bool)
+    invalid = int((~valid).sum())
+    stage = stage.loc[valid].copy()
+    stage["matched"] = stage["msisdn"].isin(languages).astype(int) if use_whitelist else 1
+    matched_rows = int(stage["matched"].sum())
+    stage = stage.drop_duplicates("msisdn", keep="first")
+    if stage.empty:
+        return [], invalid, matched_rows
+    conn.register("chunk_seen_input", stage)
+    try:
+        inserted = conn.execute(
+            """INSERT INTO seen_msisdns(msisdn,matched)
+               SELECT msisdn,matched FROM chunk_seen_input
+               ON CONFLICT DO NOTHING RETURNING msisdn""",
+        ).fetchall()
+        new_numbers = {row[0] for row in inserted}
+        positions = stage.loc[stage["msisdn"].isin(new_numbers) & (stage["matched"] == 1), "ordinal"]
+        return list(positions), invalid, matched_rows
+    finally:
+        conn.unregister("chunk_seen_input")
+
+
 def receive_file(campaign_id: int, file_path: str, original_filename: str,
                  ingestion_file_id: Optional[int] = None,
                  whitelist_version_id: Optional[int] = None,
-                 worker_id: str = "") -> dict:
+                 worker_id: str = "", lease_token: str = "") -> dict:
     conn = get_connection()
     campaign = conn.execute(
         "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
@@ -662,13 +776,31 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     # Do not retain a long-lived DuckDB snapshot while chunk state and tasks are
     # committed through their own short transactions.
     conn.close()
+    realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
+    # A previous attempt may have moved the file but failed its final DB commit.
+    # Replay completed chunk checkpoints from received, not a missing inbox path.
+    recovered_archive = False
+    if not os.path.isfile(file_path):
+        archived = os.path.join(campaign.get("campaign_dir", ""), "received", os.path.basename(original_filename))
+        if os.path.isfile(archived):
+            file_path = archived
+            recovered_archive = True
     try:
-        file_record_id, duplicate_file = operations_service.register_file(
-            "realtime", campaign_id, file_path, original_filename)
+        if lease_token:
+            file_record_id, duplicate_file = realtime_ingestion_state.register_processed(
+                campaign_id, file_path, original_filename, ingestion_file_id, lease_token,
+            )
+        else:
+            file_record_id, duplicate_file = operations_service.register_file(
+                "realtime", campaign_id, file_path, original_filename)
+    except realtime_ingestion_state.LeaseLost:
+        raise
     except Exception as exc:
+        if realtime_ingestion_state.transient(exc):
+            raise
         return {"success": False, "message": str(exc), "error_class": "INVALID_INPUT"}
     if duplicate_file:
-        duplicate_path = operations_service.archive_duplicate(
+        duplicate_path = "" if recovered_archive else operations_service.archive_duplicate(
             file_path, campaign.get("campaign_dir", ""), original_filename)
         return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
                 "message": "file already processed"}
@@ -680,38 +812,17 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         )
     if whitelist_version_id is None:
         whitelist_version_id = (realtime_whitelist_service.active_version(campaign_id) or {}).get("id")
-    if whitelist_version_id:
-        conn = get_connection()
-        conn.execute("UPDATE processed_files SET whitelist_version_id=?,processing_phase='validating' WHERE id=?",
-                     (whitelist_version_id, file_record_id))
-        conn.commit()
-        conn.close()
-        ingestion_job_service.update_progress(ingestion_file_id, "validating", whitelist_version_id=whitelist_version_id)
-    def progress(phase: str, processed_rows: int = 0, matched_rows: int = 0,
-                 chunk_index: int = 0, total_chunks: int = 0):
-        operations_service.update_file_progress(
-            file_record_id, phase, processed_rows, matched_rows, chunk_index,
-            total_chunks, worker_id, whitelist_version_id,
-        )
-        ingestion_job_service.update_progress(
-            ingestion_file_id, phase, processed_rows, matched_rows, chunk_index,
-            total_chunks, worker_id, whitelist_version_id,
-        )
-        try:
-            from services import metrics_service
-            metrics_service.set_gauge("realtime_ingestion_worker_last_progress_timestamp", time.time())
-        except Exception:
-            pass
-        logger.info(
-            "Realtime file progress campaign=%s file=%s phase=%s rows=%s matched=%s chunk=%s total_chunks=%s whitelist_version=%s worker_id=%s",
-            campaign_id, original_filename, phase, int(processed_rows or 0), int(matched_rows or 0),
-            int(chunk_index or 0), int(total_chunks or 0), whitelist_version_id or "", worker_id or "",
-        )
+    progress = realtime_ingestion_state.Progress(
+        ingestion_file_id, file_record_id, lease_token, worker_id, whitelist_version_id,
+    )
+    def finish_processed(status, path, error):
+        realtime_ingestion_state.finish_processed(ingestion_file_id, file_record_id, lease_token, status, path, error)
+    progress("validating")
     active, inactive_reason = sms_task_service.campaign_is_active(campaign)
     if not active:
         # A worker can claim a file just as an operator closes the campaign.
         # Treat terminal campaign closure as expiration, not an input failure.
-        operations_service.finish_file(file_record_id, "failed", file_path, error=inactive_reason)
+        finish_processed("failed", file_path, inactive_reason)
         terminal = inactive_reason in {"campaign is not enabled", "campaign has ended"}
         return {
             "success": False,
@@ -725,41 +836,54 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     whitelist_path = campaign.get("customer_list_path", "")
     if campaign.get("use_whitelist", True) and not whitelist_version and latest_whitelist_version \
             and latest_whitelist_version.get("status") == "building":
-        ingestion_job_service.update_progress(ingestion_file_id, "waiting_for_whitelist")
+        progress("waiting_for_whitelist")
         return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
                 "message": "whitelist index is still building"}
     if campaign.get("use_whitelist", True) and whitelist_version:
         whitelist_status = whitelist_version.get("status")
         if whitelist_status == "failed":
             error_detail = whitelist_version.get("error_detail") or "whitelist index build failed"
-            if _is_repairable_whitelist_error(error_detail) and _schedule_active_whitelist_rebuild(
+            if _is_transient_whitelist_index_error(error_detail):
+                recovered = realtime_whitelist_service.recover_transient_failure(whitelist_version_id)
+                if recovered == "ready":
+                    whitelist_version = realtime_whitelist_service.get_version(whitelist_version_id)
+                    whitelist_status = (whitelist_version or {}).get("status")
+                else:
+                    # A transient conflict with no complete index is a build
+                    # retry, not a terminal whitelist failure.  Keep the file
+                    # pending until the normal whitelist builder completes.
+                    progress("waiting_for_whitelist")
+                    return {
+                        "success": False,
+                        "status": "waiting_for_whitelist",
+                        "retryable": True,
+                        "message": f"whitelist index temporarily unavailable: {error_detail}",
+                    }
+            if whitelist_status == "failed" and _is_repairable_whitelist_error(error_detail) and _schedule_active_whitelist_rebuild(
                 campaign_id, whitelist_version_id, error_detail,
             ):
-                ingestion_job_service.update_progress(
-                    ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
-                )
+                progress("waiting_for_whitelist")
                 return {
                     "success": False,
                     "status": "waiting_for_whitelist",
                     "retryable": True,
                     "message": f"active whitelist index repair scheduled: {error_detail}",
                 }
-            terminal_error = f"whitelist index build failed: {error_detail}"
-            operations_service.finish_file(file_record_id, "failed", file_path, error=terminal_error)
-            return {
-                "success": False,
-                "status": "failed",
-                "error_class": "WHITELIST_INDEX",
-                "retryable": False,
-                "message": terminal_error,
-            }
+            if whitelist_status == "failed":
+                terminal_error = f"whitelist index build failed: {error_detail}"
+                finish_processed("failed", file_path, terminal_error)
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "error_class": "WHITELIST_INDEX",
+                    "retryable": False,
+                    "message": terminal_error,
+                }
         if whitelist_status == "ready" and not os.path.isfile(whitelist_version.get("index_path", "")):
             if _schedule_active_whitelist_rebuild(
                 campaign_id, whitelist_version_id, "active whitelist index file is missing",
             ):
-                ingestion_job_service.update_progress(
-                    ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
-                )
+                progress("waiting_for_whitelist")
                 return {
                     "success": False,
                     "status": "waiting_for_whitelist",
@@ -767,12 +891,12 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     "message": "active whitelist index repair scheduled: index file is missing",
                 }
         if whitelist_status != "ready" or not os.path.isfile(whitelist_version.get("index_path", "")):
-            ingestion_job_service.update_progress(ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id)
+            progress("waiting_for_whitelist")
             return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
                     "message": "whitelist index is still building"}
         whitelist_path = whitelist_version["index_path"]
     elif campaign.get("use_whitelist", True) and (not whitelist_path or not os.path.isfile(whitelist_path)):
-        operations_service.finish_file(file_record_id, "failed", file_path, error="No whitelist uploaded")
+        finish_processed("failed", file_path, "No whitelist uploaded")
         return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
                 "message": "No ready whitelist for this campaign"}
 
@@ -784,8 +908,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         else:
             df = pd.read_excel(file_path, dtype=str)
     except Exception as e:
+        realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
         target = operations_service.quarantine(file_path, campaign.get("campaign_dir", ""), original_filename)
-        operations_service.finish_file(file_record_id, "quarantined", target, error=e)
+        finish_processed("quarantined", target, e)
         operations_service.event("file", "READ_FAILED", str(e), context={"campaign_id": campaign_id, "file": original_filename})
         return {"success": False, "status": "quarantined", "error_class": "INVALID_INPUT",
                 "quarantine_path": target, "message": f"Cannot read file: {e}"}
@@ -793,42 +918,35 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     # Load only the persistent versioned index. Legacy campaigns are migrated by
     # the realtime worker before they are allowed to process new files.
     whitelist_conn = None
+    # Main database progress failures are not whitelist-index failures.
+    progress("loading_index")
     try:
         if not campaign.get("use_whitelist", True):
             whitelist_languages = {}
             whitelist_set = set()
         elif whitelist_version:
-            progress("loading_index")
             whitelist_conn = _open_whitelist_index(whitelist_path)
             whitelist_languages = None
             whitelist_set = None
         else:
-            ingestion_job_service.update_progress(
-                ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id
-            )
             return {"success": False, "status": "waiting_for_whitelist", "retryable": True,
                     "message": "No ready whitelist index for this campaign"}
     except Exception as e:
         if whitelist_conn:
             whitelist_conn.close()
-        rebuild_scheduled = _schedule_active_whitelist_rebuild(campaign_id, whitelist_version_id, e)
         if _is_transient_whitelist_index_error(e):
-            ingestion_job_service.update_progress(
-                ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
-            )
+            progress("waiting_for_whitelist")
             return {
                 "success": False,
                 "status": "waiting_for_whitelist",
                 "retryable": True,
-                "message": f"active whitelist index repair scheduled: {e}" if rebuild_scheduled
-                else f"whitelist index temporarily busy: {e}",
+                "message": f"whitelist index temporarily busy: {e}",
             }
+        rebuild_scheduled = _schedule_active_whitelist_rebuild(campaign_id, whitelist_version_id, e)
         # The active whitelist is authoritative. Never mark it failed or
         # substitute an older version when its index cannot be read. Keep the
         # file pending so the index can be repaired/rebuilt and retried.
-        ingestion_job_service.update_progress(
-            ingestion_file_id, "waiting_for_whitelist", whitelist_version_id=whitelist_version_id,
-        )
+        progress("waiting_for_whitelist")
         if not rebuild_scheduled:
             operations_service.event(
                 "realtime_ingestion", "WHITELIST_INDEX_UNAVAILABLE",
@@ -877,11 +995,8 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 chunk_start = total_rows
                 total_rows += len(chunk)
                 progress("matching", total_rows, matched_row_count, chunk_index, chunk_index + 1)
-                ingestion_job_service.ensure_chunk(
-                    ingestion_file_id, chunk_index, chunk_start, total_rows
-                )
-                current_job = ingestion_job_service.claim_chunk(
-                    file_id=ingestion_file_id, chunk_index=chunk_index
+                current_job = realtime_ingestion_state.prepare_chunk(
+                    ingestion_file_id, chunk_index, chunk_start, total_rows, lease_token,
                 )
                 if current_job is None:
                     raise RuntimeError(f"realtime chunk {chunk_index} lease is held by another worker")
@@ -893,35 +1008,27 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     _lookup_whitelist_languages(whitelist_conn, chunk_normalized)
                     if whitelist_conn is not None else whitelist_languages
                 )
-                matched_records = []
                 chunk_result = {}
-                chunk_matched_rows = 0
-                for idx, norm in enumerate(chunk_normalized):
-                    if not norm:
-                        task_result["invalid"] += 1
-                        continue
-                    is_matched = not campaign.get("use_whitelist", True) or norm in chunk_whitelist_languages
-                    if is_matched:
-                        chunk_matched_rows += 1
-                    inserted = unique_conn.execute(
-                        """INSERT INTO seen_msisdns(msisdn, matched) VALUES (?,?)
-                           ON CONFLICT DO NOTHING RETURNING msisdn""",
-                        (norm, 1 if is_matched else 0),
-                    ).fetchone()
-                    if not inserted or not is_matched:
-                        continue
-                    row_dict = chunk.iloc[idx].fillna("").to_dict()
-                    row_dict["msisdn"] = norm
-                    row_dict["language"] = row_dict.get("language", "") if not campaign.get("use_whitelist", True) else chunk_whitelist_languages[norm]
-                    matched_records.append(row_dict)
-                unique_conn.commit()
+                positions, invalid, chunk_matched_rows = _batch_seen_msisdns(
+                    unique_conn, chunk_normalized, chunk_whitelist_languages,
+                    campaign.get("use_whitelist", True),
+                )
+                task_result["invalid"] += invalid
+                selected = chunk.iloc[positions].fillna("").copy()
+                selected["msisdn"] = [chunk_normalized.iloc[idx] for idx in positions]
+                matched_records = selected.to_dict("records")
+                if campaign.get("use_whitelist", True):
+                    for row_dict in matched_records:
+                        row_dict["language"] = chunk_whitelist_languages[row_dict["msisdn"]]
                 matched_row_count += chunk_matched_rows
                 if matched_records and not chunk_completed:
                     expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
                     if expired_reason:
                         return {"success": False, "status": "expired", "message": expired_reason}
+                    realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
                     chunk_result = sms_task_service.enqueue_rows(
-                        "realtime", campaign, matched_records, original_filename
+                        "realtime", campaign, matched_records, original_filename,
+                        ingestion_lease=(ingestion_file_id, lease_token), ingestion_chunk=current_job,
                     )
                     for key in ("created", "duplicate", "excluded", "invalid", "no_template"):
                         task_result[key] += chunk_result.get(key, 0)
@@ -941,9 +1048,10 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     ):
                         task_result[key] += int(current_job.get(column, 0) or 0)
                 if not chunk_completed:
-                    ingestion_job_service.complete_chunk(
-                        current_job["id"], chunk_result if matched_records else {}
-                    )
+                    if not chunk_result.get("chunk_committed"):
+                        realtime_ingestion_state.complete_chunk(
+                            ingestion_file_id, current_job, chunk_result if matched_records else {}, lease_token,
+                        )
                     progress("enqueueing_tasks", total_rows, matched_row_count, chunk_index, chunk_index + 1)
                 current_job = None
                 del matched_records, chunk_normalized, chunk_whitelist_languages, chunk
@@ -953,8 +1061,19 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             total_msisdn = int(counts[0] or 0)
             matched_count = int(counts[1] or 0)
         except Exception as exc:
+            # Release the current chunk immediately so a direct retry does not
+            # wait for its lease to expire. Keep file ownership intact; the
+            # worker's outer retry transition remains authoritative.
             if current_job and current_job.get("status") != "completed":
-                ingestion_job_service.fail_chunk(current_job["id"], exc)
+                try:
+                    realtime_ingestion_state.fail_chunk(
+                        ingestion_file_id, current_job, exc, lease_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Unable to release failed realtime chunk file_id=%s chunk_id=%s",
+                        ingestion_file_id, current_job.get("id"), exc_info=True,
+                    )
             raise
         finally:
             unique_conn.close()
@@ -969,9 +1088,8 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         pressure, _ = backpressure_service.reasons()
         if pressure:
             raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
-        ingestion_job_service.ensure_chunk(ingestion_file_id, 0, 0, len(df))
-        excel_job = ingestion_job_service.claim_chunk(
-            file_id=ingestion_file_id, chunk_index=0
+        excel_job = realtime_ingestion_state.prepare_chunk(
+            ingestion_file_id, 0, 0, len(df), lease_token,
         )
         if excel_job is None:
             raise RuntimeError("realtime Excel chunk lease is held by another worker")
@@ -1020,7 +1138,8 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 if expired_reason:
                     return {"success": False, "status": "expired", "message": expired_reason}
                 task_result = sms_task_service.enqueue_rows(
-                    "realtime", campaign, matched_records, original_filename
+                    "realtime", campaign, matched_records, original_filename,
+                    ingestion_lease=(ingestion_file_id, lease_token), ingestion_chunk=excel_job,
                 )
             created_msisdns = set(task_result.get("created_msisdns", []))
             _append_realtime_output(campaign.get("campaign_dir", ""), [
@@ -1029,11 +1148,19 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 if _task_msisdn_for_campaign(record["msisdn"], campaign) in created_msisdns
             ])
             del created_msisdns
-            if excel_job.get("status") != "completed":
-                ingestion_job_service.complete_chunk(excel_job["id"], task_result)
+            if excel_job.get("status") != "completed" and not task_result.get("chunk_committed"):
+                realtime_ingestion_state.complete_chunk(ingestion_file_id, excel_job, task_result, lease_token)
         except Exception as exc:
             if excel_job.get("status") != "completed":
-                ingestion_job_service.fail_chunk(excel_job["id"], exc)
+                try:
+                    realtime_ingestion_state.fail_chunk(
+                        ingestion_file_id, excel_job, exc, lease_token,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Unable to release failed realtime Excel chunk file_id=%s chunk_id=%s",
+                        ingestion_file_id, excel_job.get("id"), exc_info=True,
+                    )
             raise
         finally:
             if whitelist_conn:
@@ -1044,25 +1171,23 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         return {"success": False, "status": "expired", "message": expired_reason}
 
     campaign_dir = campaign.get("campaign_dir", "")
-    progress("finalizing", total_rows, matched_count, 0, 0)
+    progress("finalizing", total_rows, matched_count, 0, 0, force=True)
     received_dir = os.path.join(campaign_dir, "received")
     os.makedirs(received_dir, exist_ok=True)
     dest = os.path.join(received_dir, original_filename)
-    shutil.move(file_path, dest)
+    realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
+    if os.path.abspath(file_path) != os.path.abspath(dest):
+        shutil.move(file_path, dest)
     try:
         os.utime(dest, None)
     except OSError:
         pass
 
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO realtime_campaign_files (campaign_id, filename, file_path, total_msisdn, matched_count) VALUES (?,?,?,?,?)",
-        (campaign_id, original_filename, dest, total_msisdn, matched_count)
+    realtime_ingestion_state.transition(
+        ingestion_file_id, file_record_id, lease_token, "completed", path=dest,
+        rows=total_rows, created=task_result.get("created", 0), campaign_id=campaign_id,
+        filename=original_filename, total_msisdn=total_msisdn, matched=matched_count,
     )
-    conn.commit()
-    conn.close()
-    operations_service.finish_file(file_record_id, "completed", dest, total_rows, task_result.get("created", 0))
-    ingestion_job_service.finish_file(ingestion_file_id)
     logger.info(
         "Realtime file processed campaign=%s file=%s rows=%s unique_msisdn=%s matched=%s tasks_created=%s dest=%s",
         campaign_id, original_filename, total_rows, total_msisdn, matched_count, task_result.get("created", 0), dest,
@@ -1132,11 +1257,34 @@ def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> 
     }
 
 
-def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
+def get_realtime_watch_files(
+    campaign_id: int,
+    page: int = 1,
+    page_size: int = 50,
+    extension: str = "csv",
+    status: str = "",
+    reason: str = "",
+) -> dict:
     """List watch-directory files without parsing the entire directory first."""
     campaign = get_one(campaign_id)
     if not campaign:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+    extension_filter = str(extension or "").strip().lower().lstrip(".")
+    status_filter = str(status or "").strip().lower()
+    reason_filter = str(reason or "").strip().lower()
+    supported_extensions = {".csv", ".txt", ".xlsx", ".xls"}
+
+    def matches_filters(item: dict) -> bool:
+        if extension_filter and str(item.get("_ext") or "").lower().lstrip(".") != extension_filter:
+            return False
+        if status_filter and str(item.get("status") or "").lower() != status_filter:
+            return False
+        if reason_filter and reason_filter not in str(item.get("skip_reason") or "").lower():
+            return False
+        return True
+
+    processed_records = _processed_file_records(campaign_id)
 
     if campaign.get("watch_source", "local") == "sftp":
         from services import sftp_watch_service
@@ -1148,11 +1296,16 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
             remote_label = f"sftp://{campaign.get('sftp_host')}:{campaign.get('sftp_port')}{campaign.get('watch_dir')}"
             for entry in sorted(entries, key=lambda item: item.filename):
                 name = entry.filename
-                if not stat.S_ISREG(entry.st_mode) or os.path.splitext(name)[1].lower() != ".csv":
+                ext = os.path.splitext(name)[1].lower()
+                if (
+                    not stat.S_ISREG(entry.st_mode)
+                    or ext not in supported_extensions
+                    or (extension_filter and ext.lstrip(".") != extension_filter)
+                ):
                     continue
                 match_prefix = bool(prefix and name.startswith(prefix))
                 match_schedule = _watch_file_matches_campaign(name, campaign)
-                processed_record = _processed_file_record(campaign_id, name)
+                processed_record = processed_records.get(name)
                 age = datetime.now().timestamp() - (entry.st_mtime or 0)
                 if processed_record:
                     status, label, reason = "processed", "Processed", f"Already processed: {name}"
@@ -1164,13 +1317,17 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
                     status, label, reason = "pending", "Writing", "Waiting for remote file to become stable"
                 else:
                     status, label, reason = "pending", "Pending", ""
-                files.append({
+                item = {
                     "filename": name, "directory_path": remote_label,
                     "file_size": entry.st_size or 0, "row_count": 0,
+                    "_ext": ext,
                     "match_prefix": match_prefix, "match_schedule": match_schedule,
                     "status": status, "status_label": label, "skip_reason": reason,
                     "created_at": "", "updated_at": "",
-                })
+                }
+                if matches_filters(item):
+                    item.pop("_ext", None)
+                    files.append(item)
         finally:
             if sftp:
                 sftp.close()
@@ -1187,15 +1344,31 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
 
     prefix = campaign.get("watch_filename_prefix") or ""
     files = []
-    for name in sorted(os.listdir(watch_dir)):
-        path = os.path.join(watch_dir, name)
-        ext = os.path.splitext(name)[1].lower()
-        if not os.path.isfile(path) or ext not in (".csv", ".txt", ".xlsx", ".xls"):
-            continue
+    directory_entries = []
+    try:
+        with os.scandir(watch_dir) as entries:
+            for entry in entries:
+                try:
+                    entry_stat = entry.stat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(entry_stat.st_mode):
+                    continue
+                name = entry.name
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in (".csv", ".txt", ".xlsx", ".xls"):
+                    continue
+                if extension_filter and ext.lstrip(".") != extension_filter:
+                    continue
+                directory_entries.append((name, entry.path, ext, entry_stat.st_size, entry_stat.st_mtime))
+    except OSError:
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+    for name, path, ext, file_size, file_mtime in sorted(directory_entries, key=lambda item: item[0]):
 
         match_prefix = bool(prefix and name.startswith(prefix))
         match_schedule = _watch_file_matches_campaign(name, campaign)
-        processed_record = _processed_file_record(campaign_id, name)
+        processed_record = processed_records.get(name)
         if processed_record:
             status = "processed"
             status_label = "已处理过"
@@ -1209,25 +1382,21 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
             status_label = "发送规则不匹配"
             skip_reason = "文件名时间不在当前活动发送日期或时间段内"
         else:
-            try:
-                writing = datetime.now().timestamp() - os.path.getmtime(path) < 2
-            except OSError:
-                writing = True
+            writing = datetime.now().timestamp() - file_mtime < 2
             status = "pending"
             status_label = "写入中" if writing else "待处理"
             skip_reason = "文件仍在写入稳定等待期内" if writing else ""
 
-        try:
-            file_size = os.path.getsize(path)
-        except OSError:
-            file_size = 0
-        files.append({
+        item = {
             "filename": name,
             "directory_path": watch_dir,
             "file_size": file_size,
             "row_count": 0,
             "_path": path,
             "_ext": ext,
+            "_processed_total_rows": (
+                int(processed_record.get("total_rows") or 0) if processed_record else None
+            ),
             "match_prefix": match_prefix,
             "match_schedule": match_schedule,
             "status": status,
@@ -1235,7 +1404,9 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
             "skip_reason": skip_reason,
             "created_at": "",
             "updated_at": "",
-        })
+        }
+        if matches_filters(item):
+            files.append(item)
 
     total = len(files)
     offset = max(0, page - 1) * page_size
@@ -1244,9 +1415,18 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
     # this endpoint unbounded. Calculate them only for the visible page and
     # stream CSV rows instead of loading each file into a DataFrame.
     for item in page_items:
-        if item["_ext"] != ".csv":
+        if item["_ext"] != ".csv" or item["status"] == "ignored":
+            if item["_processed_total_rows"] is not None:
+                item["row_count"] = item["_processed_total_rows"]
             item.pop("_path", None)
             item.pop("_ext", None)
+            item.pop("_processed_total_rows", None)
+            continue
+        if item["_processed_total_rows"] is not None:
+            item["row_count"] = item["_processed_total_rows"]
+            item.pop("_path", None)
+            item.pop("_ext", None)
+            item.pop("_processed_total_rows", None)
             continue
         try:
             with open(item["_path"], "r", encoding="utf-8-sig", newline="") as handle:
@@ -1255,6 +1435,7 @@ def get_realtime_watch_files(campaign_id: int, page: int = 1, page_size: int = 5
             item["row_count"] = 0
         item.pop("_path", None)
         item.pop("_ext", None)
+        item.pop("_processed_total_rows", None)
     return {
         "total": total,
         "page": page,
@@ -1384,9 +1565,10 @@ def _watch_file_timestamp(filename: str, prefix: str = "") -> Optional[datetime]
         return None
 
 
-def _watch_file_matches_campaign(filename: str, campaign: dict, now: Optional[datetime] = None) -> bool:
+def _watch_file_matches_campaign(filename: str, campaign: dict, now: Optional[datetime] = None,
+                                 file_time: Optional[datetime] = None) -> bool:
     prefix = campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_"
-    file_time = _watch_file_timestamp(filename, prefix)
+    file_time = file_time or _watch_file_timestamp(filename, prefix)
     if not file_time:
         return False
     now = now or datetime.now()
@@ -1431,6 +1613,24 @@ def _processed_file_record(campaign_id: int, filename: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _processed_file_records(campaign_id: int) -> dict[str, dict]:
+    """Load processed-file metadata once for a watch-directory listing."""
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT filename, status, total_rows, file_size, file_path
+               FROM processed_files
+               WHERE campaign_type='realtime' AND campaign_id=?""",
+            (campaign_id,),
+        ).fetchall(),
+        operation="realtime_campaign.processed_file_index",
+    )
+    return {
+        str(row["filename"]): dict(row)
+        for row in rows
+        if row["filename"]
+    }
+
+
 def _completed_processed_filenames(campaign_id: int) -> set[str]:
     conn = get_connection()
     try:
@@ -1457,6 +1657,41 @@ def _log_watch_skip_summary(campaign_id: int, skipped: int, reason: str = "alrea
         "Watch files skipped campaign=%s count=%s suppressed=%s reason=%s",
         campaign_id, int(skipped or 0), suppressed, reason,
     )
+
+
+def _watch_scan_due(campaign: dict, watch_dir: str, now: datetime, force: bool = False) -> bool:
+    """Avoid rescanning an unchanged local watch directory every scheduler tick.
+
+    The source system creates new files in the directory, so the directory
+    mtime is a cheap change hint.  The date/minute buckets ensure that a file
+    already present before the campaign window becomes eligible when the
+    filename timestamp reaches the current window.  A bounded rescan remains
+    as a safety net for filesystems with unreliable directory mtimes.
+    """
+    try:
+        directory_mtime_ns = os.stat(watch_dir).st_mtime_ns
+    except OSError:
+        return True
+    key = (int(campaign.get("id") or 0), os.path.abspath(watch_dir))
+    now_mono = time.monotonic()
+    state = {
+        "directory_mtime_ns": directory_mtime_ns,
+        "date": now.date(),
+        "minute": now.replace(second=0, microsecond=0),
+        "last_scan": now_mono,
+    }
+    with _watch_scan_lock:
+        previous = _watch_scan_state.get(key)
+        changed = (
+            not previous
+            or previous["directory_mtime_ns"] != directory_mtime_ns
+            or previous["date"] != state["date"]
+            or previous["minute"] != state["minute"]
+        )
+        if not force and not changed and now_mono - previous["last_scan"] < WATCH_RESCAN_SECONDS:
+            return False
+        _watch_scan_state[key] = state
+        return True
 
 
 def _daily_window_ended(campaign: dict, now: Optional[datetime] = None) -> bool:
@@ -1700,7 +1935,7 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
         logger.info("Realtime closed-window ingestion jobs discarded count=%s", discarded)
     return discarded
 
-def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
+def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
     conn = get_connection()
     if campaign_id:
         rows = conn.execute(
@@ -1726,6 +1961,8 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
         if not active:
             logger.info("Watch intake paused campaign=%s reason=%s", campaign.get("id"), reason)
             continue
+        if not _watch_scan_due(campaign, watch_dir, now, force=force):
+            continue
         campaign_dir = campaign.get("campaign_dir", "")
         if not campaign_dir:
             campaign_dir = _ensure_campaign_dir(campaign)
@@ -1742,22 +1979,41 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
         capacity = _inbox_capacity_snapshot(campaign["id"])
         completed_files = _completed_processed_filenames(campaign["id"])
         already_processed_skipped = 0
+        historical_skipped = 0
+        campaign_window_skipped = 0
         backpressure_rejected = 0
         backpressure_reason = ""
         # The watched filename contains a fixed-width YYYYMMDDHHMMSS token;
         # lexical order therefore matches file time order.
-        for fname in sorted(os.listdir(watch_dir)):
-            src = os.path.join(watch_dir, fname)
-            if not os.path.isfile(src):
-                continue
+        try:
+            entries = sorted(os.scandir(watch_dir), key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            fname = entry.name
             if not fname.startswith(prefix):
                 continue
             ext = os.path.splitext(fname)[1].lower()
             if ext not in (".csv", ".txt", ".xlsx", ".xls"):
                 continue
-            if not _watch_file_matches_campaign(fname, campaign, now):
-                logger.info("Watch file skipped campaign=%s file=%s reason=filename time does not match campaign", campaign.get("id"), fname)
+            # Filename time is authoritative.  Reject historical/malformed
+            # files before stat(), database lookups, copying, or whitelist
+            # work; otherwise the scheduler repeatedly reprocesses old files.
+            file_time = _watch_file_timestamp(fname, prefix)
+            if not file_time:
                 continue
+            if file_time.date() != now.date():
+                historical_skipped += 1
+                continue
+            if not _watch_file_matches_campaign(fname, campaign, now, file_time=file_time):
+                campaign_window_skipped += 1
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            src = entry.path
             # Skip files still being written (modified < 5 seconds ago)
             try:
                 mtime = os.path.getmtime(src)
@@ -1773,23 +2029,34 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
                 continue
             try:
                 file_size = os.path.getsize(src)
-                allowed, capacity_reason = _inbox_capacity_available(
-                    campaign["id"], file_size, capacity=capacity,
+                reservation = _reserve_inbox_capacity(
+                    campaign["id"], fname, file_size, "local",
                 )
-                if not allowed:
+                if not reservation.get("ok"):
+                    if reservation.get("duplicate"):
+                        already_processed_skipped += 1
+                        continue
                     backpressure_rejected += 1
-                    backpressure_reason = capacity_reason
+                    backpressure_reason = reservation["reason"]
                     break
-                shutil.copy2(src, dest)
+                reservation_token = reservation["token"]
+                consumed = False
                 try:
-                    os.utime(dest, None)
-                except OSError:
-                    pass
-                whitelist_version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
-                ingestion_job_service.register_file(
-                    "realtime", campaign["id"], fname, dest,
-                    chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
-                )
+                    shutil.copy2(src, dest)
+                    try:
+                        os.utime(dest, None)
+                    except OSError:
+                        pass
+                    whitelist_version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
+                    ingestion_job_service.register_file(
+                        "realtime", campaign["id"], fname, dest,
+                        chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
+                        reservation_token=reservation_token,
+                    )
+                    consumed = True
+                finally:
+                    if not consumed:
+                        ingestion_job_service.release_realtime_capacity(reservation_token)
                 _record_inbox_capacity_file(capacity, file_size)
                 total_moved += 1
                 logger.info("Watch file copied campaign=%s src=%s dest=%s", campaign.get("id"), src, dest)
@@ -1797,6 +2064,10 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None):
                 pass
         if backpressure_rejected:
             _log_inbox_backpressure(campaign["id"], backpressure_rejected, backpressure_reason)
+        if historical_skipped:
+            _log_watch_skip_summary(campaign["id"], historical_skipped, "historical filename timestamp")
+        if campaign_window_skipped:
+            _log_watch_skip_summary(campaign["id"], campaign_window_skipped, "filename outside campaign window")
         if already_processed_skipped:
             _log_watch_skip_summary(campaign["id"], already_processed_skipped)
     if total_moved:
@@ -1862,13 +2133,18 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                     already_processed_skipped += 1
                     continue
                 file_size = entry.st_size or 0
-                allowed, capacity_reason = _inbox_capacity_available(
-                    campaign["id"], file_size, capacity=capacity,
+                reservation = _reserve_inbox_capacity(
+                    campaign["id"], fname, file_size, "sftp",
                 )
-                if not allowed:
+                if not reservation.get("ok"):
+                    if reservation.get("duplicate"):
+                        already_processed_skipped += 1
+                        continue
                     backpressure_rejected += 1
-                    backpressure_reason = capacity_reason
+                    backpressure_reason = reservation["reason"]
                     break
+                reservation_token = reservation["token"]
+                consumed = False
                 temp_fd, temp_path = tempfile.mkstemp(prefix=".sftp-", suffix=".part", dir=inbox_dir)
                 os.close(temp_fd)
                 try:
@@ -1883,13 +2159,17 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                     ingestion_job_service.register_file(
                         "realtime", campaign["id"], fname, dest,
                         chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
+                        reservation_token=reservation_token,
                     )
+                    consumed = True
                     _record_inbox_capacity_file(capacity, file_size)
                     total_downloaded += 1
                     logger.info("SFTP watch file downloaded campaign=%s host=%s file=%s", campaign["id"], campaign.get("sftp_host"), fname)
                 finally:
                     if os.path.exists(temp_path):
                         os.unlink(temp_path)
+                    if not consumed:
+                        ingestion_job_service.release_realtime_capacity(reservation_token)
         except Exception as exc:
             logger.warning("SFTP watch poll failed campaign=%s host=%s error=%s", campaign.get("id"), campaign.get("sftp_host"), exc)
         finally:
@@ -1999,11 +2279,32 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
                 existing = ingestion_job_service.get_file("realtime", campaign["id"], fname)
                 if existing:
                     continue
-                version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
-                _file_id, duplicate = ingestion_job_service.register_file(
-                    "realtime", campaign["id"], fname, src, chunk_size=_realtime_chunk_size(),
-                    whitelist_version_id=version_id,
+                reservation = _reserve_inbox_capacity(
+                    campaign["id"], fname, os.path.getsize(src), "inbox-recovery",
                 )
+                if not reservation.get("ok"):
+                    if reservation.get("duplicate"):
+                        continue
+                    results["errors"].append({
+                        "filename": fname, "message": reservation["reason"],
+                    })
+                    _log_inbox_backpressure(
+                        campaign["id"], 1, reservation["reason"], source="inbox",
+                    )
+                    continue
+                version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
+                reservation_token = reservation["token"]
+                consumed = False
+                try:
+                    _file_id, duplicate = ingestion_job_service.register_file(
+                        "realtime", campaign["id"], fname, src, chunk_size=_realtime_chunk_size(),
+                        whitelist_version_id=version_id,
+                        reservation_token=reservation_token,
+                    )
+                    consumed = True
+                finally:
+                    if not consumed:
+                        ingestion_job_service.release_realtime_capacity(reservation_token)
                 if not duplicate:
                     results["queued"] += 1
                     depth_conn = get_connection()

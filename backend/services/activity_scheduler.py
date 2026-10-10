@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 
-from database import get_connection
+from database import get_connection, is_transient_write_error
 from services import (batch_campaign_service, realtime_campaign_service, sms_task_service,
                       p1_service, ingestion_job_service)
 
@@ -17,6 +17,44 @@ _batch_worker_thread = None
 _batch_jobs = queue.Queue(maxsize=1)
 _batch_state_lock = threading.Lock()
 _batch_job_active = False
+try:
+    _BATCH_RESET_INTERVAL = max(
+        30.0, float(os.environ.get("MC_BATCH_RESET_INTERVAL_SECONDS", "60"))
+    )
+except (TypeError, ValueError):
+    _BATCH_RESET_INTERVAL = 60.0
+try:
+    _BATCH_CANCEL_INTERVAL = max(
+        15.0, float(os.environ.get("MC_BATCH_CANCEL_INTERVAL_SECONDS", "30"))
+    )
+except (TypeError, ValueError):
+    _BATCH_CANCEL_INTERVAL = 30.0
+_last_batch_reset = 0.0
+_last_batch_cancel = 0.0
+
+
+def _run_stage(name, callback):
+    """Run one scheduler stage without starving unrelated stages on failure."""
+    try:
+        return callback()
+    except Exception as exc:
+        try:
+            from services import metrics_service
+            metrics_service.inc(
+                "marketing_copilot_scheduler_stage_failures_total",
+                labels={"stage": name},
+            )
+        except Exception:
+            pass
+        if is_transient_write_error(exc):
+            logger.warning(
+                "Scheduler stage deferred after transient database contention "
+                "stage=%s error=%s",
+                name, exc,
+            )
+        else:
+            logger.exception("Scheduler stage failed stage=%s", name)
+        return None
 
 
 def _submit_batch_job(campaign_id: int, generate: bool = False) -> bool:
@@ -64,6 +102,7 @@ def _batch_worker():
 
 
 def _process_batches():
+    global _last_batch_reset, _last_batch_cancel
     conn = get_connection()
     try:
         unbatched = conn.execute(
@@ -88,11 +127,18 @@ def _process_batches():
                 _submit_batch_job(pending["id"])
     finally:
         conn.close()
-    # Daily-repeat batch campaigns: reset batches once per day while the campaign
-    # is still in progress, so the same target list is sent again each eligible day.
-    batch_campaign_service.reset_daily_batches()
-    # Cancel the day's unfinished tasks once the daily send window has closed.
-    batch_campaign_service.cancel_overdue_daily_tasks()
+    # These operations are daily/window-boundary maintenance. Running them on
+    # every three-second scheduler tick created unnecessary write contention.
+    now = time.monotonic()
+    if now - _last_batch_reset >= _BATCH_RESET_INTERVAL:
+        _last_batch_reset = now
+        _run_stage("batch_daily_reset", batch_campaign_service.reset_daily_batches)
+    if now - _last_batch_cancel >= _BATCH_CANCEL_INTERVAL:
+        _last_batch_cancel = now
+        _run_stage(
+            "batch_overdue_cancel",
+            batch_campaign_service.cancel_overdue_daily_tasks,
+        )
 
 
 def _run():
@@ -102,24 +148,38 @@ def _run():
             ticks += 1
             from services import metrics_service
             metrics_service.set_gauge("realtime_scheduler_last_tick_timestamp", time.time())
-            _process_batches()
-            realtime_campaign_service.finalize_daily_tasks()
-            if realtime_campaign_service.has_active_realtime_campaigns():
-                realtime_campaign_service.sync_watch_dirs_to_inboxes()
-                realtime_result = realtime_campaign_service.process_realtime_inboxes()
+            _run_stage("batch_scheduler", _process_batches)
+            _run_stage("realtime_daily_finalize", realtime_campaign_service.finalize_daily_tasks)
+            active = _run_stage(
+                "realtime_active_check",
+                realtime_campaign_service.has_active_realtime_campaigns,
+            )
+            if active:
+                _run_stage("realtime_watch_sync", realtime_campaign_service.sync_watch_dirs_to_inboxes)
+                realtime_result = _run_stage(
+                    "realtime_inbox_processing",
+                    realtime_campaign_service.process_realtime_inboxes,
+                ) or {}
                 if realtime_result.get("errors"):
                     logger.error("Realtime inbox registration errors=%s", len(realtime_result["errors"]))
             if ticks % 20 == 0:
-                ingestion_job_service.recover_expired_chunks()
-                realtime_campaign_service.cleanup_realtime_retention()
+                _run_stage("recover_expired_chunks", ingestion_job_service.recover_expired_chunks)
+                _run_stage("realtime_retention", realtime_campaign_service.cleanup_realtime_retention)
                 from services import realtime_whitelist_service
-                realtime_whitelist_service.cleanup_versions()
-                sms_task_service.cleanup_task_retention()
-                p1_service.auto_complete_campaigns()
+                _run_stage("whitelist_cleanup", realtime_whitelist_service.cleanup_versions)
+                _run_stage("task_retention", sms_task_service.cleanup_task_retention)
+                _run_stage("campaign_auto_complete", p1_service.auto_complete_campaigns)
                 from services import metrics_service, task_worker
                 from services.smpp_gateway import gateway
-                metrics_service.evaluate_alerts(task_worker.worker_status()['running'], gateway.status())
+                _run_stage(
+                    "alert_evaluation",
+                    lambda: metrics_service.evaluate_alerts(
+                        task_worker.worker_status()['running'], gateway.status()
+                    ),
+                )
         except Exception:
+            # Keep the scheduler thread alive even if a future stage is added
+            # without the per-stage guard above.
             logger.exception("Activity scheduler iteration failed")
 
 

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import HTTPException, Request
+from database import is_database_read_error
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ ADMIN_ONLY_PREFIXES = (
     "/api/db-config",
     "/api/operations/audits",
     "/api/operations/export/audits",
+    "/api/capacity/policies",
 )
 CONFIG_WRITE_PREFIXES = ("/api/smpp",)
 ROLES = ("admin", "marketing", "analyst")
@@ -191,8 +193,24 @@ async def auth_middleware(request: Request, call_next):
                             from fastapi.responses import JSONResponse
 
                             return JSONResponse(status_code=403, content={"detail": "Insufficient permissions"})
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if is_database_read_error(exc):
+                            logger.warning(
+                                "Unable to revalidate admin role because database read failed: %s",
+                                exc,
+                            )
+                            from fastapi.responses import JSONResponse
+
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "detail": "Database temporarily unavailable; please retry.",
+                                    "code": "DATABASE_READ_UNAVAILABLE",
+                                    "retryable": True,
+                                },
+                                headers={"Retry-After": "1"},
+                            )
+                        raise
                 if not role_allows(user.get("role", "analyst"), request.method, path):
                     from fastapi.responses import JSONResponse
 
@@ -227,17 +245,26 @@ def record_audit(
     detail: Optional[dict] = None,
     username: Optional[str] = None,
 ) -> None:
-    try:
-        from database import get_connection
+    """Queue audit logging without making the user-facing request depend on it.
 
+    Audit rows are secondary data.  They must never turn a successful login or
+    business mutation into a 500 merely because DuckDB is busy with the main
+    transaction.  The operations service owns the bounded queue and retry
+    policy used by the rest of the application.
+    """
+    try:
         user = username or getattr(getattr(request, "state", None), "user", {}).get("username", "system")
-        conn = get_connection()
-        conn.execute(
-            "INSERT INTO audit_logs (username, action, resource, resource_id, detail, ip_address) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user, action, resource, resource_id, json.dumps(detail or {}, ensure_ascii=False), client_ip(request)),
+        from services import operations_service
+
+        operations_service.audit_async(
+            action,
+            resource,
+            resource_id,
+            detail,
+            username=user,
+            ip_address=client_ip(request),
         )
-        conn.commit()
-        conn.close()
     except Exception:
-        logger.exception("Failed to write audit log")
+        # Auditing is best effort and must not break authentication or the
+        # business operation that has already completed.
+        logger.exception("Failed to enqueue audit log")
