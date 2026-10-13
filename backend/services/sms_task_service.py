@@ -158,7 +158,7 @@ def _bulk_insert_tasks(conn, task_rows) -> list:
     if not task_rows:
         return []
     columns = ("campaign_type", "campaign_id", "batch_id", "campaign_name", "msisdn", "language",
-               "sms_template_id", "smpp_config_id", "content", "source_addr", "payload",
+               "sms_template_id", "smpp_config_id", "flash_sms", "content", "source_addr", "payload",
                "source_file", "task_date", "dedupe_key")
     placeholders = ",".join("?" for _ in columns)
     inserted = []
@@ -650,7 +650,8 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             )
             task_rows.append((
                 campaign_type, campaign["id"], batch_id, campaign.get("name", ""), msisdn,
-                language, template["id"], campaign.get("smpp_config_id"), content,
+                language, template["id"], campaign.get("smpp_config_id"),
+                bool(campaign.get("flash_sms")), content,
                 template.get("source_addr") or "",
                 json.dumps(payload, ensure_ascii=False), source_file, task_date, dedupe_key,
             ))

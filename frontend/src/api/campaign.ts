@@ -17,6 +17,7 @@ export interface BatchCampaign {
   use_custom_directory: boolean
   sms_template_id: number | null
   smpp_config_id: number | null
+  flash_sms: boolean
   phone_prefix: string
   created_at: string
 }
@@ -46,7 +47,7 @@ export function createCampaign(data: {
   name: string; start_time?: string; end_time?: string;
   send_start_time?: string; send_end_time?: string; send_days?: string[];
   batch_size?: number; campaign_dir?: string; use_custom_directory?: boolean;
-  smpp_config_id?: number; phone_prefix?: string;
+  smpp_config_id?: number; flash_sms?: boolean; phone_prefix?: string;
 }) {
   return api.post<BatchCampaign>('/batch-campaigns', data)
 }

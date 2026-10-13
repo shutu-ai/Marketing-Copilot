@@ -15,6 +15,7 @@ class BatchCampaignCreate(BaseModel):
     use_custom_directory: Optional[bool] = False
     sms_template_id: Optional[int] = None
     smpp_config_id: Optional[int] = None
+    flash_sms: Optional[bool] = False
     phone_prefix: Optional[str] = ""
 
 
@@ -31,4 +32,5 @@ class BatchCampaignUpdate(BaseModel):
     use_custom_directory: Optional[bool] = None
     sms_template_id: Optional[int] = None
     smpp_config_id: Optional[int] = None
+    flash_sms: Optional[bool] = None
     phone_prefix: Optional[str] = None

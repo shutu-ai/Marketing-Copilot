@@ -265,6 +265,8 @@ export default {
     associateSmpp: '关联SMPP',
     associateSmppPlaceholder: '请选择该活动关联的SMPP',
     associateSmppTip: '该实时活动的短信将通过所选 SMPP 连接发送，不同活动可以关联不同的 SMPP。',
+    flashSms: '闪信',
+    flashSmsTip: '启用后将按 Class 0 闪信格式发送，支持的手机将立即显示。',
     inProgressSmppOnly: '活动运行中仅可修改关联的SMPP；保存后该活动待发送的短信将改用新的SMPP发送。',
     scheduleReady: '发送计划已设置',
     scheduleMissing: '请设置活动日期和每日发送时段',

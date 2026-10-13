@@ -463,14 +463,15 @@ def create(data: RealtimeCampaignCreate) -> dict:
 
     def write(conn):
         cursor = conn.execute(
-            "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_source, watch_dir, sftp_host, sftp_port, sftp_username, sftp_password, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, campaign_dir, use_custom_directory, watch_source, watch_dir, sftp_host, sftp_port, sftp_username, sftp_password, watch_filename_prefix, phone_prefix, sms_template_id, smpp_config_id, flash_sms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, data.use_whitelist if data.use_whitelist is not None else True,
              data.start_time or "", data.end_time or "", data.send_start_time or "",
              data.send_end_time or "", _fmt_days(data.send_days), campaign_dir,
              use_custom_directory, data.watch_source or "local", data.watch_dir or "",
              data.sftp_host or "", data.sftp_port or 22, data.sftp_username or "",
              data.sftp_password or "", data.watch_filename_prefix or "Android_4G_Switch_Somali_",
-             data.phone_prefix or "", data.sms_template_id, data.smpp_config_id),
+             data.phone_prefix or "", data.sms_template_id, data.smpp_config_id,
+             bool(data.flash_sms)),
         )
         return dict(conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)
@@ -523,13 +524,13 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
     if existing_dict.get("status") != "not_started":
         only_allowed = all(
             getattr(data, field, None) is None
-            for field in ["name", "start_time", "campaign_dir"]
+            for field in ["name", "start_time", "campaign_dir", "flash_sms"]
         )
         if not only_allowed:
             raise ValueError("Campaign has already started - cannot edit")
 
     fields = {}
-    for field in ["name", "use_whitelist", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "watch_source", "watch_dir", "sftp_host", "sftp_port", "sftp_username", "sftp_password", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
+    for field in ["name", "use_whitelist", "start_time", "end_time", "status", "send_start_time", "send_end_time", "campaign_dir", "sms_template_id", "smpp_config_id", "flash_sms", "watch_source", "watch_dir", "sftp_host", "sftp_port", "sftp_username", "sftp_password", "watch_filename_prefix", "phone_prefix", "use_custom_directory"]:
         value = getattr(data, field, None)
         if value is not None:
             if field == "sftp_password" and value in ("", "********"):
@@ -553,6 +554,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         if new_dir and os.path.normcase(os.path.normpath(new_dir)) != os.path.normcase(os.path.normpath(old_dir)):
             raise ValueError("Cannot change campaign directory after a whitelist has been uploaded")
     new_smpp_id = fields.get("smpp_config_id")
+    new_flash_sms = fields.get("flash_sms")
 
     def write(conn):
         current = conn.execute(
@@ -577,6 +579,12 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
                 """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
                    WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
                 (new_smpp_id, campaign_id),
+            )
+        if new_flash_sms is not None:
+            conn.execute(
+                """UPDATE sms_tasks SET flash_sms=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
+                (bool(new_flash_sms), campaign_id),
             )
         row = conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
@@ -631,11 +639,12 @@ def copy(campaign_id: int) -> Optional[dict]:
             return None
         orig = dict(row)
         cursor = conn.execute(
-            "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO realtime_campaigns (name, use_whitelist, start_time, end_time, send_start_time, send_end_time, send_days, sms_template_id, smpp_config_id, flash_sms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (orig["name"] + " (Copy)", orig.get("use_whitelist", True),
              orig["start_time"], orig["end_time"], orig.get("send_start_time", ""),
              orig.get("send_end_time", ""), orig.get("send_days", "[]"),
-             orig.get("sms_template_id"), orig.get("smpp_config_id")),
+             orig.get("sms_template_id"), orig.get("smpp_config_id"),
+             bool(orig.get("flash_sms"))),
         )
         new_row = conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (cursor.lastrowid,)

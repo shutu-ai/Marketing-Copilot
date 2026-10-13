@@ -25,6 +25,7 @@ export interface RealtimeCampaign {
  phone_prefix: string
  sms_template_id: number | null
   smpp_config_id: number | null
+  flash_sms: boolean
   created_at: string
 }
 
@@ -52,7 +53,7 @@ export function createRealtimeCampaign(data: {
  watch_filename_prefix?: string;
  phone_prefix?: string;
  sms_template_id?: number;
- smpp_config_id?: number;
+  smpp_config_id?: number; flash_sms?: boolean;
 }) {
   return api.post<RealtimeCampaign>('/realtime-campaigns', data)
 }

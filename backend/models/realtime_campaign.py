@@ -31,6 +31,7 @@ class RealtimeCampaignCreate(BaseModel):
     phone_prefix: Optional[str] = ""
     sms_template_id: Optional[int] = None
     smpp_config_id: Optional[int] = None
+    flash_sms: Optional[bool] = False
 
 
 class RealtimeCampaignUpdate(BaseModel):
@@ -54,3 +55,4 @@ class RealtimeCampaignUpdate(BaseModel):
     phone_prefix: Optional[str] = None
     sms_template_id: Optional[int] = None
     smpp_config_id: Optional[int] = None
+    flash_sms: Optional[bool] = None

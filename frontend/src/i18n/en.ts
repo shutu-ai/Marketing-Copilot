@@ -260,6 +260,8 @@ export default {
     associateSmpp: 'Associated SMPP',
     associateSmppPlaceholder: 'Select the SMPP for this campaign',
     associateSmppTip: 'SMS for this realtime campaign is sent through the selected SMPP; different campaigns can use different SMPP connections.',
+    flashSms: 'Flash SMS',
+    flashSmsTip: 'When enabled, messages are sent as Class 0 flash SMS and displayed immediately on supported handsets.',
     inProgressSmppOnly: 'While a campaign is running, only the associated SMPP can be changed; pending SMS tasks will switch to the new SMPP after saving.',
     scheduleReady: 'Schedule configured',
     scheduleMissing: 'Set campaign dates and daily send window',

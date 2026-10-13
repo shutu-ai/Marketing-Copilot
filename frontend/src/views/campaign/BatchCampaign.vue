@@ -215,6 +215,12 @@
           </el-select>
           <div class="form-tip">{{ $t('campaign.associateSmppTip') }}</div>
         </el-form-item>
+        <el-form-item :label="$t('campaign.flashSms')">
+          <el-checkbox v-model="editForm.flash_sms" :disabled="inProgressEdit || !editForm.smpp_config_id">
+            {{ $t('campaign.flashSms') }}
+          </el-checkbox>
+          <div class="form-tip">{{ $t('campaign.flashSmsTip') }}</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
@@ -301,6 +307,7 @@ interface Campaign {
   use_custom_directory: boolean
   sms_template_id: number | null
   smpp_config_id: number | null
+  flash_sms: boolean
   phone_prefix: string
   created_at: string
 }
@@ -316,12 +323,12 @@ const editForm = ref<{
   id: number; name: string; start_time: string; end_time: string;
   send_start_time: string; send_end_time: string; send_days: string[];
   batch_size: number; campaign_dir: string; status: string;
-  smpp_config_id: number | null; phone_prefix: string
+  smpp_config_id: number | null; flash_sms: boolean; phone_prefix: string
 }>({
   id: 0, name: '', start_time: '', end_time: '',
   send_start_time: '', send_end_time: '', send_days: [],
   batch_size: 500, campaign_dir: '', status: 'not_started',
-  smpp_config_id: null, phone_prefix: '',
+  smpp_config_id: null, flash_sms: false, phone_prefix: '',
 })
 const uploadVisible = ref(false)
 const uploading = ref(false)
@@ -372,7 +379,7 @@ function showDialog(row: Campaign | null) {
       send_start_time: row.send_start_time || '', send_end_time: row.send_end_time || '',
       send_days: row.send_days || [], batch_size: row.batch_size || 500,
       campaign_dir: row.campaign_dir || '', status: row.status,
-      smpp_config_id: row.smpp_config_id ?? null, phone_prefix: row.phone_prefix || '',
+      smpp_config_id: row.smpp_config_id ?? null, flash_sms: Boolean(row.flash_sms), phone_prefix: row.phone_prefix || '',
     }
   } else {
     inProgressEdit.value = false
@@ -380,7 +387,7 @@ function showDialog(row: Campaign | null) {
     editForm.value = {
       id: 0, name: '', start_time: '', end_time: '',
       send_start_time: '', send_end_time: '', send_days: [], batch_size: 500, campaign_dir: '', status: 'not_started',
-      smpp_config_id: null, phone_prefix: '',
+      smpp_config_id: null, flash_sms: false, phone_prefix: '',
     }
   }
   dialogVisible.value = true
@@ -435,6 +442,7 @@ async function handleSave() {
       campaign_dir: customDirectory.value ? editForm.value.campaign_dir : '',
       use_custom_directory: customDirectory.value,
       smpp_config_id: editForm.value.smpp_config_id || undefined,
+      flash_sms: editForm.value.flash_sms,
       phone_prefix: editForm.value.phone_prefix || undefined,
     }
     if (editForm.value.id && editForm.value.status !== 'not_started' && editForm.value.status !== 'ended') {
@@ -447,6 +455,7 @@ async function handleSave() {
         send_end_time: editForm.value.send_end_time,
         send_days: editForm.value.send_days,
         smpp_config_id: editForm.value.smpp_config_id || undefined,
+        flash_sms: editForm.value.flash_sms,
       }
     }
     if (editForm.value.id) {

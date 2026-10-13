@@ -103,6 +103,23 @@ def _make_parts(text: str):
         return _make_ucs2_parts(text)
 
 
+def _flash_data_coding(coding: int) -> int:
+    """Return the GSM message-class-0 DCS for the detected text alphabet."""
+    # The Ethio Telecom SMPP v3.4 profile documents 1111xxxx as the GSM
+    # message-class control group.  0xF0 is Class 0 with the default alphabet;
+    # 0x18 is the widely supported UCS-2 Class 0 form used for local scripts.
+    if coding == 8:  # SMPP_ENCODING_ISO10646 / UCS-2
+        return 0x18
+    return 0xF0
+
+
+def _make_task_parts(task: dict):
+    parts, coding, esm_class = _make_parts(task["content"])
+    if task.get("flash_sms"):
+        coding = _flash_data_coding(coding)
+    return parts, coding, esm_class
+
+
 class SmppSubmitError(RuntimeError):
     def __init__(self, status: int, message: str = ""):
         self.status = int(status or 0)
@@ -670,7 +687,7 @@ class _SmppConnection:
     def _send_windowed(self, task: dict) -> list[str]:
         self.connect()
         import smpplib.consts
-        parts, coding, esm_class = _make_parts(task["content"])
+        parts, coding, esm_class = _make_task_parts(task)
         source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
         content = task.get("content") or ""
         task_id = task.get("id")
@@ -834,7 +851,7 @@ class _SmppConnection:
             )
             import smpplib.consts
             parts_started = time.monotonic()
-            parts, coding, esm_class = _make_parts(task["content"])
+            parts, coding, esm_class = _make_task_parts(task)
             metrics_service.observe_histogram(
                 "marketing_copilot_smpp_make_parts_seconds",
                 time.monotonic() - parts_started,

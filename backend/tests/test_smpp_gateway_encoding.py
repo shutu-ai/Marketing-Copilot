@@ -2,11 +2,35 @@ import pytest
 import smpplib.consts
 import smpplib.gsm
 
-from services.smpp_gateway import _encode_utf16be, _make_parts, _make_ucs2_parts
+from services.smpp_gateway import (
+    _encode_utf16be, _make_parts, _make_task_parts, _make_ucs2_parts,
+)
 
 
 def test_ascii_uses_smpplib_make_parts():
     assert _make_parts("Hello SMPP") == smpplib.gsm.make_parts("Hello SMPP")
+
+
+def test_flash_ascii_uses_gsm_class_zero_data_coding():
+    parts, coding, esm_class = _make_task_parts({"content": "Hello SMPP", "flash_sms": True})
+
+    assert parts == [b"Hello SMPP"]
+    assert coding == 0xF0
+    assert esm_class == smpplib.consts.SMPP_MSGTYPE_DEFAULT
+
+
+def test_flash_ucs2_uses_unicode_class_zero_data_coding():
+    parts, coding, esm_class = _make_task_parts({"content": "你好", "flash_sms": True})
+
+    assert parts == [b"O`Y}"]
+    assert coding == 0x18
+    assert esm_class == smpplib.consts.SMPP_MSGTYPE_DEFAULT
+
+
+def test_normal_task_keeps_standard_data_coding():
+    _parts, coding, _esm_class = _make_task_parts({"content": "你好"})
+
+    assert coding == smpplib.consts.SMPP_ENCODING_ISO10646
 
 
 def test_manual_utf16be_encodes_bmp_and_surrogate_pair():

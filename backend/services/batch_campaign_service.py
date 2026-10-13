@@ -386,12 +386,12 @@ def create(data: BatchCampaignCreate) -> dict:
 
     def write(conn):
         cursor = conn.execute(
-            "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, use_custom_directory, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, campaign_dir, use_custom_directory, sms_template_id, smpp_config_id, flash_sms, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, data.start_time or "", data.end_time or "",
              data.send_start_time or "", data.send_end_time or "",
              _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
              use_custom_directory, data.sms_template_id, data.smpp_config_id,
-             data.phone_prefix or ""),
+             bool(data.flash_sms), data.phone_prefix or ""),
         )
         return dict(conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)
@@ -460,13 +460,13 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
     elif existing_dict.get("status") != "not_started":
         only_allowed = all(
             getattr(data, f, None) is None
-            for f in ["name", "start_time", "end_time", "send_start_time", "send_end_time", "send_days", "batch_size", "campaign_dir", "use_custom_directory"]
+            for f in ["name", "start_time", "end_time", "send_start_time", "send_end_time", "send_days", "batch_size", "campaign_dir", "use_custom_directory", "flash_sms"]
         )
         if not only_allowed:
             raise ValueError("Campaign has already started - cannot edit")
 
     fields = {}
-    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "batch_size", "campaign_dir", "use_custom_directory", "sms_template_id", "smpp_config_id", "phone_prefix"]:
+    for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "batch_size", "campaign_dir", "use_custom_directory", "sms_template_id", "smpp_config_id", "flash_sms", "phone_prefix"]:
         value = getattr(data, field, None)
         if value is not None:
             fields[field] = value
@@ -483,6 +483,7 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         else:
             fields["campaign_dir"] = _ensure_campaign_dir({**existing_dict, **fields})
     new_smpp_id = fields.get("smpp_config_id")
+    new_flash_sms = fields.get("flash_sms")
 
     def write(conn):
         current = conn.execute(
@@ -507,6 +508,12 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
                 """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
                    WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
                 (new_smpp_id, campaign_id),
+            )
+        if new_flash_sms is not None:
+            conn.execute(
+                """UPDATE sms_tasks SET flash_sms=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
+                (bool(new_flash_sms), campaign_id),
             )
         row = conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
@@ -602,12 +609,12 @@ def copy(campaign_id: int) -> Optional[dict]:
             return None
         orig = dict(row)
         cursor = conn.execute(
-            "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, sms_template_id, smpp_config_id, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO batch_campaigns (name, start_time, end_time, send_start_time, send_end_time, send_days, batch_size, sms_template_id, smpp_config_id, flash_sms, phone_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (orig["name"] + " (Copy)", orig["start_time"], orig["end_time"],
              orig.get("send_start_time", ""), orig.get("send_end_time", ""),
              orig.get("send_days", "[]"), orig.get("batch_size", 500),
              orig.get("sms_template_id"), orig.get("smpp_config_id"),
-             orig.get("phone_prefix", "")),
+             bool(orig.get("flash_sms")), orig.get("phone_prefix", "")),
         )
         new_row = conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)

@@ -256,6 +256,12 @@
           </el-select>
           <div class="form-tip">{{ $t('campaign.associateSmppTip') }}</div>
         </el-form-item>
+        <el-form-item :label="$t('campaign.flashSms')">
+          <el-checkbox v-model="editForm.flash_sms" :disabled="inProgressEdit || !editForm.smpp_config_id">
+            {{ $t('campaign.flashSms') }}
+          </el-checkbox>
+          <div class="form-tip">{{ $t('campaign.flashSmsTip') }}</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
@@ -361,6 +367,7 @@ interface Campaign {
  phone_prefix: string
  sms_template_id: number | null
  smpp_config_id: number | null
+ flash_sms: boolean
   created_at: string
 }
 
@@ -395,6 +402,7 @@ const editForm = ref<{
  watch_filename_prefix: string
  phone_prefix: string
  smpp_config_id: number | null
+ flash_sms: boolean
  status: string
 }>({
   id: 0,
@@ -414,7 +422,8 @@ const editForm = ref<{
   sftp_password: '',
  watch_filename_prefix: 'Android_4G_Switch_Somali_',
  phone_prefix: '',
- smpp_config_id: null,
+  smpp_config_id: null,
+  flash_sms: false,
  status: 'not_started',
 })
 const uploadVisible = ref(false)
@@ -476,6 +485,7 @@ function showDialog(row: Campaign | null) {
      watch_filename_prefix: row.watch_filename_prefix || 'Android_4G_Switch_Somali_',
      phone_prefix: row.phone_prefix || '',
      smpp_config_id: row.smpp_config_id ?? null,
+     flash_sms: Boolean(row.flash_sms),
       status: row.status,
     }
   } else {
@@ -501,6 +511,7 @@ function showDialog(row: Campaign | null) {
      watch_filename_prefix: 'Android_4G_Switch_Somali_',
      phone_prefix: '',
      smpp_config_id: null,
+     flash_sms: false,
      status: 'not_started',
    }
  }
@@ -610,6 +621,7 @@ async function handleSave() {
      watch_filename_prefix: editForm.value.watch_filename_prefix,
      phone_prefix: editForm.value.phone_prefix,
      smpp_config_id: editForm.value.smpp_config_id || undefined,
+     flash_sms: editForm.value.flash_sms,
    }
     if (editForm.value.id && editForm.value.status !== 'not_started' && editForm.value.status !== 'ended') {
       payload = { smpp_config_id: editForm.value.smpp_config_id || undefined }
@@ -628,6 +640,7 @@ async function handleSave() {
        watch_filename_prefix: editForm.value.watch_filename_prefix,
        phone_prefix: editForm.value.phone_prefix,
        smpp_config_id: editForm.value.smpp_config_id || undefined,
+       flash_sms: editForm.value.flash_sms,
       }
     }
     if (editForm.value.id) {
