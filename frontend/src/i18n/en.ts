@@ -151,6 +151,8 @@ export default {
     uploadTargetFile: 'Upload Target File',
     uploadTargetFileHint: 'Upload a file with msisdns and event fields; it will be matched against the activity whitelist',
     dropHint: 'Drag or click to upload CSV file',
+    batchDropHint: 'Drag or click to upload a CSV, TXT, XLSX, or XLS file',
+    uploadIgnoredRows: 'Upload succeeded; {count} rows with empty or unparseable MSISDNs were ignored',
     downloadTemplate: 'Download Prospect Template',
     start: 'Start',
     stop: 'Stop',

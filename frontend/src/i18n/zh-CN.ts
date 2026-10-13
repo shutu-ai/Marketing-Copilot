@@ -162,6 +162,8 @@ export default {
     uploadTargetFile: '上传目标文件',
     uploadTargetFileHint: '上传包含 msisdn 及事件字段的目标文件，系统将按活动白名单进行匹配',
     dropHint: '拖拽或点击上传 CSV 文件',
+    batchDropHint: '拖拽或点击上传 CSV、TXT、XLSX 或 XLS 文件',
+    uploadIgnoredRows: '上传成功，已忽略 {count} 行 msisdn 为空或无法解析的记录',
     downloadTemplate: '下载潜客模板',
     start: '开始活动',
     stop: '停止活动',

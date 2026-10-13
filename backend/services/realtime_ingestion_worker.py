@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 
 from database import get_connection
+from services import backpressure_service
 from services import ingestion_job_service, operations_service, realtime_campaign_service, realtime_whitelist_service
 from services import realtime_ingestion_state
 from services import realtime_ingestion_retry_service as retry_service
@@ -362,12 +363,18 @@ def _process_claimed_file(job, worker_id):
             ingestion_file_id=job["id"],
             whitelist_version_id=job.get("whitelist_version_id"), worker_id=worker_id,
             lease_token=job.get("lease_token", ""),
+            stop_event=_stop,
         )
         processed_id = _processed_id(campaign["id"], job["filename"])
         if result.get("status") == "expired":
             _discard_claimed_expired_file(
                 job, campaign, result.get("message", "daily send window ended"), worker_id,
             )
+            return True
+        if result.get("status") == "stopped":
+            # Capacity waiting is a recoverable pause, not a file failure.
+            # Leave the processing lease for normal expiry recovery on
+            # shutdown; importantly, do not write a retry state transition.
             return True
         if result.get("success"):
             # receive_file commits both final states. Duplicate-file detection
@@ -458,6 +465,13 @@ def _run(worker_index: int):
         try:
             from services import metrics_service
             metrics_service.set_gauge("realtime_ingestion_worker_last_progress_timestamp", time.time())
+            # Do not claim a file while task/write/chunk/disk/result capacity
+            # is paused.  This keeps pure capacity pressure out of the
+            # claim -> receive_file -> retry DB write loop.
+            if not backpressure_service.wait_for_ingestion(
+                stop_event=_stop, producing_chunks=True,
+            ):
+                break
             if not process_once(worker_id):
                 continue
             metrics_service.set_gauge("realtime_ingestion_worker_last_progress_timestamp", time.time())

@@ -3,6 +3,8 @@ import json
 import math
 import re
 import hashlib
+import csv
+import errno
 import logging
 import threading
 from datetime import datetime
@@ -12,6 +14,7 @@ from typing import Optional
 import shutil
 import pandas as pd
 import time
+import uuid
 from services import settings_service
 from services import (sms_task_service, operations_service, campaign_name_service,
                       ingestion_job_service, backpressure_service, metrics_service)
@@ -38,6 +41,8 @@ except (TypeError, ValueError):
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads", "campaigns")
 ALLOWED_LANGUAGES = {"amharic", "tigrigna", "somali", "english", "oromign", "en"}
+BATCH_CUSTOMER_LIST_EXTENSIONS = {".csv", ".txt", ".xlsx", ".xls"}
+CUSTOMER_LIST_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "latin-1")
 INGEST_QUEUE_HIGH_WATERMARK = backpressure_service.TASK_HIGH
 INGEST_QUEUE_LOW_WATERMARK = backpressure_service.TASK_LOW
 
@@ -67,13 +72,51 @@ def _wait_for_ingest_capacity(stop_event=None) -> bool:
     return backpressure_service.wait_for_ingestion(stop_event=stop_event)
 
 
+class _CustomerListReadStats:
+    def __init__(self):
+        self.malformed_rows = 0
+        self.invalid_msisdn_rows = 0
+
+    @property
+    def ignored_rows(self) -> int:
+        return self.malformed_rows + self.invalid_msisdn_rows
+
+    def bad_csv_line(self, _bad_line):
+        self.malformed_rows += 1
+        return None
+
+
+def _read_delimited_sample(path: str) -> tuple[str, str]:
+    last_error = None
+    for encoding in CUSTOMER_LIST_ENCODINGS:
+        try:
+            with open(path, "r", encoding=encoding, newline="") as handle:
+                return handle.read(8192), encoding
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    if last_error:
+        raise ValueError("Unable to decode customer list file") from last_error
+    return "", "utf-8-sig"
+
+
+def _detect_csv_format(path: str) -> tuple[str, str]:
+    sample, encoding = _read_delimited_sample(path)
+    lines = [line for line in sample.splitlines() if line.strip()]
+    first_line = lines[0].strip() if lines else ""
+    counts = {delimiter: first_line.count(delimiter) for delimiter in (",", "|", ";", "\t")}
+    likely = max(counts, key=counts.get)
+    if counts[likely] > 0:
+        return likely, encoding
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters=",|;\t").delimiter
+    except csv.Error:
+        delimiter = ","
+    return delimiter, encoding
+
+
 def _detect_csv_delimiter(path: str) -> str:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            first_line = f.readline()
-        if "|" in first_line:
-            return "|"
-        return ","
+        return _detect_csv_format(path)[0]
     except Exception:
         return ","
 
@@ -101,8 +144,23 @@ def _canonicalize_customer_list_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename)
 
 
-def _read_excel_chunks(path: str, chunksize: int):
-    """Stream an XLSX workbook in read-only mode and always close its resources."""
+def _read_excel_chunks(
+    path: str, chunksize: int, stats: Optional[_CustomerListReadStats] = None,
+):
+    """Read Excel input in bounded chunks and close workbook resources."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xls":
+        # pandas delegates legacy XLS files to xlrd.  Keep the dependency
+        # explicit so offline deployments fail with a useful message if an
+        # old wheelhouse has not yet been refreshed.
+        try:
+            frame = pd.read_excel(path, dtype=str, keep_default_na=False, engine="xlrd")
+        except ImportError as exc:
+            raise ValueError("XLS files require the xlrd dependency") from exc
+        for start in range(0, len(frame), max(1, chunksize)):
+            yield frame.iloc[start:start + max(1, chunksize)].copy()
+        return
+
     from openpyxl import load_workbook
 
     workbook = load_workbook(path, read_only=True, data_only=True)
@@ -115,6 +173,13 @@ def _read_excel_chunks(path: str, chunksize: int):
         headers = [str(value or "").strip() for value in header_row]
         buffer = []
         for values in rows:
+            values = tuple(values)
+            if len(values) != len(headers):
+                # openpyxl normally pads rows to the sheet width, but retain
+                # this guard for malformed workbooks.
+                if stats is not None:
+                    stats.malformed_rows += 1
+                continue
             buffer.append(dict(zip(headers, values)))
             if len(buffer) >= chunksize:
                 yield pd.DataFrame(buffer, columns=headers)
@@ -125,53 +190,95 @@ def _read_excel_chunks(path: str, chunksize: int):
         workbook.close()
 
 
-def _validate_customer_list_file(path: str, chunksize: int = 10000) -> int:
-    ext = os.path.splitext(path)[1].lower()
-    source = (
-        pd.read_csv(path, dtype=str, sep=_detect_csv_delimiter(path), chunksize=chunksize)
-        if ext == ".csv" else _read_excel_chunks(path, chunksize)
-    )
-    total = 0
-    for frame in source:
-        total += _validate_customer_list(frame)
-        del frame
-    if total <= 0:
-        raise ValueError("Customer list file is empty")
-    return total
+def _prepare_customer_list_frame(
+    df: pd.DataFrame,
+    stats: Optional[_CustomerListReadStats] = None,
+    row_offset: int = 0,
+) -> pd.DataFrame:
+    """Canonicalize a chunk and drop only rows with unusable MSISDNs.
 
-
-def _validate_customer_list(df: pd.DataFrame) -> int:
+    Structural errors (missing/duplicate reserved columns) and invalid
+    language values remain hard failures.  An empty or unparsable MSISDN is a
+    row-level data problem and is deliberately excluded from the returned
+    frame so validation and later batch generation see the same rows.
+    """
+    stats = stats or _CustomerListReadStats()
     df = _canonicalize_customer_list_columns(df)
     columns = set(df.columns)
-    errors = []
     if "msisdn" not in columns:
-        errors.append("Customer list file must contain an msisdn column")
-    if errors:
-        raise ValueError("; ".join(errors))
-
+        raise ValueError("Customer list file must contain an msisdn column")
     if df.empty:
-        raise ValueError("Customer list file is empty")
+        return df.copy()
 
-    msisdn_col = "msisdn"
-    valid_rows = 0
-    for idx, value in enumerate(df[msisdn_col]):
-        normalized = sms_task_service.normalize_msisdn(value)
+    valid_positions = []
+    normalized_values = []
+    for idx, value in enumerate(df["msisdn"]):
+        try:
+            normalized = sms_task_service.normalize_msisdn(value)
+        except Exception:
+            normalized = ""
         if not normalized:
-            errors.append(f"Row {idx + 2}: msisdn is empty or invalid")
-        else:
-            valid_rows += 1
+            stats.invalid_msisdn_rows += 1
+            continue
+        valid_positions.append(idx)
+        normalized_values.append(normalized)
 
+    if not valid_positions:
+        return df.iloc[0:0].copy()
+
+    prepared = df.iloc[valid_positions].copy()
+    prepared["msisdn"] = normalized_values
     if "language" in columns:
-        language_col = "language"
         allowed_label = ", ".join(sorted(ALLOWED_LANGUAGES))
-        for idx, value in enumerate(df[language_col]):
+        for idx, value in enumerate(prepared["language"]):
             language = str(value).strip().lower() if pd.notna(value) else ""
             if not language or language not in ALLOWED_LANGUAGES:
-                errors.append(f"Row {idx + 2}: language '{str(value).strip()}' is invalid; allowed: {allowed_label}")
+                source_row = row_offset + valid_positions[idx] + 2
+                raise ValueError(
+                    f"Row {source_row}: language '{str(value).strip()}' is invalid; "
+                    f"allowed: {allowed_label}"
+                )
+    return prepared
 
-    if errors:
-        raise ValueError("\n".join(errors[:20]))
-    return valid_rows
+
+def _iter_customer_list_frames(
+    path: str, chunksize: int = 10000, stats: Optional[_CustomerListReadStats] = None,
+):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in BATCH_CUSTOMER_LIST_EXTENSIONS:
+        raise ValueError("Only CSV, TXT, XLSX and XLS files are supported")
+    stats = stats or _CustomerListReadStats()
+    row_offset = 0
+    if ext in {".csv", ".txt"}:
+        delimiter, encoding = _detect_csv_format(path)
+        source = pd.read_csv(
+            path, dtype=str, sep=delimiter, encoding=encoding,
+            chunksize=max(1, chunksize), keep_default_na=False,
+            engine="python", on_bad_lines=stats.bad_csv_line,
+        )
+    else:
+        source = _read_excel_chunks(path, max(1, chunksize), stats)
+    for frame in source:
+        prepared = _prepare_customer_list_frame(frame, stats, row_offset)
+        row_offset += len(frame)
+        if not prepared.empty:
+            yield prepared
+        del frame, prepared
+
+
+def _validate_customer_list_file(path: str, chunksize: int = 10000) -> dict:
+    stats = _CustomerListReadStats()
+    total = 0
+    for frame in _iter_customer_list_frames(path, chunksize, stats):
+        total += len(frame)
+    if total <= 0:
+        raise ValueError("Customer list file contains no valid MSISDN rows")
+    return {
+        "row_count": total,
+        "ignored_rows": stats.ignored_rows,
+        "ignored_msisdn_rows": stats.invalid_msisdn_rows,
+        "ignored_malformed_rows": stats.malformed_rows,
+    }
 
 
 def _get_batch_base_dir() -> str:
@@ -429,8 +536,8 @@ def get_prospects(campaign_id: int, search: str = "", field: str = "", value: st
         return {"headers": [], "rows": [], "total": 0, "page": 1, "page_size": page_size}
 
     try:
-        sep = _detect_csv_delimiter(path)
-        df = pd.read_csv(path, dtype=str, sep=sep).fillna("")
+        frames = list(_iter_customer_list_frames(path, chunksize=10000))
+        df = pd.concat(frames, ignore_index=True).fillna("") if frames else pd.DataFrame()
     except Exception:
         return {"headers": [], "rows": [], "total": 0, "page": 1, "page_size": page_size}
 
@@ -737,14 +844,7 @@ class _SequentialBatchSource:
 
     def open(self):
         self.close()
-        self.reader = (
-            pd.read_csv(
-                self.path, dtype=str, sep=_detect_csv_delimiter(self.path),
-                chunksize=self.batch_size,
-            )
-            if self.ext == ".csv"
-            else _read_excel_chunks(self.path, self.batch_size)
-        )
+        self.reader = _iter_customer_list_frames(self.path, self.batch_size)
         self.next_index = 0
         self.lookahead = None
 
@@ -1401,6 +1501,28 @@ def _attach_daily_smpp(campaign_id: int, daily_stats: list) -> None:
         item["smpp_label"] = "、".join(dict.fromkeys(label(i) for i in ids)) or "-"
 
 
+def _publish_customer_list_atomic(source_path: str, destination_path: str) -> None:
+    """Publish a validated target list without exposing a partial file."""
+    try:
+        os.replace(source_path, destination_path)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    staged_path = f"{destination_path}.upload-{uuid.uuid4().hex}.tmp"
+    try:
+        with open(source_path, "rb") as source, open(staged_path, "wb") as staged:
+            shutil.copyfileobj(source, staged, length=1024 * 1024)
+        os.replace(staged_path, destination_path)
+    finally:
+        try:
+            if os.path.exists(staged_path):
+                os.unlink(staged_path)
+        except OSError:
+            logger.warning("Unable to remove staged target-list file=%s", staged_path, exc_info=True)
+
+
 def upload_customer_list(campaign_id: int, file_path: str, original_filename: str) -> Optional[dict]:
     campaign = get_one(campaign_id)
     if not campaign:
@@ -1421,17 +1543,28 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
 
     whitelist_dir = os.path.join(campaign_dir, "whitelist")
     os.makedirs(whitelist_dir, exist_ok=True)
+    original_filename = os.path.basename(original_filename or "target-list.csv")
     ext = os.path.splitext(original_filename)[1].lower()
+    if ext not in BATCH_CUSTOMER_LIST_EXTENSIONS:
+        raise ValueError("Only CSV, TXT, XLSX and XLS files are supported")
 
     try:
-        row_count = _validate_customer_list_file(file_path)
+        validation = _validate_customer_list_file(file_path)
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError(f"Cannot read customer list file: {exc}") from exc
 
     dest = os.path.join(whitelist_dir, f"whitelist{ext}")
-    shutil.move(file_path, dest)
+    _publish_customer_list_atomic(file_path, dest)
+    row_count = int(validation["row_count"])
+    ignored_rows = int(validation.get("ignored_rows", 0) or 0)
+    if ignored_rows:
+        logger.warning(
+            "Batch target list ignored rows campaign=%s total=%s invalid_msisdn=%s malformed=%s",
+            campaign_id, ignored_rows, validation.get("ignored_msisdn_rows", 0),
+            validation.get("ignored_malformed_rows", 0),
+        )
 
     def write(conn):
         conn.execute(
@@ -1450,4 +1583,11 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
         batch_size = campaign.get("batch_size") or 500
         generate_batches(campaign_id, batch_size)
 
-    return dict(row) if row else None
+    if not row:
+        return None
+    return {
+        **dict(row),
+        "ignored_rows": ignored_rows,
+        "ignored_msisdn_rows": int(validation.get("ignored_msisdn_rows", 0) or 0),
+        "ignored_malformed_rows": int(validation.get("ignored_malformed_rows", 0) or 0),
+    }

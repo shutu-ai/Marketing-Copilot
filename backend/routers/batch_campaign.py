@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
 from database import is_transient_write_error
 from services import batch_campaign_service
+from services.operations_service import MAX_FILE_BYTES
 
 router = APIRouter(prefix="/api/batch-campaigns", tags=["Batch Campaign"])
 
@@ -93,15 +94,24 @@ def upload_customer_list(campaign_id: int, file: UploadFile = File(...)):
         if not campaign:
             raise HTTPException(status_code=404, detail="活动不存在")
         ext = os.path.splitext(file.filename or "file.csv")[1].lower()
-        if ext != ".csv":
-            raise HTTPException(status_code=400, detail="仅支持 CSV 文件")
+        if ext not in batch_campaign_service.BATCH_CUSTOMER_LIST_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="仅支持 CSV、TXT、XLSX 和 XLS 文件")
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
         os.close(fd)
         try:
-            content = file.file.read()
             with open(tmp_path, "wb") as f:
-                f.write(content)
-            result = batch_campaign_service.upload_customer_list(campaign_id, tmp_path, file.filename or "file.csv")
+                total = 0
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_FILE_BYTES:
+                        raise ValueError(f"file exceeds {MAX_FILE_BYTES} byte limit")
+                    f.write(chunk)
+            result = batch_campaign_service.upload_customer_list(
+                campaign_id, tmp_path, os.path.basename(file.filename or "file.csv")
+            )
         finally:
             try:
                 if os.path.exists(tmp_path):

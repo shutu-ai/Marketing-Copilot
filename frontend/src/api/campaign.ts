@@ -28,6 +28,12 @@ export interface CampaignListResult {
   items: BatchCampaign[]
 }
 
+export interface BatchCampaignUploadResult extends BatchCampaign {
+  ignored_rows?: number
+  ignored_msisdn_rows?: number
+  ignored_malformed_rows?: number
+}
+
 export function getCampaigns(params: { page?: number; page_size?: number } = {}) {
   return api.get<CampaignListResult>('/batch-campaigns', { params })
 }
@@ -56,7 +62,7 @@ export function deleteCampaign(id: number) {
 export function uploadCustomerList(campaignId: number, file: File) {
   const form = new FormData()
   form.append('file', file)
-  return api.post<BatchCampaign>(`/batch-campaigns/${campaignId}/upload`, form)
+  return api.post<BatchCampaignUploadResult>(`/batch-campaigns/${campaignId}/upload`, form)
 }
 
 export function copyCampaign(id: number) {

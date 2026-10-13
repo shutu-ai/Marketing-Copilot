@@ -240,10 +240,10 @@
         :auto-upload="false"
         :show-file-list="true"
         :on-change="handleFileChange"
-        accept=".csv"
+        accept=".csv,.txt,.xlsx,.xls"
       >
         <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-        <div class="el-upload__text">{{ $t('campaign.dropHint') }}</div>
+        <div class="el-upload__text">{{ $t('campaign.batchDropHint') }}</div>
       </el-upload>
       <template #footer>
         <el-button @click="uploadVisible = false">{{ $t('common.cancel') }}</el-button>
@@ -490,8 +490,13 @@ async function handleUploadSubmit() {
   if (!selectedFile.value) return
   uploading.value = true
   try {
-    await api.uploadCustomerList(uploadCampaignId.value, selectedFile.value)
-    ElMessage.success(i18n.global.t('legacy.xa7699ba7'))
+    const response = await api.uploadCustomerList(uploadCampaignId.value, selectedFile.value)
+    const ignoredRows = Number(response.data?.ignored_rows || 0)
+    if (ignoredRows > 0) {
+      ElMessage.warning(t('campaign.uploadIgnoredRows', { count: ignoredRows }))
+    } else {
+      ElMessage.success(i18n.global.t('legacy.xa7699ba7'))
+    }
     uploadVisible.value = false
     await fetchList()
   } catch (e: any) {

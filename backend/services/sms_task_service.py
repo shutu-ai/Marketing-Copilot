@@ -828,16 +828,14 @@ def claim_next_tasks(limit: int = 20) -> list:
                 key = (str(task["campaign_type"]), int(task["campaign_id"]), route_id)
                 fairness_groups[key] = fairness_groups.get(key, 0) + 1
             for (campaign_type, campaign_id, route_id), _count in fairness_groups.items():
-                remaining = conn.execute(
-                    """SELECT COUNT(*) count FROM sms_tasks
-                       WHERE campaign_type=? AND campaign_id=?
-                         AND COALESCE(transport_smpp_config_id,smpp_config_id,0)=?
-                         AND status IN ('queued','retrying')""",
-                    (campaign_type, campaign_id, route_id),
-                ).fetchone()["count"]
+                # The fairness backlog is advisory display state.  The claim
+                # scheduler uses the candidate rows and durable cursor, not
+                # this value, so do not rescan sms_tasks inside every claim
+                # write transaction.  The capacity snapshot still computes
+                # authoritative task counts when it is requested.
                 campaign_capacity_service.record_activity_event(
                     conn, campaign_type, campaign_id, "task", route_id=route_id,
-                    backlog=int(remaining or 0),
+                    backlog=None,
                 )
             return tasks
 
@@ -986,16 +984,13 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
         try:
             from services import campaign_capacity_service
             route_id = int(current.get("transport_smpp_config_id") or smpp_config_id or 0)
-            backlog = conn.execute(
-                """SELECT COUNT(*) count FROM sms_tasks
-                   WHERE campaign_type=? AND campaign_id=?
-                     AND COALESCE(transport_smpp_config_id,smpp_config_id,0)=?
-                     AND status IN ('queued','retrying','sending')""",
-                (current.get("campaign_type"), int(current.get("campaign_id") or 0), route_id),
-            ).fetchone()["count"]
+            # A per-submit route COUNT(*) held the writer gate while the
+            # sender was on its durable-before-socket authorization path.
+            # Backlog is observability-only; retain the activity timestamp
+            # without turning each SMS authorization into a table rescan.
             campaign_capacity_service.record_activity_event(
                 conn, current.get("campaign_type"), int(current.get("campaign_id") or 0),
-                "submit", route_id=route_id, backlog=int(backlog or 0),
+                "submit", route_id=route_id, backlog=None,
             )
         except Exception:
             pass

@@ -1165,7 +1165,7 @@ def _batch_seen_msisdns(conn, normalized, languages, use_whitelist):
 def receive_file(campaign_id: int, file_path: str, original_filename: str,
                  ingestion_file_id: Optional[int] = None,
                  whitelist_version_id: Optional[int] = None,
-                 worker_id: str = "", lease_token: str = "") -> dict:
+                 worker_id: str = "", lease_token: str = "", stop_event=None) -> dict:
     conn = get_connection()
     campaign = conn.execute(
         "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
@@ -1397,9 +1397,14 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
                 if expired_reason:
                     return {"success": False, "status": "expired", "message": expired_reason}
-                pressure, _ = backpressure_service.reasons()
-                if pressure:
-                    raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
+                if not backpressure_service.wait_for_ingestion(
+                    stop_event=stop_event, producing_chunks=True,
+                ):
+                    return {
+                        "success": False,
+                        "status": "stopped",
+                        "message": "realtime ingestion stopped while waiting for capacity",
+                    }
                 chunk_start = total_rows
                 total_rows += len(chunk)
                 progress("matching", total_rows, matched_row_count, chunk_index, chunk_index + 1)
@@ -1496,9 +1501,14 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             if whitelist_conn:
                 whitelist_conn.close()
     else:
-        pressure, _ = backpressure_service.reasons()
-        if pressure:
-            raise RuntimeError("ingestion backpressure: " + ",".join(pressure))
+        if not backpressure_service.wait_for_ingestion(
+            stop_event=stop_event, producing_chunks=True,
+        ):
+            return {
+                "success": False,
+                "status": "stopped",
+                "message": "realtime ingestion stopped while waiting for capacity",
+            }
         excel_job = realtime_ingestion_state.prepare_chunk(
             ingestion_file_id, 0, 0, len(df), lease_token,
         )
