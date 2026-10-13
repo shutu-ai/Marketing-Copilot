@@ -1,4 +1,8 @@
-"""Send one SMS to the local simulator and wait for its delivery receipt."""
+"""Send one SMS to an SMPP endpoint and validate submit_sm_resp.
+
+Delivery-receipt confirmation is opt-in because throughput/capacity smoke tests
+only need to verify that the SMSC accepted the submit_sm request.
+"""
 
 import argparse
 import threading
@@ -18,6 +22,10 @@ def main():
     parser.add_argument("--destination", default="251900001240")
     parser.add_argument("--message", default="Marketing Copilot local SMPP test")
     parser.add_argument("--timeout", type=float, default=10)
+    parser.add_argument(
+        "--wait-for-receipt", action="store_true",
+        help="also request and wait for delivery receipts",
+    )
     args = parser.parse_args()
 
     submitted = threading.Event()
@@ -69,14 +77,17 @@ def main():
             short_message=part,
             data_coding=coding,
             esm_class=esm_class,
-            registered_delivery=True,
+            registered_delivery=args.wait_for_receipt,
         )
 
     if not submitted.wait(args.timeout):
         raise SystemExit("FAILED: submit_sm_resp timeout")
-    if not delivered.wait(args.timeout):
-        raise SystemExit("FAILED: delivery receipt timeout")
-    print(f"PASS: {len(parts)} submit_sm_resp and DELIVRD receipt(s) received", flush=True)
+    if args.wait_for_receipt:
+        if not delivered.wait(args.timeout):
+            raise SystemExit("FAILED: delivery receipt timeout")
+        print(f"PASS: {len(parts)} submit_sm_resp and DELIVRD receipt(s) received", flush=True)
+    else:
+        print(f"PASS: {len(parts)} submit_sm_resp received; delivery receipt not required", flush=True)
     stopping.set()
     # smpplib.listen() blocks in recv(). Closing the socket wakes it with an
     # expected Windows WSAENOTSOCK error; suppress shutdown-only library logs.

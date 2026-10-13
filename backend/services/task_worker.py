@@ -137,7 +137,7 @@ def _claim_dispatch_loop(task_queue):
         try:
             claim_started = time.monotonic()
             tasks = sms_task_service.claim_next_tasks(_claim_fetch_size())
-            metrics_service.observe(
+            metrics_service.observe_histogram(
                 "marketing_copilot_task_claim_seconds",
                 time.monotonic() - claim_started,
             )
@@ -187,7 +187,7 @@ def _process_task(task: dict, worker_index: int):
 
         send_started = time.monotonic()
         gateway.send_async(task, _async_send_complete)
-        metrics_service.observe(
+        metrics_service.observe_histogram(
             "marketing_copilot_task_send_async_call_seconds",
             time.monotonic() - send_started,
         )

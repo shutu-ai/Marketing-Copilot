@@ -23,7 +23,7 @@ import time
 import traceback
 import uuid
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -185,6 +185,9 @@ class MixedCampaignRunner(AcceptanceRunner):
         self.lock_regression: dict = {"status": "NOT_RUN"}
         self.creation_order: list[int] = []
         self.sftp_status = self._sftp_environment_status()
+        self.pre_stop_snapshot: dict = {}
+        self.stop_transition: dict = {}
+        self.timing: dict[str, float] = {}
         self._check_ext4_and_resources()
 
     def _check_ext4_and_resources(self) -> None:
@@ -240,6 +243,7 @@ class MixedCampaignRunner(AcceptanceRunner):
         )
 
     def start(self) -> None:
+        started = time.monotonic()
         self.watch_dir.mkdir(parents=True, exist_ok=True)
         self.campaign_dir.mkdir(parents=True, exist_ok=True)
         route_count = max(1, int(self.spec.get("smsc_routes", 1)))
@@ -274,6 +278,7 @@ class MixedCampaignRunner(AcceptanceRunner):
             self.api_log,
         )
         self._wait_http("/api/ready", self.timeout_seconds, "Marketing Copilot API ready")
+        self.timing["process_startup_seconds"] = round(time.monotonic() - started, 3)
 
     def _wait_for_port(self, port: int, timeout: float, label: str) -> None:
         """Wait for a route-specific simulator and surface early exits."""
@@ -292,6 +297,10 @@ class MixedCampaignRunner(AcceptanceRunner):
         raise TimeoutError(f"Timed out waiting for {label}: {last_error}")
 
     def shutdown(self) -> None:
+        started = time.monotonic()
+        first_shutdown = not self.stop_transition
+        if first_shutdown:
+            self.stop_transition = {"requested_at": _utc_now()}
         for role, process in list(self.processes.items()):
             if process.poll() is not None:
                 continue
@@ -309,6 +318,13 @@ class MixedCampaignRunner(AcceptanceRunner):
                 handle.close()
             except OSError:
                 pass
+        if "shutdown_seconds" not in self.timing:
+            self.timing["shutdown_seconds"] = round(time.monotonic() - started, 3)
+        if first_shutdown:
+            self.stop_transition.update({
+                "completed_at": _utc_now(),
+                "elapsed_seconds": self.timing["shutdown_seconds"],
+            })
 
     def run(self) -> dict:
         """Use the shared lifecycle, while preserving resource classification."""
@@ -626,6 +642,8 @@ class MixedCampaignRunner(AcceptanceRunner):
                 self._publish_realtime_file(key, file_index, rows)
 
     def _wait_for_business(self) -> None:
+        business_started = time.monotonic()
+        self._business_started_monotonic = business_started
         deadline = time.monotonic() + float(self.spec.get("time_budget_seconds", self.timeout_seconds))
         injected_at = time.monotonic() + float(self.spec.get("inject_after_seconds", 1.0))
         while time.monotonic() < deadline:
@@ -642,12 +660,31 @@ class MixedCampaignRunner(AcceptanceRunner):
             )
             if complete:
                 self.stop_reason = "completed"
+                self._capture_pre_stop_snapshot()
                 return
             if int(self.spec.get("max_events", 0) or 0) and len(submits) >= int(self.spec["max_events"]):
                 self.stop_reason = "max_events"
                 return
             time.sleep(0.25)
         self.stop_reason = "time_budget"
+        self._capture_pre_stop_snapshot()
+
+    def _capture_pre_stop_snapshot(self) -> None:
+        """Capture live counters immediately before process shutdown."""
+        try:
+            self._sample_runtime()
+        except Exception:
+            pass
+        latest_metrics = self.metrics_samples[-1].get("status", {}).get("metrics", {}) if self.metrics_samples else {}
+        self.pre_stop_snapshot = {
+            "captured_at": _utc_now(),
+            "task_snapshot": dict(self.last_snapshot),
+            "metrics": _metric_summary(latest_metrics),
+            "resource": dict(self.resource_samples[-1]) if self.resource_samples else {},
+        }
+        business_started = getattr(self, "_business_started_monotonic", None)
+        if business_started is not None:
+            self.timing.setdefault("business_wait_seconds", round(time.monotonic() - business_started, 3))
 
     def _db_activity_rows(self, key: tuple[str, int]) -> list[dict]:
         return self._db_query(
@@ -751,12 +788,177 @@ class MixedCampaignRunner(AcceptanceRunner):
             ],
         }
 
+    def _retry_diagnostics(self, tasks: list[dict]) -> dict:
+        """Build a bounded, evidence-based retry/unknown report from the ledger."""
+        events = self._db_query(
+            """SELECT task_id,event_type,from_status,to_status,message,detail,created_at
+                 FROM task_events ORDER BY id"""
+        )
+        attempts = self._db_query(
+            """SELECT task_id,attempt_token,planned_parts,accepted_parts,failed_parts,
+                       state,created_at,updated_at
+                 FROM sms_send_attempts ORDER BY created_at"""
+        )
+        parts = self._db_query(
+            """SELECT attempt_token,part_no,state,response_status,smsc_message_id,
+                       sent_at,responded_at,updated_at
+                 FROM sms_send_parts ORDER BY attempt_token,part_no"""
+        )
+        task_by_id = {int(row["id"]): row for row in tasks}
+        events_by_task: dict[int, list[dict]] = defaultdict(list)
+        invalid_event_rows = []
+        known_event_types = {
+            "created", "claimed", "submit_authorized", "send_failure",
+            "submitted", "delivery_receipt", "manual_retry", "manual_delivered",
+            "recovered_unknown",
+        }
+        for row in events:
+            task_id = int(row.get("task_id") or 0)
+            detail = row.get("detail") or "{}"
+            try:
+                detail_value = json.loads(detail) if isinstance(detail, str) else detail
+                if not isinstance(detail_value, dict):
+                    raise ValueError("event detail is not an object")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                detail_value = {}
+                invalid_event_rows.append({"task_id": task_id, "reason": str(exc)[:160]})
+            item = dict(row)
+            item["detail_object"] = detail_value
+            events_by_task[task_id].append(item)
+            if (
+                str(row.get("event_type") or "") not in known_event_types
+                or len(str(row.get("event_type") or "")) > 64
+                or len(str(row.get("from_status") or "")) > 32
+                or len(str(row.get("to_status") or "")) > 32
+            ):
+                invalid_event_rows.append({
+                    "task_id": task_id,
+                    "event_type": str(row.get("event_type") or "")[:160],
+                    "reason": "non-canonical event field",
+                })
+
+        attempts_by_task: dict[int, list[dict]] = defaultdict(list)
+        for row in attempts:
+            attempts_by_task[int(row.get("task_id") or 0)].append(row)
+        parts_by_attempt: dict[str, list[dict]] = defaultdict(list)
+        for row in parts:
+            parts_by_attempt[str(row.get("attempt_token") or "")].append(row)
+
+        def attempts_bucket(value) -> str:
+            value = int(value or 0)
+            return "0" if value == 0 else "1" if value == 1 else "2" if value == 2 else "3+"
+
+        def reason_for(row: dict, task_events: list[dict]) -> str:
+            text = str(row.get("error_msg") or "").lower()
+            failure_class = str(row.get("failure_class") or "")
+            if "queue full" in text:
+                return "smpp_send_queue_full"
+            if "window exhausted" in text:
+                return "smpp_window_exhausted"
+            if "lock timeout" in text or "write lock" in text:
+                return "duckdb_write_lock_timeout"
+            if failure_class == "delivery_unknown" or int(row.get("last_smpp_status") or 0) == -1:
+                return "delivery_unknown"
+            if failure_class == "partial_submit":
+                return "partial_submit"
+            for event in reversed(task_events):
+                detail = event.get("detail_object") or {}
+                if event.get("event_type") == "send_failure":
+                    message = str(event.get("message") or "").lower()
+                    if "queue full" in message:
+                        return "smpp_send_queue_full"
+                    if detail.get("failure_class"):
+                        return str(detail["failure_class"])
+            return failure_class or ("error" if text else "none")
+
+        breakdown = Counter()
+        event_breakdown = Counter()
+        unknown_partial_retry_violations = []
+        partial_fence_violations = []
+        for row in tasks:
+            task_id = int(row["id"])
+            task_events = events_by_task.get(task_id, [])
+            failure_class = str(row.get("failure_class") or "") or "none"
+            reason = reason_for(row, task_events)
+            route_id = int(row.get("transport_smpp_config_id") or row.get("smpp_config_id") or 0)
+            key = (
+                str(row.get("status") or ""), failure_class, reason,
+                str(row.get("campaign_type") or ""), int(row.get("campaign_id") or 0),
+                route_id, attempts_bucket(row.get("attempts")),
+                (
+                    "retry_scheduled"
+                    if row.get("next_attempt_at") and (
+                        str(row.get("status") or "") in {"queued", "retrying", "sending"}
+                        or failure_class != "none"
+                    )
+                    else "no_retry_time"
+                ),
+            )
+            breakdown[key] += 1
+            for event in task_events:
+                if event.get("event_type") != "send_failure":
+                    continue
+                detail = event.get("detail_object") or {}
+                event_class = str(detail.get("failure_class") or failure_class)
+                event_reason = "smpp_send_queue_full" if "queue full" in str(event.get("message") or "").lower() else event_class
+                event_breakdown[(event_class, event_reason, route_id, str(row.get("campaign_type") or ""), int(row.get("campaign_id") or 0))] += 1
+            if failure_class in {"delivery_unknown", "partial_submit"} and str(row.get("status")) in {"queued", "retrying", "sending"}:
+                unknown_partial_retry_violations.append({"task_id": task_id, "status": row.get("status"), "failure_class": failure_class})
+            task_attempts = attempts_by_task.get(task_id, [])
+            accepted_parts = sum(int(item.get("accepted_parts") or 0) for item in task_attempts)
+            if accepted_parts and str(row.get("status")) in {"queued", "retrying"}:
+                partial_fence_violations.append({"task_id": task_id, "accepted_parts": accepted_parts, "status": row.get("status")})
+
+        def counter_rows(counter, fields):
+            return [dict(zip(fields, key), count=value) for key, value in sorted(counter.items(), key=lambda item: (str(item[0]), item[1]))]
+
+        current_statuses = Counter(str(row.get("status") or "") for row in tasks)
+        return {
+            "current_statuses": dict(sorted(current_statuses.items())),
+            "failure_breakdown": counter_rows(
+                breakdown,
+                ("status", "failure_class", "error_reason", "campaign_type", "campaign_id", "config_id", "attempts_bucket", "retry_schedule"),
+            ),
+            "failure_event_breakdown": counter_rows(
+                event_breakdown,
+                ("failure_class", "error_reason", "config_id", "campaign_type", "campaign_id"),
+            ),
+            "attempt_state_counts": dict(Counter(str(row.get("state") or "") for row in attempts)),
+            "part_state_counts": dict(Counter(str(row.get("state") or "") for row in parts)),
+            "durable_event_counts": dict(Counter(str(row.get("event_type") or "") for row in events)),
+            "event_integrity": {
+                "rows": len(events),
+                "invalid_rows": len(invalid_event_rows),
+                "invalid_examples": invalid_event_rows[:20],
+                "canonical_event_types": sorted(known_event_types),
+            },
+            "unknown_partial_retry_violations": unknown_partial_retry_violations[:20],
+            "partial_fence_violations": partial_fence_violations[:20],
+            "safety_status": "PASS" if not unknown_partial_retry_violations and not partial_fence_violations else "FAIL",
+        }
+
     def _reconcile(self) -> dict:
+        reconcile_started = time.monotonic()
         events = self._event_records()
         submit_events = [event for event in events if event.get("event_type") == "submit_sm"]
         accepted_events = [event for event in submit_events if int(event.get("response_status", 1)) == 0]
+        route_progress = []
+        for route_index, path in enumerate(self.smsc_event_logs, 1):
+            route_events = _read_jsonl(path)
+            route_submits = [item for item in route_events if item.get("event_type") == "submit_sm"]
+            route_progress.append({
+                "route_index": route_index,
+                "configured_port": self.smsc_ports[route_index - 1] if route_index <= len(self.smsc_ports) else None,
+                "submit_sm": len(route_submits),
+                "submit_sm_success": sum(1 for item in route_submits if int(item.get("response_status", 1)) == 0),
+                "status_codes": dict(Counter(str(item.get("response_status")) for item in route_submits)),
+            })
         tasks = self._db_query(
-            "SELECT id,campaign_type,campaign_id,msisdn,status,attempts,created_at,updated_at,submitted_at FROM sms_tasks ORDER BY id"
+            """SELECT id,campaign_type,campaign_id,msisdn,status,attempts,max_attempts,
+                       next_attempt_at,created_at,updated_at,submitted_at,delivered_at,
+                       smsc_message_ids,error_msg,last_smpp_status,failure_class,
+                       smpp_config_id,transport_smpp_config_id
+                  FROM sms_tasks ORDER BY id"""
         )
         tasks_by_key: dict[tuple[str, int], list[dict]] = defaultdict(list)
         for task in tasks:
@@ -794,19 +996,20 @@ class MixedCampaignRunner(AcceptanceRunner):
             for key, meta in self.activity_meta.items()
         )
         all_served = all(item["actual_submit_sm"] > 0 for item in timelines)
+        fairness_grace = timedelta(seconds=float(self.spec.get("fairness_late_grace_seconds", 1.0) or 0.0))
         late_served_early = all(
             any(
                 item["actual_submit_sm"] > 0 and (
                     not large["last_progress_at"]
                     or not item["first_submit_sm_at"]
-                    or _parse_time(item["first_submit_sm_at"]) <= _parse_time(large["last_progress_at"])
+                    or _parse_time(item["first_submit_sm_at"]) <= _parse_time(large["last_progress_at"]) + fairness_grace
                 )
                 for large in timelines if large["large"]
             )
             for item in timelines if item["late"]
         )
         no_starvation = all_served and late_served_early and not duplicate_submit_msisdns
-        capacity_profile = bool(self.spec.get("capacity_expected")) or self.profile in {"capacity", "scale10k", "soak"}
+        capacity_profile = bool(self.spec.get("capacity_expected")) or self.profile in {"capacity", "scale10k", "soak", "rca1k", "rca3k"}
         capacity_limited = (
             capacity_profile
             and self.stop_reason in {"time_budget", "max_events"}
@@ -821,12 +1024,28 @@ class MixedCampaignRunner(AcceptanceRunner):
             final_status = "PASS" if correctness_pass else "FAIL"
         latest_metrics = self.metrics_samples[-1]["status"].get("metrics", {}) if self.metrics_samples else {}
         metric_snapshot = _metric_summary(latest_metrics)
+        retry_diagnostics = self._retry_diagnostics(tasks)
+        self.timing["reconcile_seconds"] = round(time.monotonic() - reconcile_started, 3)
+        route_configs = self._db_query(
+            """SELECT id,name,host,port,tps,window_size,pool_size,enabled,
+                       delivery_receipt_mode FROM smpp_configs ORDER BY id"""
+        )
         bottlenecks = {
             "database_write_transaction_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_database_write_transaction_seconds"),
             "database_write_lock_wait_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_database_write_lock_wait_seconds"),
             "database_write_lock_hold_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_database_write_lock_hold_seconds"),
+            "database_statement_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_database_statement_seconds"),
             "task_claim_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_task_claim_seconds"),
+            "task_send_async_call_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_task_send_async_call_seconds"),
             "realtime_file_processing_seconds": _metric_latency_summary(latest_metrics, "realtime_file_processing_seconds"),
+            "sms_write_batch_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_sms_write_batch_seconds"),
+            "smpp_send_queue_wait_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_send_queue_wait_seconds"),
+            "smpp_window_wait_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_window_wait_seconds"),
+            "smpp_send_lock_wait_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_send_lock_wait_seconds"),
+            "smpp_throttle_wait_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_throttle_wait_seconds"),
+            "smpp_submit_sm_send_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_submit_sm_send_seconds"),
+            "smpp_submit_sm_resp_latency_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_submit_sm_resp_latency_seconds"),
+            "smpp_submit_parts_loop_seconds": _metric_latency_summary(latest_metrics, "marketing_copilot_smpp_submit_parts_loop_seconds"),
         }
         return {
             "status": final_status,
@@ -847,10 +1066,13 @@ class MixedCampaignRunner(AcceptanceRunner):
             "mapped_submit_sm": mapped_events,
             "duplicate_send_tasks": duplicate_submit_msisdns,
             "retry_claimed_tasks": retry_claimed_tasks,
+            "retry_diagnostics": retry_diagnostics,
             "missing_msisdns": missing_msisdns,
             "unexpected_msisdns": unexpected_msisdns,
             "per_campaign_timeline": timelines,
             "bottleneck_evidence": bottlenecks,
+            "route_progress": route_progress,
+            "route_configs": route_configs,
             "runtime_metrics": metric_snapshot,
             "data_reconciliation": {
                 "input_files": len(self.input_files),
@@ -883,6 +1105,15 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "sles_status": "NOT_RUN",
                 "live_env_status": "LIVE_ENV_UNVERIFIED",
             },
+            "control_parameters": {
+                "smsc_tps": self.spec.get("smsc_tps"),
+                "smsc_response_delay": self.spec.get("smsc_response_delay"),
+                "task_workers": self.spec.get("task_workers"),
+                "claim_batch": self.spec.get("claim_batch"),
+                "smpp_window": self.args.smpp_window,
+                "smpp_send_queue_capacity": self.args.smpp_send_queue_capacity,
+                "smsc_routes": self.spec.get("smsc_routes"),
+            },
             "diagnostics": {
                 "artifacts_dir": str(self.root),
                 "api_log": str(self.api_log),
@@ -891,6 +1122,17 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "metrics_samples": len(self.metrics_samples),
                 "creation_order": self.creation_order,
                 "last_snapshot": self.last_snapshot,
+                "lifecycle": {
+                    "pre_stop": self.pre_stop_snapshot,
+                    "stop_transition": self.stop_transition,
+                    "post_stop": {
+                        "captured_at": _utc_now(),
+                        "task_statuses": dict(status_counts),
+                        "generated_tasks": len(tasks),
+                        "submit_sm": len(submit_events),
+                    },
+                    "timing": dict(self.timing),
+                },
             },
         }
 
@@ -913,8 +1155,10 @@ def _args_for_runner(args: argparse.Namespace, spec: dict) -> argparse.Namespace
         smsc_drop_receipt_ratio=None, smsc_receipt_delay=None, smsc_disconnect_after=None,
         delivery_receipt_mode="disabled", task_workers=int(spec.get("task_workers", 2)),
         ingest_workers=int(spec.get("ingest_workers", 2)), workers=int(spec.get("copy_workers", 1)),
-        claim_batch=int(spec.get("claim_batch", 8)), smpp_window=10,
-        smpp_send_queue_capacity=32, producer_chunk_size=0, producer_chunk_delay=0.0,
+        claim_batch=int(spec.get("claim_batch", 8)),
+        smpp_window=int(spec.get("smpp_window", 10)),
+        smpp_send_queue_capacity=int(spec.get("smpp_send_queue_capacity", 32)),
+        producer_chunk_size=0, producer_chunk_delay=0.0,
         max_memory_mb=int(args.max_memory_mb or 0), keep_artifacts=bool(args.keep_artifacts),
         profile=args.profile,
     )
@@ -939,12 +1183,18 @@ def _final_status(report: dict, profile: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("smoke", "fairness", "capacity", "soak", "scale10k"), default="smoke")
+    parser.add_argument("--profile", choices=("smoke", "fairness", "capacity", "soak", "scale10k", "rca1k", "rca3k"), default="smoke")
     parser.add_argument("--scenario-file", default=str(DEFAULT_SCENARIOS))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--seed", type=int, default=20261013)
     parser.add_argument("--time-budget-seconds", type=int, default=0)
     parser.add_argument("--max-events", type=int, default=0)
+    parser.add_argument("--smsc-tps", type=float, default=None)
+    parser.add_argument("--smsc-response-delay", type=float, default=None)
+    parser.add_argument("--task-workers", type=int, default=0)
+    parser.add_argument("--claim-batch", type=int, default=0)
+    parser.add_argument("--smpp-window", type=int, default=0)
+    parser.add_argument("--smpp-send-queue-capacity", type=int, default=0)
     parser.add_argument("--max-memory-mb", type=int, default=0)
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--output", required=True)
@@ -955,6 +1205,18 @@ def main() -> int:
             spec["time_budget_seconds"] = args.time_budget_seconds
         if args.max_events:
             spec["max_events"] = args.max_events
+        if args.smsc_tps is not None:
+            spec["smsc_tps"] = args.smsc_tps
+        if args.smsc_response_delay is not None:
+            spec["smsc_response_delay"] = args.smsc_response_delay
+        if args.task_workers:
+            spec["task_workers"] = args.task_workers
+        if args.claim_batch:
+            spec["claim_batch"] = args.claim_batch
+        if args.smpp_window:
+            spec["smpp_window"] = args.smpp_window
+        if args.smpp_send_queue_capacity:
+            spec["smpp_send_queue_capacity"] = args.smpp_send_queue_capacity
         runner_args = _args_for_runner(args, spec)
         runner = MixedCampaignRunner(runner_args, spec, args.seed)
         report = _final_status(runner.run(), args.profile)

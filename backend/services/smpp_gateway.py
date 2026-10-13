@@ -397,7 +397,7 @@ class _SmppConnection:
         except Exception:
             logger.exception("SMPP async completion callback failed task=%s", task.get("id"))
         finally:
-            metrics_service.observe(
+            metrics_service.observe_histogram(
                 "marketing_copilot_smpp_async_completion_seconds",
                 time.monotonic() - callback_started,
                 labels=self._metric_labels(),
@@ -604,15 +604,15 @@ class _SmppConnection:
         # Reserve the next slot while holding the lock, but never sleep while
         # holding it.  Multiple workers can therefore reserve consecutive
         # slots immediately instead of queueing behind a sleeping worker.
-        metrics_service.observe(
+        metrics_service.observe_histogram(
             "marketing_copilot_smpp_throttle_lock_wait_seconds",
             lock_wait, labels=self._metric_labels(),
         )
-        metrics_service.observe(
+        metrics_service.observe_histogram(
             "marketing_copilot_smpp_throttle_sleep_seconds",
             wait, labels=self._metric_labels(),
         )
-        metrics_service.observe(
+        metrics_service.observe_histogram(
             "marketing_copilot_smpp_throttle_wait_seconds",
             wait, labels=self._metric_labels(),
         )
@@ -634,13 +634,31 @@ class _SmppConnection:
         """
         self._start_async_sender()
         self._start_async_reaper()
+        queue_wait_started = time.monotonic()
+        queue_wait_timeout = max(
+            0.1, min(60.0, float(self.config.get("timeout") or 10) + 2.0)
+        )
         try:
-            self._send_queue.put_nowait((task, callback))
+            # Queue capacity is an in-process backpressure boundary, not an
+            # SMSC rejection.  Waiting briefly lets the sender drain at the
+            # configured route TPS instead of converting normal low-TPS load
+            # into a retryable 0x45 task failure and another DB claim cycle.
+            self._send_queue.put((task, callback), timeout=queue_wait_timeout)
+            metrics_service.observe_histogram(
+                "marketing_copilot_smpp_send_queue_wait_seconds",
+                time.monotonic() - queue_wait_started,
+                labels=self._metric_labels(),
+            )
             metrics_service.set_gauge(
                 "marketing_copilot_smpp_send_queue_depth",
                 self._send_queue.qsize(), labels=self._metric_labels(),
             )
         except queue.Full:
+            metrics_service.observe_histogram(
+                "marketing_copilot_smpp_send_queue_wait_seconds",
+                time.monotonic() - queue_wait_started,
+                labels=self._metric_labels(),
+            )
             metrics_service.inc(
                 "marketing_copilot_smpp_send_queue_full_total",
                 labels=self._metric_labels(),
@@ -682,7 +700,7 @@ class _SmppConnection:
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
-                    metrics_service.observe(
+                    metrics_service.observe_histogram(
                         "marketing_copilot_smpp_send_lock_wait_seconds",
                         time.monotonic() - send_lock_started,
                         labels=self._metric_labels(),
@@ -703,7 +721,7 @@ class _SmppConnection:
                     "marketing_copilot_smpp_submit_sm_sent",
                     labels=self._metric_labels(),
                 )
-                metrics_service.observe(
+                metrics_service.observe_histogram(
                     "marketing_copilot_smpp_submit_sm_send_seconds",
                     sent_at - send_started, labels=self._metric_labels(),
                 )
@@ -737,7 +755,7 @@ class _SmppConnection:
                         self._outcomes[sequence] = outcome
                         response_latency = self._response_latency_locked(sequence, outcome)
                         if response_latency is not None:
-                            metrics_service.observe(
+                            metrics_service.observe_histogram(
                                 "marketing_copilot_smpp_submit_sm_resp_latency_seconds",
                                 response_latency, labels=self._metric_labels(),
                             )
@@ -791,7 +809,7 @@ class _SmppConnection:
         wait_timeout = max(1.0, min(60.0, float(self.config.get("timeout") or 10) + 2.0))
         window_wait_started = time.monotonic()
         window_acquired = self._window.acquire(timeout=wait_timeout)
-        metrics_service.observe(
+        metrics_service.observe_histogram(
             "marketing_copilot_smpp_window_wait_seconds",
             time.monotonic() - window_wait_started,
             labels=self._metric_labels(),
@@ -809,7 +827,7 @@ class _SmppConnection:
             connect_started = time.monotonic()
             self.connect()
             self._start_async_reaper()
-            metrics_service.observe(
+            metrics_service.observe_histogram(
                 "marketing_copilot_smpp_connection_ensure_seconds",
                 time.monotonic() - connect_started,
                 labels=self._metric_labels(),
@@ -817,7 +835,7 @@ class _SmppConnection:
             import smpplib.consts
             parts_started = time.monotonic()
             parts, coding, esm_class = _make_parts(task["content"])
-            metrics_service.observe(
+            metrics_service.observe_histogram(
                 "marketing_copilot_smpp_make_parts_seconds",
                 time.monotonic() - parts_started,
                 labels=self._metric_labels(),
@@ -854,7 +872,7 @@ class _SmppConnection:
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
-                    metrics_service.observe(
+                    metrics_service.observe_histogram(
                         "marketing_copilot_smpp_send_lock_wait_seconds",
                         time.monotonic() - send_lock_started,
                         labels=self._metric_labels(),
@@ -876,7 +894,7 @@ class _SmppConnection:
                     "marketing_copilot_smpp_submit_sm_sent",
                     labels=self._metric_labels(),
                 )
-                metrics_service.observe(
+                metrics_service.observe_histogram(
                     "marketing_copilot_smpp_submit_sm_send_seconds",
                     sent_at - send_started, labels=self._metric_labels(),
                 )
@@ -911,7 +929,7 @@ class _SmppConnection:
                         self._outcomes[sequence] = early_outcome
                         response_latency = self._response_latency_locked(sequence, early_outcome)
                         if response_latency is not None:
-                            metrics_service.observe(
+                            metrics_service.observe_histogram(
                                 "marketing_copilot_smpp_submit_sm_resp_latency_seconds",
                                 response_latency, labels=self._metric_labels(),
                             )
@@ -923,7 +941,7 @@ class _SmppConnection:
                         self.config["id"], self._connection_generation,
                     )
 
-            metrics_service.observe(
+            metrics_service.observe_histogram(
                 "marketing_copilot_smpp_submit_parts_loop_seconds",
                 time.monotonic() - parts_loop_started,
                 labels=self._metric_labels(),

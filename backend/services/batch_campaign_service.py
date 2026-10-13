@@ -1311,7 +1311,7 @@ def process_pending_batches(campaign_id: Optional[int] = None, target_batch_id: 
                     source.open()
                     break
             if processed:
-                metrics_service.observe(
+                metrics_service.observe_histogram(
                     "marketing_copilot_batch_quantum_seconds",
                     time.monotonic() - started,
                     labels={"campaign_id": campaign_id},

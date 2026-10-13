@@ -388,8 +388,11 @@ def _record_batch_metrics(items: list[WriteItem], duration: float,
         metrics_service.inc(
             "marketing_copilot_sms_write_batches_committed_total",
         )
-        metrics_service.observe("marketing_copilot_sms_write_batch_seconds", duration)
-        metrics_service.observe("marketing_copilot_sms_write_batch_items", len(newly_committed))
+        metrics_service.observe_histogram("marketing_copilot_sms_write_batch_seconds", duration)
+        metrics_service.observe_histogram(
+            "marketing_copilot_sms_write_batch_items", len(newly_committed),
+            buckets=(1, 10, 50, 100, 250, 500, 1000),
+        )
         for kind, count in Counter(item.kind for item in newly_committed).items():
             metrics_service.inc(
                 "marketing_copilot_sms_write_committed_total",

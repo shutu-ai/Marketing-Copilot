@@ -377,8 +377,8 @@ def _process_claimed_file(job, worker_id):
                 realtime_ingestion_state.transition(job["id"], None, job.get("lease_token", ""), "completed")
             elapsed_ms = int((time.monotonic() - started) * 1000)
             from services import metrics_service
-            metrics_service.observe("realtime_file_processing_seconds", elapsed_ms / 1000.0,
-                                    {"campaign_id": campaign["id"], "result": "success"})
+            metrics_service.observe_histogram("realtime_file_processing_seconds", elapsed_ms / 1000.0,
+                                              {"campaign_id": campaign["id"], "result": "success"})
             logger.info(
                 "Realtime file completed campaign=%s file=%s elapsed_ms=%s tasks_created=%s whitelist_version=%s worker_id=%s",
                 campaign["id"], job["filename"], elapsed_ms, result.get("task_result", {}).get("created", 0),
@@ -387,8 +387,8 @@ def _process_claimed_file(job, worker_id):
             return True
         decision = retry_service.classify(result.get("message", ""), result.get("status", ""))
         from services import metrics_service
-        metrics_service.observe("realtime_file_processing_seconds", (time.monotonic() - started),
-                                {"campaign_id": campaign["id"], "result": "failed"})
+        metrics_service.observe_histogram("realtime_file_processing_seconds", (time.monotonic() - started),
+                                          {"campaign_id": campaign["id"], "result": "failed"})
         metrics_service.inc("realtime_file_processing_errors_total",
                             labels={"campaign_id": campaign["id"], "error_class": decision.error_class})
         if result.get("status") == "waiting_for_whitelist":
@@ -407,8 +407,8 @@ def _process_claimed_file(job, worker_id):
         raise
     except Exception as exc:
         from services import metrics_service
-        metrics_service.observe("realtime_file_processing_seconds", (time.monotonic() - started),
-                                {"campaign_id": campaign_id, "result": "failed"})
+        metrics_service.observe_histogram("realtime_file_processing_seconds", (time.monotonic() - started),
+                                          {"campaign_id": campaign_id, "result": "failed"})
         metrics_service.inc("realtime_file_processing_errors_total",
                             labels={"campaign_id": campaign_id, "error_class": retry_service.classify(exc).error_class})
         processed_id = processed_id or _processed_id(campaign_id, filename)

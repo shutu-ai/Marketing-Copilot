@@ -86,14 +86,10 @@ def record_smpp_response(config_id, slot, status: int, result: str,
                 base_labels,
             )
             _gauges[latency_key] = latency
-            _counters[_key(
-                "marketing_copilot_smpp_submit_sm_resp_latency_seconds_count",
-                base_labels,
-            )] += 1
-            _counters[_key(
-                "marketing_copilot_smpp_submit_sm_resp_latency_seconds_sum",
-                base_labels,
-            )] += latency
+            _observe_histogram_locked(
+                "marketing_copilot_smpp_submit_sm_resp_latency_seconds",
+                latency, base_labels,
+            )
 
 
 def rolling_rate(name: str, labels=None, window_seconds: float = 60.0) -> float:
@@ -137,14 +133,22 @@ def observe_histogram(name: str, value: float, labels=None, buckets=None):
     limits = tuple(buckets or (0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0))
     base_labels = dict(labels or {})
     with _lock:
-        _gauges[_key(f"{name}_latest", base_labels)] = value
-        _counters[_key(f"{name}_count", base_labels)] += 1
-        _counters[_key(f"{name}_sum", base_labels)] += value
-        for limit in limits:
-            if value <= limit:
-                bucket_labels = {**base_labels, "le": str(limit)}
-                _counters[_key(f"{name}_bucket", bucket_labels)] += 1
-        _counters[_key(f"{name}_bucket", {**base_labels, "le": "+Inf"})] += 1
+        _observe_histogram_locked(name, value, base_labels, limits)
+
+
+def _observe_histogram_locked(name: str, value: float, labels=None, buckets=None):
+    """Update a histogram while the metrics lock is already held."""
+    value = max(0.0, float(value))
+    base_labels = dict(labels or {})
+    limits = tuple(buckets or (0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0))
+    _gauges[_key(f"{name}_latest", base_labels)] = value
+    _counters[_key(f"{name}_count", base_labels)] += 1
+    _counters[_key(f"{name}_sum", base_labels)] += value
+    for limit in limits:
+        if value <= limit:
+            bucket_labels = {**base_labels, "le": str(limit)}
+            _counters[_key(f"{name}_bucket", bucket_labels)] += 1
+    _counters[_key(f"{name}_bucket", {**base_labels, "le": "+Inf"})] += 1
 
 
 def observe_runtime_state(worker_count=0, allow_cached: bool = False):

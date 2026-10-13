@@ -296,7 +296,7 @@ def _is_read_only_statement(sql: str) -> bool:
 def _observe_database_metric(name: str, value: float, labels=None) -> None:
     try:
         from services import metrics_service
-        metrics_service.observe(name, value, labels=labels)
+        metrics_service.observe_histogram(name, value, labels=labels)
     except Exception:
         # Database operations must not fail because runtime metrics are down.
         pass
