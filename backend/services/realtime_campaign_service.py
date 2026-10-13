@@ -4,7 +4,9 @@ import re
 import math
 import stat
 import shutil
+import hashlib
 import logging
+import queue
 from datetime import datetime, timedelta
 from typing import Optional
 import pandas as pd
@@ -16,6 +18,7 @@ import threading
 from database import get_connection, read_transaction, write_transaction
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
+from services import metrics_service
 from services import sms_task_service
 from services import (operations_service, campaign_name_service, ingestion_job_service,
                       backpressure_service, realtime_whitelist_service, realtime_ingestion_state)
@@ -31,6 +34,29 @@ try:
     WATCH_RESCAN_SECONDS = max(3.0, float(os.environ.get("MC_REALTIME_WATCH_RESCAN_SECONDS", "30")))
 except (TypeError, ValueError):
     WATCH_RESCAN_SECONDS = 30.0
+try:
+    WATCH_STABILITY_SECONDS = max(
+        0.5, float(os.environ.get("MC_REALTIME_WATCH_STABILITY_SECONDS", "5"))
+    )
+except (TypeError, ValueError):
+    WATCH_STABILITY_SECONDS = 5.0
+try:
+    WATCH_PENDING_RECHECK_SECONDS = max(
+        0.2, float(os.environ.get("MC_REALTIME_WATCH_PENDING_RECHECK_SECONDS", "1"))
+    )
+except (TypeError, ValueError):
+    WATCH_PENDING_RECHECK_SECONDS = 1.0
+WATCH_REQUIRE_READY = str(os.environ.get("MC_REALTIME_REQUIRE_READY", "0")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
+try:
+    WATCH_COPY_QUEUE_SIZE = max(1, min(256, int(os.environ.get("MC_REALTIME_COPY_QUEUE_SIZE", "32"))))
+except (TypeError, ValueError):
+    WATCH_COPY_QUEUE_SIZE = 32
+try:
+    WATCH_COPY_WORKERS = max(1, min(8, int(os.environ.get("MC_REALTIME_COPY_WORKERS", "2"))))
+except (TypeError, ValueError):
+    WATCH_COPY_WORKERS = 2
 _daily_finalize_lock = threading.Lock()
 _daily_finalize_date = None
 _daily_finalized_windows = set()
@@ -41,6 +67,19 @@ _watch_skip_log_lock = threading.Lock()
 _watch_skip_log_state = {}
 _watch_scan_lock = threading.Lock()
 _watch_scan_state = {}
+_watch_pending_stability = {}
+_watch_copy_queue = queue.Queue(maxsize=WATCH_COPY_QUEUE_SIZE)
+_watch_copy_stop = threading.Event()
+_watch_copy_threads = []
+_watch_copy_start_lock = threading.Lock()
+
+
+class WatchFileChanged(RuntimeError):
+    """The producer changed a file while it was being handed off."""
+
+
+class InputSchemaError(ValueError):
+    """The input does not contain an explicit, auditable recipient column."""
 
 
 def _run_campaign_write(operation: str, writer):
@@ -74,8 +113,150 @@ def _clean_text(value) -> str:
     return "" if text.lower() in {"nan", "nat", "none", "<na>"} else text
 
 
-def _read_csv(path: str, chunksize: int = 0):
-    """Read CSV file. If chunksize > 0, returns a chunk iterator instead of a DataFrame."""
+def _watch_snapshot(path: str) -> tuple[int, int, int]:
+    info = os.stat(path)
+    return (
+        int(info.st_size),
+        int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
+        int(getattr(info, "st_ino", 0) or 0),
+    )
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _copy_watch_file_atomic(src: str, dest: str) -> tuple[int, int, int]:
+    """Copy through an inbox-local staging file and publish atomically.
+
+    The source is checked before and after the copy, and the copied bytes are
+    hashed against a second source read.  This prevents a changed source from
+    being published as a formal inbox file.  The staging file is always in
+    the inbox directory, so ``os.replace`` is a same-filesystem publication.
+    """
+    started = time.monotonic()
+    before = _watch_snapshot(src)
+    if os.path.exists(dest):
+        raise FileExistsError(dest)
+    inbox_dir = os.path.dirname(dest)
+    fd, staged = tempfile.mkstemp(
+        prefix=f".{os.path.basename(dest)}.", suffix=".part", dir=inbox_dir,
+    )
+    os.close(fd)
+    try:
+        shutil.copyfile(src, staged)
+        with open(staged, "r+b") as handle:
+            os.fsync(handle.fileno())
+        copied_hash = _sha256_file(staged)
+        after = _watch_snapshot(src)
+        source_hash = _sha256_file(src)
+        final_source = _watch_snapshot(src)
+        if before != after or after != final_source or before[0] != os.path.getsize(staged):
+            raise WatchFileChanged(f"source changed during copy: {src}")
+        if copied_hash != source_hash:
+            raise WatchFileChanged(f"source content changed during copy: {src}")
+        os.replace(staged, dest)
+        return final_source
+    finally:
+        metrics_service.observe_histogram(
+            "realtime_watch_atomic_copy_seconds", time.monotonic() - started,
+        )
+        try:
+            if os.path.exists(staged):
+                os.unlink(staged)
+        except OSError:
+            logger.warning("Unable to clean watch staging file=%s", staged, exc_info=True)
+
+
+def _pending_watch_key(campaign_id: int, src: str) -> tuple[int, str]:
+    return int(campaign_id), os.path.abspath(src)
+
+
+def _track_watch_stability(campaign_id: int, src: str, snapshot: tuple[int, int, int],
+                           producer_ready: bool = False) -> bool:
+    """Return whether a source may be copied under the configured policy.
+
+    A producer completion marker is authoritative.  Without one this is an
+    explicitly heuristic compatibility path: an old enough mtime is only a
+    hint and the atomic copy still rejects changes observed during copying.
+    """
+    key = _pending_watch_key(campaign_id, src)
+    now = time.monotonic()
+    if producer_ready:
+        with _watch_scan_lock:
+            _watch_pending_stability.pop(key, None)
+        metrics_service.inc(
+            "realtime_watch_stability_ready_total",
+            labels={"campaign_id": campaign_id},
+        )
+        return True
+    if WATCH_REQUIRE_READY:
+        with _watch_scan_lock:
+            current = _watch_pending_stability.get(key)
+            if not current or current["snapshot"] != snapshot:
+                _watch_pending_stability[key] = {
+                    "snapshot": snapshot, "first_seen": now,
+                    "next_check": now + WATCH_PENDING_RECHECK_SECONDS,
+                }
+                metrics_service.set_gauge(
+                    "realtime_watch_first_seen_timestamp", time.time(),
+                    labels={"campaign_id": campaign_id},
+                )
+            else:
+                current["next_check"] = now + WATCH_PENDING_RECHECK_SECONDS
+        metrics_service.inc(
+            "realtime_watch_stability_pending_total",
+            labels={"campaign_id": campaign_id, "mode": "ready_required"},
+        )
+        return False
+    age = max(0.0, time.time() - (snapshot[1] / 1_000_000_000))
+    if age >= WATCH_STABILITY_SECONDS:
+        with _watch_scan_lock:
+            _watch_pending_stability.pop(key, None)
+        metrics_service.inc(
+            "realtime_watch_stability_accepted_total",
+            labels={"campaign_id": campaign_id, "mode": "mtime_heuristic"},
+        )
+        return True
+    with _watch_scan_lock:
+        current = _watch_pending_stability.get(key)
+        if not current or current["snapshot"] != snapshot:
+            _watch_pending_stability[key] = {
+                "snapshot": snapshot, "first_seen": now,
+                "next_check": now + WATCH_PENDING_RECHECK_SECONDS,
+            }
+            metrics_service.set_gauge(
+                "realtime_watch_first_seen_timestamp", time.time(),
+                labels={"campaign_id": campaign_id},
+            )
+        else:
+            current["next_check"] = now + WATCH_PENDING_RECHECK_SECONDS
+    metrics_service.inc(
+        "realtime_watch_stability_pending_total",
+        labels={"campaign_id": campaign_id, "mode": "mtime_heuristic"},
+    )
+    return False
+
+
+def _pending_watch_names(campaign_id: int, watch_dir: str) -> list[str]:
+    prefix = (int(campaign_id), os.path.abspath(watch_dir))
+    with _watch_scan_lock:
+        return sorted(
+            os.path.basename(path)
+            for (cid, path), state in _watch_pending_stability.items()
+            if cid == prefix[0] and os.path.dirname(path) == prefix[1]
+            and state.get("next_check", 0) <= time.monotonic()
+        )
+
+
+def _csv_delimiter(path: str) -> str:
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         sample = handle.read(8192)
     # Detect delimiter: check for pipe (|) in first line, fall back to Sniffer
@@ -87,9 +268,79 @@ def _read_csv(path: str, chunksize: int = 0):
             delimiter = csv.Sniffer().sniff(sample, delimiters=",|;\t").delimiter
         except csv.Error:
             delimiter = ","
+    return delimiter
+
+
+def _read_csv(path: str, chunksize: int = 0):
+    """Read CSV file. If chunksize > 0, returns a chunk iterator instead of a DataFrame."""
+    delimiter = _csv_delimiter(path)
     if chunksize:
         return pd.read_csv(path, dtype=str, sep=delimiter, chunksize=chunksize)
     return pd.read_csv(path, dtype=str, sep=delimiter)
+
+
+def _read_csv_columns(path: str):
+    return pd.read_csv(path, dtype=str, sep=_csv_delimiter(path), nrows=0).columns
+
+
+_MSISDN_ALIASES = {
+    "msisdn": "msisdn",
+    "msisdn_number": "msisdn",
+    "mobile": "msisdn",
+    "mobile_number": "msisdn",
+    "phone": "msisdn",
+    "phone_number": "msisdn",
+    "recipient": "msisdn",
+}
+
+
+def _configured_msisdn_column() -> str:
+    configured = os.environ.get("MC_REALTIME_MSISDN_COLUMN", "")
+    if not configured:
+        configured = settings_service.get_setting("realtime_msisdn_column", "") or ""
+    return str(configured).lstrip("\ufeff").strip().lower()
+
+
+def _resolve_msisdn_column(columns) -> str:
+    """Resolve a recipient column from an explicit name or audited alias."""
+    original = list(columns) if columns is not None else []
+    if not original:
+        raise InputSchemaError("input has no header row")
+    normalized = [str(value).lstrip("\ufeff").strip().lower() for value in original]
+    if any(not value for value in normalized):
+        raise InputSchemaError("input contains an empty column name")
+    duplicate_suffixes = {
+        value.split(".", 1)[0]
+        for value in normalized
+        if re.match(r"^(?:msisdn|msisdn_number|mobile|mobile_number|phone|phone_number|recipient)\.\d+$", value)
+    }
+    if duplicate_suffixes:
+        raise InputSchemaError(
+            "input contains duplicate recipient column names: "
+            + ", ".join(sorted(duplicate_suffixes))
+        )
+    duplicates = {value for value in normalized if normalized.count(value) > 1}
+    if duplicates:
+        raise InputSchemaError(
+            "input contains duplicate column names: " + ", ".join(sorted(duplicates))
+        )
+    configured = _configured_msisdn_column()
+    if configured:
+        matches = [index for index, value in enumerate(normalized) if value == configured]
+        if len(matches) != 1:
+            raise InputSchemaError(
+                f"configured MSISDN column '{configured}' is missing or duplicated"
+            )
+        return original[matches[0]]
+    matches = [index for index, value in enumerate(normalized) if value in _MSISDN_ALIASES]
+    if len(matches) != 1:
+        if not matches:
+            raise InputSchemaError(
+                "missing explicit MSISDN column; accepted names: "
+                + ", ".join(sorted(_MSISDN_ALIASES))
+            )
+        raise InputSchemaError("multiple possible MSISDN columns; configure one explicitly")
+    return original[matches[0]]
 
 
 def _get_base_dir() -> str:
@@ -482,15 +733,30 @@ def queue_file(campaign_id: int, file_path: str, original_filename: str) -> dict
                 "message": reservation["reason"]}
     reservation_token = reservation["token"]
     consumed = False
+    published = False
     try:
-        shutil.move(file_path, dest)
+        _copy_watch_file_atomic(file_path, dest)
+        published = True
         file_id, duplicate = ingestion_job_service.register_file(
             "realtime", campaign_id, safe_name, dest, chunk_size=_realtime_chunk_size(),
             whitelist_version_id=(realtime_whitelist_service.active_version(campaign_id) or {}).get("id"),
             reservation_token=reservation_token,
         )
         consumed = True
+        try:
+            os.unlink(file_path)
+        except FileNotFoundError:
+            pass
     finally:
+        if published and not consumed:
+            try:
+                os.unlink(dest)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Unable to remove unpublished upload inbox file=%s", dest, exc_info=True,
+                )
         if not consumed:
             ingestion_job_service.release_realtime_capacity(reservation_token)
     if duplicate:
@@ -636,6 +902,133 @@ def _reserve_inbox_capacity(campaign_id: int, filename: str, file_size: int,
         MAX_PENDING_FILES_PER_CAMPAIGN, MAX_INBOX_FILES, MAX_INBOX_BYTES,
         source=source,
     )
+
+
+def _copy_watch_job(job: dict) -> bool:
+    campaign_id = int(job["campaign_id"])
+    fname = str(job["filename"])
+    reservation_token = str(job.get("reservation_token") or "")
+    consumed = False
+    published = False
+    started = time.monotonic()
+    dest = job["dest"]
+    try:
+        _copy_watch_file_atomic(job["src"], dest)
+        published = True
+        whitelist_version_id = (realtime_whitelist_service.active_version(campaign_id) or {}).get("id")
+        file_id, duplicate = ingestion_job_service.register_file(
+            "realtime", campaign_id, fname, dest,
+            chunk_size=_realtime_chunk_size(),
+            whitelist_version_id=whitelist_version_id,
+            reservation_token=reservation_token,
+        )
+        consumed = True
+        metrics_service.set_gauge(
+            "realtime_watch_last_registered_timestamp", time.time(),
+            labels={"campaign_id": campaign_id},
+        )
+        if duplicate:
+            duplicate_path = operations_service.archive_duplicate(
+                dest, job["campaign_dir"], fname,
+            )
+            logger.info(
+                "Watch duplicate archived campaign=%s file=%s path=%s",
+                campaign_id, fname, duplicate_path,
+            )
+        else:
+            logger.info(
+                "Watch file copied campaign=%s src=%s dest=%s ingestion_file_id=%s",
+                campaign_id, job["src"], dest, file_id,
+            )
+        return True
+    except (WatchFileChanged, FileNotFoundError, OSError) as exc:
+        # Keep the source for a later stability check; only the inbox-local
+        # staging file is removed by _copy_watch_file_atomic.
+        logger.info(
+            "Watch file handoff deferred campaign=%s file=%s reason=%s",
+            campaign_id, fname, exc,
+        )
+        metrics_service.inc(
+            "realtime_watch_copy_deferred_total",
+            labels={"reason": type(exc).__name__},
+        )
+    except Exception:
+        logger.exception("Watch file handoff failed campaign=%s file=%s", campaign_id, fname)
+        metrics_service.inc("realtime_watch_copy_failures_total")
+    finally:
+        metrics_service.observe_histogram(
+            "realtime_watch_handoff_seconds", time.monotonic() - started,
+            labels={"campaign_id": campaign_id},
+        )
+        if published and not consumed:
+            try:
+                os.unlink(dest)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Unable to remove unpublished watch inbox file=%s", dest, exc_info=True,
+                )
+        if not consumed and reservation_token:
+            try:
+                ingestion_job_service.release_realtime_capacity(reservation_token)
+            except Exception:
+                logger.exception(
+                    "Unable to release watch reservation campaign=%s file=%s",
+                    campaign_id, fname,
+                )
+    return False
+
+
+def _watch_copy_worker() -> None:
+    while not _watch_copy_stop.is_set():
+        try:
+            job = _watch_copy_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            _copy_watch_job(job)
+        finally:
+            _watch_copy_queue.task_done()
+            metrics_service.set_gauge(
+                "realtime_watch_copy_queue_depth", _watch_copy_queue.qsize(),
+            )
+
+
+def start_watch_copy_workers() -> None:
+    with _watch_copy_start_lock:
+        if any(thread.is_alive() for thread in _watch_copy_threads):
+            return
+        _watch_copy_stop.clear()
+        _watch_copy_threads[:] = [
+            threading.Thread(
+                target=_watch_copy_worker,
+                name=f"realtime-watch-copy-{index + 1}",
+                daemon=True,
+            )
+            for index in range(WATCH_COPY_WORKERS)
+        ]
+        for thread in _watch_copy_threads:
+            thread.start()
+
+
+def stop_watch_copy_workers() -> None:
+    _watch_copy_stop.set()
+    for thread in list(_watch_copy_threads):
+        if thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+    while True:
+        try:
+            job = _watch_copy_queue.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            token = job.get("reservation_token")
+            if token:
+                ingestion_job_service.release_realtime_capacity(token)
+        finally:
+            _watch_copy_queue.task_done()
+    _watch_copy_threads.clear()
 
 
 def _log_inbox_backpressure(campaign_id: int, rejected: int, reason: str,
@@ -902,12 +1295,20 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
 
     ext = os.path.splitext(file_path)[1].lower()
     progress("reading_input")
+    reader = None
     try:
         if ext in (".csv", ".txt"):
             reader = _read_csv(file_path, chunksize=chunk_size)
+            msisdn_col = _resolve_msisdn_column(_read_csv_columns(file_path))
         else:
             df = pd.read_excel(file_path, dtype=str)
+            msisdn_col = _resolve_msisdn_column(df.columns)
     except Exception as e:
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
         realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
         target = operations_service.quarantine(file_path, campaign.get("campaign_dir", ""), original_filename)
         finish_processed("quarantined", target, e)
@@ -975,7 +1376,6 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     if ext in (".csv", ".txt"):
         total_rows = 0
         matched_row_count = 0
-        msisdn_col = None
         task_result = {"success": True, "created": 0, "duplicate": 0,
                        "excluded": 0, "invalid": 0, "no_template": 0}
         unique_fd, unique_path = tempfile.mkstemp(prefix="mc-realtime-", suffix=".duckdb")
@@ -1001,8 +1401,6 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 if current_job is None:
                     raise RuntimeError(f"realtime chunk {chunk_index} lease is held by another worker")
                 chunk_completed = current_job.get("status") == "completed"
-                if msisdn_col is None:
-                    msisdn_col = "msisdn" if "msisdn" in chunk.columns else chunk.columns[0]
                 chunk_normalized = chunk[msisdn_col].map(sms_task_service.normalize_msisdn)
                 chunk_whitelist_languages = (
                     _lookup_whitelist_languages(whitelist_conn, chunk_normalized)
@@ -1077,6 +1475,11 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             raise
         finally:
             unique_conn.close()
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
             if os.path.exists(unique_path):
                 try:
                     os.unlink(unique_path)
@@ -1095,7 +1498,6 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             raise RuntimeError("realtime Excel chunk lease is held by another worker")
         try:
             progress("matching", 0, 0, 0, 1)
-            msisdn_col = "msisdn" if "msisdn" in df.columns else df.columns[0]
             normalized_msisdns = df[msisdn_col].map(sms_task_service.normalize_msisdn)
             received_msisdns = {value for value in normalized_msisdns if value}
             total_msisdn = len(received_msisdns)
@@ -1674,6 +2076,7 @@ def _watch_scan_due(campaign: dict, watch_dir: str, now: datetime, force: bool =
         return True
     key = (int(campaign.get("id") or 0), os.path.abspath(watch_dir))
     now_mono = time.monotonic()
+    pending_due = bool(_pending_watch_names(int(campaign.get("id") or 0), watch_dir))
     state = {
         "directory_mtime_ns": directory_mtime_ns,
         "date": now.date(),
@@ -1688,9 +2091,31 @@ def _watch_scan_due(campaign: dict, watch_dir: str, now: datetime, force: bool =
             or previous["date"] != state["date"]
             or previous["minute"] != state["minute"]
         )
+        if not force and pending_due and not changed:
+            state["last_scan"] = now_mono
+            _watch_scan_state[key] = state
+            campaign["_watch_scan_mode"] = "pending"
+            metrics_service.inc(
+                "realtime_watch_pending_rescans_total",
+                labels={"campaign_id": campaign.get("id", 0)},
+            )
+            metrics_service.set_gauge(
+                "realtime_watch_last_pending_rescan_timestamp", time.time(),
+                labels={"campaign_id": campaign.get("id", 0)},
+            )
+            return True
         if not force and not changed and now_mono - previous["last_scan"] < WATCH_RESCAN_SECONDS:
             return False
         _watch_scan_state[key] = state
+        campaign["_watch_scan_mode"] = "full"
+        metrics_service.inc(
+            "realtime_watch_full_scans_total",
+            labels={"campaign_id": campaign.get("id", 0)},
+        )
+        metrics_service.set_gauge(
+            "realtime_watch_last_full_scan_timestamp", time.time(),
+            labels={"campaign_id": campaign.get("id", 0)},
+        )
         return True
 
 
@@ -1768,7 +2193,13 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
                 stale_count = conn.execute(
                     """SELECT COUNT(*) AS count FROM sms_tasks
                        WHERE campaign_type='realtime' AND task_date < CAST(? AS DATE)
-                         AND status IN ('queued','retrying','sending')""",
+                         AND (status IN ('queued','retrying') OR
+                              (status='sending' AND NOT EXISTS (
+                                  SELECT 1 FROM sms_send_attempts a
+                                  WHERE a.task_id=sms_tasks.id
+                                    AND a.claim_token=sms_tasks.claim_token
+                                    AND a.state IN ('intent','authorized','responding','partial')
+                              )))""",
                     (today,),
                 ).fetchone()["count"]
                 if int(stale_count or 0):
@@ -1776,7 +2207,13 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
                         """UPDATE sms_tasks SET status='cancelled', error_msg='previous day task cancelled',
                            claim_token='',updated_at=CURRENT_TIMESTAMP
                            WHERE campaign_type='realtime' AND task_date < CAST(? AS DATE)
-                             AND status IN ('queued','retrying','sending')""",
+                             AND (status IN ('queued','retrying') OR
+                                  (status='sending' AND NOT EXISTS (
+                                      SELECT 1 FROM sms_send_attempts a
+                                      WHERE a.task_id=sms_tasks.id
+                                        AND a.claim_token=sms_tasks.claim_token
+                                        AND a.state IN ('intent','authorized','responding','partial')
+                                  )))""",
                         (today,),
                     )
                     stale_cancelled = int(stale_count)
@@ -1786,7 +2223,13 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
                     """SELECT status,COUNT(*) AS count FROM sms_tasks
                        WHERE campaign_type='realtime' AND campaign_id=?
                          AND task_date=CAST(? AS DATE)
-                         AND status IN ('queued','retrying','sending')
+                         AND (status IN ('queued','retrying') OR
+                              (status='sending' AND NOT EXISTS (
+                                  SELECT 1 FROM sms_send_attempts a
+                                  WHERE a.task_id=sms_tasks.id
+                                    AND a.claim_token=sms_tasks.claim_token
+                                    AND a.state IN ('intent','authorized','responding','partial')
+                              )))
                        GROUP BY status""",
                     (campaign["id"], today),
                 ).fetchall()
@@ -1798,7 +2241,13 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
                            claim_token='',updated_at=CURRENT_TIMESTAMP
                            WHERE campaign_type='realtime' AND campaign_id=?
                              AND task_date=CAST(? AS DATE)
-                             AND status IN ('queued','retrying','sending')""",
+                             AND (status IN ('queued','retrying') OR
+                                  (status='sending' AND NOT EXISTS (
+                                      SELECT 1 FROM sms_send_attempts a
+                                      WHERE a.task_id=sms_tasks.id
+                                        AND a.claim_token=sms_tasks.claim_token
+                                        AND a.state IN ('intent','authorized','responding','partial')
+                                  )))""",
                         (campaign["id"], today),
                     )
                     cancelled += int(daily_count)
@@ -1935,7 +2384,8 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
         logger.info("Realtime closed-window ingestion jobs discarded count=%s", discarded)
     return discarded
 
-def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
+def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
+                               enqueue_only: bool = False):
     conn = get_connection()
     if campaign_id:
         rows = conn.execute(
@@ -1950,6 +2400,7 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
     if now is None:
         now = datetime.now()
     total_moved = 0
+    total_enqueued = 0
     for row in rows:
         campaign = dict(row)
         watch_dir = campaign.get("watch_dir", "")
@@ -1985,13 +2436,38 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
         backpressure_reason = ""
         # The watched filename contains a fixed-width YYYYMMDDHHMMSS token;
         # lexical order therefore matches file time order.
+        pending_only = campaign.pop("_watch_scan_mode", "full") == "pending"
         try:
-            entries = sorted(os.scandir(watch_dir), key=lambda entry: entry.name)
+            if pending_only:
+                entries = [
+                    (name, os.path.join(watch_dir, name))
+                    for name in _pending_watch_names(campaign["id"], watch_dir)
+                ]
+            else:
+                entries = sorted(os.scandir(watch_dir), key=lambda entry: entry.name)
         except OSError:
             continue
+        ready_names = set()
+        if not pending_only:
+            try:
+                ready_names = {
+                    item.name[:-6]
+                    for item in entries
+                    if item.name.endswith(".ready")
+                }
+            except AttributeError:
+                ready_names = set()
         for entry in entries:
-            fname = entry.name
+            if isinstance(entry, tuple):
+                fname, entry_path = entry
+                entry_stat = None
+            else:
+                fname = entry.name
+                entry_path = entry.path
+                entry_stat = None
             if not fname.startswith(prefix):
+                continue
+            if fname.startswith(".") or fname.endswith((".part", ".ready")):
                 continue
             ext = os.path.splitext(fname)[1].lower()
             if ext not in (".csv", ".txt", ".xlsx", ".xls"):
@@ -2008,18 +2484,17 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
             if not _watch_file_matches_campaign(fname, campaign, now, file_time=file_time):
                 campaign_window_skipped += 1
                 continue
+            src = entry_path
             try:
-                if not entry.is_file(follow_symlinks=False):
+                if entry_stat is None:
+                    entry_stat = os.stat(src)
+                if not stat.S_ISREG(entry_stat.st_mode):
                     continue
+                snapshot = _watch_snapshot(src)
             except OSError:
                 continue
-            src = entry.path
-            # Skip files still being written (modified < 5 seconds ago)
-            try:
-                mtime = os.path.getmtime(src)
-                if now.timestamp() - mtime < 5:
-                    continue
-            except OSError:
+            producer_ready = fname in ready_names or os.path.exists(src + ".ready")
+            if not _track_watch_stability(campaign["id"], src, snapshot, producer_ready):
                 continue
             dest = os.path.join(inbox_dir, fname)
             if os.path.exists(dest):
@@ -2040,28 +2515,36 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
                     backpressure_reason = reservation["reason"]
                     break
                 reservation_token = reservation["token"]
-                consumed = False
-                try:
-                    shutil.copy2(src, dest)
+                if enqueue_only:
                     try:
-                        os.utime(dest, None)
-                    except OSError:
-                        pass
-                    whitelist_version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
-                    ingestion_job_service.register_file(
-                        "realtime", campaign["id"], fname, dest,
-                        chunk_size=_realtime_chunk_size(), whitelist_version_id=whitelist_version_id,
-                        reservation_token=reservation_token,
-                    )
-                    consumed = True
-                finally:
-                    if not consumed:
+                        _watch_copy_queue.put_nowait({
+                            "campaign_id": campaign["id"], "filename": fname,
+                            "src": src, "dest": dest,
+                            "campaign_dir": campaign_dir,
+                            "reservation_token": reservation_token,
+                        })
+                    except queue.Full:
                         ingestion_job_service.release_realtime_capacity(reservation_token)
-                _record_inbox_capacity_file(capacity, file_size)
-                total_moved += 1
-                logger.info("Watch file copied campaign=%s src=%s dest=%s", campaign.get("id"), src, dest)
+                        backpressure_rejected += 1
+                        backpressure_reason = "realtime watch copy queue is full"
+                        break
+                    total_enqueued += 1
+                    metrics_service.set_gauge(
+                        "realtime_watch_copy_queue_depth", _watch_copy_queue.qsize(),
+                    )
+                else:
+                    copied = _copy_watch_job({
+                        "campaign_id": campaign["id"], "filename": fname,
+                        "src": src, "dest": dest, "campaign_dir": campaign_dir,
+                        "reservation_token": reservation_token,
+                    })
+                    if copied:
+                        total_moved += 1
+                        metrics_service.inc("realtime_watch_files_published_total")
+                if enqueue_only or copied:
+                    _record_inbox_capacity_file(capacity, file_size)
             except OSError:
-                pass
+                ingestion_job_service.release_realtime_capacity(reservation_token)
         if backpressure_rejected:
             _log_inbox_backpressure(campaign["id"], backpressure_rejected, backpressure_reason)
         if historical_skipped:
@@ -2070,9 +2553,9 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False):
             _log_watch_skip_summary(campaign["id"], campaign_window_skipped, "filename outside campaign window")
         if already_processed_skipped:
             _log_watch_skip_summary(campaign["id"], already_processed_skipped)
-    if total_moved:
-        logger.info("Watch sync complete moved=%s", total_moved)
-    return {"moved": total_moved}
+    if total_moved or total_enqueued:
+        logger.info("Watch sync complete moved=%s enqueued=%s", total_moved, total_enqueued)
+    return {"moved": total_moved, "enqueued": total_enqueued}
 
 
 def sync_sftp_watch_dirs_to_inboxes(now=None):
@@ -2145,6 +2628,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                     break
                 reservation_token = reservation["token"]
                 consumed = False
+                published = False
                 temp_fd, temp_path = tempfile.mkstemp(prefix=".sftp-", suffix=".part", dir=inbox_dir)
                 os.close(temp_fd)
                 try:
@@ -2154,6 +2638,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                     if os.path.exists(dest):
                         continue
                     os.replace(temp_path, dest)
+                    published = True
                     os.utime(dest, None)
                     whitelist_version_id = (realtime_whitelist_service.active_version(campaign["id"]) or {}).get("id")
                     ingestion_job_service.register_file(
@@ -2168,6 +2653,16 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                 finally:
                     if os.path.exists(temp_path):
                         os.unlink(temp_path)
+                    if published and not consumed:
+                        try:
+                            os.unlink(dest)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            logger.warning(
+                                "Unable to remove unpublished SFTP inbox file=%s",
+                                dest, exc_info=True,
+                            )
                     if not consumed:
                         ingestion_job_service.release_realtime_capacity(reservation_token)
         except Exception as exc:

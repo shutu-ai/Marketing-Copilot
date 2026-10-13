@@ -155,7 +155,10 @@ def _run():
                 realtime_campaign_service.has_active_realtime_campaigns,
             )
             if active:
-                _run_stage("realtime_watch_sync", realtime_campaign_service.sync_watch_dirs_to_inboxes)
+                _run_stage(
+                    "realtime_watch_sync",
+                    lambda: realtime_campaign_service.sync_watch_dirs_to_inboxes(enqueue_only=True),
+                )
                 realtime_result = _run_stage(
                     "realtime_inbox_processing",
                     realtime_campaign_service.process_realtime_inboxes,
@@ -216,6 +219,7 @@ def start_scheduler():
         target=_batch_worker, name="batch-ingestion-worker", daemon=True
     )
     _batch_worker_thread.start()
+    realtime_campaign_service.start_watch_copy_workers()
     from services import realtime_ingestion_worker
     realtime_ingestion_worker.start_worker()
     _thread = threading.Thread(target=_run, name="activity-scheduler", daemon=True)
@@ -237,4 +241,5 @@ def stop_scheduler():
         sftp_worker.join(timeout=18)
     from services import realtime_ingestion_worker
     realtime_ingestion_worker.stop_worker()
+    realtime_campaign_service.stop_watch_copy_workers()
     logger.info("Activity scheduler stopped")

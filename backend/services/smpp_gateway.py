@@ -117,6 +117,14 @@ class SmppWindowExhaustedError(SmppSubmitError):
         super().__init__(0x00000045, message)
 
 
+class SmppSubmissionNotAllowedError(SmppSubmitError):
+    """The DB/claim/window fence rejected a submission before socket I/O."""
+
+    def __init__(self, message="SMPP submission is no longer authorized"):
+        self.pre_submit = True
+        super().__init__(-3, message)
+
+
 class SmppPartialSubmitError(SmppSubmitError):
     """At least one part was accepted, so retrying the full SMS is unsafe."""
 
@@ -271,7 +279,13 @@ class _SmppConnection:
                 break
         for task, callback in queued:
             self._send_queue.task_done()
-            self._dispatch_async_completion(task, [], error, callback)
+            self._dispatch_async_completion(
+                task, [],
+                SmppSubmissionNotAllowedError(
+                    "SMPP queued submission was stopped before socket write"
+                ),
+                callback,
+            )
 
     def _store_outcome(self, pdu, ok: bool):
         sequence = getattr(pdu, "sequence", None)
@@ -629,10 +643,15 @@ class _SmppConnection:
         content = task.get("content") or ""
         task_id = task.get("id")
         persist_message_ids = self._persist_message_ids(task)
-        sms_task_service.record_send_intent(
+        attempt_token = sms_task_service.record_send_intent(
             task, self.config["id"], self.slot, len(parts),
             self._connection_generation,
         )
+        if not attempt_token:
+            raise SmppSubmissionNotAllowedError(
+                task.pop("_submit_gate_reason", None)
+                or "task claim or send window is no longer active"
+            )
         detail_logger.info(
             "[SMPP SEND] task=%s campaign=%s/%s name=%s msisdn=%s source_addr=%s "
             "config=%s %s:%s slot=%s parts=%d content_len=%d content=%s",
@@ -727,6 +746,9 @@ class _SmppConnection:
                 outcomes = [self._outcomes.pop(seq) for seq in sequences]
             failed = next((item for item in outcomes if not item["ok"]), None)
             if failed:
+                accepted_parts = sum(1 for item in outcomes if item["ok"])
+                if accepted_parts:
+                    raise SmppPartialSubmitError(failed["status"], accepted_parts)
                 raise SmppSubmitError(failed["status"])
             task["_submit_sm_parts"] = len(parts)
             detail_logger.info(
@@ -790,10 +812,15 @@ class _SmppConnection:
             if task_id is None:
                 raise ValueError("SMPP async submission requires a task id")
             persist_message_ids = self._persist_message_ids(task)
-            sms_task_service.record_send_intent(
+            attempt_token = sms_task_service.record_send_intent(
                 task, self.config["id"], self.slot, len(parts),
                 self._connection_generation,
             )
+            if not attempt_token:
+                raise SmppSubmissionNotAllowedError(
+                    task.pop("_submit_gate_reason", None)
+                    or "task claim or send window is no longer active"
+                )
             source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
             detail_logger.info(
                 "[SMPP ASYNC SEND] task=%s msisdn=%s config=%s slot=%s parts=%s",

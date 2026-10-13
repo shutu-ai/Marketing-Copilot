@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Iterable, Optional
 
 from database import get_connection, read_transaction, write_transaction
-from services import settings_service
+from services import metrics_service, settings_service
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -40,6 +40,26 @@ FINAL_STATES = {
     "delivered", "failed", "expired", "cancelled", "archived", "accepted",
     "unknown", "partial",
 }
+
+# A normal retry is deliberately narrower than the set of terminal states.
+# Once a transport has accepted a submit_sm (or we can no longer prove that it
+# did not), the task must be reconciled instead of being put back on the send
+# queue.  Keep this list close to the service boundary so callers cannot make
+# the UI/API safety check optional.
+MANUAL_RETRY_FAILURE_CLASSES = {
+    "transport",
+    "window_exhausted",
+    "submit_sm_resp",
+    "scheduler",
+}
+
+
+class TaskRetryRejected(RuntimeError):
+    """A normal manual retry is unsafe for the task's current evidence."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+        super().__init__(self.reason)
 
 DLR_STATE_MAP = {
     "DELIVRD": {"status": "delivered", "label": "Delivered", "retryable": False},
@@ -204,7 +224,13 @@ def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
     summary = conn.execute(
         """SELECT COUNT(*) count,MIN(id) first_id,MAX(id) last_id FROM sms_tasks
            WHERE campaign_type=? AND campaign_id=?
-             AND status IN ('queued','retrying','sending')""",
+             AND (status IN ('queued','retrying') OR
+                  (status='sending' AND NOT EXISTS (
+                      SELECT 1 FROM sms_send_attempts a
+                      WHERE a.task_id=sms_tasks.id
+                        AND a.claim_token=sms_tasks.claim_token
+                        AND a.state IN ('intent','authorized','responding','partial')
+                  )))""",
         (campaign_type, campaign_id),
     ).fetchone()
     count = int(summary["count"] or 0)
@@ -214,7 +240,13 @@ def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
         """UPDATE sms_tasks SET status='cancelled', error_msg=?, claim_token='',
                updated_at=CURRENT_TIMESTAMP
            WHERE campaign_type=? AND campaign_id=?
-             AND status IN ('queued','retrying','sending')""",
+             AND (status IN ('queued','retrying') OR
+                  (status='sending' AND NOT EXISTS (
+                      SELECT 1 FROM sms_send_attempts a
+                      WHERE a.task_id=sms_tasks.id
+                        AND a.claim_token=sms_tasks.claim_token
+                        AND a.state IN ('intent','authorized','responding','partial')
+                  )))""",
         (message, campaign_type, campaign_id),
     )
     _add_task_event_batch_summary(
@@ -648,6 +680,15 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             result["chunk_committed"] = True
         conn.execute("DROP TABLE IF EXISTS ingest_task_stage")
         conn.commit()
+        if result["created"] and campaign_type == "realtime":
+            metrics_service.inc(
+                "realtime_sms_tasks_created_total", result["created"],
+                labels={"campaign_id": campaign["id"]},
+            )
+            metrics_service.set_gauge(
+                "realtime_last_task_created_timestamp", time.time(),
+                labels={"campaign_id": campaign["id"]},
+            )
         # Keep INFO logs bounded.  The created MSISDN list can contain tens of
         # thousands of sensitive values and is not needed to diagnose queue
         # throughput; callers still receive it in the API result when needed.
@@ -839,35 +880,86 @@ def apply_buffered_writes(conn, items) -> None:
 
 def record_send_intent(task: dict, smpp_config_id: int, slot: int,
                        planned_parts: int, connection_generation: str = "") -> str:
-    """Durably record an attempt before its first socket write."""
-    from services import sms_write_buffer
+    """Authorize and durably record an attempt before its first socket write.
+
+    The sender queue is intentionally not an authorization boundary.  This
+    transaction is the hand-off fence between the task worker and the SMPP
+    sender: it re-reads the current claim and campaign schedule, then creates
+    the attempt row while the task is still owned by the same claim.  The
+    daily finalizer only cancels ``sending`` tasks without an active attempt,
+    so a later callback can still be fenced and persisted.
+
+    An empty return value means the task is no longer allowed to begin an
+    external submission.  The caller must not write a socket in that case.
+    """
     claim_token = str(task.get("claim_token") or "")
     attempt_token = str(task.get("_attempt_token") or "")
     if not attempt_token:
         attempt_token = f"{claim_token or 'external'}:{uuid.uuid4().hex}"
-        task["_attempt_token"] = attempt_token
-    task["_source_namespace"] = smpp_source_namespace(smpp_config_id)
-    # In no-DLR mode the claim row is already the durable send intent and
-    # stale `sending` recovery deliberately becomes `unknown` (never an
-    # automatic retry).  Persisting another intent for every task would add a
-    # hot DuckDB write with no additional safety.  Explicit submit failures
-    # and the final accepted outcome remain durable journal events.
-    if (task.get("_delivery_receipt_mode") or "optional") == "disabled":
-        return attempt_token
-    sms_write_buffer.submit(
-        "send_intent",
-        {
-            "task_id": int(task["id"]),
-            "claim_token": claim_token,
-            "attempt_token": attempt_token,
-            "source_namespace": task["_source_namespace"],
-            "smpp_config_id": int(smpp_config_id),
-            "slot": int(slot),
-            "planned_parts": max(1, int(planned_parts)),
-            "connection_generation": str(connection_generation or ""),
-        },
-        wait=False,
-    )
+    source_namespace = smpp_source_namespace(smpp_config_id)
+
+    def authorize(conn):
+        row = conn.execute(
+            "SELECT * FROM sms_tasks WHERE id=? AND status='sending' AND claim_token=?",
+            (int(task["id"]), claim_token),
+        ).fetchone()
+        if not row:
+            return False
+        current = dict(row)
+        if current.get("campaign_type") == "realtime" and current.get("task_date") is not None:
+            if str(current["task_date"])[:10] != datetime.now().astimezone().date().isoformat():
+                return False
+        table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(
+            current.get("campaign_type")
+        )
+        if not table:
+            return False
+        campaign_row = conn.execute(
+            f"SELECT * FROM {table} WHERE id=?", (int(current["campaign_id"]),)
+        ).fetchone()
+        if not campaign_row:
+            return False
+        active, _reason = campaign_is_active(dict(campaign_row), datetime.now().astimezone())
+        if not active:
+            return False
+
+        conn.execute(
+            """INSERT INTO sms_send_attempts
+                  (attempt_token,task_id,claim_token,source_namespace,smpp_config_id,slot,
+                   planned_parts,state,lease_until,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,'authorized',
+                       CAST(CURRENT_TIMESTAMP + INTERVAL '5 minutes' AS VARCHAR),
+                       CAST(CURRENT_TIMESTAMP AS VARCHAR),CAST(CURRENT_TIMESTAMP AS VARCHAR))
+               ON CONFLICT(attempt_token) DO UPDATE SET
+                   lease_until=excluded.lease_until,
+                   updated_at=excluded.updated_at""",
+            (attempt_token, int(task["id"]), claim_token, source_namespace,
+             int(smpp_config_id), int(slot), max(1, int(planned_parts))),
+        )
+        for part_no in range(1, max(1, int(planned_parts)) + 1):
+            conn.execute(
+                """INSERT INTO sms_send_parts
+                      (attempt_token,part_no,connection_generation,source_namespace,state,updated_at)
+                   VALUES (?,?,?,?,'planned',CURRENT_TIMESTAMP)
+                   ON CONFLICT(attempt_token,part_no) DO NOTHING""",
+                (attempt_token, part_no, str(connection_generation or ""), source_namespace),
+            )
+        _add_task_event(
+            conn, int(task["id"]), "submit_authorized", "sending", "sending",
+            "SMPP submit authorization acquired before socket write",
+            {"claim_token": claim_token, "attempt_token": attempt_token,
+             "planned_parts": max(1, int(planned_parts))},
+        )
+        return True
+
+    if not write_transaction(authorize, attempts=3, operation="sms_task.submit_authorize", base_delay=0.05):
+        task["_submit_gate_reason"] = (
+            "task claim is no longer owned or the campaign send window is closed"
+        )
+        task["_submit_gate_denied"] = True
+        return ""
+    task["_attempt_token"] = attempt_token
+    task["_source_namespace"] = source_namespace
     return attempt_token
 
 
@@ -884,11 +976,11 @@ def _apply_send_intent(conn, task_id: int, claim_token: str, attempt_token: str,
         """INSERT INTO sms_send_attempts
               (attempt_token,task_id,claim_token,source_namespace,smpp_config_id,slot,
                planned_parts,state,lease_until,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,'intent',CURRENT_TIMESTAMP + INTERVAL '5 minutes',
-                   CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+           VALUES (?,?,?,?,?,?,?,'intent',CAST(CURRENT_TIMESTAMP + INTERVAL '5 minutes' AS VARCHAR),
+                    CAST(CURRENT_TIMESTAMP AS VARCHAR),CAST(CURRENT_TIMESTAMP AS VARCHAR))
            ON CONFLICT(attempt_token) DO UPDATE SET
-               lease_until=CURRENT_TIMESTAMP + INTERVAL '5 minutes',
-               updated_at=CURRENT_TIMESTAMP""",
+               lease_until=excluded.lease_until,
+               updated_at=excluded.updated_at""",
         (str(attempt_token), int(task_id), str(claim_token or ""),
          str(source_namespace or "legacy"), int(smpp_config_id), int(slot),
          max(1, int(planned_parts))),
@@ -956,7 +1048,7 @@ def _apply_part_result(conn, task_id: int, claim_token: str, attempt_token: str,
               smsc_message_id=excluded.smsc_message_id,
               state=excluded.state,
               responded_at=excluded.responded_at,
-              updated_at=CURRENT_TIMESTAMP""",
+              updated_at=excluded.updated_at""",
         (str(attempt_token), int(part_no), int(sequence),
          str(connection_generation or ""), str(source_namespace or "legacy"),
          int(status or 0), str(message_id or ""), state),
@@ -1486,22 +1578,51 @@ def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int]
 
 
 def requeue_transport_failures() -> int:
-    """Put terminal transport failures back into the send queue after recovery."""
+    """Put only proven pre-submit transport failures back after recovery.
+
+    This recovery path is intentionally separate from manual retry, but it
+    still uses the same evidence fence: no SMSC id, no submit/delivery time,
+    and no durable attempt that has started responding.  Ambiguous failures
+    remain ``unknown`` and are never requeued here.
+    """
     conn = get_connection()
     count = conn.execute(
-        "SELECT COUNT(*) count FROM sms_tasks WHERE status='failed' AND failure_class='transport'"
+        """SELECT COUNT(*) count FROM sms_tasks
+           WHERE status='failed' AND failure_class='transport'
+             AND COALESCE(smsc_message_ids,'[]')='[]'
+             AND submitted_at IS NULL AND delivered_at IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM sms_send_attempts a
+                 WHERE a.task_id=sms_tasks.id
+                   AND a.state IN ('authorized','responding','partial','accepted')
+             )"""
     ).fetchone()["count"]
     if count:
         by_batch = conn.execute(
             """SELECT batch_id,COUNT(*) count FROM sms_tasks
-               WHERE status='failed' AND failure_class='transport' AND batch_id IS NOT NULL
+               WHERE status='failed' AND failure_class='transport'
+                 AND COALESCE(smsc_message_ids,'[]')='[]'
+                 AND submitted_at IS NULL AND delivered_at IS NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM sms_send_attempts a
+                     WHERE a.task_id=sms_tasks.id
+                       AND a.state IN ('authorized','responding','partial','accepted')
+                 )
+                 AND batch_id IS NOT NULL
                GROUP BY batch_id"""
         ).fetchall()
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='',
                 claim_token='', last_smpp_status=NULL, next_attempt_at=CURRENT_TIMESTAMP,
                 updated_at=CURRENT_TIMESTAMP
-                WHERE status='failed' AND failure_class='transport'"""
+                WHERE status='failed' AND failure_class='transport'
+                  AND COALESCE(smsc_message_ids,'[]')='[]'
+                  AND submitted_at IS NULL AND delivered_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sms_send_attempts a
+                      WHERE a.task_id=sms_tasks.id
+                        AND a.state IN ('authorized','responding','partial','accepted')
+                  )"""
         )
         for row in by_batch:
             conn.execute(
@@ -1872,25 +1993,62 @@ def task_stats() -> dict:
 def retry_task(task_id: int) -> bool:
     def write(conn):
         row = conn.execute(
-            "SELECT id,status,batch_id FROM sms_tasks WHERE id=?", (task_id,)
+            """SELECT id,status,batch_id,failure_class,smsc_message_ids,attempts,
+                      submitted_at,delivered_at,claim_token
+                 FROM sms_tasks WHERE id=?""", (task_id,)
         ).fetchone()
         if not row:
             return False
         previous = row["status"]
-        conn.execute(
-            """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='', claim_token='',
-                smsc_message_ids='[]', submitted_at=NULL, delivered_at=NULL,
-                next_attempt_at=CURRENT_TIMESTAMP WHERE id=?""",
-            (task_id,),
-        )
-        if previous in {"failed", "expired", "cancelled"} and row["batch_id"]:
+        failure_class = str(row["failure_class"] or "")
+        if previous != "failed":
+            raise TaskRetryRejected(
+                f"normal retry is not allowed for status '{previous}'; "
+                "only a definite pre-submit failure may be retried"
+            )
+        if failure_class not in MANUAL_RETRY_FAILURE_CLASSES:
+            raise TaskRetryRejected(
+                f"failure class '{failure_class or 'unknown'}' is not a definite pre-submit failure"
+            )
+        try:
+            message_ids = json.loads(row["smsc_message_ids"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            message_ids = []
+        if message_ids or row["submitted_at"] or row["delivered_at"]:
+            raise TaskRetryRejected(
+                "submission evidence exists; reconcile the attempt instead of using normal retry"
+            )
+
+        # The status/failure-class/message-id predicates form the CAS.  A
+        # concurrent DLR, callback, or second retry therefore wins or loses
+        # atomically; it cannot clear metadata from the newer state.
+        updated = conn.execute(
+            """UPDATE sms_tasks SET status='queued', attempts=0,
+                    error_msg='manual retry requested after definite failure',
+                    claim_token='',next_attempt_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='failed' AND failure_class=?
+                  AND COALESCE(smsc_message_ids,'[]')='[]'
+                  AND submitted_at IS NULL AND delivered_at IS NULL
+                RETURNING id""",
+            (task_id, failure_class),
+        ).fetchone()
+        if not updated:
+            raise TaskRetryRejected(
+                "task changed while retry was being requested; refresh before retrying"
+            )
+        if row["batch_id"]:
             conn.execute(
                 """UPDATE batch_campaign_batches
                    SET failed_count=GREATEST(COALESCE(failed_count,0)-1,0),
                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (row["batch_id"],),
             )
-        _add_task_event(conn, task_id, "manual_retry", previous, "queued", "manual retry requested")
+        _add_task_event(
+            conn, task_id, "manual_retry", previous, "queued",
+            "manual retry requested after definite pre-submit failure",
+            {"previous_failure_class": failure_class, "previous_attempts": row["attempts"]},
+        )
         return True
 
     return write_transaction(

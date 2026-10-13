@@ -34,7 +34,11 @@ def dlr_codes():
 
 @router.post("/{task_id}/retry")
 def retry(task_id: int):
-    if not sms_task_service.retry_task(task_id):
+    try:
+        retried = sms_task_service.retry_task(task_id)
+    except sms_task_service.TaskRetryRejected as exc:
+        raise HTTPException(status_code=409, detail=exc.reason) from exc
+    if not retried:
         raise HTTPException(404, "Task not found")
     return {"success": True}
 

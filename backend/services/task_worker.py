@@ -8,6 +8,7 @@ from services import metrics_service, sms_task_service
 from services.settings_service import get_setting
 from services.smpp_gateway import (
     gateway, SmppSubmitError, SmppDeliveryUnknownError, SmppPartialSubmitError,
+    SmppSubmissionNotAllowedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,14 @@ def _async_send_complete(task, message_ids, error):
             return
 
         if isinstance(error, SmppSubmitError):
+            if isinstance(error, SmppSubmissionNotAllowedError):
+                # No submit_sm was written.  Re-check/finalize through the
+                # claim fence rather than manufacturing a transport failure
+                # or clearing evidence needed by a late callback.
+                sms_task_service.defer_task(
+                    task["id"], str(error), False, task.get("claim_token", "")
+                )
+                return
             temporary = error.status in {0x00000008, 0x00000014, 0x00000045, 0x00000058}
             failure_class = (
                 "partial_submit" if isinstance(error, SmppPartialSubmitError)

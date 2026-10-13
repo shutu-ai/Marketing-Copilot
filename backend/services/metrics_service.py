@@ -131,6 +131,22 @@ def observe(name: str, value: float, labels=None):
         _counters[_key(f"{name}_sum", labels)] += value
 
 
+def observe_histogram(name: str, value: float, labels=None, buckets=None):
+    """Record a bounded cumulative histogram for latency/size measurements."""
+    value = max(0.0, float(value))
+    limits = tuple(buckets or (0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0))
+    base_labels = dict(labels or {})
+    with _lock:
+        _gauges[_key(f"{name}_latest", base_labels)] = value
+        _counters[_key(f"{name}_count", base_labels)] += 1
+        _counters[_key(f"{name}_sum", base_labels)] += value
+        for limit in limits:
+            if value <= limit:
+                bucket_labels = {**base_labels, "le": str(limit)}
+                _counters[_key(f"{name}_bucket", bucket_labels)] += 1
+        _counters[_key(f"{name}_bucket", {**base_labels, "le": "+Inf"})] += 1
+
+
 def observe_runtime_state(worker_count=0, allow_cached: bool = False):
     global _last_runtime_observe_at, _last_runtime_counts
     now = time.monotonic()

@@ -4,7 +4,7 @@ from typing import Optional
 from database import get_connection
 from services.settings_service import get_setting
 from services import sms_task_service
-from services.smpp_gateway import SmppSubmitError, gateway
+from services.smpp_gateway import SmppSubmitError, SmppSubmissionNotAllowedError, gateway
 from services.sms_task_service import normalize_language_key
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,12 @@ def _send_sms_via_smpp(task: dict) -> bool:
         )
         return True
     except SmppSubmitError as exc:
+        if isinstance(exc, SmppSubmissionNotAllowedError):
+            sms_task_service.defer_task(
+                task["id"], str(exc), claim_token=task.get("claim_token", "")
+            )
+            logger.warning("RabbitMQ SMPP task %s deferred before socket write: %s", task["id"], exc)
+            return False
         sms_task_service.mark_send_failure(
             task, str(exc), exc.status, retryable=False,
             failure_class="delivery_unknown" if exc.status == -1 else "submit_sm_resp",
