@@ -627,6 +627,7 @@ async function handleSave() {
       payload = { smpp_config_id: editForm.value.smpp_config_id || undefined }
     } else if (editForm.value.id && editForm.value.status === 'ended') {
       payload = {
+        name: editForm.value.name,
         end_time: editForm.value.end_time,
        send_start_time: editForm.value.send_start_time,
        send_end_time: editForm.value.send_end_time,

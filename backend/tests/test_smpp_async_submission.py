@@ -2,7 +2,9 @@ from types import SimpleNamespace
 import threading
 import time
 
-from services import metrics_service, sms_task_service
+import smpplib.consts
+
+from services import metrics_service, sms_task_service, smpp_gateway
 from services.smpp_gateway import _SmppConnection
 
 
@@ -184,6 +186,71 @@ def test_existing_sync_send_still_waits_and_returns_message_ids(monkeypatch):
     # The source-scoped per-part result path supersedes the legacy standalone
     # message-id callback.  It is monkeypatched by this gateway-only unit test.
     assert append_calls == []
+
+
+def test_sync_flash_send_uses_class_zero_dcs_and_keeps_delivery_mode(monkeypatch):
+    connection = _connection(monkeypatch, delivery_receipt_mode="optional")
+    completed = []
+    task = {"id": 47, "content": "Hello flash", "flash_sms": True,
+            "msisdn": "251900000005"}
+
+    sender = threading.Thread(
+        target=lambda: completed.append(connection.send(task)), daemon=True,
+    )
+    sender.start()
+    for _ in range(100):
+        if connection.client.sent:
+            break
+        time.sleep(0.01)
+
+    assert connection.client.sent
+    _sequence, kwargs = connection.client.sent[0]
+    assert kwargs["short_message"] == b"Hello flash"
+    assert kwargs["data_coding"] == 0xF0
+    assert kwargs["esm_class"] == 0
+    assert kwargs["registered_delivery"] is True
+
+    connection._store_outcome(SimpleNamespace(sequence=101, status=0, message_id="flash-47"), True)
+    sender.join(timeout=1)
+    assert not sender.is_alive()
+    assert completed == [["flash-47"]]
+
+
+def test_async_flash_multipart_pdu_params_match_normal_except_dcs(monkeypatch):
+    connection = _connection(monkeypatch, window_size=2, delivery_receipt_mode="disabled")
+    monkeypatch.setattr(smpp_gateway.random, "randint", lambda _start, _end: 9)
+    text = "你" * 71 + "😀"
+    task = {"id": 48, "content": text, "flash_sms": True,
+            "msisdn": "251900000006"}
+    normal_task = {"id": 49, "content": text, "msisdn": "251900000007"}
+    from services.smpp_gateway import _make_task_parts
+
+    normal_parts, normal_coding, normal_esm_class = _make_task_parts(normal_task)
+    completed = []
+    connection.send_async(task, lambda sent_task, ids, error: completed.append((ids, error)))
+
+    for _ in range(200):
+        if len(connection.client.sent) >= len(normal_parts):
+            break
+        time.sleep(0.01)
+
+    assert len(connection.client.sent) == len(normal_parts)
+    assert [item[1]["short_message"] for item in connection.client.sent] == normal_parts
+    assert all(item[1]["data_coding"] == 0x18 for item in connection.client.sent)
+    assert all(item[1]["esm_class"] == normal_esm_class for item in connection.client.sent)
+    assert normal_coding == smpplib.consts.SMPP_ENCODING_ISO10646
+    assert all(item[1]["registered_delivery"] is False for item in connection.client.sent)
+
+    for sequence, _kwargs in connection.client.sent:
+        connection._store_outcome(
+            SimpleNamespace(sequence=sequence, status=0, message_id=f"flash-{sequence}"),
+            True,
+        )
+    for _ in range(100):
+        if completed:
+            break
+        time.sleep(0.01)
+    assert completed and completed[0][1] is None
 
 
 def test_disabled_receipt_mode_does_not_persist_submitted_message_ids(monkeypatch):

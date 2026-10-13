@@ -385,6 +385,7 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "watch_filename_prefix": f"MIX_{label}_",
                 "phone_prefix": "251",
                 "smpp_config_id": route_config_id,
+                "flash_sms": bool(getattr(self.args, "flash_sms", False) and index % 2 == 0),
             })
             campaign_id = int(response["id"])
             template_id = self._make_content(campaign_type, campaign_id, label, route_id + 1)
@@ -396,6 +397,7 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "use_custom_directory": True,
                 "phone_prefix": "251",
                 "smpp_config_id": route_config_id,
+                "flash_sms": bool(getattr(self.args, "flash_sms", False) and index % 2 == 0),
             })
             campaign_id = int(response["id"])
             source_name = f"mixed-{label}.csv"
@@ -1160,7 +1162,7 @@ def _args_for_runner(args: argparse.Namespace, spec: dict) -> argparse.Namespace
         smpp_send_queue_capacity=int(spec.get("smpp_send_queue_capacity", 32)),
         producer_chunk_size=0, producer_chunk_delay=0.0,
         max_memory_mb=int(args.max_memory_mb or 0), keep_artifacts=bool(args.keep_artifacts),
-        profile=args.profile,
+        profile=args.profile, flash_sms=bool(args.flash_sms),
     )
 
 
@@ -1195,6 +1197,7 @@ def main() -> int:
     parser.add_argument("--claim-batch", type=int, default=0)
     parser.add_argument("--smpp-window", type=int, default=0)
     parser.add_argument("--smpp-send-queue-capacity", type=int, default=0)
+    parser.add_argument("--flash-sms", action="store_true", help="enable Flash SMS on alternating activities")
     parser.add_argument("--max-memory-mb", type=int, default=0)
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--output", required=True)

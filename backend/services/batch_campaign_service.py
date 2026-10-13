@@ -483,7 +483,6 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         else:
             fields["campaign_dir"] = _ensure_campaign_dir({**existing_dict, **fields})
     new_smpp_id = fields.get("smpp_config_id")
-    new_flash_sms = fields.get("flash_sms")
 
     def write(conn):
         current = conn.execute(
@@ -508,12 +507,6 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
                 """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
                    WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
                 (new_smpp_id, campaign_id),
-            )
-        if new_flash_sms is not None:
-            conn.execute(
-                """UPDATE sms_tasks SET flash_sms=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
-                (bool(new_flash_sms), campaign_id),
             )
         row = conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)

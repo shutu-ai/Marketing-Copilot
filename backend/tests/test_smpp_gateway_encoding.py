@@ -2,6 +2,7 @@ import pytest
 import smpplib.consts
 import smpplib.gsm
 
+from services import smpp_gateway
 from services.smpp_gateway import (
     _encode_utf16be, _make_parts, _make_task_parts, _make_ucs2_parts,
 )
@@ -31,6 +32,25 @@ def test_normal_task_keeps_standard_data_coding():
     _parts, coding, _esm_class = _make_task_parts({"content": "你好"})
 
     assert coding == smpplib.consts.SMPP_ENCODING_ISO10646
+
+
+@pytest.mark.parametrize("text", [
+    "Hello SMPP",
+    "a" * 161,
+    "እንደምን አለህ",
+    "你" * 71 + "😀",
+])
+def test_flash_changes_only_data_coding_for_parts(text, monkeypatch):
+    monkeypatch.setattr(smpp_gateway.random, "randint", lambda _start, _end: 7)
+    normal_parts, normal_coding, normal_esm_class = _make_task_parts({"content": text})
+    flash_parts, flash_coding, flash_esm_class = _make_task_parts(
+        {"content": text, "flash_sms": True}
+    )
+
+    assert flash_parts == normal_parts
+    assert flash_esm_class == normal_esm_class
+    assert flash_coding != normal_coding
+    assert flash_coding == (0x18 if normal_coding == smpplib.consts.SMPP_ENCODING_ISO10646 else 0xF0)
 
 
 def test_manual_utf16be_encodes_bmp_and_surrogate_pair():

@@ -521,7 +521,17 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             raise ValueError("; ".join(validation_errors))
         if validation_campaign.get("use_whitelist", True) and not validation_campaign.get("row_count", 0):
             raise ValueError("No whitelist uploaded - cannot start campaign")
-    if existing_dict.get("status") != "not_started":
+    if existing_dict.get("status") == "ended":
+        only_allowed = all(
+            getattr(data, field, None) is None
+            for field in [
+                "use_whitelist", "start_time", "status", "campaign_dir",
+                "use_custom_directory",
+            ]
+        )
+        if not only_allowed:
+            raise ValueError("Ended campaign cannot edit runtime control fields")
+    elif existing_dict.get("status") != "not_started":
         only_allowed = all(
             getattr(data, field, None) is None
             for field in ["name", "start_time", "campaign_dir", "flash_sms"]
@@ -554,7 +564,6 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         if new_dir and os.path.normcase(os.path.normpath(new_dir)) != os.path.normcase(os.path.normpath(old_dir)):
             raise ValueError("Cannot change campaign directory after a whitelist has been uploaded")
     new_smpp_id = fields.get("smpp_config_id")
-    new_flash_sms = fields.get("flash_sms")
 
     def write(conn):
         current = conn.execute(
@@ -579,12 +588,6 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
                 """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
                    WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
                 (new_smpp_id, campaign_id),
-            )
-        if new_flash_sms is not None:
-            conn.execute(
-                """UPDATE sms_tasks SET flash_sms=?, updated_at=CURRENT_TIMESTAMP
-                   WHERE campaign_type='realtime' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
-                (bool(new_flash_sms), campaign_id),
             )
         row = conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)

@@ -196,6 +196,7 @@ class AcceptanceRunner:
         self.delivery_receipt_mode = str(
             args.delivery_receipt_mode or self.spec.get("delivery_receipt_mode") or "disabled"
         )
+        self.flash_sms = bool(getattr(args, "flash_sms", False))
 
         events = int(args.events if args.events is not None else self.spec.get("events", 5))
         files = int(args.files if args.files is not None else self.spec.get("files", 1))
@@ -548,6 +549,7 @@ class AcceptanceRunner:
             "watch_filename_prefix": "E2E_",
             "phone_prefix": "251",
             "smpp_config_id": self.smpp_config_id,
+            "flash_sms": self.flash_sms,
         })
         campaigns = self._api_json("GET", "/api/realtime-campaigns")
         self.realtime_campaign_id = int(campaigns["items"][0]["id"])
@@ -837,6 +839,11 @@ class AcceptanceRunner:
         max_rss = max((int(item.get("rss_bytes") or 0) for item in resources), default=0)
         max_cpu = max((float(item.get("cpu_seconds") or 0.0) for item in resources), default=0.0)
         final_backlog = sum(statuses.get(key, 0) for key in ("queued", "sending", "retrying"))
+        data_coding_counts = Counter(str(item.get("data_coding")) for item in submit_events)
+        esm_class_counts = Counter(str(item.get("esm_class")) for item in submit_events)
+        multipart_counts = Counter(
+            str((item.get("concat") or {}).get("total", 1)) for item in submit_events
+        )
         return {
             "status": "PASS" if expected_ok else "FAIL",
             "expected_terminal_status": expected_status,
@@ -849,6 +856,9 @@ class AcceptanceRunner:
             "smsc_submit_sm": len(submit_events),
             "smsc_submit_sm_success": len(accepted_events),
             "smsc_submit_sm_rejected": len(submit_events) - len(accepted_events),
+            "data_coding_counts": dict(data_coding_counts),
+            "esm_class_counts": dict(esm_class_counts),
+            "multipart_total_counts": dict(multipart_counts),
             "smsc_dlr": len(dlr_events),
             "dlr_violation": dlr_violation,
             "duplicate_send_tasks": duplicate_tasks,
@@ -886,6 +896,7 @@ class AcceptanceRunner:
                 "smpp_host": smpp_rows[0].get("host") if smpp_rows else None,
                 "smpp_port": smpp_rows[0].get("port") if smpp_rows else None,
                 "smpp_loopback_only": loopback,
+                "flash_sms": self.flash_sms,
                 "live_env_status": "LIVE_ENV_UNVERIFIED",
             },
             "diagnostics": {
@@ -1022,6 +1033,7 @@ def main() -> int:
     parser.add_argument("--smsc-receipt-delay", type=float)
     parser.add_argument("--smsc-disconnect-after", type=int)
     parser.add_argument("--delivery-receipt-mode", choices=("disabled", "optional", "required"))
+    parser.add_argument("--flash-sms", action="store_true", help="create the loopback campaign with Flash SMS enabled")
     parser.add_argument("--task-workers", type=int, default=2)
     parser.add_argument("--ingest-workers", type=int, default=2)
     parser.add_argument("--workers", type=int, default=2, help="local watch-copy workers")
