@@ -1,0 +1,113 @@
+{
+  "scenario": "drop-response",
+  "started_at": "2026-10-13T09:08:37.542149+00:00",
+  "git_commit": "6750dc825a01311708790666d99e5294a21f36a5",
+  "command": "backend/tools/local_e2e_acceptance.py --scenario drop-response --python /home/jabing/marketing-copilot-wsl-acceptance/.venv-linux/bin/python --keep-artifacts --output Docs/wsl-drop-response-final.json",
+  "status": "PASS",
+  "local_e2e_status": "LOCAL_E2E_PASS",
+  "live_env_status": "LIVE_ENV_UNVERIFIED",
+  "reconciliation": {
+    "status": "PASS",
+    "expected_terminal_status": "unknown",
+    "delivery_receipt_mode": "disabled",
+    "input_files": 1,
+    "input_rows": 3,
+    "valid_events_expected": 3,
+    "generated_tasks": 3,
+    "task_statuses": {
+      "unknown": 3
+    },
+    "smsc_submit_sm": 3,
+    "smsc_submit_sm_success": 3,
+    "smsc_submit_sm_rejected": 0,
+    "smsc_dlr": 0,
+    "dlr_violation": false,
+    "duplicate_send_tasks": [],
+    "lost_submit_mappings": [],
+    "unknown_submit_ids": [
+      "1791882517653",
+      "1791882517654",
+      "1791882517655"
+    ],
+    "misdelivered": [],
+    "unknown_retry_violation": false,
+    "latency_ms": {
+      "file_discovery_to_ingestion_start": {
+        "p50": 473.0,
+        "p95": 473.0,
+        "p99": 473.0
+      },
+      "ingestion_to_task_creation": {
+        "p50": 1013.0,
+        "p95": 1013.0,
+        "p99": 1013.0
+      },
+      "task_creation_to_submit_sm_resp": {
+        "p50": null,
+        "p95": null,
+        "p99": null
+      }
+    },
+    "throughput": {
+      "events_per_second": 15.155,
+      "submit_sm_per_second": 15.155,
+      "queue_backlog_max": 3,
+      "queue_backlog_final": 0
+    },
+    "resource": {
+      "max_rss_bytes": 228544512,
+      "max_cpu_seconds_sampled": 0.0,
+      "sample_count": 56
+    },
+    "recovery": {
+      "db_file_exists": true,
+      "api_log_scheduler_started": true,
+      "api_log_ingestion_started": true,
+      "smsc_bind_seen": true
+    },
+    "environment": {
+      "system_mode": "production",
+      "smpp_host": "127.0.0.1",
+      "smpp_port": 40333,
+      "smpp_loopback_only": true,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    "diagnostics": {
+      "last_snapshot": {
+        "files": {
+          "completed": 1
+        },
+        "tasks": {
+          "queued": 0,
+          "sending": 0,
+          "submitted": 0,
+          "accepted": 0,
+          "delivered": 0,
+          "retrying": 0,
+          "failed": 0,
+          "partial": 0,
+          "unknown": 3,
+          "expired": 0,
+          "cancelled": 0
+        },
+        "task_total": 3,
+        "task_terminal": 3,
+        "backlog": 0
+      },
+      "artifacts_dir": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-drop-response-b92a2516",
+      "api_log": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-drop-response-b92a2516/api.log",
+      "app_log": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-drop-response-b92a2516/marketing-copilot.log",
+      "smsc_log": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-drop-response-b92a2516/smsc.log",
+      "smsc_event_log": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-drop-response-b92a2516/smsc.events.jsonl"
+    }
+  },
+  "finished_at": "2026-10-13T09:08:52.108484+00:00",
+  "ports": {
+    "api": 57829,
+    "smsc": 40333
+  },
+  "artifacts_retained": true,
+  "diagnostics": {
+    "artifacts_dir": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-drop-response-b92a2516"
+  }
+}

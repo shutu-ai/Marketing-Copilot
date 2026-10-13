@@ -22,7 +22,8 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then useradd --system --home "$PREFIX" 
 mkdir -p "$PREFIX"
 cp -a payload/backend payload/frontend "$PREFIX/"
 cp -a runtime/opt/marketing-copilot/python runtime/opt/marketing-copilot/python-deps "$PREFIX/"
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 /var/lib/marketing-copilot /var/lib/marketing-copilot/backups /var/log/marketing-copilot /run/marketing-copilot
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 \
+  "$PREFIX/data" "$PREFIX/logs" "$PREFIX/run" "$PREFIX/backups" "$PREFIX/updates"
 chown "$SERVICE_USER:$SERVICE_USER" "$PREFIX"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$PREFIX/backend" "$PREFIX/frontend"
 

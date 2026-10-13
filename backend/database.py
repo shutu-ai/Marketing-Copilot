@@ -19,6 +19,7 @@ _write_lock = threading.RLock()
 _write_state_lock = threading.Lock()
 _write_holder = {
     "thread_id": None,
+    "thread_name": "",
     "operation": "",
     "acquired_at": 0.0,
 }
@@ -182,16 +183,21 @@ def write_transaction(callback, attempts: int = 3, operation: str = "write",
     attempts = max(1, min(5, int(attempts or 1)))
     for attempt in range(1, attempts + 1):
         conn = None
+        transaction_started = time.perf_counter()
+        transaction_result = "error"
         try:
             # Connection acquisition can itself fail while DuckDB is replaying
             # a WAL or another process briefly owns the file lock. Keep it
             # inside the retry scope so Web writes do not fail before the
             # transaction retry policy gets a chance to run.
             conn = get_connection()
+            if hasattr(conn, "set_operation"):
+                conn.set_operation(operation)
             conn.write_lock_timeout = lock_timeout
             conn.execute("BEGIN TRANSACTION")
             result = callback(conn)
             conn.commit()
+            transaction_result = "success"
             return result
         except BaseException as exc:
             if conn is not None:
@@ -211,6 +217,11 @@ def write_transaction(callback, attempts: int = 3, operation: str = "write",
             )
             time.sleep(max(0.0, float(base_delay)) * attempt)
         finally:
+            _observe_database_metric(
+                "marketing_copilot_database_write_transaction_seconds",
+                time.perf_counter() - transaction_started,
+                labels={"operation": operation, "result": transaction_result},
+            )
             if conn is not None:
                 conn.close()
     raise RuntimeError(f"DuckDB write transaction did not complete: {operation}")
@@ -318,9 +329,15 @@ def _acquire_write_lock(operation: str, timeout=None) -> float:
     with _write_state_lock:
         _write_holder.update({
             "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
             "operation": str(operation),
             "acquired_at": time.monotonic(),
         })
+    _observe_database_metric(
+        "marketing_copilot_database_write_lock_wait_seconds",
+        waited,
+        labels={"operation": str(operation)},
+    )
     return waited
 
 
@@ -333,19 +350,26 @@ def _update_write_holder(operation: str) -> None:
 def _clear_write_holder() -> None:
     with _write_state_lock:
         if _write_holder["thread_id"] == threading.get_ident():
-            _write_holder.update({"thread_id": None, "operation": "", "acquired_at": 0.0})
+            _write_holder.update({
+                "thread_id": None,
+                "thread_name": "",
+                "operation": "",
+                "acquired_at": 0.0,
+            })
 
 
 def write_lock_status() -> dict:
     """Return non-sensitive diagnostics for the process-wide writer gate."""
     with _write_state_lock:
         thread_id = _write_holder["thread_id"]
+        thread_name = _write_holder["thread_name"]
         operation = _write_holder["operation"]
         acquired_at = _write_holder["acquired_at"]
     age = max(0.0, time.monotonic() - acquired_at) if acquired_at else 0.0
     return {
         "held": bool(thread_id),
         "thread_id": thread_id,
+        "thread_name": thread_name,
         "operation": operation,
         "age_seconds": round(age, 3),
     }
@@ -444,11 +468,18 @@ class WrappedConnection:
     def __init__(self, conn):
         self.conn = conn
         self._last_sql = ""
+        self._operation = ""
         self._connection_lock = threading.RLock()
         self._write_lock_held = False
         self.write_lock_timeout = None
 
+    def set_operation(self, operation: str):
+        """Attach a bounded business operation name to subsequent DB writes."""
+        self._operation = str(operation or "")
+        return self
+
     def _ensure_write_lock(self, operation: str) -> float:
+        operation = self._operation or operation
         if self._write_lock_held:
             _update_write_holder(operation)
             return 0.0
@@ -459,6 +490,15 @@ class WrappedConnection:
     def _release_write_lock(self) -> None:
         if self._write_lock_held:
             self._write_lock_held = False
+            with _write_state_lock:
+                acquired_at = _write_holder["acquired_at"]
+                operation = _write_holder["operation"]
+            if acquired_at:
+                _observe_database_metric(
+                    "marketing_copilot_database_write_lock_hold_seconds",
+                    max(0.0, time.monotonic() - acquired_at),
+                    labels={"operation": operation or "unknown"},
+                )
             _clear_write_holder()
             _write_lock.release()
 
@@ -505,10 +545,6 @@ class WrappedConnection:
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": kind},
         )
-        if not read_only:
-            _observe_database_metric(
-                "marketing_copilot_database_write_lock_wait_seconds", write_wait,
-            )
         return self
 
     def executemany(self, sql, rows):
@@ -528,9 +564,6 @@ class WrappedConnection:
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": "write"},
-        )
-        _observe_database_metric(
-            "marketing_copilot_database_write_lock_wait_seconds", write_wait,
         )
         return self
 
@@ -602,10 +635,6 @@ class WrappedConnection:
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": "commit"},
         )
-        _observe_database_metric(
-            "marketing_copilot_database_write_lock_wait_seconds", write_wait,
-        )
-
     def rollback(self):
         with self._connection_lock:
             started = time.perf_counter()

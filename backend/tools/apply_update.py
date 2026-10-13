@@ -27,7 +27,7 @@ HEALTH_URL = os.environ.get(
     "MC_PROBE_URL",
     f"http://127.0.0.1:{os.environ.get('MC_PORT', '19090')}/api/ready",
 )
-HEALTH_TRIES = int(os.environ.get("MC_UPDATE_HEALTH_TRIES", "30"))
+HEALTH_TRIES = int(os.environ.get("MC_UPDATE_HEALTH_TRIES", "180"))
 HEALTH_INTERVAL = float(os.environ.get("MC_UPDATE_HEALTH_INTERVAL", "2.0"))
 STOP_GRACE = float(os.environ.get("MC_UPDATE_STOP_GRACE", "30"))
 

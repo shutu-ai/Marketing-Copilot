@@ -10,11 +10,13 @@ import asyncio
 import itertools
 import json
 import logging
+import random
 import signal
 import struct
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 HEADER = struct.Struct("!IIII")
@@ -165,6 +167,13 @@ class Session:
             status = 0x0000000E
         self.bound = status == ESME_ROK
         self.system_id = system_id
+        self.server.record_event({
+            "event_type": "bind",
+            "peer": self.peer,
+            "system_id": system_id,
+            "status": status,
+            "success": self.bound,
+        })
         print(f"[{self.peer}] BIND system_id={system_id!r} result={'OK' if self.bound else hex(status)}", flush=True)
         await self.send_pdu(command_id | RESPONSE_MASK, sequence, cstring("LOCAL-SMSC"), status)
 
@@ -173,14 +182,25 @@ class Session:
             await self.send_pdu(SUBMIT_SM | RESPONSE_MASK, sequence, b"", 0x00000004)
             return
         message = parse_submit_sm(body)
+        submit_index = self.server.next_submit_index()
+        await self.server.wait_for_tps()
         message_id = f"{next(self.server.message_ids):010d}"
+        response_status = self.server.response_status(submit_index)
+        response_dropped = self.server.should_drop_response(submit_index)
+        disconnect_after = self.server.should_disconnect(submit_index)
         event = {
             "time": datetime.now(timezone.utc).isoformat(),
+            "event_type": "submit_sm",
             "peer": self.peer,
             "sequence": sequence,
+            "submit_index": submit_index,
             "message_id": message_id,
+            "response_status": response_status,
+            "response_dropped": response_dropped,
+            "disconnect_after": disconnect_after,
             **message,
         }
+        self.server.record_event(event)
         print("\n=== SMSC RECEIVED submit_sm ===", flush=True)
         print(json.dumps(event, ensure_ascii=False, indent=2), flush=True)
         concat = message.get("concat")
@@ -193,9 +213,23 @@ class Session:
                 print(f"=== REASSEMBLED multipart SMS ({concat['total']} parts) ===\n{full_text}\n", flush=True)
                 self.multipart.pop(key, None)
 
-        await self.send_pdu(SUBMIT_SM | RESPONSE_MASK, sequence, cstring(message_id), self.server.submit_status)
-        if self.server.submit_status == 0 and message["registered_delivery"] and not self.server.drop_receipts:
+        if self.server.submit_response_delay:
+            await asyncio.sleep(self.server.submit_response_delay)
+        if not response_dropped:
+            await self.send_pdu(
+                SUBMIT_SM | RESPONSE_MASK,
+                sequence,
+                cstring(message_id) if response_status == 0 else b"",
+                response_status,
+            )
+        else:
+            print(f"[{self.peer}] DROP submit_sm_resp sequence={sequence}", flush=True)
+        if response_status == 0 and not response_dropped and message["registered_delivery"] and not self.server.should_drop_receipt(submit_index):
             asyncio.create_task(self.send_delivery_receipt(message, message_id))
+        if disconnect_after:
+            print(f"[{self.peer}] DISCONNECT after submit_index={submit_index}", flush=True)
+            self.writer.close()
+            return
 
     async def send_delivery_receipt(self, message: dict, message_id: str):
         await asyncio.sleep(self.server.receipt_delay)
@@ -214,6 +248,13 @@ class Session:
         ])
         sequence = next(self.server.server_sequences)
         await self.send_pdu(DELIVER_SM, sequence, body)
+        self.server.record_event({
+            "event_type": "dlr",
+            "peer": self.peer,
+            "message_id": message_id,
+            "state": self.server.receipt_state,
+            "sequence": sequence,
+        })
         print(f"[{self.peer}] DELIVERY_RECEIPT message_id={message_id} state={self.server.receipt_state}", flush=True)
 
     async def run(self):
@@ -265,7 +306,12 @@ class Session:
 
 class SmscSimulator:
     def __init__(self, host: str, port: int, system_id: str, password: str, receipt_delay: float,
-                 submit_status: int = 0, receipt_state: str = "DELIVRD", drop_receipts: bool = False):
+                 submit_status: int = 0, receipt_state: str = "DELIVRD", drop_receipts: bool = False,
+                 tps: float = 0.0, submit_response_delay: float = 0.0,
+                 reject_ratio: float = 0.0, drop_response_ratio: float = 0.0,
+                 drop_receipt_ratio: float = 0.0, disconnect_after: int = 0,
+                 partial_submit_after: int = 0, partial_submit_status: int = 0x0000000B,
+                 seed: int = 1, event_log: str = ""):
         self.host, self.port = host, port
         self.system_id, self.password = system_id, password
         self.receipt_delay = receipt_delay
@@ -274,6 +320,22 @@ class SmscSimulator:
         self.receipt_state_code = {"DELIVRD": 2, "EXPIRED": 3, "UNDELIV": 5, "ACCEPTD": 6,
                                    "UNKNOWN": 7, "REJECTD": 8}.get(self.receipt_state, 7)
         self.drop_receipts = drop_receipts
+        self.tps = max(0.0, float(tps or 0.0))
+        self.submit_response_delay = max(0.0, float(submit_response_delay or 0.0))
+        self.reject_ratio = min(1.0, max(0.0, float(reject_ratio or 0.0)))
+        self.drop_response_ratio = min(1.0, max(0.0, float(drop_response_ratio or 0.0)))
+        self.drop_receipt_ratio = min(1.0, max(0.0, float(drop_receipt_ratio or 0.0)))
+        self.disconnect_after = max(0, int(disconnect_after or 0))
+        self.partial_submit_after = max(0, int(partial_submit_after or 0))
+        self.partial_submit_status = int(partial_submit_status)
+        self.random = random.Random(int(seed))
+        self.event_log = Path(event_log) if event_log else None
+        if self.event_log:
+            self.event_log.parent.mkdir(parents=True, exist_ok=True)
+        self.submit_counter = itertools.count(1)
+        self._tps_lock = asyncio.Lock()
+        self._last_submit_at = 0.0
+        self._event_lock = asyncio.Lock()
         self.max_pdu_size = 1024 * 1024
         # Start from a time-based base so message ids are unique across
         # simulator restarts; reusing ids (0000000001, 0000000002, ...) makes
@@ -281,9 +343,50 @@ class SmscSimulator:
         self.message_ids = itertools.count(int(time.time() * 1000))
         self.server_sequences = itertools.count(1_000_000)
 
+    def record_event(self, event: dict) -> None:
+        """Append one machine-readable event without changing SMPP behaviour."""
+        if not self.event_log:
+            return
+        record = {"time": datetime.now(timezone.utc).isoformat(), **event}
+        with self.event_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def next_submit_index(self) -> int:
+        return next(self.submit_counter)
+
+    async def wait_for_tps(self) -> None:
+        if self.tps <= 0:
+            return
+        interval = 1.0 / self.tps
+        async with self._tps_lock:
+            now = time.monotonic()
+            wait = interval - (now - self._last_submit_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_submit_at = time.monotonic()
+
+    def response_status(self, submit_index: int) -> int:
+        if self.submit_status:
+            return self.submit_status
+        if self.partial_submit_after and submit_index > self.partial_submit_after:
+            return self.partial_submit_status
+        if self.reject_ratio and self.random.random() < self.reject_ratio:
+            return self.partial_submit_status
+        return 0
+
+    def should_drop_response(self, submit_index: int) -> bool:
+        return bool(self.drop_response_ratio and self.random.random() < self.drop_response_ratio)
+
+    def should_drop_receipt(self, submit_index: int) -> bool:
+        return bool(self.drop_receipt_ratio and self.random.random() < self.drop_receipt_ratio)
+
+    def should_disconnect(self, submit_index: int) -> bool:
+        return bool(self.disconnect_after and submit_index >= self.disconnect_after)
+
     async def client_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer_info = writer.get_extra_info("peername")
         peer = f"{peer_info[0]}:{peer_info[1]}" if peer_info else "unknown"
+        self.record_event({"event_type": "connected", "peer": peer})
         print(f"[{peer}] CONNECTED", flush=True)
         try:
             await Session(reader, writer, self, peer).run()
@@ -298,6 +401,14 @@ class SmscSimulator:
         addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
         print(f"Local SMSC simulator listening on {addresses}", flush=True)
         print(f"Credentials: system_id={self.system_id!r}, password={self.password!r}", flush=True)
+        print(
+            "Fault profile: "
+            f"tps={self.tps} response_delay={self.submit_response_delay} "
+            f"reject_ratio={self.reject_ratio} drop_response_ratio={self.drop_response_ratio} "
+            f"drop_receipt_ratio={self.drop_receipt_ratio} disconnect_after={self.disconnect_after} "
+            f"partial_submit_after={self.partial_submit_after}",
+            flush=True,
+        )
         print("Press Ctrl+C to stop.\n", flush=True)
         async with server:
             await server.serve_forever()
@@ -310,12 +421,32 @@ def main():
     parser.add_argument("--system-id", default="test")
     parser.add_argument("--password", default="test")
     parser.add_argument("--receipt-delay", type=float, default=0.5)
+    parser.add_argument("--tps", type=float, default=0.0,
+                        help="Global submit_sm pacing; 0 disables pacing")
+    parser.add_argument("--submit-response-delay", type=float, default=0.0)
     parser.add_argument("--submit-status", type=lambda value: int(value, 0), default=0)
+    parser.add_argument("--reject-ratio", type=float, default=0.0)
+    parser.add_argument("--drop-response-ratio", type=float, default=0.0)
+    parser.add_argument("--drop-receipt-ratio", type=float, default=0.0)
+    parser.add_argument("--disconnect-after", type=int, default=0,
+                        help="Close the SMPP socket after this global submit_sm index")
+    parser.add_argument("--partial-submit-after", type=int, default=0,
+                        help="Accept this many submit_sm PDUs, then reject later parts")
+    parser.add_argument("--partial-submit-status", type=lambda value: int(value, 0), default=0x0000000B)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--event-log", default="")
     parser.add_argument("--receipt-state", default="DELIVRD")
     parser.add_argument("--drop-receipts", action="store_true")
     args = parser.parse_args()
-    simulator = SmscSimulator(args.host, args.port, args.system_id, args.password, args.receipt_delay,
-                              args.submit_status, args.receipt_state, args.drop_receipts)
+    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+        parser.error("The local SMSC simulator must bind to loopback")
+    simulator = SmscSimulator(
+        args.host, args.port, args.system_id, args.password, args.receipt_delay,
+        args.submit_status, args.receipt_state, args.drop_receipts,
+        args.tps, args.submit_response_delay, args.reject_ratio,
+        args.drop_response_ratio, args.drop_receipt_ratio, args.disconnect_after,
+        args.partial_submit_after, args.partial_submit_status, args.seed, args.event_log,
+    )
     try:
         asyncio.run(simulator.run())
     except KeyboardInterrupt:

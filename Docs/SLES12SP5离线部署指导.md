@@ -118,7 +118,7 @@ sudo systemctl enable marketing-copilot-backup.timer
 
 ```bash
 sudo journalctl -u marketing-copilot.service -f
-tail -f /var/log/marketing-copilot/app.log
+tail -f /opt/marketing-copilot/logs/app.log
 ```
 
 ## 6. 可选：本地 SMSC 模拟器
@@ -155,7 +155,7 @@ sudo systemctl stop marketing-copilot.service
 sudo -u marketing-copilot /opt/marketing-copilot/venv/bin/python -m tools.backup_database
 ```
 
-备份默认存放在 `/var/lib/marketing-copilot/backups`。升级前应先执行一次备份，
+备份默认存放在 `/opt/marketing-copilot/backups`。升级前应先执行一次备份，
 保留原包与对应 SHA-256，并在维护窗口内停止服务后进行升级。
 
 ### 7.1 在线更新（前端上传更新包）
@@ -197,7 +197,7 @@ sudo systemctl restart marketing-copilot.service
 ```bash
 sudo systemctl status marketing-copilot.service --no-pager
 sudo journalctl -u marketing-copilot.service -n 100 --no-pager
-ls -ld /var/lib/marketing-copilot /var/log/marketing-copilot /run/marketing-copilot
+ls -ld /opt/marketing-copilot/data /opt/marketing-copilot/logs /opt/marketing-copilot/run
 ```
 
 运行目录应允许 `marketing-copilot` 账户写入。不要手工替换

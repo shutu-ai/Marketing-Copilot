@@ -28,9 +28,9 @@ _last_lease_recovery_at = 0.0
 
 def _configured_worker_count() -> int:
     try:
-        return max(1, min(16, int(os.environ.get("MC_REALTIME_INGEST_WORKERS", "1"))))
+        return max(1, min(16, int(os.environ.get("MC_REALTIME_INGEST_WORKERS", "4"))))
     except (TypeError, ValueError):
-        return 1
+        return 4
 
 
 def _processed_id(campaign_id: int, filename: str):

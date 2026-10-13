@@ -1,0 +1,20 @@
+{
+  "scenario": "stress-10k",
+  "status": "BLOCKED_RESOURCE",
+  "command": "backend/tools/local_e2e_acceptance.py --scenario stress-10k --task-workers 8 --ingest-workers 8 --workers 8 --claim-batch 100 --smpp-window 50 --smpp-send-queue-capacity 2000 --max-memory-mb 1800",
+  "artifacts_dir": "/home/jabing/marketing-copilot-wsl-acceptance/.local-e2e-runs/marketing-copilot-stress-10k-aabc7ac0",
+  "input_events": 10000,
+  "persisted_tasks": 10000,
+  "task_statuses_at_controlled_stop": {
+    "accepted": 261,
+    "queued": 4202,
+    "retrying": 3476,
+    "sending": 2061
+  },
+  "smsc_submit_sm_at_controlled_stop": 263,
+  "duplicate_attempt_task_count": 0,
+  "database_reopen_after_stop": true,
+  "business_row_read_after_stop": true,
+  "integrity_check": "DuckDB 1.2.0 does not expose PRAGMA integrity_check; independent business-row read succeeded",
+  "reason": "At the measured in-process DuckDB writer-gate throughput, completion was projected beyond the safe acceptance window; the run was terminated without marking the partial workload PASS."
+}

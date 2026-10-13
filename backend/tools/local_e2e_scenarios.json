@@ -1,0 +1,115 @@
+{
+  "quick": {
+    "description": "One ready-marked local watch file with whitelist, duplicate and excluded rows.",
+    "files": 1,
+    "events": 5,
+    "expected_tasks": 3,
+    "expected_terminal_status": "accepted",
+    "timeout_seconds": 90,
+    "faults": {}
+  },
+  "stress-1k": {
+    "description": "Ten local watch files and one thousand unique events.",
+    "files": 10,
+    "events": 1000,
+    "expected_tasks": 1000,
+    "expected_terminal_status": "accepted",
+    "timeout_seconds": 300,
+    "faults": {
+      "tps": 50
+    }
+  },
+  "stress-10k": {
+    "description": "Fifty local watch files and ten thousand unique events.",
+    "files": 50,
+    "events": 10000,
+    "expected_tasks": 10000,
+    "expected_terminal_status": "accepted",
+    "timeout_seconds": 1200,
+    "faults": {
+      "tps": 100
+    }
+  },
+  "stress-100k": {
+    "description": "One hundred local watch files and one hundred thousand unique events.",
+    "files": 100,
+    "events": 100000,
+    "expected_tasks": 100000,
+    "expected_terminal_status": "accepted",
+    "timeout_seconds": 3600,
+    "faults": {
+      "tps": 200
+    }
+  },
+  "reject": {
+    "description": "SMSC rejects every submit_sm_resp; tasks must become failed without ordinary retry.",
+    "files": 1,
+    "events": 5,
+    "expected_tasks": 5,
+    "timeout_seconds": 120,
+    "faults": {
+      "reject_ratio": 1.0
+    },
+    "expected_terminal_status": "failed"
+  },
+  "drop-response": {
+    "description": "SMSC accepts the PDU but drops submit_sm_resp; unknown tasks must not auto-resend.",
+    "files": 1,
+    "events": 3,
+    "expected_tasks": 3,
+    "timeout_seconds": 120,
+    "faults": {
+      "drop_response_ratio": 1.0
+    },
+    "expected_terminal_status": "unknown"
+  },
+  "partial-submit": {
+    "description": "A long multipart SMS accepts its first part and rejects later parts.",
+    "files": 1,
+    "events": 1,
+    "expected_tasks": 1,
+    "timeout_seconds": 120,
+    "message": "Multipart acceptance probe: this message is intentionally long enough to exercise UCS2/GSM segmentation and partial submit handling. ",
+    "repeat_message": 6,
+    "faults": {
+      "partial_submit_after": 1
+    },
+    "expected_terminal_status": "partial"
+  },
+  "restart": {
+    "description": "Run the happy path, restart the real API process, then prove no duplicate submit_sm is emitted.",
+    "files": 1,
+    "events": 5,
+    "expected_tasks": 5,
+    "timeout_seconds": 120,
+    "faults": {}
+  },
+  "dlr-delay": {
+    "description": "Required delivery receipts arrive after a bounded simulator delay.",
+    "files": 1,
+    "events": 5,
+    "expected_tasks": 5,
+    "expected_terminal_status": "delivered",
+    "delivery_receipt_mode": "required",
+    "timeout_seconds": 120,
+    "faults": {
+      "dlr_delay": 2.0
+    }
+  },
+  "disconnect": {
+    "description": "SMSC disconnects after two submits; accepted messages stay accepted and the unknown task is not retried.",
+    "files": 1,
+    "events": 3,
+    "expected_tasks": 3,
+    "expected_submit_events": 2,
+    "expected_terminal_status": "mixed",
+    "expected_status_counts": {
+      "accepted": 2,
+      "unknown": 1
+    },
+    "timeout_seconds": 120,
+    "faults": {
+      "disconnect_after": 2
+    }
+  }
+}

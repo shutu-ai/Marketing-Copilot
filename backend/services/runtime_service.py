@@ -146,10 +146,15 @@ def release_instance_lock():
         finally: _owns_lock = False
 
 
-def backup_database(target_dir: str = "") -> str:
+def backup_database(target_dir: str = "", *, resolve_database: bool = True) -> str:
     import database
     from services import db_config as db_config_service
-    database.set_database_file(db_config_service.get_effective_db_path(database.get_database_file()))
+    # The running API has already resolved the dynamic database path during
+    # startup.  Re-running the config emptiness probe from the owner endpoint
+    # would open a second DuckDB connection while the service is busy.  The
+    # standalone stopped-service CLI keeps the original resolution behavior.
+    if resolve_database:
+        database.set_database_file(db_config_service.get_effective_db_path(database.get_database_file()))
     source = Path(database.get_database_file())
     if str(source) == ":memory:" or not source.exists():
         raise RuntimeError("database file is not available for backup")
@@ -157,11 +162,16 @@ def backup_database(target_dir: str = "") -> str:
     destination_dir.mkdir(parents=True, exist_ok=True)
     from datetime import datetime
     target = destination_dir / f"{source.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{source.suffix}"
+    # Keep the application writer gate held from CHECKPOINT through the file
+    # copy.  Releasing it between those operations allows another writer to
+    # mutate the live database while the backup is being copied.
     conn = database.get_connection()
-    conn.execute("CHECKPOINT")
-    conn.close()
-    with database._write_lock:
+    conn.set_operation("backup.database")
+    try:
+        conn.execute("CHECKPOINT")
         shutil.copy2(source, target)
+    finally:
+        conn.close()
     keep = int(os.environ.get("MC_BACKUP_KEEP", "14"))
     backups = sorted(destination_dir.glob(f"{source.stem}-*{source.suffix}"), reverse=True)
     for old in backups[keep:]: old.unlink(missing_ok=True)

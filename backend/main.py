@@ -20,7 +20,7 @@ from database import (
 )
 from auth import auth_middleware
 from services import update_service
-from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router, users as users_router
+from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router, users as users_router, internal as internal_router
 
 from services.runtime_service import configure_logging, acquire_instance_lock, release_instance_lock
 configure_logging()
@@ -149,6 +149,7 @@ app.include_router(logs_router.router)
 app.include_router(auth_router.router)
 app.include_router(update_router.router)
 app.include_router(users_router.router)
+app.include_router(internal_router.router)
 
 
 @app.on_event("startup")

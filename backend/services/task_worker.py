@@ -72,17 +72,17 @@ def _async_send_complete(task, message_ids, error):
 
 def configured_worker_count():
     try:
-        value = int(os.environ.get("MC_TASK_WORKERS", get_setting("task_workers", "1")))
+        value = int(os.environ.get("MC_TASK_WORKERS", get_setting("task_workers", "8")))
     except (TypeError, ValueError):
-        value = 1
+        value = 8
     return max(1, min(value, 32))
 
 
 def configured_claim_batch():
     try:
-        value = int(os.environ.get("MC_CLAIM_BATCH", get_setting("task_claim_batch", "20")))
+        value = int(os.environ.get("MC_CLAIM_BATCH", get_setting("task_claim_batch", "30")))
     except (TypeError, ValueError):
-        value = 20
+        value = 30
     return max(1, min(value, 500))
 
 

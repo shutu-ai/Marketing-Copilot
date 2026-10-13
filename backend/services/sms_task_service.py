@@ -1685,7 +1685,16 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
             ).fetchall()
             delivered_ids = {r["smsc_message_id"] for r in delivered_rows}
             delivered_ids.add(message_id)
-            all_parts_delivered = bool(expected_ids) and expected_ids.issubset(delivered_ids)
+            # A delivery receipt for an accepted multipart part must not
+            # promote a task that has already been durably classified as
+            # partial.  The accepted part can be delivered while other parts
+            # were rejected; the business outcome remains partial and must
+            # never be rewritten to delivered by the late DLR.
+            all_parts_delivered = (
+                task.get("status") != "partial"
+                and bool(expected_ids)
+                and expected_ids.issubset(delivered_ids)
+            )
             status = "delivered" if all_parts_delivered else ("accepted" if task.get("status") == "accepted" else "submitted")
             delivered_sql = ", delivered_at=CURRENT_TIMESTAMP" if all_parts_delivered else ""
         elif normalized_state in {"ACCEPTD", "ENROUTE", "SCHEDULED", "1", "6", "7"}:

@@ -16,7 +16,7 @@ from services import result_journal_service
 
 logger = logging.getLogger(__name__)
 
-MAX_BATCH_SIZE = max(100, min(1000, int(os.environ.get("MC_SMS_WRITE_BATCH_SIZE", "250"))))
+MAX_BATCH_SIZE = max(100, min(1000, int(os.environ.get("MC_SMS_WRITE_BATCH_SIZE", "1000"))))
 # Keep the operator-facing collection batch independent from the actual
 # transaction size.  A large collection window improves batching, while a
 # smaller transaction bounds the time for which DuckDB's single writer gate is

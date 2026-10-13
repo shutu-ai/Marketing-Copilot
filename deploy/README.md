@@ -53,7 +53,8 @@ sudo -u marketing-copilot python3.12 -m venv /opt/marketing-copilot/venv
 sudo -u marketing-copilot /opt/marketing-copilot/venv/bin/pip install -r /opt/marketing-copilot/backend/requirements.txt
 
 sudo install -d -o marketing-copilot -g marketing-copilot -m 0750 \
-  /var/lib/marketing-copilot /var/lib/marketing-copilot/backups /var/log/marketing-copilot /run/marketing-copilot
+  /opt/marketing-copilot/data /opt/marketing-copilot/logs \
+  /opt/marketing-copilot/run /opt/marketing-copilot/backups /opt/marketing-copilot/updates
 
 sudo cp /opt/marketing-copilot/deploy/marketing-copilot.env.example /etc/marketing-copilot.env
 sudo cp /opt/marketing-copilot/deploy/marketing-copilot.service /etc/systemd/system/

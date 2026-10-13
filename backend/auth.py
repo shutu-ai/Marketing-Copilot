@@ -33,6 +33,7 @@ DEFAULT_PASSWORD = "Huawei@123"
 # Paths reachable without a token. Health/readiness are needed by probes and
 # by the update runner's post-restart health check.
 PUBLIC_API_PATHS = {"/api/ready", "/api/health", "/api/auth/login"}
+INTERNAL_BACKUP_PATH = "/api/internal/backup"
 
 # Prefixes that only the admin role may use. `/api/users/me/*` (self password
 # change) is exempt and available to every authenticated role.
@@ -130,6 +131,34 @@ def get_auth_secret() -> str:
     return value
 
 
+def internal_backup_token() -> str:
+    """Return the loopback-only token used by the backup CLI protocol."""
+    configured = os.environ.get("MC_BACKUP_REQUEST_TOKEN", "").strip()
+    if configured:
+        return configured
+    return hmac.new(
+        get_auth_secret().encode("utf-8"),
+        b"marketing-copilot-backup-v1",
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def is_internal_maintenance_request(request: Request, path: str) -> bool:
+    """Authenticate a loopback-only maintenance request with the service secret."""
+    if request.url.path != path or request.method != "POST":
+        return False
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        return False
+    provided = request.headers.get("X-MC-Backup-Token", "").strip()
+    return bool(provided) and hmac.compare_digest(provided, internal_backup_token())
+
+
+def is_internal_backup_request(request: Request) -> bool:
+    """Authenticate the systemd backup request without a browser token."""
+    return is_internal_maintenance_request(request, INTERNAL_BACKUP_PATH)
+
+
 def _b64encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
@@ -175,6 +204,9 @@ def get_current_user(request: Request) -> dict:
 
 
 async def auth_middleware(request: Request, call_next):
+    if is_internal_backup_request(request):
+        request.state.user = {"username": "system-backup", "role": "admin"}
+        return await call_next(request)
     if not auth_disabled():
         path = request.url.path
         if request.method != "OPTIONS" and path.startswith("/api") and path not in PUBLIC_API_PATHS:

@@ -186,6 +186,12 @@ class _SmppConnection:
         self._sender_stop = threading.Event()
         self._sender_start_lock = threading.Lock()
         self._last_submit = 0.0
+        try:
+            self.tps_multiplier = max(
+                0.01, float(os.environ.get("MC_SMPP_INTERNAL_TPS_MULTIPLIER", "1"))
+            )
+        except (TypeError, ValueError):
+            self.tps_multiplier = 1.0
         self._throttle_lock = threading.Lock()
         self._response_log_lock = threading.Lock()
         self._last_response_warning_at = {}
@@ -578,7 +584,8 @@ class _SmppConnection:
                                   {"config_id": self.config.get("id", 0), "slot": self.slot})
 
     def _throttle(self):
-        interval = 1.0 / max(1, int(self.config.get("tps") or 1))
+        configured_tps = max(1.0, float(self.config.get("tps") or 1))
+        interval = 1.0 / (configured_tps * self.tps_multiplier)
         lock_started = time.monotonic()
         with self._throttle_lock:
             lock_wait = time.monotonic() - lock_started
