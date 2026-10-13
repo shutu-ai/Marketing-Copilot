@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import math
 import os
+import logging
+from bisect import bisect_right
 import threading
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from typing import Iterable
 
 from database import read_transaction, write_transaction
 from services import metrics_service
 
+logger = logging.getLogger(__name__)
 
 _lock = threading.RLock()
 _deficits: dict[tuple[str, int, int], float] = {}
@@ -25,6 +29,7 @@ _virtual_service: dict[tuple[str, int, int], float] = {}
 _rate_tokens: dict[tuple[str, int, int], float] = {}
 _rate_updated: dict[tuple[str, int, int], float] = {}
 _cursor = 0
+_disabled_warning_emitted = False
 
 
 def enabled() -> bool:
@@ -86,6 +91,126 @@ def fairness_key(task: dict) -> tuple[str, int, int]:
         str(task.get("campaign_type") or ""),
         int(task.get("campaign_id") or 0),
         int(task.get("target_smpp_config_id") or task.get("smpp_config_id") or 0),
+    )
+
+
+def _cursor_key(key: tuple[str, int, int]) -> str:
+    return f"{key[0]}|{int(key[1])}|{int(key[2])}"
+
+
+def _parse_cursor_key(value: str) -> tuple[str, int, int] | None:
+    try:
+        campaign_type, campaign_id, route_id = str(value or "").split("|", 2)
+        return campaign_type, int(campaign_id), int(route_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def rotate_candidate_groups(conn, groups: Iterable[dict], limit: int,
+                            stage: str = "sms_claim") -> list[tuple[str, int, int]]:
+    """Return a durable round-robin window over all eligible campaign groups.
+
+    The old claim query sorted groups by oldest task and then applied LIMIT,
+    which made a later campaign invisible forever when the active set exceeded
+    the limit.  The cursor is stored in DuckDB so a restart continues from the
+    last bounded window instead of resetting the starvation boundary.
+    """
+    keys = sorted({
+        (str(group["campaign_type"]), int(group["campaign_id"]), int(group["route_id"]))
+        for group in groups
+    })
+    if not keys:
+        return []
+    limit = max(1, min(len(keys), int(limit)))
+    state = conn.execute(
+        "SELECT cursor_key FROM fair_scheduler_state WHERE stage=?", (stage,)
+    ).fetchone()
+    previous = _parse_cursor_key(state["cursor_key"] if state else "")
+    if previous in keys:
+        start = (keys.index(previous) + 1) % len(keys)
+    elif previous is not None:
+        # The previous window may have been fully claimed and therefore
+        # disappeared from the live set. Continue after its durable key rather
+        # than resetting to the first remaining activity every time.
+        start = bisect_right(keys, previous) % len(keys)
+    else:
+        start = 0
+    ordered = keys[start:] + keys[:start]
+    selected = ordered[:limit]
+    cursor = selected[-1]
+    conn.execute(
+        """INSERT INTO fair_scheduler_state(stage,cursor_key,rounds,updated_at)
+           VALUES (?,?,1,CURRENT_TIMESTAMP)
+           ON CONFLICT(stage) DO UPDATE SET
+             cursor_key=excluded.cursor_key,rounds=fair_scheduler_state.rounds+1,
+             updated_at=excluded.updated_at""",
+        (stage, _cursor_key(cursor)),
+    )
+    metrics_service.set_gauge(
+        "marketing_copilot_fair_candidate_groups",
+        len(keys), labels={"stage": stage},
+    )
+    metrics_service.set_gauge(
+        "marketing_copilot_fair_candidate_window",
+        len(selected), labels={"stage": stage},
+    )
+    return selected
+
+
+def record_activity_event(conn, campaign_type: str, campaign_id: int,
+                          stage: str, route_id: int = 0, backlog: int | None = None,
+                          skip_reason: str = "") -> None:
+    """Persist low-cardinality per-activity fairness timestamps and backlog."""
+    campaign_type = str(campaign_type or "")
+    campaign_id = int(campaign_id)
+    route_id = int(route_id or 0)
+    timestamp_column = {
+        "file": "last_file_claim_at",
+        "task": "last_task_claim_at",
+        "submit": "last_submit_at",
+        "dispatch": "last_dispatched_at",
+    }.get(str(stage or ""))
+    if not timestamp_column:
+        raise ValueError(f"unsupported fairness stage: {stage}")
+    backlog_value = None if backlog is None else max(0, int(backlog))
+    updates = [
+        f"{timestamp_column}=excluded.eligible_since",
+        "consecutive_skip_rounds=0",
+        "updated_at=excluded.eligible_since",
+    ]
+    if stage == "dispatch" and timestamp_column != "last_dispatched_at":
+        updates.append("last_dispatched_at=excluded.eligible_since")
+    now_text = datetime.now().astimezone().isoformat()
+    values = [campaign_type, campaign_id, route_id,
+              now_text,
+              backlog_value if backlog_value is not None else 0,
+              str(skip_reason or "")[:120]]
+    update_values = []
+    if backlog_value is not None:
+        updates.append("backlog=?")
+        update_values.append(backlog_value)
+    if skip_reason:
+        updates.append("last_skip_reason=?")
+        update_values.append(str(skip_reason)[:120])
+    conn.execute(
+        """INSERT INTO campaign_fairness_state
+             (campaign_type,campaign_id,route_id,eligible_since,backlog,last_skip_reason)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(campaign_type,campaign_id,route_id) DO UPDATE SET """
+        + ",".join(updates),
+        values + update_values,
+    )
+
+
+def record_activity_event_transaction(campaign_type: str, campaign_id: int,
+                                      stage: str, route_id: int = 0,
+                                      backlog: int | None = None,
+                                      skip_reason: str = "") -> None:
+    write_transaction(
+        lambda conn: record_activity_event(
+            conn, campaign_type, campaign_id, stage, route_id, backlog, skip_reason,
+        ),
+        operation=f"fairness.{stage}",
     )
 
 
@@ -209,6 +334,7 @@ def status() -> dict:
     with _lock:
         return {
             "enabled": enabled(),
+            "disabled_behavior": "global_fifo_without_starvation_protection" if not enabled() else "bounded_drr_with_durable_candidate_cursor",
             "active_deficits": len(_deficits),
             "quantum_parts": quantum_parts(),
             "per_campaign_candidates": per_campaign_candidates(),
@@ -292,19 +418,30 @@ def snapshot(limit: int = 200) -> dict:
 
     def read(conn):
         rows = conn.execute(
-            """SELECT campaign_type,campaign_id,COALESCE(smpp_config_id,0) config_id,
+            """SELECT t.campaign_type,t.campaign_id,
+                       COALESCE(t.smpp_config_id,0) config_id,
                       MAX(campaign_name) campaign_name,
-                      SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) queued,
-                      SUM(CASE WHEN status='retrying' THEN 1 ELSE 0 END) retrying,
-                      SUM(CASE WHEN status='sending' THEN 1 ELSE 0 END) sending,
-                      SUM(CASE WHEN status='submitted' THEN 1 ELSE 0 END) submitted,
-                      SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END) partial_count,
-                      SUM(CASE WHEN status='unknown' THEN 1 ELSE 0 END) unknown_count,
-                      MIN(CASE WHEN status IN ('queued','retrying') THEN created_at END) oldest_pending_at
-               FROM sms_tasks
-               WHERE status IN ('queued','retrying','sending','submitted','partial','unknown')
-               GROUP BY campaign_type,campaign_id,COALESCE(smpp_config_id,0)
-               ORDER BY (queued+retrying+sending) DESC,campaign_type,campaign_id,config_id
+                       SUM(CASE WHEN t.status='queued' THEN 1 ELSE 0 END) queued,
+                       SUM(CASE WHEN t.status='retrying' THEN 1 ELSE 0 END) retrying,
+                       SUM(CASE WHEN t.status='sending' THEN 1 ELSE 0 END) sending,
+                       SUM(CASE WHEN t.status='submitted' THEN 1 ELSE 0 END) submitted,
+                       SUM(CASE WHEN t.status='partial' THEN 1 ELSE 0 END) partial_count,
+                       SUM(CASE WHEN t.status='unknown' THEN 1 ELSE 0 END) unknown_count,
+                       MIN(CASE WHEN t.status IN ('queued','retrying') THEN t.created_at END) oldest_pending_at,
+                       MAX(fs.eligible_since) eligible_since,
+                       MAX(fs.last_dispatched_at) last_dispatched_at,
+                       MAX(fs.last_file_claim_at) last_file_claim_at,
+                       MAX(fs.last_task_claim_at) last_task_claim_at,
+                       MAX(fs.last_submit_at) last_submit_at,
+                       MAX(fs.backlog) fairness_backlog,
+                       MAX(fs.consecutive_skip_rounds) fairness_skip_rounds
+                FROM sms_tasks t
+                LEFT JOIN campaign_fairness_state fs
+                  ON fs.campaign_type=t.campaign_type AND fs.campaign_id=t.campaign_id
+                 AND fs.route_id=COALESCE(t.smpp_config_id,0)
+                WHERE t.status IN ('queued','retrying','sending','submitted','partial','unknown')
+                GROUP BY t.campaign_type,t.campaign_id,COALESCE(t.smpp_config_id,0)
+                ORDER BY (queued+retrying+sending) DESC,t.campaign_type,t.campaign_id,config_id
                LIMIT ?""",
             (limit,),
         ).fetchall()
@@ -323,6 +460,8 @@ def snapshot(limit: int = 200) -> dict:
     }
     transport = metrics_service.campaign_transport_snapshot(60.0)
     items = []
+    max_wait_seconds = 0.0
+    max_wait_rounds = 0
     for row in rows:
         item = dict(row)
         item["partial"] = int(item.pop("partial_count", 0) or 0)
@@ -337,6 +476,28 @@ def snapshot(limit: int = 200) -> dict:
         else:
             transport_values = transport.get(key, {})
         item["transport"] = transport_values
+        eligible_since = item.get("eligible_since")
+        wait_seconds = 0.0
+        if eligible_since and (int(item.get("queued", 0) or 0) + int(item.get("retrying", 0) or 0)):
+            try:
+                parsed = datetime.fromisoformat(str(eligible_since).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.astimezone()
+                wait_seconds = max(0.0, time.time() - parsed.timestamp())
+            except (TypeError, ValueError, OverflowError):
+                wait_seconds = 0.0
+        item["fairness"] = {
+            "eligible_since": eligible_since,
+            "last_dispatched_at": item.pop("last_dispatched_at", None),
+            "last_file_claim_at": item.pop("last_file_claim_at", None),
+            "last_task_claim_at": item.pop("last_task_claim_at", None),
+            "last_submit_at": item.pop("last_submit_at", None),
+            "backlog": int(item.pop("fairness_backlog", 0) or 0),
+            "consecutive_skip_rounds": int(item.pop("fairness_skip_rounds", 0) or 0),
+            "wait_seconds": wait_seconds,
+        }
+        max_wait_seconds = max(max_wait_seconds, wait_seconds)
+        max_wait_rounds = max(max_wait_rounds, item["fairness"]["consecutive_skip_rounds"])
         item["policy"] = policies.get(key[:2], {
             "campaign_type": key[0], "campaign_id": key[1], "weight": 1.0,
             "min_parts_tps": 0.0, "max_parts_tps": None,
@@ -350,4 +511,6 @@ def snapshot(limit: int = 200) -> dict:
         "policies": [dict(row) for row in policy_rows],
         "limit": limit,
         "truncated": len(rows) >= limit,
+        "fairness_max_wait_seconds": max_wait_seconds,
+        "fairness_max_wait_rounds": max_wait_rounds,
     }

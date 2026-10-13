@@ -36,7 +36,7 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
                   total_rows: int = 0, chunk_size: int = 5000,
                   chunks: Optional[Iterable[dict]] = None, reset: bool = False,
                   whitelist_version_id: Optional[int] = None,
-                  reservation_token: str = "") -> tuple[int, bool]:
+                  reservation_token: str = "", manifest_id: Optional[int] = None) -> tuple[int, bool]:
     """Register by stable business identity; a renamed file is a new manifest."""
     safe_filename = os.path.basename(filename)
     absolute_path = os.path.abspath(file_path) if file_path else ""
@@ -56,14 +56,19 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
                WHERE campaign_type=? AND campaign_id=? AND filename=?""",
             (campaign_type, campaign_id, safe_filename),
         ).fetchone()
-        if existing and existing["status"] == "completed" and not reset:
+        same_manifest = (
+            manifest_id is None
+            or existing is None
+            or existing.get("manifest_id") in (None, int(manifest_id))
+        )
+        if existing and existing["status"] == "completed" and not reset and same_manifest:
             if reservation_token:
                 conn.execute(
                     "DELETE FROM realtime_inbox_reservations WHERE token=?",
                     (reservation_token,),
                 )
             return existing["id"], True
-        if existing and not reset and existing["file_path"] == absolute_path \
+        if existing and not reset and same_manifest and existing["file_path"] == absolute_path \
                 and int(existing.get("file_size", 0) or 0) == file_size:
             if reservation_token:
                 conn.execute(
@@ -74,24 +79,24 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
         if existing:
             file_id = existing["id"]
             conn.execute(
-                """UPDATE ingestion_files SET file_path=?,file_size=?,total_rows=?,chunk_size=?,
+                """UPDATE ingestion_files SET file_path=?,file_size=?,manifest_id=?,total_rows=?,chunk_size=?,
                    total_chunks=0,completed_chunks=0,created_tasks=0,status='pending',
                    error_detail='',processing_phase='queued',processed_rows=0,matched_rows=0,
                    current_chunk_index=0,worker_id='',lease_token='',lease_expires_at=NULL,
                    retry_count=0,last_error_class='',last_error_at=NULL,next_retry_at=NULL,
                    whitelist_version_id=COALESCE(?,whitelist_version_id),
                    updated_at=CURRENT_TIMESTAMP,completed_at=NULL WHERE id=?""",
-                (absolute_path, file_size, int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id, file_id),
+                (absolute_path, file_size, manifest_id, int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id, file_id),
             )
             if reset:
                 conn.execute("DELETE FROM ingestion_chunks WHERE file_id=?", (file_id,))
         else:
             file_id = conn.execute(
                 """INSERT INTO ingestion_files
-                   (campaign_type,campaign_id,filename,file_path,file_size,total_rows,chunk_size,whitelist_version_id)
-                   VALUES (?,?,?,?,?,?,?,?) RETURNING id""",
-                (campaign_type, campaign_id, safe_filename, absolute_path, file_size,
-                 int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id),
+                   (campaign_type,campaign_id,filename,file_path,file_size,manifest_id,total_rows,chunk_size,whitelist_version_id)
+                   VALUES (?,?,?,?,?,?,?,?,?) RETURNING id""",
+                 (campaign_type, campaign_id, safe_filename, absolute_path, file_size,
+                  manifest_id, int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id),
             ).fetchone()["id"]
         chunk_rows = list(chunks or [])
         for index, item in enumerate(chunk_rows):
@@ -265,6 +270,22 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
                RETURNING *""", claim_params,
         ).fetchone()
         if claimed:
+            try:
+                from services import campaign_capacity_service
+                backlog = conn.execute(
+                    """SELECT COUNT(*) count FROM ingestion_files
+                       WHERE campaign_type=? AND campaign_id=?
+                         AND status IN ('pending','processing','retrying')""",
+                    (campaign_type, int(claimed["campaign_id"])),
+                ).fetchone()["count"]
+                campaign_capacity_service.record_activity_event(
+                    conn, campaign_type, int(claimed["campaign_id"]),
+                    "file", backlog=int(backlog or 0),
+                )
+            except Exception:
+                # Fairness telemetry must never turn a correctly fenced lease
+                # into a failed claim.
+                pass
             conn.commit()
             return dict(claimed)
         return None

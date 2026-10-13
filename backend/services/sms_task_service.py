@@ -30,6 +30,7 @@ _TEMPLATE_CACHE = {}
 _CAMPAIGN_CACHE_TTL = 30.0
 _CAMPAIGN_CACHE_GENERATION = 0
 _TEMPLATE_CACHE_GENERATION = 0
+_FAIR_DISABLED_WARNING_EMITTED = False
 
 # Keep SQL statements bounded. 2000 rows is inside the requested 1000-5000
 # range while leaving room for the task/event columns in DuckDB statements.
@@ -713,58 +714,76 @@ def claim_next_tasks(limit: int = 20) -> list:
         token = uuid.uuid4().hex
 
         def claim(conn):
+            global _FAIR_DISABLED_WARNING_EMITTED
             from services import campaign_capacity_service
             if campaign_capacity_service.enabled():
                 per_campaign = campaign_capacity_service.per_campaign_candidates()
-                candidate_limit = (
-                    per_campaign * campaign_capacity_service.active_campaign_limit()
+                active_groups = conn.execute(
+                    """SELECT campaign_type,campaign_id,
+                              COALESCE(transport_smpp_config_id,smpp_config_id,0) route_id,
+                              MIN(created_at) oldest
+                       FROM sms_tasks
+                       WHERE status IN ('queued','retrying')
+                         AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+                         AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE)
+                       GROUP BY campaign_type,campaign_id,
+                                COALESCE(transport_smpp_config_id,smpp_config_id,0)
+                       ORDER BY oldest,campaign_type,campaign_id,route_id"""
+                ).fetchall()
+                selected_groups = campaign_capacity_service.rotate_candidate_groups(
+                    conn, (dict(row) for row in active_groups),
+                    campaign_capacity_service.active_campaign_limit(),
                 )
-                candidates = conn.execute(
-                    """WITH active_groups AS (
-                           SELECT campaign_type,campaign_id,COALESCE(smpp_config_id,0) route_id,
-                                  MIN(created_at) oldest
-                           FROM sms_tasks
-                           WHERE status IN ('queued','retrying')
-                             AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
-                             AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE)
-                           GROUP BY campaign_type,campaign_id,COALESCE(smpp_config_id,0)
-                           ORDER BY oldest,campaign_type,campaign_id,route_id
-                           LIMIT ?
-                       ), ranked AS (
-                           SELECT t.*,COALESCE(t.smpp_config_id,0) target_smpp_config_id,
+                if not selected_groups:
+                    return []
+                candidate_limit = per_campaign * max(1, len(selected_groups))
+                group_clause = " OR ".join(
+                    "(t.campaign_type=? AND t.campaign_id=? AND "
+                    "COALESCE(t.transport_smpp_config_id,t.smpp_config_id,0)=?)"
+                    for _ in selected_groups
+                )
+                candidate_params = [value for group in selected_groups for value in group]
+                candidate_params.extend([per_campaign, candidate_limit])
+                candidate_sql = """WITH ranked AS (
+                           SELECT t.*,
+                                  COALESCE(t.transport_smpp_config_id,t.smpp_config_id,0)
+                                    target_smpp_config_id,
                                   COALESCE(p.weight,1.0) scheduling_weight,
                                   p.max_parts_tps,p.max_outstanding_parts,
                                   ROW_NUMBER() OVER (
                                     PARTITION BY t.campaign_type,t.campaign_id,
-                                                 COALESCE(t.smpp_config_id,0)
+                                      COALESCE(t.transport_smpp_config_id,t.smpp_config_id,0)
                                     ORDER BY t.created_at,t.id
                                   ) fair_row
                            FROM sms_tasks t
-                           JOIN active_groups g
-                             ON g.campaign_type=t.campaign_type
-                            AND g.campaign_id=t.campaign_id
-                            AND g.route_id=COALESCE(t.smpp_config_id,0)
                            LEFT JOIN campaign_capacity_policies p
                              ON p.campaign_type=t.campaign_type
                             AND p.campaign_id=t.campaign_id AND p.enabled=1
-                           WHERE t.status IN ('queued','retrying')
+                           WHERE (""" + group_clause + """
+                             )
+                             AND t.status IN ('queued','retrying')
                              AND CAST(t.next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
                              AND (t.campaign_type <> 'realtime' OR t.task_date=CURRENT_DATE)
                        )
                        SELECT * EXCLUDE(fair_row) FROM ranked
                        WHERE fair_row<=?
-                       ORDER BY created_at,id LIMIT ?""",
-                    (
-                        campaign_capacity_service.active_campaign_limit(),
-                        per_campaign,
-                        candidate_limit,
-                    ),
+                       ORDER BY created_at,id LIMIT ?"""
+                candidates = conn.execute(
+                    candidate_sql,
+                    candidate_params,
                 ).fetchall()
                 scheduled = campaign_capacity_service.select(
                     (dict(row) for row in candidates), limit
                 )
                 selected_ids = [int(task["id"]) for task in scheduled]
             else:
+                if not _FAIR_DISABLED_WARNING_EMITTED:
+                    _FAIR_DISABLED_WARNING_EMITTED = True
+                    logger.warning(
+                        "Fair SMS task scheduler is disabled; claims use global FIFO and "
+                        "campaign starvation protection is not active"
+                    )
+                    metrics_service.inc("marketing_copilot_fair_scheduler_disabled_total")
                 selected_ids = [
                     int(row["id"]) for row in conn.execute(
                         """SELECT id FROM sms_tasks
@@ -799,6 +818,26 @@ def claim_next_tasks(limit: int = 20) -> list:
                     [task["id"] for task in items],
                     {"claim_token": token, "attempt_min": min(task["attempts"] for task in items),
                      "attempt_max": max(task["attempts"] for task in items)},
+                )
+            fairness_groups = {}
+            for task in tasks:
+                route_id = int(
+                    task.get("transport_smpp_config_id")
+                    or task.get("smpp_config_id") or 0
+                )
+                key = (str(task["campaign_type"]), int(task["campaign_id"]), route_id)
+                fairness_groups[key] = fairness_groups.get(key, 0) + 1
+            for (campaign_type, campaign_id, route_id), _count in fairness_groups.items():
+                remaining = conn.execute(
+                    """SELECT COUNT(*) count FROM sms_tasks
+                       WHERE campaign_type=? AND campaign_id=?
+                         AND COALESCE(transport_smpp_config_id,smpp_config_id,0)=?
+                         AND status IN ('queued','retrying')""",
+                    (campaign_type, campaign_id, route_id),
+                ).fetchone()["count"]
+                campaign_capacity_service.record_activity_event(
+                    conn, campaign_type, campaign_id, "task", route_id=route_id,
+                    backlog=int(remaining or 0),
                 )
             return tasks
 
@@ -944,6 +983,22 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
                    ON CONFLICT(attempt_token,part_no) DO NOTHING""",
                 (attempt_token, part_no, str(connection_generation or ""), source_namespace),
             )
+        try:
+            from services import campaign_capacity_service
+            route_id = int(current.get("transport_smpp_config_id") or smpp_config_id or 0)
+            backlog = conn.execute(
+                """SELECT COUNT(*) count FROM sms_tasks
+                   WHERE campaign_type=? AND campaign_id=?
+                     AND COALESCE(transport_smpp_config_id,smpp_config_id,0)=?
+                     AND status IN ('queued','retrying','sending')""",
+                (current.get("campaign_type"), int(current.get("campaign_id") or 0), route_id),
+            ).fetchone()["count"]
+            campaign_capacity_service.record_activity_event(
+                conn, current.get("campaign_type"), int(current.get("campaign_id") or 0),
+                "submit", route_id=route_id, backlog=int(backlog or 0),
+            )
+        except Exception:
+            pass
         _add_task_event(
             conn, int(task["id"]), "submit_authorized", "sending", "sending",
             "SMPP submit authorization acquired before socket write",

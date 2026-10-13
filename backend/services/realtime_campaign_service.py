@@ -57,6 +57,12 @@ try:
     WATCH_COPY_WORKERS = max(1, min(8, int(os.environ.get("MC_REALTIME_COPY_WORKERS", "2"))))
 except (TypeError, ValueError):
     WATCH_COPY_WORKERS = 2
+try:
+    WATCH_DISCOVERY_QUANTUM = max(
+        1, min(64, int(os.environ.get("MC_REALTIME_DISCOVERY_QUANTUM", "2")))
+    )
+except (TypeError, ValueError):
+    WATCH_DISCOVERY_QUANTUM = 2
 _daily_finalize_lock = threading.Lock()
 _daily_finalize_date = None
 _daily_finalized_windows = set()
@@ -72,6 +78,8 @@ _watch_copy_queue = queue.Queue(maxsize=WATCH_COPY_QUEUE_SIZE)
 _watch_copy_stop = threading.Event()
 _watch_copy_threads = []
 _watch_copy_start_lock = threading.Lock()
+_watch_campaign_cursor = 0
+_sftp_campaign_cursor = 0
 
 
 class WatchFileChanged(RuntimeError):
@@ -2386,6 +2394,7 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
 
 def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
                                enqueue_only: bool = False):
+    global _watch_campaign_cursor
     conn = get_connection()
     if campaign_id:
         rows = conn.execute(
@@ -2399,6 +2408,12 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
     conn.close()
     if now is None:
         now = datetime.now()
+    rows = list(rows)
+    if campaign_id is None and len(rows) > 1:
+        rows.sort(key=lambda item: int(item["id"]))
+        start = _watch_campaign_cursor % len(rows)
+        rows = rows[start:] + rows[:start]
+        _watch_campaign_cursor = (_watch_campaign_cursor + 1) % len(rows)
     total_moved = 0
     total_enqueued = 0
     for row in rows:
@@ -2434,6 +2449,7 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
         campaign_window_skipped = 0
         backpressure_rejected = 0
         backpressure_reason = ""
+        admitted = 0
         # The watched filename contains a fixed-width YYYYMMDDHHMMSS token;
         # lexical order therefore matches file time order.
         pending_only = campaign.pop("_watch_scan_mode", "full") == "pending"
@@ -2458,6 +2474,12 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
             except AttributeError:
                 ready_names = set()
         for entry in entries:
+            if admitted >= WATCH_DISCOVERY_QUANTUM:
+                metrics_service.inc(
+                    "realtime_watch_campaign_quantum_yield_total",
+                    labels={"campaign_id": campaign["id"]},
+                )
+                break
             if isinstance(entry, tuple):
                 fname, entry_path = entry
                 entry_stat = None
@@ -2515,6 +2537,7 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
                     backpressure_reason = reservation["reason"]
                     break
                 reservation_token = reservation["token"]
+                copied = False
                 if enqueue_only:
                     try:
                         _watch_copy_queue.put_nowait({
@@ -2542,6 +2565,7 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
                         total_moved += 1
                         metrics_service.inc("realtime_watch_files_published_total")
                 if enqueue_only or copied:
+                    admitted += 1
                     _record_inbox_capacity_file(capacity, file_size)
             except OSError:
                 ingestion_job_service.release_realtime_capacity(reservation_token)
@@ -2560,15 +2584,28 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
 
 def sync_sftp_watch_dirs_to_inboxes(now=None):
     """Poll configured SFTP folders and atomically download eligible files."""
-    from services import sftp_watch_service
-
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM realtime_campaigns WHERE status='in_progress' "
         "AND watch_source='sftp' AND COALESCE(watch_dir,'')<>''"
     ).fetchall()
     conn.close()
+    # Local-watch deployments do not need the optional Paramiko dependency;
+    # avoid turning the SFTP poller into a repeating error loop when there are
+    # no configured remote campaigns.  A configured SFTP campaign still gets
+    # the same explicit dependency error below.
+    if not rows:
+        return {"downloaded": 0}
+    from services import sftp_watch_service
+
     now = now or datetime.now()
+    global _sftp_campaign_cursor
+    rows = list(rows)
+    if len(rows) > 1:
+        rows.sort(key=lambda item: int(item["id"]))
+        start = _sftp_campaign_cursor % len(rows)
+        rows = rows[start:] + rows[:start]
+        _sftp_campaign_cursor = (_sftp_campaign_cursor + 1) % len(rows)
     total_downloaded = 0
     for row in rows:
         campaign = dict(row)
@@ -2576,6 +2613,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
         backpressure_rejected = 0
         backpressure_reason = ""
         already_processed_skipped = 0
+        admitted = 0
         try:
             active, reason = sms_task_service.campaign_is_active(campaign, now)
             if not active:
@@ -2597,6 +2635,12 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             already_processed_skipped = 0
             # Keep SFTP intake order consistent with local watch intake.
             for entry in sorted(entries, key=lambda item: item.filename):
+                if admitted >= WATCH_DISCOVERY_QUANTUM:
+                    metrics_service.inc(
+                        "realtime_sftp_campaign_quantum_yield_total",
+                        labels={"campaign_id": campaign["id"]},
+                    )
+                    break
                 fname = entry.filename
                 if fname in (".", "..") or os.path.basename(fname) != fname:
                     continue
@@ -2647,6 +2691,7 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
                         reservation_token=reservation_token,
                     )
                     consumed = True
+                    admitted += 1
                     _record_inbox_capacity_file(capacity, file_size)
                     total_downloaded += 1
                     logger.info("SFTP watch file downloaded campaign=%s host=%s file=%s", campaign["id"], campaign.get("sftp_host"), fname)

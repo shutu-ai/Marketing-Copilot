@@ -2,7 +2,9 @@ import os
 import json
 import math
 import re
+import hashlib
 import logging
+import threading
 from datetime import datetime
 from database import get_connection, read_transaction, write_transaction
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
@@ -12,7 +14,7 @@ import pandas as pd
 import time
 from services import settings_service
 from services import (sms_task_service, operations_service, campaign_name_service,
-                      ingestion_job_service, backpressure_service)
+                      ingestion_job_service, backpressure_service, metrics_service)
 
 logger = logging.getLogger(__name__)
 OVERDUE_CANCEL_BATCH_SIZE = max(
@@ -22,6 +24,17 @@ OVERDUE_CANCEL_CAMPAIGNS_PER_RUN = max(
     1, min(32, int(os.environ.get("MC_BATCH_CANCEL_CAMPAIGNS_PER_RUN", "4")))
 )
 _overdue_campaign_cursor = 0
+_batch_generation_lock = threading.RLock()
+_batch_source_lock = threading.RLock()
+_batch_source_cursors = {}
+_batch_generation_cursors = {}
+
+try:
+    _BATCH_INGEST_QUANTUM = max(
+        1, min(100, int(os.environ.get("MC_BATCH_INGEST_QUANTUM", "1")))
+    )
+except (TypeError, ValueError):
+    _BATCH_INGEST_QUANTUM = 1
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads", "campaigns")
 ALLOWED_LANGUAGES = {"amharic", "tigrigna", "somali", "english", "oromign", "en"}
@@ -704,8 +717,247 @@ def cancel_overdue_daily_tasks() -> int:
     return cancelled
 
 
-def generate_batches(campaign_id: int, batch_size: int = 500) -> dict:
-    """Split customer list file into batches using one sequential CSV iterator."""
+class _SequentialBatchSource:
+    """A resumable sequential reader shared by one campaign's fair turns.
+
+    The iterator is intentionally kept outside DuckDB.  A normal fair turn
+    resumes the same reader in O(quantum) work; after a crash a new reader
+    advances once to the durable manifest/chunk offset.  This avoids seeking
+    from row zero for every batch while retaining a recoverable boundary.
+    """
+
+    def __init__(self, path: str, batch_size: int):
+        self.path = path
+        self.batch_size = max(1, int(batch_size or 500))
+        self.ext = os.path.splitext(path)[1].lower()
+        self.reader = None
+        self.next_index = 0
+        self.lookahead = None
+        self.open()
+
+    def open(self):
+        self.close()
+        self.reader = (
+            pd.read_csv(
+                self.path, dtype=str, sep=_detect_csv_delimiter(self.path),
+                chunksize=self.batch_size,
+            )
+            if self.ext == ".csv"
+            else _read_excel_chunks(self.path, self.batch_size)
+        )
+        self.next_index = 0
+        self.lookahead = None
+
+    def close(self):
+        reader = self.reader
+        self.reader = None
+        if reader is not None:
+            close = getattr(reader, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    def frame_at(self, batch_index: int):
+        batch_index = int(batch_index)
+        if self.lookahead is not None and self.lookahead[0] == batch_index:
+            frame = self.lookahead[1]
+            self.lookahead = None
+            return frame
+        if self.lookahead is not None and self.lookahead[0] < batch_index:
+            self.lookahead = None
+        if batch_index < self.next_index:
+            self.open()
+        while self.next_index < batch_index:
+            try:
+                next(self.reader)
+            except StopIteration:
+                return None
+            self.next_index += 1
+        try:
+            frame = next(self.reader)
+        except StopIteration:
+            return None
+        self.next_index += 1
+        return frame
+
+    def peek_at(self, batch_index: int):
+        frame = self.frame_at(batch_index)
+        if frame is not None:
+            self.lookahead = (int(batch_index), frame)
+        return frame
+
+
+def _source_signature(path: str) -> dict:
+    stat = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+    }
+
+
+def _source_hash(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _manifest_for_campaign(campaign_id: int, manifest_id: Optional[int] = None) -> Optional[dict]:
+    def read(conn):
+        if manifest_id is not None:
+            row = conn.execute(
+                "SELECT * FROM batch_campaign_manifests WHERE id=? AND campaign_id=?",
+                (int(manifest_id), int(campaign_id)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT * FROM batch_campaign_manifests
+                   WHERE campaign_id=? AND status IN ('building','ready')
+                   ORDER BY CASE WHEN status='building' THEN 0 ELSE 1 END,
+                            updated_at DESC,id DESC LIMIT 1""",
+                (int(campaign_id),),
+            ).fetchone()
+        return dict(row) if row else None
+    return read_transaction(read, operation="batch_campaign.manifest.get")
+
+
+def _manifest_matches(manifest: Optional[dict], signature: dict, batch_size: int) -> bool:
+    return bool(
+        manifest
+        and os.path.abspath(str(manifest.get("source_path") or "")) == signature["path"]
+        and int(manifest.get("source_size", 0) or 0) == signature["size"]
+        and int(manifest.get("source_mtime_ns", 0) or 0) == signature["mtime_ns"]
+        and int(manifest.get("batch_size", 0) or 0) == int(batch_size)
+    )
+
+
+def _create_manifest(campaign: dict, signature: dict, batch_size: int) -> dict:
+    source_filename = campaign.get("customer_list_filename") or os.path.basename(signature["path"])
+
+    def write(conn):
+        # A stale builder must never become the active manifest. It remains in
+        # the table for post-incident inspection and can be superseded safely.
+        conn.execute(
+            """UPDATE batch_campaign_manifests SET status='failed',
+                      error_detail='superseded by newer source identity',updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_id=? AND status='building'""",
+            (int(campaign["id"]),),
+        )
+        row = conn.execute(
+            """INSERT INTO batch_campaign_manifests
+                 (campaign_id,source_path,source_filename,source_size,source_mtime_ns,
+                  batch_size,status)
+               VALUES (?,?,?,?,?,?, 'building') RETURNING *""",
+            (int(campaign["id"]), signature["path"], source_filename,
+             signature["size"], signature["mtime_ns"], int(batch_size)),
+        ).fetchone()
+        return dict(row)
+    return _run_campaign_write("manifest.create", write)
+
+
+def _manifest_batches(manifest_id: int) -> list[dict]:
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM batch_campaign_batches WHERE manifest_id=? ORDER BY batch_index",
+            (int(manifest_id),),
+        ).fetchall(),
+        operation="batch_campaign.manifest_batches",
+    )
+    return [dict(row) for row in rows]
+
+
+def _ensure_batch_ingestion(campaign: dict, manifest: dict) -> None:
+    """Publish the chunk lease manifest idempotently after generation commits."""
+    batches = _manifest_batches(manifest["id"])
+    existing = ingestion_job_service.get_file(
+        "batch", campaign["id"],
+        campaign.get("customer_list_filename") or os.path.basename(manifest["source_path"]),
+    )
+    same_manifest = existing and int(existing.get("manifest_id") or 0) == int(manifest["id"])
+    if same_manifest and int(existing.get("total_chunks") or 0) == len(batches):
+        return
+    ingestion_job_service.register_file(
+        "batch", campaign["id"],
+        campaign.get("customer_list_filename") or os.path.basename(manifest["source_path"]),
+        manifest["source_path"], total_rows=int(manifest.get("total_rows") or 0),
+        chunk_size=int(manifest.get("batch_size") or 500),
+        chunks=[
+            {"source_batch_id": item["id"], "chunk_index": item["batch_index"],
+             "start_row": item["start_row"], "end_row": item["end_row"]}
+            for item in batches
+        ], reset=bool(existing and not same_manifest), manifest_id=int(manifest["id"]),
+    )
+
+
+def _publish_manifest(campaign_id: int, manifest_id: int, total_rows: int,
+                      source_hash: str = "") -> dict:
+    def write(conn):
+        # Hashing happens after the source has been fully read, outside this
+        # short publication transaction.  The hash itself is published in the
+        # same visibility flip as the ready state.
+        conn.execute(
+            """UPDATE batch_campaign_manifests SET status='ready',total_rows=?,
+                      total_batches=generated_batches,source_hash=?,published_at=CURRENT_TIMESTAMP,
+                      updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND campaign_id=? AND status='building'""",
+            (int(total_rows), source_hash, int(manifest_id), int(campaign_id)),
+        )
+        conn.execute(
+            """UPDATE batch_campaigns SET active_manifest_id=?,updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (int(manifest_id), int(campaign_id)),
+        )
+        return dict(conn.execute(
+            "SELECT * FROM batch_campaign_manifests WHERE id=?", (int(manifest_id),)
+        ).fetchone())
+    return _run_campaign_write("manifest.publish", write)
+
+
+def _mark_manifest_failed(manifest_id: int, error: Exception) -> None:
+    try:
+        _run_campaign_write(
+            "manifest.fail",
+            lambda conn: conn.execute(
+                """UPDATE batch_campaign_manifests SET status='failed',error_detail=?,
+                          updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='building'""",
+                (str(error)[:4000], int(manifest_id)),
+            ),
+        )
+    except Exception:
+        logger.exception("Unable to mark batch manifest failed manifest=%s", manifest_id)
+
+
+def pending_campaign_ids() -> list[int]:
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT id FROM batch_campaigns
+               WHERE status='in_progress' AND COALESCE(customer_list_path,'')<>''
+               ORDER BY id"""
+        ).fetchall(),
+        operation="batch_campaign.pending_campaigns",
+    )
+    return [int(row["id"]) for row in rows]
+
+
+def _manifest_ready_for_campaign(campaign: dict) -> Optional[dict]:
+    manifest = _manifest_for_campaign(campaign["id"], campaign.get("active_manifest_id"))
+    return manifest if manifest and manifest.get("status") == "ready" else None
+
+
+def generate_batches(campaign_id: int, batch_size: int = 500,
+                     max_batches: Optional[int] = None) -> dict:
+    """Build a durable, invisible manifest in bounded write transactions.
+
+    ``max_batches`` is used by the scheduler as its fairness quantum. API
+    callers retain the historical full-generation behavior when it is omitted.
+    """
     campaign = get_one(campaign_id)
     pressure, _ = backpressure_service.reasons(producing_chunks=True)
     if pressure:
@@ -715,62 +967,109 @@ def generate_batches(campaign_id: int, batch_size: int = 500) -> dict:
     path = campaign.get("customer_list_path", "")
     if not path or not os.path.isfile(path):
         return {"success": False, "message": "No customer list uploaded"}
-    ext = os.path.splitext(path)[1].lower()
+    batch_size = max(1, int(batch_size or 500))
     try:
-        source = (
-            pd.read_csv(path, dtype=str, sep=_detect_csv_delimiter(path),
-                        chunksize=max(1, int(batch_size or 500)))
-            if ext == ".csv"
-            else _read_excel_chunks(path, max(1, int(batch_size or 500)))
-        )
-        total = 0
-    except Exception as e:
-        return {"success": False, "message": f"Cannot read file: {e}"}
-    def write(conn):
-        source = (
-            pd.read_csv(path, dtype=str, sep=_detect_csv_delimiter(path),
-                        chunksize=max(1, int(batch_size or 500)))
-            if ext == ".csv"
-            else _read_excel_chunks(path, max(1, int(batch_size or 500)))
-        )
-        local_created = []
-        local_total = 0
-        conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,))
-        for chunk in source:
-            count = len(chunk)
-            start = local_total
-            local_total += count
-            end = local_total
-            cursor = conn.execute(
-                "INSERT INTO batch_campaign_batches (campaign_id, batch_index, start_row, end_row, total_count) VALUES (?,?,?,?,?)",
-                (campaign_id, len(local_created), start, end, count),
-            )
-            local_created.append({
-                "id": cursor.lastrowid, "batch_index": len(local_created),
-                "start_row": start, "end_row": end, "count": count, "status": "pending"
-            })
-            del chunk
-        return local_created, local_total
+        signature = _source_signature(path)
+    except OSError as exc:
+        return {"success": False, "message": f"Cannot read file: {exc}"}
 
-    created, total = _run_campaign_write("generate_batches", write)
-    manifest_chunks = [
-        {"source_batch_id": item["id"], "chunk_index": item["batch_index"],
-         "start_row": item["start_row"], "end_row": item["end_row"]}
-        for item in created
-    ]
-    ingestion_job_service.register_file(
-        "batch", campaign_id,
-        campaign.get("customer_list_filename") or os.path.basename(path), path,
-        total_rows=total, chunk_size=max(1, int(batch_size or 500)),
-        chunks=manifest_chunks, reset=True,
-    )
-    return {"success": True, "batches": created, "total_batches": len(created), "total_rows": total}
+    with _batch_generation_lock:
+        manifest = _manifest_for_campaign(campaign_id)
+        if not _manifest_matches(manifest, signature, batch_size):
+            manifest = _create_manifest(campaign, signature, batch_size)
+        if manifest.get("status") == "ready":
+            _ensure_batch_ingestion(campaign, manifest)
+            batches = _manifest_batches(manifest["id"])
+            return {"success": True, "batches": [
+                {**item, "count": item.get("total_count", 0)} for item in batches
+            ], "total_batches": len(batches), "total_rows": manifest.get("total_rows", 0),
+                    "manifest_id": manifest["id"], "complete": True}
+
+        key = (int(manifest["id"]), signature["path"], batch_size)
+        with _batch_source_lock:
+            source = _batch_generation_cursors.get(key)
+            if source is None:
+                source = _SequentialBatchSource(path, batch_size)
+                _batch_generation_cursors[key] = source
+            generated = int(manifest.get("generated_batches", 0) or 0)
+            total_rows = int(manifest.get("total_rows", 0) or 0)
+            # A process restart has no cursor; advance exactly once to the
+            # durable generated offset. Normal fair turns continue in place.
+            if source.next_index > generated:
+                source.open()
+            local_created = []
+            limit = None if max_batches is None else max(1, int(max_batches))
+            try:
+                while limit is None or len(local_created) < limit:
+                    frame = source.frame_at(generated)
+                    if frame is None:
+                        break
+                    count = len(frame)
+                    start = total_rows
+                    total_rows += count
+
+                    def write_batch(conn, index=generated, start_row=start,
+                                    end_row=total_rows, item_count=count):
+                        existing = conn.execute(
+                            "SELECT * FROM batch_campaign_batches WHERE manifest_id=? AND batch_index=?",
+                            (int(manifest["id"]), int(index)),
+                        ).fetchone()
+                        if existing:
+                            return dict(existing)
+                        row = conn.execute(
+                            """INSERT INTO batch_campaign_batches
+                               (campaign_id,manifest_id,batch_index,start_row,end_row,total_count)
+                               VALUES (?,?,?,?,?,?) RETURNING *""",
+                            (int(campaign_id), int(manifest["id"]), int(index),
+                             int(start_row), int(end_row), int(item_count)),
+                        ).fetchone()
+                        conn.execute(
+                            """UPDATE batch_campaign_manifests SET generated_batches=?,
+                                      total_rows=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                            (int(index + 1), int(end_row), int(manifest["id"])),
+                        )
+                        return dict(row)
+
+                    batch = _run_campaign_write("manifest.batch", write_batch)
+                    local_created.append({**batch, "count": batch.get("total_count", count)})
+                    generated += 1
+                    del frame
+                source_exhausted = source.peek_at(generated) is None
+                if source_exhausted:
+                    # The probe above advances no state beyond EOF and keeps
+                    # the source cursor reusable for diagnostics.
+                    final_hash = _source_hash(path)
+                    current_signature = _source_signature(path)
+                    if current_signature != signature:
+                        raise RuntimeError("customer list changed during manifest generation")
+                    manifest = _publish_manifest(
+                        campaign_id, manifest["id"], total_rows, source_hash=final_hash,
+                    )
+                    _ensure_batch_ingestion(campaign, manifest)
+                    _batch_generation_cursors.pop(key, None)
+                    return {"success": True, "batches": [
+                        {**item, "count": item.get("total_count", 0)}
+                        for item in _manifest_batches(manifest["id"])
+                    ], "total_batches": generated, "total_rows": total_rows,
+                            "manifest_id": manifest["id"], "complete": True,
+                            "source_hash": final_hash}
+                return {"success": True, "batches": local_created,
+                        "total_batches": generated, "total_rows": total_rows,
+                        "manifest_id": manifest["id"], "complete": False}
+            except Exception as exc:
+                _batch_generation_cursors.pop(key, None)
+                _mark_manifest_failed(manifest["id"], exc)
+                return {"success": False, "message": str(exc), "manifest_id": manifest["id"]}
 
 
 def get_batches(campaign_id: int) -> list:
     rows = read_transaction(
         lambda conn: conn.execute(
-            "SELECT * FROM batch_campaign_batches WHERE campaign_id=? ORDER BY batch_index",
+            """SELECT b.* FROM batch_campaign_batches b
+               JOIN batch_campaigns c ON c.id=b.campaign_id
+               WHERE b.campaign_id=?
+                 AND (c.active_manifest_id IS NULL OR b.manifest_id=c.active_manifest_id)
+               ORDER BY b.batch_index""",
             (campaign_id,)
         ).fetchall(),
         operation="batch_campaign.batches",
@@ -801,6 +1100,14 @@ def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[di
         return {"success": False, "message": "Batch not found"}
     batch = dict(row)
     campaign_id = batch["campaign_id"]
+
+    active_manifest = conn.execute(
+        "SELECT active_manifest_id FROM batch_campaigns WHERE id=?", (campaign_id,)
+    ).fetchone()
+    active_manifest_id = active_manifest["active_manifest_id"] if active_manifest else None
+    if active_manifest_id is not None and int(batch.get("manifest_id") or 0) != int(active_manifest_id):
+        conn.close()
+        return {"success": False, "message": "Batch belongs to an inactive manifest"}
 
     if batch["status"] not in {"pending", "failed"}:
         conn.close()
@@ -901,34 +1208,48 @@ def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[di
 
 
 def process_pending_batches(campaign_id: Optional[int] = None, target_batch_id: Optional[int] = None,
-                            stop_event=None) -> dict:
-    """Process one campaign's batches with a single sequential CSV read.
+                            stop_event=None, max_batches: Optional[int] = None,
+                            quantum_seconds: Optional[float] = None) -> dict:
+    """Process a bounded batch quantum and yield the shared worker.
 
-    Batch metadata remains addressable for the API, but the scheduler no longer
-    opens the same CSV once per batch and seeks from row zero each time.
+    The per-manifest source cursor advances sequentially and is keyed by the
+    durable manifest identity.  A restart reconstructs it once to the first
+    incomplete batch; ordinary scheduler turns never rescan the file prefix.
     """
-    conn = get_connection()
     if campaign_id is None:
-        row = conn.execute(
-            """SELECT c.id FROM batch_campaigns c
-               JOIN batch_campaign_batches b ON b.campaign_id=c.id
-               WHERE c.status='in_progress' AND b.status='pending'
-               ORDER BY b.created_at LIMIT 1"""
-        ).fetchone()
-        campaign_id = row["id"] if row else None
+        pending = pending_campaign_ids()
+        campaign_id = pending[0] if pending else None
     if campaign_id is None:
-        conn.close()
         return {"success": True, "processed": 0}
-    campaign_row = conn.execute(
-        "SELECT * FROM batch_campaigns WHERE id=? AND status='in_progress'", (campaign_id,)
-    ).fetchone()
-    batches = conn.execute(
-        "SELECT * FROM batch_campaign_batches WHERE campaign_id=? ORDER BY batch_index", (campaign_id,)
-    ).fetchall()
-    conn.close()
+
+    conn = get_connection()
+    try:
+        campaign_row = conn.execute(
+            "SELECT * FROM batch_campaigns WHERE id=? AND status='in_progress'", (campaign_id,)
+        ).fetchone()
+        if campaign_row:
+            active_manifest_id = campaign_row.get("active_manifest_id")
+            batches = conn.execute(
+                """SELECT * FROM batch_campaign_batches
+                   WHERE campaign_id=? AND
+                     ((? IS NULL AND manifest_id IS NULL) OR manifest_id=?)
+                   ORDER BY batch_index""",
+                (campaign_id, active_manifest_id, active_manifest_id),
+            ).fetchall()
+        else:
+            batches = []
+    finally:
+        conn.close()
     campaign = _enrich(dict(campaign_row)) if campaign_row else None
-    if not campaign or not batches:
-        return {"success": False, "message": "Campaign or batches not found", "processed": 0}
+    if not campaign:
+        return {"success": False, "message": "Campaign not found", "processed": 0}
+    manifest = _manifest_for_campaign(campaign_id, campaign.get("active_manifest_id"))
+    if manifest and manifest.get("status") != "ready":
+        return {"success": True, "message": "batch manifest is still building", "processed": 0}
+    if not batches:
+        return {"success": True, "message": "no visible batches", "processed": 0}
+    if manifest:
+        _ensure_batch_ingestion(campaign, manifest)
     active, reason = sms_task_service.campaign_is_active(campaign)
     if not active:
         return {"success": False, "message": reason, "processed": 0}
@@ -936,37 +1257,78 @@ def process_pending_batches(campaign_id: Optional[int] = None, target_batch_id: 
     if not path or not os.path.isfile(path):
         return {"success": False, "message": "Customer list file not found", "processed": 0}
 
-    processed = 0
-    ext = os.path.splitext(path)[1].lower()
+    batch_dicts = [dict(row) for row in batches]
+    target = next((row for row in batch_dicts if target_batch_id is not None and
+                   int(row["id"]) == int(target_batch_id)), None)
+    if target_batch_id is not None and target is None:
+        return {"success": False, "message": "Batch not found", "processed": 0}
+    pending = [row for row in batch_dicts if row.get("status") in {"pending", "failed"}]
+    if target is not None:
+        pending = [target]
+    if not pending:
+        return {"success": True, "processed": 0, "complete": True}
+
+    batch_index = int(pending[0].get("batch_index") or 0)
+    manifest_key = int((manifest or {}).get("id") or 0)
     try:
-        source = (
-            pd.read_csv(path, dtype=str, sep=_detect_csv_delimiter(path),
-                        chunksize=max(1, int(campaign.get("batch_size") or 500)))
-            if ext == ".csv" else
-            _read_excel_chunks(path, max(1, int(campaign.get("batch_size") or 500)))
-        )
-        for batch, frame in zip(batches, source):
-            if not _wait_for_ingest_capacity(stop_event):
-                return {"success": False, "message": "batch ingestion worker stopping", "processed": processed}
-            if target_batch_id is not None:
-                if batch["id"] != target_batch_id:
-                    continue
-            elif batch["status"] != "pending":
-                continue
-            result = process_batch(batch["id"], batch_rows=frame, campaign_override=campaign)
-            if result.get("success"):
-                processed += 1
-            del frame
-    except Exception as exc:
-        logger.exception("Sequential batch read failed campaign=%s", campaign_id)
-        return {"success": False, "message": str(exc), "processed": processed}
-    manifest = ingestion_job_service.get_file(
+        signature = _source_signature(path)
+    except OSError as exc:
+        return {"success": False, "message": str(exc), "processed": 0}
+    source_key = (int(campaign_id), manifest_key, signature["path"],
+                  signature["size"], signature["mtime_ns"],
+                  int(campaign.get("batch_size") or 500))
+    processed = 0
+    started = time.monotonic()
+    limit = None if max_batches is None else max(1, int(max_batches))
+    with _batch_source_lock:
+        source = _batch_source_cursors.get(source_key)
+        if source is None:
+            source = _SequentialBatchSource(path, int(campaign.get("batch_size") or 500))
+            _batch_source_cursors[source_key] = source
+        try:
+            for batch in pending:
+                if limit is not None and processed >= limit:
+                    break
+                if quantum_seconds is not None and processed and time.monotonic() - started >= quantum_seconds:
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    break
+                active, reason = sms_task_service.campaign_is_active(campaign)
+                if not active:
+                    return {"success": False, "message": reason, "processed": processed}
+                if not _wait_for_ingest_capacity(stop_event):
+                    return {"success": False, "message": "batch ingestion worker stopping", "processed": processed}
+                frame = source.frame_at(int(batch.get("batch_index") or 0))
+                if frame is None:
+                    raise RuntimeError(f"batch source ended before batch {batch.get('batch_index')}")
+                result = process_batch(batch["id"], batch_rows=frame, campaign_override=campaign)
+                del frame
+                if result.get("success"):
+                    processed += 1
+                else:
+                    # Do not let a failed frame advance the in-memory cursor;
+                    # its durable chunk remains retryable on the next turn.
+                    source.open()
+                    break
+            if processed:
+                metrics_service.observe(
+                    "marketing_copilot_batch_quantum_seconds",
+                    time.monotonic() - started,
+                    labels={"campaign_id": campaign_id},
+                )
+        except Exception as exc:
+            source.open()
+            logger.exception("Sequential batch read failed campaign=%s", campaign_id)
+            return {"success": False, "message": str(exc), "processed": processed}
+
+    manifest_file = ingestion_job_service.get_file(
         "batch", campaign_id,
         campaign.get("customer_list_filename") or os.path.basename(path),
     )
-    if manifest:
-        ingestion_job_service.finish_file(manifest["id"])
-    return {"success": True, "processed": processed}
+    if manifest_file and processed:
+        ingestion_job_service.finish_file(manifest_file["id"])
+    return {"success": True, "processed": processed,
+            "complete": processed >= len(pending)}
 
 
 def _count_reached_users(campaign_dir: str) -> int:

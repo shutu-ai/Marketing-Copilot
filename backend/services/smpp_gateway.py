@@ -13,6 +13,12 @@ from services import metrics_service, sms_task_service
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
 
+# A configured SMSC TPS is a physical route limit, not a per-pool-connection
+# limit.  Pool slots therefore share one process-wide reservation clock per
+# configuration so campaign weights cannot multiply the same SMSC allowance.
+_SHARED_TPS_LOCK = threading.Lock()
+_SHARED_TPS_NEXT = {}
+
 
 def _encode_utf16be(text: str) -> bytes:
     """Encode text as UTF-16BE without relying on Python's codec registry."""
@@ -587,11 +593,12 @@ class _SmppConnection:
         configured_tps = max(1.0, float(self.config.get("tps") or 1))
         interval = 1.0 / (configured_tps * self.tps_multiplier)
         lock_started = time.monotonic()
-        with self._throttle_lock:
+        with _SHARED_TPS_LOCK:
             lock_wait = time.monotonic() - lock_started
             now = time.monotonic()
-            scheduled_at = max(now, self._last_submit + interval)
-            self._last_submit = scheduled_at
+            route_key = int(self.config.get("id") or 0)
+            scheduled_at = max(now, _SHARED_TPS_NEXT.get(route_key, 0.0) + interval)
+            _SHARED_TPS_NEXT[route_key] = scheduled_at
             wait = max(0.0, scheduled_at - now)
 
         # Reserve the next slot while holding the lock, but never sleep while

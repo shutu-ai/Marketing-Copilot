@@ -163,15 +163,18 @@ def backup_database(target_dir: str = "", *, resolve_database: bool = True) -> s
     from datetime import datetime
     target = destination_dir / f"{source.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{source.suffix}"
     # Keep the application writer gate held from CHECKPOINT through the file
-    # copy.  Releasing it between those operations allows another writer to
-    # mutate the live database while the backup is being copied.
-    conn = database.get_connection()
-    conn.set_operation("backup.database")
-    try:
-        conn.execute("CHECKPOINT")
+    # copy.  The raw DuckDB connection is closed before copying because
+    # Windows otherwise keeps an exclusive file handle open even after the
+    # checkpoint has completed.
+    with database.write_gate("backup.database"):
+        conn = database.duckdb.connect(
+            str(source), config=database.duckdb_connection_config()
+        )
+        try:
+            conn.execute("CHECKPOINT")
+        finally:
+            conn.close()
         shutil.copy2(source, target)
-    finally:
-        conn.close()
     keep = int(os.environ.get("MC_BACKUP_KEEP", "14"))
     backups = sorted(destination_dir.glob(f"{source.stem}-*{source.suffix}"), reverse=True)
     for old in backups[keep:]: old.unlink(missing_ok=True)

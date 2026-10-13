@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import time
+from contextlib import contextmanager
 
 import duckdb
 
@@ -358,6 +359,24 @@ def _clear_write_holder() -> None:
             })
 
 
+@contextmanager
+def write_gate(operation: str = "write", timeout=None):
+    """Hold the process writer gate across a multi-step file operation.
+
+    Some operations, such as an online backup, must checkpoint and then copy
+    the database after the DuckDB connection is closed (Windows keeps the
+    file handle locked while a connection is open).  This helper keeps other
+    application writers fenced during that gap without holding a DuckDB file
+    handle itself.
+    """
+    _acquire_write_lock(operation, timeout)
+    try:
+        yield
+    finally:
+        _clear_write_holder()
+        _write_lock.release()
+
+
 def write_lock_status() -> dict:
     """Return non-sensitive diagnostics for the process-wide writer gate."""
     with _write_state_lock:
@@ -400,6 +419,7 @@ TABLE_SEQUENCES = {
     "rabbitmq_configs": "seq_rabbitmq_configs",
     "sms_log": "seq_sms_log",
     "batch_campaigns": "seq_batch_campaigns",
+    "batch_campaign_manifests": "seq_batch_campaign_manifests",
     "batch_campaign_daily_stats": "seq_batch_campaign_daily_stats",
     "batch_campaign_batches": "seq_batch_campaign_batches",
     "app_settings": "seq_app_settings",
@@ -800,12 +820,32 @@ def init_db():
            sms_template_id INTEGER DEFAULT NULL,
            phone_prefix TEXT NOT NULL DEFAULT '',
            smpp_config_id INTEGER DEFAULT NULL,
+             active_manifest_id BIGINT DEFAULT NULL,
            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
+        """CREATE TABLE IF NOT EXISTS batch_campaign_manifests (
+            id BIGINT DEFAULT nextval('seq_batch_campaign_manifests') PRIMARY KEY,
+            campaign_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL DEFAULT '',
+            source_filename TEXT NOT NULL DEFAULT '',
+            source_size BIGINT NOT NULL DEFAULT 0,
+            source_mtime_ns BIGINT NOT NULL DEFAULT 0,
+            source_hash TEXT NOT NULL DEFAULT '',
+            batch_size INTEGER NOT NULL DEFAULT 500,
+            generated_batches BIGINT NOT NULL DEFAULT 0,
+            total_rows BIGINT NOT NULL DEFAULT 0,
+            total_batches BIGINT NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'building',
+            error_detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            published_at TEXT
         )""",
         """CREATE TABLE IF NOT EXISTS batch_campaign_batches (
             id INTEGER DEFAULT nextval('seq_batch_campaign_batches') PRIMARY KEY,
             campaign_id INTEGER NOT NULL,
+             manifest_id BIGINT DEFAULT NULL,
             batch_index INTEGER NOT NULL DEFAULT 0,
             start_row INTEGER NOT NULL DEFAULT 0,
             end_row INTEGER NOT NULL DEFAULT 0,
@@ -1002,6 +1042,27 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             UNIQUE(campaign_id,filename)
         )""",
+        """CREATE TABLE IF NOT EXISTS fair_scheduler_state (
+            stage TEXT PRIMARY KEY,
+            cursor_key TEXT NOT NULL DEFAULT '',
+            rounds BIGINT NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )""",
+        """CREATE TABLE IF NOT EXISTS campaign_fairness_state (
+            campaign_type TEXT NOT NULL,
+            campaign_id BIGINT NOT NULL,
+            route_id BIGINT NOT NULL DEFAULT 0,
+            eligible_since TEXT,
+            last_dispatched_at TEXT,
+            last_file_claim_at TEXT,
+            last_task_claim_at TEXT,
+            last_submit_at TEXT,
+            backlog BIGINT NOT NULL DEFAULT 0,
+            consecutive_skip_rounds BIGINT NOT NULL DEFAULT 0,
+            last_skip_reason TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            PRIMARY KEY(campaign_type,campaign_id,route_id)
+        )""",
         """CREATE TABLE IF NOT EXISTS processed_files (
             id INTEGER DEFAULT nextval('seq_processed_files') PRIMARY KEY,
             campaign_type TEXT NOT NULL, campaign_id INTEGER NOT NULL,
@@ -1025,6 +1086,7 @@ def init_db():
             filename TEXT NOT NULL,
             file_path TEXT NOT NULL DEFAULT '',
             file_size BIGINT NOT NULL DEFAULT 0,
+             manifest_id BIGINT DEFAULT NULL,
             total_rows BIGINT NOT NULL DEFAULT 0,
             chunk_size INTEGER NOT NULL DEFAULT 5000,
             total_chunks INTEGER NOT NULL DEFAULT 0,
@@ -1225,6 +1287,7 @@ def init_db():
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS next_retry_at TEXT",
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS max_retry_count INTEGER DEFAULT 4",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS whitelist_version_id INTEGER",
+         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS manifest_id BIGINT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processing_started_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS last_progress_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processing_phase TEXT DEFAULT 'queued'",
@@ -1244,6 +1307,8 @@ def init_db():
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS submit_sm_parts INTEGER DEFAULT 0",
         "ALTER TABLE delivery_receipts ADD COLUMN IF NOT EXISTS source_namespace TEXT DEFAULT 'legacy'",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
+         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS active_manifest_id BIGINT",
+         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS manifest_id BIGINT",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS window_size INTEGER DEFAULT 10",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS task_count INTEGER DEFAULT 0",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS delivered_count INTEGER DEFAULT 0",
@@ -1374,7 +1439,10 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_attempt_state ON sms_send_attempts(state,lease_until)",
         "CREATE INDEX IF NOT EXISTS idx_sms_parts_state ON sms_send_parts(attempt_token,state)",
         "CREATE INDEX IF NOT EXISTS idx_capacity_policy_enabled ON campaign_capacity_policies(enabled,campaign_type,campaign_id)",
+        "CREATE INDEX IF NOT EXISTS idx_batch_manifest_campaign ON batch_campaign_manifests(campaign_id,status,updated_at,id)",
+        "CREATE INDEX IF NOT EXISTS idx_batch_batches_manifest ON batch_campaign_batches(manifest_id,status,batch_index)",
         "CREATE INDEX IF NOT EXISTS idx_realtime_reservation_expiry ON realtime_inbox_reservations(expires_at,campaign_id)",
+        "CREATE INDEX IF NOT EXISTS idx_campaign_fairness_updated ON campaign_fairness_state(updated_at,campaign_type,campaign_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_task_event_batches_campaign ON task_event_batches(campaign_type,campaign_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ingestion_chunks_status ON ingestion_chunks(status,lease_expires_at,id)",

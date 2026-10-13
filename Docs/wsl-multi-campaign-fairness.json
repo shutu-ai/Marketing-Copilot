@@ -1,0 +1,214 @@
+{
+  "scenario": "multi_campaign_fairness",
+  "started_at": "2026-10-13T10:12:30.086850+00:00",
+  "status": "PASS",
+  "local_e2e_status": "LOCAL_E2E_PASS",
+  "live_env_status": "LIVE_ENV_UNVERIFIED",
+  "git_commit": "unknown",
+  "command": "/tmp/mc-fair-20261013130644/backend/tools/multi_campaign_fair_acceptance.py --python /opt/marketing-copilot/venv/bin/python --timeout-seconds 180 --keep-artifacts --output /mnt/d/dev-projects/MarketingCopilot/Docs/wsl-multi-campaign-fairness.json",
+  "reconciliation": {
+    "status": "PASS",
+    "acceptance_states": {
+      "BATCH_INGEST_FAIRNESS": "PASS",
+      "REALTIME_INTAKE_FAIRNESS": "PASS",
+      "SMS_DISPATCH_FAIRNESS": "PASS",
+      "CROSS_TYPE_E2E": "PASS",
+      "FAIRNESS_TELEMETRY": "PASS",
+      "SFTP": "BLOCKED_ENV"
+    },
+    "expected_tasks": 88,
+    "generated_tasks": 88,
+    "smsc_submit_sm": 88,
+    "smsc_submit_sm_success": 88,
+    "duplicate_send_tasks": [],
+    "duplicate_message_ids": [],
+    "missing_msisdns": [],
+    "activities": [
+      {
+        "label": "batch-A",
+        "campaign_type": "batch",
+        "campaign_id": 1,
+        "expected_rows": 40,
+        "task_count": 40,
+        "task_statuses": {
+          "accepted": 40
+        },
+        "accepted_submit_count": 40,
+        "first_submit_at": "2026-10-13T10:12:40.254140+00:00",
+        "first_service_wait_ms": 669.8009999999999,
+        "fairness_events": [
+          {
+            "campaign_type": "batch",
+            "campaign_id": 1,
+            "route_id": 0,
+            "eligible_since": "2026-10-13T13:12:56.100894+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": null,
+            "last_dispatched_at": "2026-10-13T13:12:56.100894+03:00",
+            "backlog": 0,
+            "consecutive_skip_rounds": 0
+          },
+          {
+            "campaign_type": "batch",
+            "campaign_id": 1,
+            "route_id": 1,
+            "eligible_since": "2026-10-13T13:12:57.180465+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": "2026-10-13T13:12:57.180465+03:00",
+            "last_dispatched_at": null,
+            "backlog": 2,
+            "consecutive_skip_rounds": 0
+          }
+        ]
+      },
+      {
+        "label": "batch-B",
+        "campaign_type": "batch",
+        "campaign_id": 2,
+        "expected_rows": 4,
+        "task_count": 4,
+        "task_statuses": {
+          "accepted": 4
+        },
+        "accepted_submit_count": 4,
+        "first_submit_at": "2026-10-13T10:12:47.179246+00:00",
+        "first_service_wait_ms": 5942.109,
+        "fairness_events": [
+          {
+            "campaign_type": "batch",
+            "campaign_id": 2,
+            "route_id": 0,
+            "eligible_since": "2026-10-13T13:12:52.654785+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": null,
+            "last_dispatched_at": "2026-10-13T13:12:52.654785+03:00",
+            "backlog": 0,
+            "consecutive_skip_rounds": 0
+          },
+          {
+            "campaign_type": "batch",
+            "campaign_id": 2,
+            "route_id": 1,
+            "eligible_since": "2026-10-13T13:12:47.533255+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": "2026-10-13T13:12:47.533255+03:00",
+            "last_dispatched_at": null,
+            "backlog": 2,
+            "consecutive_skip_rounds": 0
+          }
+        ]
+      },
+      {
+        "label": "realtime-A",
+        "campaign_type": "realtime",
+        "campaign_id": 1,
+        "expected_rows": 40,
+        "task_count": 40,
+        "task_statuses": {
+          "accepted": 40
+        },
+        "accepted_submit_count": 40,
+        "first_submit_at": "2026-10-13T10:12:41.459934+00:00",
+        "first_service_wait_ms": 2542.288,
+        "fairness_events": [
+          {
+            "campaign_type": "realtime",
+            "campaign_id": 1,
+            "route_id": 0,
+            "eligible_since": "2026-10-13T13:12:40.113791+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": null,
+            "last_dispatched_at": null,
+            "backlog": 1,
+            "consecutive_skip_rounds": 0
+          },
+          {
+            "campaign_type": "realtime",
+            "campaign_id": 1,
+            "route_id": 1,
+            "eligible_since": "2026-10-13T13:12:45.562852+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": "2026-10-13T13:12:45.562852+03:00",
+            "last_dispatched_at": null,
+            "backlog": 3,
+            "consecutive_skip_rounds": 0
+          }
+        ]
+      },
+      {
+        "label": "realtime-B",
+        "campaign_type": "realtime",
+        "campaign_id": 2,
+        "expected_rows": 4,
+        "task_count": 4,
+        "task_statuses": {
+          "accepted": 4
+        },
+        "accepted_submit_count": 4,
+        "first_submit_at": "2026-10-13T10:12:46.652978+00:00",
+        "first_service_wait_ms": 6327.194,
+        "fairness_events": [
+          {
+            "campaign_type": "realtime",
+            "campaign_id": 2,
+            "route_id": 0,
+            "eligible_since": "2026-10-13T13:12:43.781976+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": null,
+            "last_dispatched_at": null,
+            "backlog": 1,
+            "consecutive_skip_rounds": 0
+          },
+          {
+            "campaign_type": "realtime",
+            "campaign_id": 2,
+            "route_id": 1,
+            "eligible_since": "2026-10-13T13:12:47.017358+03:00",
+            "last_file_claim_at": null,
+            "last_task_claim_at": null,
+            "last_submit_at": "2026-10-13T13:12:47.017358+03:00",
+            "last_dispatched_at": null,
+            "backlog": 2,
+            "consecutive_skip_rounds": 0
+          }
+        ]
+      }
+    ],
+    "fairness": {
+      "fairness_state_rows": 8,
+      "max_first_service_wait_ms": 6327.194,
+      "all_activities_served": true
+    },
+    "throughput": {
+      "queue_backlog_max": 45,
+      "queue_backlog_final": 0
+    },
+    "environment": {
+      "live_env_status": "LIVE_ENV_UNVERIFIED",
+      "sftp_status": "BLOCKED_ENV",
+      "smpp_loopback_only": true
+    },
+    "diagnostics": {
+      "artifacts_dir": "/tmp/mc-fair-20261013130644/.local-e2e-runs/marketing-copilot-multi_campaign_fairness-d4290b4e",
+      "api_log": "/tmp/mc-fair-20261013130644/.local-e2e-runs/marketing-copilot-multi_campaign_fairness-d4290b4e/api.log",
+      "app_log": "/tmp/mc-fair-20261013130644/.local-e2e-runs/marketing-copilot-multi_campaign_fairness-d4290b4e/marketing-copilot.log",
+      "smsc_event_log": "/tmp/mc-fair-20261013130644/.local-e2e-runs/marketing-copilot-multi_campaign_fairness-d4290b4e/smsc.events.jsonl"
+    }
+  },
+  "finished_at": "2026-10-13T10:12:59.331667+00:00",
+  "ports": {
+    "api": 36225,
+    "smsc": 43559
+  },
+  "artifacts_retained": true,
+  "diagnostics": {
+    "artifacts_dir": "/tmp/mc-fair-20261013130644/.local-e2e-runs/marketing-copilot-multi_campaign_fairness-d4290b4e"
+  }
+}

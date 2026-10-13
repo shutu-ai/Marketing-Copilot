@@ -17,6 +17,7 @@ _batch_worker_thread = None
 _batch_jobs = queue.Queue(maxsize=1)
 _batch_state_lock = threading.Lock()
 _batch_job_active = False
+_batch_campaign_cursor = 0
 try:
     _BATCH_RESET_INTERVAL = max(
         30.0, float(os.environ.get("MC_BATCH_RESET_INTERVAL_SECONDS", "60"))
@@ -31,6 +32,13 @@ except (TypeError, ValueError):
     _BATCH_CANCEL_INTERVAL = 30.0
 _last_batch_reset = 0.0
 _last_batch_cancel = 0.0
+
+
+def _batch_quantum_seconds() -> float:
+    try:
+        return max(0.05, float(os.environ.get("MC_BATCH_QUANTUM_SECONDS", "1.5")))
+    except (TypeError, ValueError):
+        return 1.5
 
 
 def _run_stage(name, callback):
@@ -79,20 +87,33 @@ def _batch_worker():
         with _batch_state_lock:
             _batch_job_active = True
         try:
-            if generate:
-                conn = get_connection()
-                try:
-                    row = conn.execute(
-                        "SELECT batch_size FROM batch_campaigns WHERE id=? AND status='in_progress'",
-                        (campaign_id,),
-                    ).fetchone()
-                finally:
-                    conn.close()
-                if row:
-                    batch_campaign_service.generate_batches(campaign_id, row["batch_size"] or 500)
-            batch_campaign_service.process_pending_batches(
-                campaign_id, stop_event=_batch_worker_stop
-            )
+            conn = get_connection()
+            try:
+                row = conn.execute(
+                    "SELECT batch_size FROM batch_campaigns WHERE id=? AND status='in_progress'",
+                    (campaign_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                # Generation and processing each receive a bounded quantum.
+                # The worker returns to the campaign selector after one turn,
+                # so a large file cannot occupy the only batch worker forever.
+                generated = batch_campaign_service.generate_batches(
+                    campaign_id, row["batch_size"] or 500,
+                    max_batches=batch_campaign_service._BATCH_INGEST_QUANTUM,
+                )
+                if generated.get("success"):
+                    batch_campaign_service.process_pending_batches(
+                        campaign_id,
+                        stop_event=_batch_worker_stop,
+                        max_batches=batch_campaign_service._BATCH_INGEST_QUANTUM,
+                        quantum_seconds=_batch_quantum_seconds(),
+                    )
+                from services import campaign_capacity_service
+                campaign_capacity_service.record_activity_event_transaction(
+                    "batch", campaign_id, "dispatch",
+                )
         except Exception:
             logger.exception("Batch ingestion worker failed campaign=%s", campaign_id)
         finally:
@@ -102,31 +123,30 @@ def _batch_worker():
 
 
 def _process_batches():
-    global _last_batch_reset, _last_batch_cancel
-    conn = get_connection()
-    try:
-        unbatched = conn.execute(
-            """SELECT c.* FROM batch_campaigns c
-               WHERE c.status='in_progress' AND c.customer_list_path <> ''
-                 AND NOT EXISTS (SELECT 1 FROM batch_campaign_batches b WHERE b.campaign_id=c.id)
-               ORDER BY c.created_at LIMIT 1"""
-        ).fetchone()
-        if unbatched:
-            candidate = dict(unbatched)
+    global _last_batch_reset, _last_batch_cancel, _batch_campaign_cursor
+    campaign_ids = batch_campaign_service.pending_campaign_ids()
+    if campaign_ids:
+        start = _batch_campaign_cursor % len(campaign_ids)
+        ordered = campaign_ids[start:] + campaign_ids[:start]
+        _batch_campaign_cursor = (_batch_campaign_cursor + 1) % len(campaign_ids)
+        # Activity eligibility is checked again immediately before processing;
+        # this filter only avoids spending the turn on a closed campaign.
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM batch_campaigns WHERE id IN (" +
+                ",".join("?" for _ in ordered) + ")", ordered,
+            ).fetchall()
+        finally:
+            conn.close()
+        by_id = {int(row["id"]): dict(row) for row in rows}
+        for campaign_id in ordered:
+            candidate = by_id.get(int(campaign_id))
+            if not candidate:
+                continue
             active, _ = sms_task_service.campaign_is_active(candidate)
-            if active:
-                _submit_batch_job(candidate["id"], generate=True)
-        else:
-            pending = conn.execute(
-                """SELECT c.id FROM batch_campaigns c
-                   JOIN batch_campaign_batches b ON b.campaign_id=c.id
-                   WHERE c.status='in_progress' AND b.status='pending'
-                   ORDER BY b.created_at LIMIT 1"""
-            ).fetchone()
-            if pending:
-                _submit_batch_job(pending["id"])
-    finally:
-        conn.close()
+            if active and _submit_batch_job(campaign_id, generate=True):
+                break
     # These operations are daily/window-boundary maintenance. Running them on
     # every three-second scheduler tick created unnecessary write contention.
     now = time.monotonic()
