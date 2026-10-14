@@ -24,6 +24,12 @@ The retained result is a historical pre-fix local ext4 convergence observation w
 
 All loopback runs use the local simulator only; `live_env_status` is `LIVE_ENV_UNVERIFIED`.
 
+## The historical 200/1000 gap
+
+The two original tuned reports are retained as failed exploratory evidence, not replaced by the later ext4 runs. They recorded 1,000 input rows but only 200 generated tasks: the first report ended at 119 accepted, 61 sending, 20 queued, and 180 `submit_sm`; the rerun ended at 80 accepted, 20 sending, 100 queued, and 100 `submit_sm`. Therefore the first accounting gap was `1,000 input rows - 200 generated tasks`, and the later gaps were separately `submit_sm - accepted` (`61` and `20`). Those numbers cannot be collapsed into one delivery-loss claim.
+
+The current-commit G1 ingest-only report is the stronger boundary check for the first gap: 10 files × 100 rows completed, 1,000 tasks created, zero invalid/excluded/no-template rows, and all 1,000 tasks queued with no socket activity. Current-commit full G3/G4 was not rerun, so this does not by itself prove end-to-end convergence.
+
 ## Root-cause analysis
 
 ### Claim × Pause deadlock
