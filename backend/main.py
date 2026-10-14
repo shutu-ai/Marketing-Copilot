@@ -154,6 +154,22 @@ app.include_router(users_router.router)
 app.include_router(internal_router.router)
 
 
+def _start_background_services():
+    """Start services in an order that leaves startup recovery uncontended.
+
+    ``start_scheduler`` performs the one-time ingestion lease recovery before
+    it starts its own workers.  Keep it ahead of the SMS result buffer and
+    task workers, both of which may begin writing as soon as they start.
+    """
+    from services.activity_scheduler import start_scheduler
+    from services.sms_write_buffer import start as start_sms_write_buffer
+    from services.task_worker import start_worker
+
+    start_scheduler()
+    start_sms_write_buffer()
+    start_worker()
+
+
 @app.on_event("startup")
 def startup():
     acquire_instance_lock()
@@ -178,12 +194,7 @@ def startup():
     os.makedirs(os.path.join(os.path.dirname(__file__), "uploads"), exist_ok=True)
     os.makedirs(os.path.join(os.path.dirname(__file__), "monitor_dir"), exist_ok=True)
     update_service.ensure_update_dir()
-    from services.sms_write_buffer import start as start_sms_write_buffer
-    from services.task_worker import start_worker
-    from services.activity_scheduler import start_scheduler
-    start_sms_write_buffer()
-    start_worker()
-    start_scheduler()
+    _start_background_services()
 
     try:
         from services.rabbitmq_service import get_config, start_consumer

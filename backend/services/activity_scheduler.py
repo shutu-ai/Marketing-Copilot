@@ -217,6 +217,30 @@ def _run_sftp_watch():
             break
 
 
+def _recover_expired_chunks_on_startup() -> int:
+    """Recover ingestion leases without making startup fail on contention.
+
+    The SMS result buffer and task workers can have durable work to flush as
+    soon as they start.  A short-lived DuckDB writer conflict during startup
+    is therefore an availability condition, not an application bootstrap
+    failure.  The normal scheduler loop retries this stage periodically.
+    """
+    try:
+        recovered = ingestion_job_service.recover_expired_chunks()
+    except Exception as exc:
+        if not is_transient_write_error(exc):
+            raise
+        logger.warning(
+            "Startup ingestion recovery deferred after transient database contention "
+            "error=%s",
+            exc,
+        )
+        return 0
+    if recovered:
+        logger.warning("Recovered %s expired ingestion chunk leases", recovered)
+    return recovered
+
+
 def start_scheduler():
     global _thread, _sftp_thread, _batch_worker_thread
     if _thread and _thread.is_alive():
@@ -230,9 +254,7 @@ def start_scheduler():
                 break
     _stop.clear()
     _batch_worker_stop.clear()
-    recovered = ingestion_job_service.recover_expired_chunks()
-    if recovered:
-        logger.warning("Recovered %s expired ingestion chunk leases", recovered)
+    _recover_expired_chunks_on_startup()
     _batch_worker_thread = threading.Thread(
         target=_batch_worker, name="batch-ingestion-worker", daemon=True
     )
