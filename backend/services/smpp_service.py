@@ -252,6 +252,14 @@ def _get_config_stats() -> dict:
                 "tps": cfg.get("tps", 0),
                 "pool_size": cfg.get("pool_size", 1),
                 "window_size": cfg.get("window_size", 10),
+                # The gateway reserves one shared route clock per config.
+                # Keep the scope explicit so pool_size is not mistaken for a
+                # multiplication of the SMSC/account allowance.
+                "configured_route_tps": float(cfg.get("tps") or 0) if cfg.get("enabled") else 0.0,
+                "configured_per_bind_tps": None,
+                "effective_total_limit_tps": float(cfg.get("tps") or 0) if cfg.get("enabled") else 0.0,
+                "tps_scope": "route_shared",
+                "tps_unit": "submit_sm_parts/s",
                 "queue_size": _count(where, params, "status IN ('queued','retrying')"),
                 "sending": _count(where, params, "status='sending'"),
                 "submitted": _count(where, params, "status='submitted'"),
@@ -307,6 +315,11 @@ def _get_config_stats() -> dict:
             "submitted_parts_1m": sum(item["submitted_parts_1m"] for item in stats),
             "submitted_parts_5m": sum(item["submitted_parts_5m"] for item in stats),
             "submitted_parts_60m": sum(item["submitted_parts_60m"] for item in stats),
+            "configured_route_tps": sum(item["configured_route_tps"] for item in stats),
+            "configured_per_bind_tps": None,
+            "effective_total_limit_tps": sum(item["effective_total_limit_tps"] for item in stats),
+            "tps_scope": "route_shared",
+            "tps_unit": "submit_sm_parts/s",
             "submit_sm_tps_1m": round(sum(item["submitted_parts_1m"] for item in stats) / 60.0, 2),
             "send_message_1m": sum(item["send_message_1m"] for item in stats),
             "send_message_tps_1m": round(sum(item["send_message_1m"] for item in stats) / 60.0, 2),

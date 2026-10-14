@@ -59,7 +59,8 @@ def _seed(task_count: int, history_count: int) -> None:
     conn.close()
 
 
-def run(db_path: str, task_count: int, iterations: int, history_count: int) -> dict:
+def run(db_path: str, task_count: int, iterations: int, history_count: int,
+        planned_parts: int = 1) -> dict:
     database.set_database_file(db_path)
     database.init_db()
     _seed(task_count, history_count)
@@ -123,7 +124,7 @@ def run(db_path: str, task_count: int, iterations: int, history_count: int) -> d
                 break
             started = time.perf_counter()
             attempt = sms_task_service.record_send_intent(
-                claimed[0], smpp_config_id=7, slot=0, planned_parts=1,
+                claimed[0], smpp_config_id=7, slot=0, planned_parts=planned_parts,
             )
             authorize_samples.append(time.perf_counter() - started)
             if not attempt:
@@ -148,6 +149,7 @@ def run(db_path: str, task_count: int, iterations: int, history_count: int) -> d
         "task_count": int(task_count),
         "history_count": int(history_count),
         "iterations_requested": int(iterations),
+        "planned_parts": max(1, int(planned_parts)),
         "claim": summary(claim_samples),
         "submit_authorize": summary(authorize_samples),
         "sms_tasks_count_queries": count_queries,
@@ -165,9 +167,10 @@ def main() -> None:
     parser.add_argument("--task-count", type=int, default=3000)
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--history-count", type=int, default=0)
+    parser.add_argument("--planned-parts", type=int, default=1)
     args = parser.parse_args()
     print(json.dumps(
-        run(args.db, args.task_count, args.iterations, args.history_count),
+        run(args.db, args.task_count, args.iterations, args.history_count, args.planned_parts),
         indent=2,
     ))
 

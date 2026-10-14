@@ -18,6 +18,22 @@ detail_logger = logging.getLogger("mc.detail")
 # configuration so campaign weights cannot multiply the same SMSC allowance.
 _SHARED_TPS_LOCK = threading.Lock()
 _SHARED_TPS_NEXT = {}
+_SHARED_TPS_CONFIG = {}
+
+
+def _internal_tps_multiplier() -> float:
+    """Return the bounded local pacing multiplier.
+
+    The configured SMPP TPS is the route ceiling.  A local multiplier may slow
+    an isolated test, but it must never raise the process above the configured
+    route allowance (which would make the value an undocumented quota bypass).
+    """
+    try:
+        return max(0.01, min(1.0, float(
+            os.environ.get("MC_SMPP_INTERNAL_TPS_MULTIPLIER", "1")
+        )))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def _encode_utf16be(text: str) -> bytes:
@@ -209,12 +225,7 @@ class _SmppConnection:
         self._sender_stop = threading.Event()
         self._sender_start_lock = threading.Lock()
         self._last_submit = 0.0
-        try:
-            self.tps_multiplier = max(
-                0.01, float(os.environ.get("MC_SMPP_INTERNAL_TPS_MULTIPLIER", "1"))
-            )
-        except (TypeError, ValueError):
-            self.tps_multiplier = 1.0
+        self.tps_multiplier = _internal_tps_multiplier()
         self._throttle_lock = threading.Lock()
         self._response_log_lock = threading.Lock()
         self._last_response_warning_at = {}
@@ -606,14 +617,28 @@ class _SmppConnection:
         metrics_service.set_gauge("marketing_copilot_smpp_connection", 0,
                                   {"config_id": self.config.get("id", 0), "slot": self.slot})
 
-    def _throttle(self):
+    def _throttle(self) -> bool:
         configured_tps = max(1.0, float(self.config.get("tps") or 1))
         interval = 1.0 / (configured_tps * self.tps_multiplier)
+        route_key = int(self.config.get("id") or 0)
+        route_revision = str(self.config.get("updated_at") or "")
+        if not route_revision:
+            route_revision = f"tps:{configured_tps}:multiplier:{self.tps_multiplier}"
         lock_started = time.monotonic()
         with _SHARED_TPS_LOCK:
             lock_wait = time.monotonic() - lock_started
             now = time.monotonic()
-            route_key = int(self.config.get("id") or 0)
+            previous = _SHARED_TPS_CONFIG.get(route_key)
+            if previous and previous[0] != route_revision:
+                # A dynamic route update must not inherit an arbitrarily long
+                # reservation debt from the old interval.  Preserve at most
+                # one current-interval reservation, and let already-reserved
+                # old callers re-check the shared state below.
+                _SHARED_TPS_NEXT[route_key] = max(
+                    now,
+                    min(_SHARED_TPS_NEXT.get(route_key, now), now + interval),
+                )
+            _SHARED_TPS_CONFIG[route_key] = (route_revision, interval)
             scheduled_at = max(now, _SHARED_TPS_NEXT.get(route_key, 0.0) + interval)
             _SHARED_TPS_NEXT[route_key] = scheduled_at
             wait = max(0.0, scheduled_at - now)
@@ -633,8 +658,38 @@ class _SmppConnection:
             "marketing_copilot_smpp_throttle_wait_seconds",
             wait, labels=self._metric_labels(),
         )
-        if wait > 0:
-            time.sleep(wait)
+        if wait <= 0:
+            return True
+
+        # Re-check the route reservation while waiting.  This makes a live
+        # tps update stop-aware and prevents a stale long sleep from surviving
+        # a configuration revision.
+        slept = 0.0
+        while wait > 0:
+            chunk_started = time.monotonic()
+            if self._sender_stop.wait(min(wait, 0.1)):
+                metrics_service.observe_histogram(
+                    "marketing_copilot_smpp_throttle_actual_sleep_seconds",
+                    slept + (time.monotonic() - chunk_started),
+                    labels=self._metric_labels(),
+                )
+                return False
+            slept += time.monotonic() - chunk_started
+            with _SHARED_TPS_LOCK:
+                current = _SHARED_TPS_CONFIG.get(route_key)
+                now = time.monotonic()
+                if current and current[0] != route_revision:
+                    route_revision, interval = current
+                    scheduled_at = max(
+                        now, _SHARED_TPS_NEXT.get(route_key, now) + interval,
+                    )
+                    _SHARED_TPS_NEXT[route_key] = scheduled_at
+                wait = max(0.0, scheduled_at - now)
+        metrics_service.observe_histogram(
+            "marketing_copilot_smpp_throttle_actual_sleep_seconds",
+            slept, labels=self._metric_labels(),
+        )
+        return True
 
     def send(self, task: dict) -> list[str]:
         with self._window:
@@ -713,7 +768,10 @@ class _SmppConnection:
         submitted_any = False
         try:
             for part_no, part in enumerate(parts, 1):
-                self._throttle()
+                if not self._throttle():
+                    raise SmppSubmissionNotAllowedError(
+                        "SMPP submission stopped before socket write"
+                    )
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
@@ -885,7 +943,10 @@ class _SmppConnection:
         parts_loop_started = time.monotonic()
         try:
             for part_no, part in enumerate(parts, 1):
-                self._throttle()
+                if not self._throttle():
+                    raise SmppSubmissionNotAllowedError(
+                        "SMPP submission stopped before socket write"
+                    )
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
@@ -993,11 +1054,17 @@ class _SmppConnection:
             )
 
     def status(self):
+        configured_route_tps = max(0.0, float(self.config.get("tps") or 0))
         return {"slot": self.slot, "state": self.state, "connected": self.connected,
                 "last_error": self.last_error, "last_connected_at": self.last_connected_at,
                 "window_size": self.window_size, "inflight": len(self._sequence_tasks),
                 "send_queue_size": self._send_queue.qsize(),
-                "send_queue_capacity": self._send_queue_capacity}
+                "send_queue_capacity": self._send_queue_capacity,
+                "configured_route_tps": configured_route_tps,
+                "configured_per_bind_tps": None,
+                "effective_total_limit_tps": configured_route_tps * self.tps_multiplier,
+                "tps_scope": "route_shared",
+                "tps_unit": "submit_sm_parts/s"}
 
 
 class SmppGateway:

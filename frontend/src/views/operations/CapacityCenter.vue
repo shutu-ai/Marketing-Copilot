@@ -61,8 +61,8 @@
         <el-table-column :label="$t('legacy.x89e1cf1b')" width="110">
           <template #default="{ row }">{{ pct(row.failure_rate_60m) }}</template>
         </el-table-column>
-        <el-table-column :label="$t('legacy.xc7e8969c')" width="110">
-          <template #default="{ row }">{{ row.submit_sm_tps_1m || 0 }} / {{ row.configured_tps || 0 }}</template>
+        <el-table-column :label="$t('legacy.xc7e8969c') + ' (' + (stats.summary.tps_unit || 'submit_sm_parts/s') + ') '" width="170">
+          <template #default="{ row }">{{ row.observed_parts_tps || 0 }} / {{ row.effective_total_limit_tps || 0 }}</template>
         </el-table-column>
         <el-table-column :label="$t('legacy.xa2b83df0')" min-width="150">
           <template #default="{ row }">{{ errorText(row) }}</template>

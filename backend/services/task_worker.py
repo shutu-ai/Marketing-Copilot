@@ -152,10 +152,25 @@ def _claim_dispatch_loop(task_queue):
 
         for task in tasks:
             while not _stop.is_set():
+                enqueue_started = time.monotonic()
                 try:
                     task_queue.put(task, timeout=0.2)
+                    metrics_service.observe_histogram(
+                        "marketing_copilot_task_dispatch_queue_enqueue_wait_seconds",
+                        time.monotonic() - enqueue_started,
+                    )
+                    metrics_service.set_gauge(
+                        "marketing_copilot_task_dispatch_queue_depth", task_queue.qsize(),
+                    )
                     break
                 except queue.Full:
+                    metrics_service.observe_histogram(
+                        "marketing_copilot_task_dispatch_queue_enqueue_wait_seconds",
+                        time.monotonic() - enqueue_started,
+                    )
+                    metrics_service.inc(
+                        "marketing_copilot_task_dispatch_queue_full_total",
+                    )
                     continue
 
 

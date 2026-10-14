@@ -1,0 +1,98 @@
+{
+  "task": "Marketing_Copilot_SMPP_Send_Hotpath_TPS_Optimization_Codex_Task.md",
+  "baseline_sha": "398e0e8b0d06cd774480f8240333406857d01459",
+  "implementation_sha": "UNCOMMITTED",
+  "commit_push": "NOT_DONE",
+  "overall_status": "PASS_WITH_LIMITATIONS",
+  "production_safety": {
+    "real_smsc_connected": false,
+    "real_sms_sent": false,
+    "live_smsc_sampling": "NOT_RUN",
+    "sles12sp5": "NOT_RUN"
+  },
+  "environment": {
+    "host": "Windows 11 workspace",
+    "python": "CPython 3.11 (.p0-test-venv)",
+    "database": "isolated DuckDB for benchmark; local acceptance runtime database",
+    "fake_smsc": "127.0.0.1 loopback only",
+    "tps_unit": "submit_sm_parts/s",
+    "tps_scope": "route_shared"
+  },
+  "external_production_evidence": {
+    "status": "EXTERNAL_PROVIDED_NOT_REPLAYED",
+    "source": "user-provided task brief / production report",
+    "route_tps_scope": "CAP_UNKNOWN",
+    "near_500_tps_metric": "NOT_COMPARABLE"
+  },
+  "authorization_hotpath_benchmark": {
+    "status": "PASS_WITH_LIMITATIONS",
+    "rounds": 1,
+    "planned_parts": 1,
+    "same_machine_and_isolated_db": true,
+    "baseline": {
+      "authorize_mean_ms": 190.997,
+      "authorize_p50_ms": 194.513,
+      "authorize_p95_ms": 242.876,
+      "authorize_p99_ms": 255.72,
+      "lock_hold_mean_ms": 47.22,
+      "insert_statements": 350,
+      "select_statements": 250,
+      "update_statements": 50,
+      "commit_count": 100
+    },
+    "current": {
+      "authorize_mean_ms": 169.238,
+      "authorize_p50_ms": 172.435,
+      "authorize_p95_ms": 218.627,
+      "authorize_p99_ms": 238.018,
+      "lock_hold_mean_ms": 43.59,
+      "insert_statements": 300,
+      "select_statements": 250,
+      "update_statements": 50,
+      "commit_count": 100
+    },
+    "formal_ab": "NOT_PROVEN",
+    "statement_reduction_for_planned_parts_4": "TESTED_SET_BASED_INSERT"
+  },
+  "loopback_stress_1k": {
+    "status": "PASS",
+    "input_rows": 1000,
+    "tasks_accepted": 1000,
+    "submit_sm": 1000,
+    "submit_sm_success": 1000,
+    "duplicate_send_tasks": 0,
+    "lost_submit_mappings": 0,
+    "unknown_submit_ids": 0,
+    "multipart_distribution": {
+      "1": 1000
+    },
+    "business_sms_per_second": 3.794,
+    "observed_parts_per_second": 3.794,
+    "queue_backlog_max": 916,
+    "queue_backlog_final": 0,
+    "task_to_submit_sm_resp_latency_ms": {
+      "p50": 118095.008,
+      "p95": 234863.969,
+      "p99": 246647.997
+    },
+    "evidence": ".tmp/smpp-hotpath-e2e-stress1k-final-20261014.json",
+    "formal_throughput_target": "NOT_PROVEN"
+  },
+  "acceptance_gates": {
+    "SEND_CORRECTNESS": "PASS_WITH_LIMITATIONS",
+    "THROTTLE_SEMANTICS": "PASS_WITH_LIMITATIONS",
+    "AUTHORIZATION_HOTPATH": "PASS_WITH_LIMITATIONS",
+    "SMPP_WINDOW_UTILIZATION": "NOT_PROVEN",
+    "PERFORMANCE_AB": "NOT_PROVEN",
+    "THROUGHPUT_TARGET": "NOT_RUN",
+    "LONG_SOAK": "NOT_RUN",
+    "LIVE_SMSC": "NOT_RUN"
+  },
+  "not_run": [
+    "formal 1K/3K/10K baseline-vs-optimized A/B with at least three rounds",
+    "fake SMSC stair-step at or above 200 submit_sm parts/s",
+    "five-minute non-empty-queue soak and HIGH-to-LOW-to-RESUME cycle",
+    "SLES12SP5 deployment validation",
+    "read-only production sampling"
+  ]
+}

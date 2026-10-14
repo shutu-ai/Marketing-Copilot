@@ -1007,10 +1007,13 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
     if not attempt_token:
         attempt_token = f"{claim_token or 'external'}:{uuid.uuid4().hex}"
     source_namespace = smpp_source_namespace(smpp_config_id)
+    planned_parts = max(1, int(planned_parts))
 
     def authorize(conn):
         row = conn.execute(
-            "SELECT * FROM sms_tasks WHERE id=? AND status='sending' AND claim_token=?",
+            """SELECT id,campaign_type,campaign_id,task_date,claim_token,status
+               FROM sms_tasks
+               WHERE id=? AND status='sending' AND claim_token=?""",
             (int(task["id"]), claim_token),
         ).fetchone()
         if not row:
@@ -1044,43 +1047,70 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
                    lease_until=excluded.lease_until,
                    updated_at=excluded.updated_at""",
             (attempt_token, int(task["id"]), claim_token, source_namespace,
-             int(smpp_config_id), int(slot), max(1, int(planned_parts))),
+             int(smpp_config_id), int(slot), planned_parts),
         )
-        for part_no in range(1, max(1, int(planned_parts)) + 1):
-            conn.execute(
-                """INSERT INTO sms_send_parts
-                      (attempt_token,part_no,connection_generation,source_namespace,state,updated_at)
-                   VALUES (?,?,?,?,'planned',CURRENT_TIMESTAMP)
-                   ON CONFLICT(attempt_token,part_no) DO NOTHING""",
-                (attempt_token, part_no, str(connection_generation or ""), source_namespace),
-            )
-        try:
-            from services import campaign_capacity_service
-            route_id = int(current.get("transport_smpp_config_id") or smpp_config_id or 0)
-            # A per-submit route COUNT(*) held the writer gate while the
-            # sender was on its durable-before-socket authorization path.
-            # Backlog is observability-only; retain the activity timestamp
-            # without turning each SMS authorization into a table rescan.
-            campaign_capacity_service.record_activity_event(
-                conn, current.get("campaign_type"), int(current.get("campaign_id") or 0),
-                "submit", route_id=route_id, backlog=None,
-            )
-        except Exception:
-            pass
+        # Keep every planned part durable before socket I/O, but materialize a
+        # multipart range in one statement.  The former one-INSERT-per-part
+        # loop multiplied writer-gate work for the normal 3-4-part message.
+        conn.execute(
+            """INSERT INTO sms_send_parts
+                  (attempt_token,part_no,connection_generation,source_namespace,state,updated_at)
+               SELECT ?, part_no + 1, ?, ?, 'planned', CURRENT_TIMESTAMP
+               FROM range(?) AS planned(part_no)
+               ON CONFLICT(attempt_token,part_no) DO NOTHING""",
+            (attempt_token, str(connection_generation or ""), source_namespace,
+             planned_parts),
+        )
+        # ``last_submit_at`` is a dashboard/fairness observation, not part of
+        # the send fence.  It is recorded once per campaign in the buffered
+        # result transaction below, rather than adding one more writer-gate
+        # statement to every pre-wire authorization.
         _add_task_event(
             conn, int(task["id"]), "submit_authorized", "sending", "sending",
             "SMPP submit authorization acquired before socket write",
             {"claim_token": claim_token, "attempt_token": attempt_token,
-             "planned_parts": max(1, int(planned_parts))},
+             "planned_parts": planned_parts},
         )
         return True
 
-    if not write_transaction(authorize, attempts=3, operation="sms_task.submit_authorize", base_delay=0.05):
+    authorization_started = time.perf_counter()
+    authorization_result = "error"
+    try:
+        authorized = write_transaction(
+            authorize, attempts=3, operation="sms_task.submit_authorize", base_delay=0.05,
+        )
+        authorization_result = "success" if authorized else "denied"
+    except TimeoutError:
+        authorization_result = "timeout"
+        metrics_service.inc(
+            "marketing_copilot_smpp_submit_authorize_timeouts_total",
+            labels={"config_id": smpp_config_id, "slot": slot},
+        )
+        raise
+    finally:
+        metrics_service.observe_histogram(
+            "marketing_copilot_smpp_submit_authorize_seconds",
+            time.perf_counter() - authorization_started,
+            labels={
+                "config_id": smpp_config_id,
+                "slot": slot,
+                "result": authorization_result,
+            },
+        )
+    if not authorized:
+        metrics_service.inc(
+            "marketing_copilot_smpp_submit_authorize_denied_total",
+            labels={"config_id": smpp_config_id, "slot": slot},
+        )
         task["_submit_gate_reason"] = (
             "task claim is no longer owned or the campaign send window is closed"
         )
         task["_submit_gate_denied"] = True
         return ""
+    metrics_service.inc(
+        "marketing_copilot_smpp_submit_authorize_success_total",
+        labels={"config_id": smpp_config_id, "slot": slot},
+    )
     task["_attempt_token"] = attempt_token
     task["_source_namespace"] = source_namespace
     return attempt_token
@@ -1203,6 +1233,27 @@ def _apply_part_result(conn, task_id: int, claim_token: str, attempt_token: str,
         )])
 
 
+def _record_submit_activity(conn, activity_keys) -> None:
+    """Persist dashboard submit timestamps at result-batch granularity.
+
+    This metadata is not an authorization or fairness fence.  Keep failures
+    best-effort as before, but avoid holding the sender's durable pre-wire
+    transaction for a write that is only consumed by the capacity snapshot.
+    """
+    try:
+        from services import campaign_capacity_service
+    except Exception:
+        return
+    for campaign_type, campaign_id, route_id in activity_keys:
+        try:
+            campaign_capacity_service.record_activity_event(
+                conn, campaign_type, campaign_id, "submit", route_id=route_id,
+                backlog=None,
+            )
+        except Exception:
+            logger.debug("Unable to record buffered submit activity", exc_info=True)
+
+
 def _apply_disabled_submitted_batch(conn, payloads) -> None:
     """Finalize no-DLR successes with one set-based task update.
 
@@ -1296,6 +1347,7 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
     batch_delivered_increments = {}
     daily_sent_increments = {}
     event_groups = {}
+    submit_activity = set()
     for task_id in updated_ids:
         row = rows_by_id.get(task_id)
         if not row:
@@ -1304,6 +1356,11 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
             row["campaign_type"], row["campaign_id"], row["batch_id"], row["status"]
         )
         event_groups.setdefault(event_key, []).append(task_id)
+        payload = latest[task_id]
+        submit_activity.add((
+            row["campaign_type"], int(row["campaign_id"]),
+            int(payload.get("transport_smpp_config_id") or 0),
+        ))
         if row["batch_id"]:
             batch_id = int(row["batch_id"])
             campaign_id = int(row["campaign_id"])
@@ -1333,6 +1390,8 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
         )
     else:
         _add_task_event_batch_summaries(conn, event_summaries)
+
+    _record_submit_activity(conn, submit_activity)
 
     if batch_delivered_increments:
         values = ",".join("(?,?)" for _ in batch_delivered_increments)
@@ -1464,6 +1523,7 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
     batch_delivered_increments = {}
     daily_sent_increments = {}
     event_groups = {}
+    submit_activity = set()
     for task_id, task_payloads in grouped.items():
         row = rows_by_id.get(task_id)
         existing_ids = []
@@ -1508,6 +1568,10 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
         ).fetchone()
         if not updated:
             continue
+        submit_activity.add((
+            row["campaign_type"], int(row["campaign_id"]),
+            int(payload.get("transport_smpp_config_id") or 0),
+        ))
         # Only the currently owned claim may publish message-id mappings.
         # A delayed callback from an expired attempt must not make an old SMSC
         # response addressable as if it belonged to the replacement attempt.
@@ -1543,6 +1607,8 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
             "submitted", from_status, to_status, task_group,
             {"buffered": True, "attempt_fenced": True},
         )
+
+    _record_submit_activity(conn, submit_activity)
 
     _insert_message_bindings(conn, mapping_rows)
     if batch_delivered_increments:

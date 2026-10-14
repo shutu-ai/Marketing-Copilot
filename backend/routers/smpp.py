@@ -65,9 +65,32 @@ def config_stats():
         item["last_error"] = "; ".join(
             str(conn.get("last_error") or "") for conn in connections if conn.get("last_error")
         )[:500]
-        item["configured_tps"] = (
-            (item.get("tps") or 0) * int(item.get("pool_size") or 1)
-            if item.get("enabled") else 0
+        # ``tps`` is a route/account ceiling shared by every pool slot.  Keep
+        # the old field as a compatibility alias, but never multiply it by
+        # pool_size or connected_count.
+        item["configured_route_tps"] = (
+            float(item.get("tps") or 0) if item.get("enabled") else 0.0
         )
-        item["connected_tps"] = (item.get("tps") or 0) * connected_count
+        item["configured_per_bind_tps"] = None
+        live_limits = [
+            float(conn.get("effective_total_limit_tps") or 0)
+            for conn in connections if conn.get("effective_total_limit_tps") is not None
+        ]
+        item["effective_total_limit_tps"] = (
+            live_limits[0] if live_limits else item["configured_route_tps"]
+        )
+        item["tps_scope"] = "route_shared"
+        item["tps_unit"] = "submit_sm_parts/s"
+        item["observed_parts_tps"] = item.get("submit_sm_tps_1m", 0.0)
+        item["configured_tps"] = item["configured_route_tps"]
+        item["connected_tps"] = item["effective_total_limit_tps"] if connected_count else 0.0
+    result["summary"]["configured_route_tps"] = sum(
+        item.get("configured_route_tps", 0.0) for item in result["items"]
+    )
+    result["summary"]["effective_total_limit_tps"] = sum(
+        item.get("effective_total_limit_tps", 0.0) for item in result["items"]
+    )
+    result["summary"]["tps_scope"] = "route_shared"
+    result["summary"]["tps_unit"] = "submit_sm_parts/s"
+    result["summary"]["observed_parts_tps"] = result["summary"].get("submit_sm_tps_1m", 0.0)
     return result
