@@ -1460,6 +1460,15 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
                     if expired_reason:
                         return {"success": False, "status": "expired", "message": expired_reason}
+                    if not backpressure_service.wait_for_ingestion(
+                        stop_event=stop_event, producing_chunks=True,
+                        work_units=len(matched_records),
+                    ):
+                        return {
+                            "success": False,
+                            "status": "stopped",
+                            "message": "realtime ingestion stopped while waiting for recovery budget",
+                        }
                     realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
                     chunk_result = sms_task_service.enqueue_rows(
                         "realtime", campaign, matched_records, original_filename,
@@ -1581,6 +1590,15 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
                 if expired_reason:
                     return {"success": False, "status": "expired", "message": expired_reason}
+                if matched_records and not backpressure_service.wait_for_ingestion(
+                    stop_event=stop_event, producing_chunks=True,
+                    work_units=len(matched_records),
+                ):
+                    return {
+                        "success": False,
+                        "status": "stopped",
+                        "message": "realtime ingestion stopped while waiting for recovery budget",
+                    }
                 task_result = sms_task_service.enqueue_rows(
                     "realtime", campaign, matched_records, original_filename,
                     ingestion_lease=(ingestion_file_id, lease_token), ingestion_chunk=excel_job,

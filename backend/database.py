@@ -491,6 +491,10 @@ class WrappedConnection:
         self._operation = ""
         self._connection_lock = threading.RLock()
         self._write_lock_held = False
+        # Keep the business operation captured at first gate acquisition.
+        # Later execute/commit phases must not relabel a long transaction as
+        # merely ``commit`` in contention diagnostics.
+        self._write_operation = ""
         self.write_lock_timeout = None
 
     def set_operation(self, operation: str):
@@ -501,10 +505,11 @@ class WrappedConnection:
     def _ensure_write_lock(self, operation: str) -> float:
         operation = self._operation or operation
         if self._write_lock_held:
-            _update_write_holder(operation)
+            _update_write_holder(self._write_operation or operation)
             return 0.0
         waited = _acquire_write_lock(operation, self.write_lock_timeout)
         self._write_lock_held = True
+        self._write_operation = operation
         return waited
 
     def _release_write_lock(self) -> None:
@@ -517,10 +522,11 @@ class WrappedConnection:
                 _observe_database_metric(
                     "marketing_copilot_database_write_lock_hold_seconds",
                     max(0.0, time.monotonic() - acquired_at),
-                    labels={"operation": operation or "unknown"},
+                    labels={"operation": self._write_operation or operation or "unknown"},
                 )
             _clear_write_holder()
             _write_lock.release()
+            self._write_operation = ""
 
     def _rollback_underlying(self) -> None:
         """Rollback without masking the original DuckDB exception."""

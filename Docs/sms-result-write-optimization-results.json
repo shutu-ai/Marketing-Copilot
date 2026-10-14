@@ -1,0 +1,62 @@
+{
+  "task": "Marketing_Copilot_SMS_Result_Batch_Write_And_Ingestion_Backpressure_Optimization_Codex_Task.md",
+  "date": "2026-10-14",
+  "baseline_sha": "a3440e57824c2452e1ee934e5fe03c631bb0f11d",
+  "implementation_sha": "UNCOMMITTED",
+  "root_cause": {
+    "status": "CONFIRMED_FROM_PROVIDED_OBSERVATIONS_AND_SOURCE",
+    "evidence": [
+      "Provided production anchor: sms_result_batch hold 42.6ms -> 346.2ms and submit_authorize wait 116ms -> 419ms",
+      "Provided production anchor: write lock timeout holder=sms_result_batch holder_age=5.253s",
+      "Source baseline: no-DLR task update was set-based but attempts and secondary counters used executemany; ingestion release had no shared recovery budget"
+    ]
+  },
+  "changed_files": [
+    "backend/database.py",
+    "backend/services/backpressure_service.py",
+    "backend/services/metrics_service.py",
+    "backend/services/realtime_campaign_service.py",
+    "backend/services/result_journal_service.py",
+    "backend/services/sms_task_service.py",
+    "backend/services/sms_write_buffer.py",
+    "backend/tests/test_live_duckdb_hotpath_backpressure.py",
+    "backend/tests/test_phase2_write_reduction.py",
+    "backend/tests/test_sms_result_recovery.py",
+    "Docs/SMS-Result-Write-Optimization-Baseline.md",
+    "Docs/SMS-Result-Write-Optimization-Acceptance.md",
+    "Docs/sms-result-write-optimization-results.json"
+  ],
+  "gates": {
+    "no_dlr_fast_path": {"status": "PASS", "evidence": "phase2 set-based and count-once tests; 1K/3K accepted=created tasks"},
+    "result_journal_crash_recovery": {"status": "PASS", "evidence": "test_db_commit_before_terminal_marker_replays_once plus existing recovery suite"},
+    "unknown_and_partial_safety": {"status": "PASS", "evidence": "DuckDB SMS reliability and SMPP async submission suites"},
+    "ingestion_ramp_up": {"status": "PASS_WITH_LIMITATIONS", "evidence": "shared token-bucket and stop-aware unit tests; sustained high-watermark stress not run"},
+    "duckdb_lock_contention": {"status": "NOT_RUN_AFTER_FIX", "before": "provided anchor only", "after": null},
+    "full_backend_tests": {"status": "PASS", "passed": 154, "skipped": 3, "duration_seconds": 148.99}
+  },
+  "ab": {
+    "environment": "Windows local, CPython 3.11, independent temporary DuckDB and Journal, no real SMSC",
+    "one_k": {
+      "no_dlr": {"baseline_seconds": 15.126, "implementation_seconds": 15.406, "baseline_commits": 56, "implementation_commits": 50, "baseline_accepted": 1000, "implementation_accepted": 1000},
+      "secondary_writes": {"baseline_seconds": 15.609, "implementation_seconds": 15.413, "baseline_commits": 39, "implementation_commits": 41, "both_attempts_accepted": 1000, "both_batch_delivered": 1000, "both_daily_sent": 1000}
+    },
+    "three_k": {
+      "no_dlr": {"baseline_seconds": 45.242, "implementation_seconds": 45.177, "baseline_commits": 148, "implementation_commits": 161, "baseline_accepted": 3000, "implementation_accepted": 3000},
+      "secondary_writes": {"baseline_seconds": 45.568, "implementation_seconds": 45.699, "baseline_commits": 115, "implementation_commits": 128, "both_attempts_accepted": 3000, "both_batch_delivered": 3000, "both_daily_sent": 3000}
+    },
+    "interpretation": "Correctness and count-once gates pass; single-thread wall-clock improvement is not demonstrated and remains limited by Journal/fsync and collection timing."
+  },
+  "not_run": [
+    "10K_AB",
+    "LONG_SOAK",
+    "SLES12SP5",
+    "LIVE_SMSC",
+    "post-fix production gate wait/hold P50/P95/P99"
+  ],
+  "commit_push": "NOT_DONE",
+  "raw_artifacts": {
+    "persistent_path": null,
+    "note": "Benchmarks used temporary independent databases and terminal JSON output; no runtime database, Journal, log, upload, or secret was added to the repository."
+  },
+  "final_status": "PASS_WITH_LIMITATIONS"
+}

@@ -40,6 +40,24 @@ def _counter(name):
                if key == "marketing_copilot_sms_write_" + name)
 
 
+@pytest.fixture
+def result_db(tmp_path):
+    sms_write_buffer.flush()
+    database.set_database_file(str(tmp_path / "result-recovery.duckdb"))
+    database.init_db()
+    conn = database.get_connection()
+    task_id = conn.execute(
+        """INSERT INTO sms_tasks
+           (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status)
+           VALUES ('batch',1,'recovery','25190001','hello','recovery-1','sending')
+           RETURNING id"""
+    ).fetchone()["id"]
+    conn.commit()
+    conn.close()
+    yield task_id
+    sms_write_buffer.flush()
+
+
 def test_ack_outage_groups_1000_events_and_recovers(buffer_state, monkeypatch):
     buffer = buffer_state
     items = _items(buffer, 1000)
@@ -143,6 +161,66 @@ def test_metrics_observe_each_actual_transaction_once(buffer_state, monkeypatch)
     assert _counter("batch_items_count") == 4
     assert _counter("batch_items_sum") == 1000
     assert _counter("committed_total") == 1000
+
+
+def test_db_commit_before_terminal_marker_replays_once(result_db, monkeypatch):
+    payload = {
+        "task_id": result_db,
+        "message_ids": [],
+        "delivery_receipt_mode": "disabled",
+        "claim_token": "",
+        "attempt_token": "",
+        "submit_sm_parts": 1,
+    }
+    event_id, journal_path = result_journal_service.append_event("submitted", payload)
+    committed = sms_write_buffer.WriteItem(
+        "submitted", payload, event_id=event_id, journal_path=journal_path,
+        sequence=1, db_committed=True, terminal_state="committed",
+    )
+    sms_write_buffer._commit_transaction_batch([committed])
+
+    conn = database.get_connection()
+    assert conn.execute(
+        "SELECT status FROM sms_tasks WHERE id=?", (result_db,)
+    ).fetchone()["status"] == "accepted"
+    conn.close()
+
+    original_append_terminal = result_journal_service.append_terminal
+    monkeypatch.setattr(
+        result_journal_service,
+        "append_terminal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("injected marker crash")),
+    )
+    sms_write_buffer._pending = {event_id: committed}
+    sms_write_buffer._retry_heap = []
+    sms_write_buffer._ack_terminal_items([committed])
+    assert result_journal_service.load_state(journal_path)["pending"]
+
+    monkeypatch.setattr(result_journal_service, "append_terminal", original_append_terminal)
+    replay = sms_write_buffer.WriteItem(
+        "submitted", payload, event_id=event_id, journal_path=journal_path,
+        sequence=2, db_committed=False, terminal_state="committed",
+    )
+    sms_write_buffer._pending = {event_id: replay}
+    sms_write_buffer._commit_transaction_batch([replay])
+    sms_write_buffer._ack_terminal_items([replay])
+
+    state = result_journal_service.load_state(journal_path)
+    conn = database.get_connection()
+    task = conn.execute(
+        "SELECT status FROM sms_tasks WHERE id=?", (result_db,)
+    ).fetchone()
+    event_count = conn.execute(
+        "SELECT COUNT(*) count FROM sms_result_events WHERE event_id=?", (event_id,)
+    ).fetchone()["count"]
+    summary_count = conn.execute(
+        "SELECT COALESCE(SUM(event_count),0) count FROM task_event_batches WHERE event_type='submitted'"
+    ).fetchone()["count"]
+    conn.close()
+    assert state["pending"] == []
+    assert task["status"] == "accepted"
+    assert event_count == 1
+    assert summary_count == 1
 
 
 def test_partial_commit_metrics_exclude_failed_chunk(buffer_state, monkeypatch):

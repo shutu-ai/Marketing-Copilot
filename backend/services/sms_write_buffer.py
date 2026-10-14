@@ -83,6 +83,25 @@ _last_ack_log_at = 0.0
 _ack_log_suppressed = 0
 
 
+def _observe_result_stage(stage: str, started: float, item_count: int = 0) -> None:
+    """Record non-sensitive result-batch stage timings."""
+    try:
+        from services import metrics_service
+        metrics_service.observe_histogram(
+            "marketing_copilot_sms_result_stage_seconds",
+            max(0.0, time.perf_counter() - started),
+            labels={"stage": str(stage)},
+        )
+        metrics_service.observe_histogram(
+            "marketing_copilot_sms_result_stage_items",
+            max(0, int(item_count or 0)),
+            labels={"stage": str(stage)},
+            buckets=(1, 10, 50, 100, 250, 500, 1000, 5000),
+        )
+    except Exception:
+        logger.debug("Failed to record SMS result batch stage metrics", exc_info=True)
+
+
 class _PartialCommitError(RuntimeError):
     """A later transaction chunk failed after earlier chunks committed."""
 
@@ -290,16 +309,20 @@ def _commit_transaction_batch(actionable: list[WriteItem]) -> None:
                 int(item.payload.get("task_id") or
                     (item.payload.get("task") or {}).get("id") or 0),
             ])
+        stage_started = time.perf_counter()
         inserted = conn.execute(
             f"""INSERT INTO sms_result_events(event_id,kind,task_id,created_at)
                 VALUES {values} ON CONFLICT(event_id) DO NOTHING
                 RETURNING event_id""",
             params,
         ).fetchall()
+        _observe_result_stage("event_id_fence_insert", stage_started, len(actionable))
         inserted_ids = {str(row["event_id"]) for row in inserted}
         fresh = [item for item in actionable if item.event_id in inserted_ids]
         if fresh:
+            stage_started = time.perf_counter()
             sms_task_service.apply_buffered_writes(conn, fresh)
+            _observe_result_stage("apply_buffered_writes", stage_started, len(fresh))
 
     write_transaction(
         commit_batch, attempts=3, operation="sms_result_batch", lock_timeout=10.0

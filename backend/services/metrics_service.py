@@ -191,6 +191,10 @@ def observe_runtime_state(worker_count=0, allow_cached: bool = False):
         set_gauge("marketing_copilot_ingestion_chunk_backlog", pressure["chunk_depth"])
         set_gauge("marketing_copilot_disk_used_percent", pressure["disk"]["used_pct"])
         set_gauge("marketing_copilot_disk_free_bytes", pressure["disk"]["free_bytes"])
+        ramp = pressure.get("ingestion_ramp", {})
+        set_gauge("marketing_copilot_realtime_ingestion_ramp_rate_tps", ramp.get("rate_tps", 0))
+        set_gauge("marketing_copilot_realtime_ingestion_ramp_tokens", ramp.get("tokens", 0))
+        set_gauge("marketing_copilot_realtime_ingestion_ramp_throttled_total", ramp.get("throttled", 0))
     except Exception:
         pass
     try:

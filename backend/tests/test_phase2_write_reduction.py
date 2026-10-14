@@ -190,6 +190,116 @@ def test_no_dlr_successes_use_one_set_based_update_without_message_ids(isolated_
     assert 1 <= len(updates) <= 30
 
 
+def test_no_dlr_secondary_state_updates_are_set_based_and_fenced(isolated_db, monkeypatch):
+    conn = database.get_connection()
+    campaign_id = conn.execute(
+        "INSERT INTO batch_campaigns(name,status) VALUES ('set-based','in_progress') RETURNING id"
+    ).fetchone()["id"]
+    batch_id = conn.execute(
+        """INSERT INTO batch_campaign_batches
+           (campaign_id,batch_index,start_row,end_row,total_count,task_count,status)
+           VALUES (?,0,0,120,120,120,'queued') RETURNING id""",
+        (campaign_id,),
+    ).fetchone()["id"]
+    stats_date = datetime.now().strftime("%Y-%m-%d")
+    conn.execute(
+        "INSERT INTO batch_campaign_daily_stats(campaign_id,stats_date,total_prospects,sent_count) VALUES (?,?,120,0)",
+        (campaign_id, stats_date),
+    )
+    conn.commit()
+    conn.close()
+    task_ids = _insert_tasks(120, batch_id=batch_id)
+
+    conn = database.get_connection()
+    attempts = []
+    for task_id in task_ids:
+        token = f"attempt-{task_id}"
+        attempts.append(token)
+        conn.execute(
+            """INSERT INTO sms_send_attempts
+               (attempt_token,task_id,claim_token,planned_parts,state)
+               VALUES (?,?,?,1,'responding')""",
+            (token, task_id, ""),
+        )
+    conn.commit()
+    conn.close()
+
+    statements = []
+    original_execute = database.WrappedConnection.execute
+
+    def tracked_execute(self, sql, params=None):
+        normalized = " ".join(str(sql).upper().split())
+        if any(marker in normalized for marker in (
+            "UPDATE SMS_SEND_ATTEMPTS AS",
+            "UPDATE BATCH_CAMPAIGN_BATCHES AS",
+            "UPDATE BATCH_CAMPAIGN_DAILY_STATS AS",
+        )):
+            statements.append(normalized)
+        return original_execute(self, sql, params)
+
+    monkeypatch.setattr(database.WrappedConnection, "execute", tracked_execute)
+    for task_id, attempt_token in zip(task_ids, attempts):
+        sms_task_service.mark_submitted(
+            task_id, [], "disabled", attempt_token=attempt_token, wait=False,
+        )
+    sms_task_service.flush_pending_writes()
+
+    conn = database.get_connection()
+    task_count = conn.execute(
+        "SELECT COUNT(*) count FROM sms_tasks WHERE status='accepted' AND batch_id=?",
+        (batch_id,),
+    ).fetchone()["count"]
+    attempt_count = conn.execute(
+        "SELECT COUNT(*) count FROM sms_send_attempts WHERE state='accepted'"
+    ).fetchone()["count"]
+    batch = conn.execute(
+        "SELECT delivered_count,status FROM batch_campaign_batches WHERE id=?",
+        (batch_id,),
+    ).fetchone()
+    daily = conn.execute(
+        "SELECT sent_count FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",
+        (campaign_id, stats_date),
+    ).fetchone()
+    conn.close()
+
+    assert task_count == 120
+    assert attempt_count == 120
+    assert batch["delivered_count"] == 120
+    assert batch["status"] == "sent"
+    assert daily["sent_count"] == 120
+    # The buffer may create a few transactions due to fsync/collection timing,
+    # but each transaction uses one statement per secondary table, never one
+    # UPDATE per task.
+    assert len(statements) < 30
+
+
+def test_no_dlr_stale_attempt_cannot_finalize_current_claim(isolated_db):
+    task_id = _insert_tasks(1)[0]
+    conn = database.get_connection()
+    conn.execute("UPDATE sms_tasks SET claim_token='current-claim' WHERE id=?", (task_id,))
+    conn.execute(
+        """INSERT INTO sms_send_attempts
+           (attempt_token,task_id,claim_token,planned_parts,state)
+           VALUES ('old-attempt',?,'current-claim',1,'responding')""",
+        (task_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    sms_task_service.mark_submitted(
+        task_id, [], "disabled", claim_token="current-claim",
+        attempt_token="replacement-attempt", wait=False,
+    )
+    sms_task_service.flush_pending_writes()
+
+    conn = database.get_connection()
+    row = conn.execute(
+        "SELECT status FROM sms_tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    conn.close()
+    assert row["status"] == "sending"
+
+
 def test_hot_writes_use_independent_bounded_queues(isolated_db):
     state = sms_write_buffer.status()
     assert set(state["queue_depths"]) == {

@@ -97,6 +97,38 @@ def test_ingestion_capacity_wait_resumes_after_low_watermark(monkeypatch):
     assert sleeps == [0.05]
 
 
+def test_ingestion_recovery_ramp_admits_shared_chunk_budget(monkeypatch):
+    monkeypatch.setattr(
+        backpressure_service,
+        "_ramp",
+        {
+            "rate": backpressure_service._RAMP_INITIAL_TPS,
+            "tokens": 0.0,
+            "last_at": backpressure_service.time.monotonic(),
+            "last_resume_at": 0.0,
+            "paused": False,
+            "seen_task_pause": False,
+            "admitted": 0,
+            "throttled": 0,
+        },
+    )
+    states = iter([
+        (["tasks"], {"paused": {"tasks": True}}),
+        ([], {"paused": {"tasks": False}}),
+        ([], {"paused": {"tasks": False}}),
+        *([([], {"paused": {"tasks": False}})] * 8),
+    ])
+    monkeypatch.setattr(backpressure_service, "reasons", lambda **_kwargs: next(states))
+
+    assert backpressure_service.wait_for_ingestion(
+        producing_chunks=True, work_units=1, interval=0.01,
+    )
+    ramp = backpressure_service._ramp_snapshot()
+    assert ramp["seen_task_pause"] is True
+    assert ramp["admitted"] == 1
+    assert ramp["rate_tps"] >= backpressure_service._RAMP_INITIAL_TPS
+
+
 def test_stopped_capacity_wait_does_not_write_retry_state(isolated_db, monkeypatch):
     conn = database.get_connection()
     campaign_id = conn.execute(

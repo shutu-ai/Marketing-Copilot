@@ -219,6 +219,55 @@ def _add_task_event_batch_summary(conn, campaign_type: str, campaign_id: int,
     )
 
 
+def _add_task_event_batch_summaries(conn, summaries) -> None:
+    """Insert several aggregated event summaries with one statement.
+
+    Result batches can contain tasks from several campaign batches.  The
+    summary rows are already aggregated in Python, so issuing one INSERT per
+    group only adds writer-gate round trips without improving correctness.
+    """
+    rows = []
+    for summary in summaries:
+        (campaign_type, campaign_id, batch_id, event_type, from_status,
+         to_status, event_count, first_task_id, last_task_id, detail) = summary
+        if not event_count:
+            continue
+        rows.append((
+            campaign_type, int(campaign_id), batch_id, event_type, from_status,
+            to_status, int(event_count), int(first_task_id), int(last_task_id),
+            json.dumps(detail or {}, ensure_ascii=False, default=str),
+        ))
+    if not rows:
+        return
+    values = ",".join("(?,?,?,?,?,?,?,?,?,?)" for _ in rows)
+    conn.execute(
+        f"""INSERT INTO task_event_batches
+           (campaign_type,campaign_id,batch_id,event_type,from_status,to_status,
+            event_count,first_task_id,last_task_id,detail)
+           VALUES {values}""",
+        [value for row in rows for value in row],
+    )
+
+
+def _observe_result_stage(stage: str, started: float, item_count: int = 0) -> None:
+    """Expose bounded, non-sensitive timings for result-batch sub-stages."""
+    try:
+        metrics_service.observe_histogram(
+            "marketing_copilot_sms_result_stage_seconds",
+            max(0.0, time.perf_counter() - started),
+            labels={"stage": str(stage)},
+        )
+        metrics_service.observe_histogram(
+            "marketing_copilot_sms_result_stage_items",
+            max(0, int(item_count or 0)),
+            labels={"stage": str(stage)},
+            buckets=(1, 10, 50, 100, 250, 500, 1000, 5000),
+        )
+    except Exception:
+        # Observability must never change result durability semantics.
+        logger.debug("Failed to record SMS result stage metrics", exc_info=True)
+
+
 def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
                                   message: str = "campaign cancelled") -> int:
     """Mark not-yet-submitted campaign tasks terminal so workers cannot claim them."""
@@ -852,11 +901,16 @@ def apply_buffered_writes(conn, items) -> None:
     """Apply one buffered delivery batch inside a single database transaction."""
     # Persist intents and per-part facts before folding the task-level result.
     # All changes share the caller's explicit transaction and event-id fence.
+    stage_started = time.perf_counter()
+    intent_count = 0
     for item in items:
         if item.kind == "send_intent":
             _apply_send_intent(conn, **item.payload)
+            intent_count += 1
         elif item.kind == "part_result":
             _apply_part_result(conn, **item.payload)
+            intent_count += 1
+    _observe_result_stage("intent_and_part_result", stage_started, intent_count)
     # The buffer polls its per-kind queues fairly, so message_id entries can be
     # interleaved with submitted/receipt entries. Collect them across the whole
     # transaction; otherwise each interleaved item breaks the batch and turns
@@ -894,26 +948,37 @@ def apply_buffered_writes(conn, items) -> None:
     ]
 
     if disabled_payloads:
+        stage_started = time.perf_counter()
         _apply_disabled_submitted_batch(conn, disabled_payloads)
+        _observe_result_stage("disabled_submitted", stage_started, len(disabled_payloads))
     if regular_payloads:
         # submit_sm_resp callbacks enqueue each part's message id immediately
         # for crash recovery; the later submitted event contains those same ids.
         # Combine both sources so a successful part reaches the indexed mapping
         # table only once per transaction.
+        stage_started = time.perf_counter()
         _apply_submitted_batch(conn, regular_payloads, regular_message_id_items)
+        _observe_result_stage("submitted", stage_started, len(regular_payloads))
     elif regular_message_id_items:
+        stage_started = time.perf_counter()
         _apply_message_id_batch(conn, regular_message_id_items)
+        _observe_result_stage("message_id", stage_started, len(regular_message_id_items))
 
+    stage_started = time.perf_counter()
+    secondary_count = 0
     for item in items:
         payload = item.payload
         if item.kind in {"message_id", "submitted", "send_intent", "part_result"}:
             continue
         if item.kind == "send_failure":
             _apply_send_failure(conn, **payload)
+            secondary_count += 1
         elif item.kind == "receipt":
             _apply_receipt(conn, **payload)
+            secondary_count += 1
         else:
             raise ValueError(f"unknown SMS buffered write kind: {item.kind}")
+    _observe_result_stage("failure_and_receipt", stage_started, secondary_count)
 
 
 def record_send_intent(task: dict, smpp_config_id: int, slot: int,
@@ -1171,6 +1236,14 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
             str(payload.get("claim_token") or ""),
             str(payload.get("attempt_token") or ""),
         ])
+    attempt_fence_sql = ""
+    if any(str(payload.get("attempt_token") or "") for payload in latest.values()):
+        attempt_fence_sql = """
+              AND (i.attempt_token='' OR EXISTS (
+                  SELECT 1 FROM sms_send_attempts a
+                  WHERE a.attempt_token=i.attempt_token
+                    AND a.task_id=t.id AND a.claim_token=i.claim_token
+              ))"""
     updated = conn.execute(
         f"""UPDATE sms_tasks AS t SET
                 status='accepted', smsc_message_ids='[]', error_msg='',
@@ -1187,6 +1260,7 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
                                         claim_token,attempt_token)
             WHERE t.id=i.task_id AND t.status IN ('sending','submitted','unknown')
               AND t.claim_token=i.claim_token
+              {attempt_fence_sql}
             RETURNING t.id""",
         params,
     ).fetchall()
@@ -1201,11 +1275,14 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
         if latest[task_id].get("attempt_token")
     ]
     if attempt_updates:
-        conn.executemany(
-            """UPDATE sms_send_attempts SET state='accepted',lease_until=NULL,
-               updated_at=CURRENT_TIMESTAMP
-               WHERE attempt_token=? AND task_id=? AND claim_token=?""",
-            attempt_updates,
+        values = ",".join("(?,?,?)" for _ in attempt_updates)
+        conn.execute(
+            f"""UPDATE sms_send_attempts AS a SET state='accepted',lease_until=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+                FROM (VALUES {values}) AS i(attempt_token,task_id,claim_token)
+                WHERE a.attempt_token=i.attempt_token
+                  AND a.task_id=i.task_id AND a.claim_token=i.claim_token""",
+            [value for row in attempt_updates for value in row],
         )
 
     rows_by_id = {int(row["id"]): row for row in before_rows}
@@ -1230,32 +1307,50 @@ def _apply_disabled_submitted_batch(conn, payloads) -> None:
                 daily_sent_increments.get(campaign_id, 0) + 1
             )
 
+    event_summaries = []
     for (campaign_type, campaign_id, batch_id, from_status), task_group in event_groups.items():
+        event_summaries.append((
+            campaign_type, campaign_id, batch_id, "submitted", from_status,
+            "accepted", len(task_group), min(task_group), max(task_group),
+            {"buffered": True, "no_delivery_receipt": True, "set_based": True},
+        ))
+    if len(event_summaries) == 1:
+        # Keep the existing helper as the compatibility seam for small/legacy
+        # callers that provide a minimal in-memory schema in unit tests.
+        (event_key, task_group), = event_groups.items()
+        campaign_type, campaign_id, batch_id, from_status = event_key
         _add_task_event_batch(
-            conn, campaign_type, campaign_id, batch_id,
-            "submitted", from_status, "accepted", task_group,
+            conn, campaign_type, campaign_id, batch_id, "submitted", from_status,
+            "accepted", task_group,
             {"buffered": True, "no_delivery_receipt": True, "set_based": True},
         )
+    else:
+        _add_task_event_batch_summaries(conn, event_summaries)
 
     if batch_delivered_increments:
-        conn.executemany(
-            """UPDATE batch_campaign_batches
-               SET delivered_count=COALESCE(delivered_count,0)+?,
+        values = ",".join("(?,?)" for _ in batch_delivered_increments)
+        conn.execute(
+            f"""UPDATE batch_campaign_batches AS b SET
+                   delivered_count=COALESCE(b.delivered_count,0)+i.delta,
                    status=CASE
-                     WHEN task_count>0 AND COALESCE(delivered_count,0)+?>=task_count
-                     THEN 'sent' ELSE status END,
-                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-            [(count, count, batch_id) for batch_id, count in batch_delivered_increments.items()],
+                     WHEN b.task_count>0 AND COALESCE(b.delivered_count,0)+i.delta>=b.task_count
+                     THEN 'sent' ELSE b.status END,
+                   updated_at=CURRENT_TIMESTAMP
+                FROM (VALUES {values}) AS i(batch_id,delta)
+                WHERE b.id=i.batch_id""",
+            [value for batch_id, count in batch_delivered_increments.items()
+             for value in (batch_id, count)],
         )
         stats_date = datetime.now().astimezone().strftime("%Y-%m-%d")
-        conn.executemany(
-            """UPDATE batch_campaign_daily_stats
-               SET sent_count=COALESCE(sent_count,0)+?, updated_at=CURRENT_TIMESTAMP
-               WHERE campaign_id=? AND stats_date=?""",
-            [
-                (count, campaign_id, stats_date)
-                for campaign_id, count in daily_sent_increments.items()
-            ],
+        values = ",".join("(?,?)" for _ in daily_sent_increments)
+        conn.execute(
+            f"""UPDATE batch_campaign_daily_stats AS s SET
+                   sent_count=COALESCE(s.sent_count,0)+i.delta,
+                   updated_at=CURRENT_TIMESTAMP
+                FROM (VALUES {values}) AS i(campaign_id,delta)
+                WHERE s.campaign_id=i.campaign_id AND s.stats_date=?""",
+            [value for campaign_id, count in daily_sent_increments.items()
+             for value in (campaign_id, count)] + [stats_date],
         )
 
 

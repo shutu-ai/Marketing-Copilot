@@ -115,13 +115,35 @@ def _append(records: list[dict[str, Any]], journal_path: Optional[str] = None,
     start()
     target = os.path.abspath(journal_path or _path())
     request = _AppendRequest(path=target, records=records)
+    started = time.perf_counter()
     deadline = time.monotonic() + max(0.0, timeout)
     _queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
     if not request.done.wait(max(0.0, deadline - time.monotonic())):
         raise TimeoutError("SMS result journal fsync timed out")
     if request.error:
         raise request.error
+    _observe_journal_metric("append_wait_seconds", time.perf_counter() - started)
     return target
+
+
+def _observe_journal_metric(stage: str, duration: float, item_count: int = 0) -> None:
+    """Record bounded journal timings without making metrics a durability dependency."""
+    try:
+        from services import metrics_service
+        metrics_service.observe_histogram(
+            "marketing_copilot_sms_result_stage_seconds",
+            duration,
+            labels={"stage": f"journal_{stage}"},
+        )
+        if item_count:
+            metrics_service.observe_histogram(
+                "marketing_copilot_sms_result_stage_items",
+                item_count,
+                labels={"stage": f"journal_{stage}"},
+                buckets=(1, 10, 50, 100, 250, 500, 1000, 5000),
+            )
+    except Exception:
+        pass
 
 
 def append_event(kind: str, payload: dict[str, Any], timeout: float = 10.0,
@@ -245,6 +267,7 @@ def _writer_loop() -> None:
             except queue.Empty:
                 break
         error: Optional[BaseException] = None
+        fsync_started = time.perf_counter()
         try:
             by_path: dict[str, list[dict[str, Any]]] = {}
             for request in requests:
@@ -258,6 +281,10 @@ def _writer_loop() -> None:
                 _maybe_compact(target)
             _last_error = ""
             _last_fsync_at = time.time()
+            _observe_journal_metric(
+                "fsync_seconds", time.perf_counter() - fsync_started,
+                sum(len(records) for records in by_path.values()),
+            )
         except BaseException as exc:
             error = exc
             _last_error = str(exc)[:2000]
