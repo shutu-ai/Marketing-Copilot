@@ -1168,7 +1168,6 @@ def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
                     task["_fast_lease_id"] = fast_lease_id
                     task["_fast_campaign_status"] = "in_progress"
                     task["_attempt_token"] = f"fast:{fast_batch_id}:{task['id']}"
-                    fast_send_service.observe_claimed_task(task)
             for task in tasks:
                 metrics_service.inc(
                     "marketing_copilot_campaign_tasks_claimed_total",
@@ -1209,10 +1208,20 @@ def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
                 )
             return tasks
 
-        return write_transaction(
+        claimed_tasks = write_transaction(
             claim, attempts=3,
             operation="sms_tasks.fast_claim" if fast_mode else "sms_tasks.claim",
         )
+        if fast_mode:
+            # The durable claim is now committed.  Never acquire a campaign
+            # fence from inside the DuckDB writer transaction: campaign
+            # control takes the fence first and then the writer gate, so doing
+            # it in the opposite order recreates a Claim x Pause deadlock.
+            # The SQL generation fence remains authoritative if control wins
+            # this race before the local observation is published.
+            for task in claimed_tasks:
+                fast_send_service.observe_claimed_task(task)
+        return claimed_tasks
 
 
 def claim_next_task() -> Optional[dict]:
@@ -2283,6 +2292,19 @@ def _apply_submitted_batch(conn, payloads, message_id_items=()) -> None:
              str(payload.get("claim_token") or "")),
         ).fetchone()
         if not updated:
+            current = conn.execute(
+                "SELECT status,claim_token FROM sms_tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            logger.warning(
+                "Buffered submit callback fenced out task=%s current_status=%s "
+                "current_claim=%s payload_claim=%s attempt=%s",
+                task_id,
+                current["status"] if current else "missing",
+                current["claim_token"] if current else "",
+                str(payload.get("claim_token") or ""),
+                attempt_token,
+            )
             continue
         submit_activity.add((
             row["campaign_type"], int(row["campaign_id"]),

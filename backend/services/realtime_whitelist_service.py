@@ -892,9 +892,26 @@ def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
             write_transaction(write, operation="whitelist.version.activate")
         return {**campaign, "success": True, "whitelist_version_id": existing["id"],
                 "whitelist_status": existing["status"], "row_count": existing["row_count"]}
-    version, _duplicate = create_version(campaign_id, original_filename, file_path, source_hash)
-    source_path = os.path.join(source_dir, f"whitelist-v{int(version['version_no']):06d}{os.path.splitext(original_filename)[1].lower()}")
-    shutil.copy2(file_path, source_path)
+    # Materialize the durable source before publishing the ``building`` row.
+    # The scheduler can pick a new version immediately after create_version;
+    # recording the request's temporary UploadFile path first lets that worker
+    # race the router's finally block and observe FileNotFoundError.
+    fd, source_path = tempfile.mkstemp(
+        prefix="whitelist-upload-",
+        suffix=os.path.splitext(original_filename)[1].lower(),
+        dir=source_dir,
+    )
+    os.close(fd)
+    try:
+        shutil.copy2(file_path, source_path)
+    except Exception:
+        try:
+            os.unlink(source_path)
+        except OSError:
+            pass
+        raise
+    version, _duplicate = create_version(campaign_id, original_filename, source_path, source_hash)
+    source_path = version.get("source_path") or source_path
     def write(conn):
         conn.execute("UPDATE realtime_whitelist_versions SET source_path=?,row_count=? WHERE id=?",
                      (source_path, source_rows, version["id"]))

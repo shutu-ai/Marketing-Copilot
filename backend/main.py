@@ -17,6 +17,8 @@ from database import (
     is_database_read_error,
     is_transient_write_error,
     read_transaction,
+    start_stall_watchdog,
+    stop_stall_watchdog,
 )
 from auth import auth_middleware
 from services import update_service
@@ -159,6 +161,10 @@ def startup():
     from database import get_database_file, set_database_file
     set_database_file(db_config_service.get_effective_db_path(get_database_file()))
     init_db()
+    start_stall_watchdog(
+        os.environ.get("MC_STALL_DIAGNOSTICS_DIR"),
+        os.environ.get("MC_STALL_DIAGNOSTICS_THRESHOLD_SECONDS", "30"),
+    )
     from services import user_service
     user_service.bootstrap_admin()
     update_service.record_pending_result()
@@ -211,6 +217,10 @@ def shutdown():
         release_instance_lock()
     except Exception:
         logger.exception("Failed to release instance lock during shutdown")
+    try:
+        stop_stall_watchdog()
+    except Exception:
+        logger.exception("Failed to stop database stall watchdog during shutdown")
 
 
 @app.get("/api/health")

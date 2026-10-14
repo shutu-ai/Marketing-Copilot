@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +97,59 @@ def test_fast_claim_has_durable_batch_and_uncertain_attempts(fast_db):
     assert [row["state"] for row in items] == ["claimed"] * 3
     assert [row["planned_parts"] for row in items] == [0] * 3
     assert [row["state"] for row in attempts] == ["authorized"] * 3
+
+
+def test_fast_claim_publishes_local_fence_after_db_commit(fast_db, monkeypatch):
+    """Claim and control must not wait on each other through opposite locks."""
+    campaign_id = _campaign_and_tasks(1)
+    observation_started = threading.Event()
+    release_observation = threading.Event()
+    claim_result = []
+    claim_error = []
+
+    def delayed_observation(task):
+        observation_started.set()
+        assert release_observation.wait(timeout=2)
+
+    monkeypatch.setattr(
+        fast_send_service, "observe_claimed_task", delayed_observation,
+    )
+
+    def claim():
+        try:
+            claim_result.extend(sms_task_service.claim_next_fast_batch(1))
+        except Exception as exc:  # pragma: no cover - surfaced below
+            claim_error.append(exc)
+
+    claim_thread = threading.Thread(target=claim, daemon=True)
+    claim_thread.start()
+    assert observation_started.wait(timeout=2)
+
+    transition_result = []
+    transition_error = []
+
+    def pause():
+        try:
+            transition_result.append(
+                sms_task_service.transition_campaign_status(
+                    "batch", campaign_id, "in_progress", "paused",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - surfaced below
+            transition_error.append(exc)
+
+    transition_thread = threading.Thread(target=pause, daemon=True)
+    transition_thread.start()
+    transition_thread.join(timeout=1)
+    release_observation.set()
+    claim_thread.join(timeout=2)
+
+    assert not transition_thread.is_alive(), "control is blocked behind claim observation"
+    assert not claim_thread.is_alive(), "claim did not finish after observation release"
+    assert not transition_error
+    assert not claim_error
+    assert len(claim_result) == 1
+    assert transition_result and transition_result[0]["campaign"]["status"] == "paused"
 
 
 def test_fast_checkpoint_is_one_durable_event_for_normal_success(fast_db, monkeypatch):

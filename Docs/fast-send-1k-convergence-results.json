@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "as_of_sha": "WORKTREE_UNCOMMITTED",
+  "verified_remote_sha": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9",
+  "generated_at": "2026-10-14T18:24:00Z",
+  "decision": {
+    "local_ext4_equal_window": "PASS",
+    "production_fast_cutover": "NO_GO",
+    "production_default": "reliable",
+    "live_environment": "UNVERIFIED"
+  },
+  "fixed_window": {
+    "input_rows": 1000,
+    "input_files": 10,
+    "pool_size": 4,
+    "smpp_window": 50,
+    "route_tps": 200,
+    "send_queue_capacity": 2000,
+    "task_workers": 8,
+    "ingest_workers": 2,
+    "watch_copy_workers": 2,
+    "delivery_receipt_mode": "disabled",
+    "smsc": "local_loopback_only",
+    "run_root": "WSL ext4 (/tmp)"
+  },
+  "gates": {
+    "G0": "PASS_WITH_LIMITATIONS",
+    "G1_ingest_only": "NOT_RUN",
+    "G2_sender_only": "NOT_RUN",
+    "G3_fast_1k_x3": "PASS_LOCAL_EXT4",
+    "G3_reliable_1k_x3": "PASS_LOCAL_EXT4",
+    "G4_equal_window_ab": "PASS_LOCAL_EXT4",
+    "G5_stop_fault_restart_soak": "PARTIAL"
+  },
+  "runs": [
+    {"id": "wsl-ext4-fast-1", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 38.096, "queue_backlog_max": 400, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-fast-2", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 39.479, "queue_backlog_max": 340, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-fast-3", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 37.947, "queue_backlog_max": 419, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-reliable-1", "mode": "reliable", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.620, "queue_backlog_max": 722, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-reliable-2", "mode": "reliable", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.303, "queue_backlog_max": 744, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-reliable-3", "mode": "reliable", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.028, "queue_backlog_max": 741, "watchdog": "NO_STALL_CAPTURED"}
+  ],
+  "environment_limitations": [
+    {"id": "wsl-drvfs-fast-1k", "status": "FAIL", "accepted": 980, "submitted": 1000, "sending": 20, "failure": "SMS result journal fsync timed out on /mnt/d; retained as environment/storage evidence"},
+    {"id": "windows-native-duckdb", "status": "BLOCKED_ENV", "failure": "API exited 0xC0000374 in duckdb.cp313-win_amd64.pyd"}
+  ],
+  "invariants": {
+    "duplicate_send_tasks": 0,
+    "lost_submit_mappings": 0,
+    "misdelivered": 0,
+    "unknown_retry_violation": false,
+    "dlr_violation": false
+  },
+  "not_run": ["real_smsc", "sles12sp5_canary", "dedicated_G1", "dedicated_G2", "complete_G5_soak"]
+}

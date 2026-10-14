@@ -128,6 +128,28 @@ def test_whitelist_hash_is_built_once_and_reused(isolated_db):
     conn.close()
 
 
+def test_whitelist_source_is_durable_before_build_row_is_published(isolated_db, monkeypatch):
+    campaign_id, _campaign_dir = _campaign(isolated_db)
+    source = isolated_db / "uploaded-whitelist.csv"
+    source.write_text("msisdn,language\n090001,en\n", encoding="utf-8")
+    observed = {}
+    original_create_version = realtime_whitelist_service.create_version
+
+    def create_version_with_observation(campaign, filename, path, source_hash):
+        observed["exists_before_publish"] = Path(path).is_file()
+        return original_create_version(campaign, filename, path, source_hash)
+
+    monkeypatch.setattr(
+        realtime_whitelist_service, "create_version", create_version_with_observation
+    )
+    result = realtime_campaign_service.upload_customer_list(
+        campaign_id, str(source), source.name
+    )
+
+    assert observed["exists_before_publish"] is True
+    assert Path(result["customer_list_path"]).is_file()
+
+
 def test_transient_whitelist_conflict_reuses_valid_index_without_rebuild(isolated_db):
     campaign_id, campaign_dir = _campaign(isolated_db)
     source = campaign_dir / "whitelist.csv"

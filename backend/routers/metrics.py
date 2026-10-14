@@ -1,5 +1,8 @@
 import logging
+import sys
+import threading
 import time
+import traceback
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -95,6 +98,43 @@ def capacity_status():
             'database': {'write_lock': write_lock_status()},
             'metrics': metrics_service.snapshot(),
             'calculated_at': time.time()}
+
+
+@router.get('/api/metrics/stall-diagnostics')
+def stall_diagnostics():
+    """Return bounded in-process state and all Python thread stacks.
+
+    This endpoint is intentionally diagnostic-only.  It avoids opening a new
+    DuckDB connection so a stalled writer can still expose its in-memory lock
+    holder and the blocked call stacks to the local acceptance watchdog.
+    """
+    frames = sys._current_frames()
+    threads = []
+    for thread in threading.enumerate():
+        frame = frames.get(thread.ident)
+        threads.append({
+            'name': thread.name,
+            'ident': thread.ident,
+            'daemon': thread.daemon,
+            'alive': thread.is_alive(),
+            'stack': ''.join(traceback.format_stack(frame)) if frame else '',
+        })
+    try:
+        fast_send = fast_send_service.status()
+    except Exception as exc:
+        fast_send = {'error': f'{type(exc).__name__}: {exc}'}
+    try:
+        backpressure = backpressure_service.snapshot()
+    except Exception as exc:
+        backpressure = {'error': f'{type(exc).__name__}: {exc}'}
+    return {
+        'captured_at': time.time(),
+        'database': {'write_lock': write_lock_status()},
+        'threads': threads,
+        'workers': worker_status(),
+        'fast_send': fast_send,
+        'backpressure': backpressure,
+    }
 
 
 @router.get('/api/capacity/campaigns')

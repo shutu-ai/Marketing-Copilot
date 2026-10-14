@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import faulthandler
 import json
 import os
 import platform
@@ -22,6 +23,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -159,9 +161,17 @@ class AcceptanceRunner:
         self.scenario = args.scenario
         # Some managed Windows images expose a temp directory whose child
         # ACLs are stricter than its parent.  Keep the run isolated but place
-        # it under the writable repository root so a legitimate environment
-        # restriction is not mistaken for an application failure.
-        run_parent = REPO_ROOT / ".local-e2e-runs"
+        # it under the writable repository root by default.  WSL callers may
+        # opt into an ext4-backed root (for example /tmp) so a DrvFS fsync
+        # stall is not mistaken for an application lock or result-fold bug.
+        configured_run_root = str(
+            getattr(args, "run_root", "")
+            or os.environ.get("MC_LOCAL_E2E_RUN_ROOT", "")
+        ).strip()
+        run_parent = (
+            Path(configured_run_root).expanduser().resolve()
+            if configured_run_root else REPO_ROOT / ".local-e2e-runs"
+        )
         run_parent.mkdir(parents=True, exist_ok=True)
         self.root = run_parent / f"marketing-copilot-{self.scenario}-{uuid.uuid4().hex[:8]}"
         self.root.mkdir(parents=True, exist_ok=False)
@@ -189,6 +199,17 @@ class AcceptanceRunner:
         self.rows: list[dict] = []
         self.started_at = time.time()
         self.last_snapshot: dict = {}
+        self.last_snapshot_at = 0.0
+        self.last_runtime_snapshot_at = 0.0
+        self.diagnostics_dir = self.root / "diagnostics"
+        self.watchdog_stop = threading.Event()
+        self.watchdog_thread: threading.Thread | None = None
+        self.watchdog_samples: list[dict] = []
+        self.watchdog_events: list[dict] = []
+        self.watchdog_last_progress: dict | None = None
+        self.watchdog_last_progress_at = time.monotonic()
+        self.watchdog_stall_30_emitted = False
+        self.watchdog_stall_60_emitted = False
         # Keep the venv launcher path intact.  On Linux a venv's python is
         # commonly a symlink to the system interpreter; resolving it here
         # would make child API/SMSC processes lose the venv dependencies.
@@ -205,6 +226,7 @@ class AcceptanceRunner:
             raise ValueError("send mode must be reliable or fast")
         self.pool_size = max(1, int(getattr(args, "pool_size", 1) or 1))
         self.flash_sms = bool(getattr(args, "flash_sms", False))
+        self.no_live_observer = bool(getattr(args, "no_live_observer", False))
 
         events = int(args.events if args.events is not None else self.spec.get("events", 5))
         files = int(args.files if args.files is not None else self.spec.get("files", 1))
@@ -265,6 +287,8 @@ class AcceptanceRunner:
             "MC_FRONTEND_DIR": str(self.root / "no-dist"),
             "MC_INSTANCE_LOCK": str(self.root / "instance.lock"),
             "MC_LOG_PATH": str(self.root / "marketing-copilot.log"),
+            "MC_STALL_DIAGNOSTICS_DIR": str(self.diagnostics_dir),
+            "MC_STALL_DIAGNOSTICS_THRESHOLD_SECONDS": "30",
             "MC_SYSTEM_MODE": "production",
             "MC_AUTH_DISABLED": "1",
             "MC_LOG_LEVEL": "INFO",
@@ -356,7 +380,8 @@ class AcceptanceRunner:
         raise TimeoutError(f"Timed out waiting for {label}: {last_error}")
 
     def _http(self, method: str, path: str, payload: Any = None,
-              *, body: bytes | None = None, headers: dict[str, str] | None = None) -> tuple[int, Any]:
+              *, body: bytes | None = None, headers: dict[str, str] | None = None,
+              timeout: float = 10) -> tuple[int, Any]:
         request_headers = {"Accept": "application/json"}
         if headers:
             request_headers.update(headers)
@@ -368,7 +393,7 @@ class AcceptanceRunner:
             self.base_url + path, data=data, headers=request_headers, method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
                 if not raw:
                     return response.status, None
@@ -409,7 +434,7 @@ class AcceptanceRunner:
             time.sleep(0.25)
         raise TimeoutError(f"Timed out waiting for {label}: {last}")
 
-    def _wait_until(self, predicate, timeout: float, label: str, interval: float = 0.25):
+    def _wait_until(self, predicate, timeout: float, label: str, interval: float = 0.5):
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
@@ -425,16 +450,28 @@ class AcceptanceRunner:
 
     def _sample_runtime(self) -> None:
         for role, process in self.processes.items():
-            if process.poll() is None:
+            returncode = process.poll()
+            if role == "api" and returncode is not None:
+                if not any(
+                    item.get("event") == "process_exit" and item.get("role") == role
+                    for item in self.watchdog_events
+                ):
+                    self._capture_process_exit(role, returncode)
+                raise RuntimeError(f"API exited with code {returncode} (0x{returncode & 0xffffffff:08X})")
+            if returncode is None:
                 self.resource_samples.append(_safe_process_snapshot(process.pid, role))
         # Do not open DuckDB from this controller while the application is
         # running.  The application already exposes the same counters through
         # its read APIs, and a second Windows process can otherwise hold a
         # transient DuckDB lock against the real workers.
-        snapshot = self._live_snapshot()
-        if snapshot:
-            self.last_snapshot = snapshot
-            self.backlog_samples.append(int(snapshot.get("backlog", 0)))
+        now = time.monotonic()
+        if not self.no_live_observer and now - self.last_runtime_snapshot_at >= 1.0:
+            snapshot = self._live_snapshot(timeout=2)
+            self.last_runtime_snapshot_at = now
+            if snapshot:
+                self.last_snapshot = snapshot
+                self.last_snapshot_at = now
+                self.backlog_samples.append(int(snapshot.get("backlog", 0)))
         if self.args.max_memory_mb:
             limit = int(self.args.max_memory_mb) * 1024 * 1024
             if any(int(item.get("rss_bytes", 0) or 0) > limit for item in self.resource_samples[-4:]):
@@ -474,13 +511,16 @@ class AcceptanceRunner:
         except Exception:
             return {}
 
-    def _live_snapshot(self) -> dict:
+    def _live_snapshot(self, timeout: float = 10) -> dict:
         if not self.realtime_campaign_id:
             return {}
         try:
-            stats = self._api_json(
-                "GET", f"/api/realtime-campaigns/{self.realtime_campaign_id}/stats"
+            status, stats = self._http(
+                "GET", f"/api/realtime-campaigns/{self.realtime_campaign_id}/stats",
+                timeout=timeout,
             )
+            if status < 200 or status >= 300 or not isinstance(stats, dict):
+                return {}
             task_keys = (
                 "queued", "sending", "submitted", "accepted", "delivered",
                 "retrying", "failed", "partial", "unknown", "expired", "cancelled",
@@ -494,10 +534,13 @@ class AcceptanceRunner:
                 # The realtime campaign summary predates these terminal
                 # outcomes.  Use the normal task API for the bounded fault
                 # scenarios instead of opening DuckDB from this observer.
-                listed = self._api_json(
+                listed_status, listed = self._http(
                     "GET",
                     f"/api/sms-tasks?campaign_type=realtime&status={expected_status}&page_size=200",
+                    timeout=timeout,
                 )
+                if listed_status < 200 or listed_status >= 300 or not isinstance(listed, dict):
+                    listed = {}
                 task_counts[expected_status] = max(
                     task_counts.get(expected_status, 0),
                     len(listed.get("items") or []),
@@ -512,6 +555,221 @@ class AcceptanceRunner:
             }
         except Exception:
             return {}
+
+    def _watchdog_metrics(self) -> dict:
+        if self.no_live_observer:
+            return {"disabled": True}
+        try:
+            status, body = self._http("GET", "/api/metrics/status", timeout=2)
+            if status < 200 or status >= 300:
+                return {"error": f"HTTP {status}", "body": body}
+            return body if isinstance(body, dict) else {"body": body}
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _watchdog_db_snapshot(self) -> dict:
+        """Describe the deferred database part of a live watchdog snapshot.
+
+        DuckDB permits only compatible connection modes across processes.  A
+        second process opening the live database, even read-only, can hold the
+        file lock against the application's read-write connection.  The
+        watchdog therefore uses the live API/metrics/thread snapshots while
+        the service is running; ``_reconcile`` performs the authoritative
+        database aggregate after both child processes have stopped.
+        """
+        return {
+            "status": "deferred_until_shutdown",
+            "reason": "opening a second live DuckDB connection can create a false file-lock stall",
+            "campaign_id": self.realtime_campaign_id,
+            "authoritative_source": "post_shutdown_reconciliation",
+        }
+
+    def _watchdog_tail(self, path: Path, limit: int = 120) -> list[str]:
+        text = self._read_log(path)
+        return text.splitlines()[-limit:]
+
+    def _watchdog_snapshot(self, full: bool = False) -> dict:
+        live = {} if self.no_live_observer else self._live_snapshot(timeout=2)
+        submit_events = [
+            item for item in _read_jsonl(self.smsc_event_log)
+            if item.get("event_type") == "submit_sm"
+        ]
+        response_observed = sum(
+            1 for item in submit_events if not item.get("response_dropped", False)
+        )
+        task_counts = live.get("tasks") or {}
+        progress = {
+            "generated": int(live.get("task_total", 0) or 0),
+            "socket_submit": len(submit_events),
+            "response_observed": response_observed,
+            "task_accepted": int(task_counts.get("accepted", 0) or 0),
+        }
+        process_states = {
+            role: {
+                "pid": process.pid,
+                "running": process.poll() is None,
+                "returncode": process.poll(),
+            }
+            for role, process in self.processes.items()
+        }
+        snapshot = {
+            "captured_at": _utc_now(),
+            "progress": progress,
+            "live_snapshot": live,
+            "metrics": self._watchdog_metrics(),
+            "process_states": process_states,
+            "processes": [
+                _safe_process_snapshot(process.pid, role)
+                for role, process in self.processes.items()
+                if process.poll() is None
+            ],
+        }
+        if full:
+            snapshot.update({
+                "database": self._watchdog_db_snapshot(),
+                "logs": {
+                    "app": self._watchdog_tail(self.app_log),
+                    "api": self._watchdog_tail(self.api_log),
+                    "smsc": self._watchdog_tail(self.smsc_log),
+                },
+            })
+            try:
+                if self.no_live_observer:
+                    raise RuntimeError("live observer disabled")
+                status, body = self._http(
+                    "GET", "/api/metrics/stall-diagnostics", timeout=2
+                )
+                snapshot["api_stacks"] = {
+                    "status": status,
+                    "body": body,
+                }
+            except Exception as exc:
+                snapshot["api_stacks"] = {
+                    "error": f"{type(exc).__name__}: {exc}"
+                }
+            stack_path = self.diagnostics_dir / (
+                f"controller-threads-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.txt"
+            )
+            try:
+                with stack_path.open("w", encoding="utf-8") as handle:
+                    faulthandler.dump_traceback(file=handle, all_threads=True)
+                snapshot["controller_stack_file"] = str(stack_path)
+            except OSError as exc:
+                snapshot["controller_stack_error"] = str(exc)
+        return snapshot
+
+    def _watchdog_capture(self, threshold: int, snapshot: dict) -> None:
+        self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = self.diagnostics_dir / f"stall-{threshold}s-{stamp}.json"
+        payload = {
+            "threshold_seconds": threshold,
+            "no_progress_seconds": round(max(0.0, time.monotonic() - self.watchdog_last_progress_at), 3),
+            "last_progress": self.watchdog_last_progress,
+            "snapshot": snapshot,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+        self.watchdog_events.append({
+            "threshold_seconds": threshold,
+            "captured_at": payload["snapshot"].get("captured_at"),
+            "path": str(path),
+            "full": threshold >= 60,
+        })
+
+    def _capture_process_exit(self, role: str, returncode: int) -> None:
+        self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = self.diagnostics_dir / f"process-exit-{role}-{stamp}.json"
+        try:
+            snapshot = self._watchdog_snapshot(full=True)
+            path.write_text(json.dumps({
+                "event": "process_exit",
+                "role": role,
+                "returncode": returncode,
+                "returncode_hex": f"0x{returncode & 0xffffffff:08X}",
+                "captured_at": _utc_now(),
+                "snapshot": snapshot,
+            }, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+            self.watchdog_events.append({
+                "event": "process_exit",
+                "role": role,
+                "returncode": returncode,
+                "returncode_hex": f"0x{returncode & 0xffffffff:08X}",
+                "captured_at": snapshot.get("captured_at"),
+                "path": str(path),
+                "full": True,
+            })
+        except Exception as exc:
+            self.watchdog_events.append({
+                "event": "process_exit_diagnostic_failed",
+                "role": role,
+                "returncode": returncode,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    def _watchdog_loop(self) -> None:
+        while not self.watchdog_stop.wait(5):
+            try:
+                snapshot = self._watchdog_snapshot(full=False)
+                progress = snapshot["progress"]
+                now = time.monotonic()
+                if self.watchdog_last_progress is None or progress != self.watchdog_last_progress:
+                    self.watchdog_last_progress = dict(progress)
+                    self.watchdog_last_progress_at = now
+                    self.watchdog_stall_30_emitted = False
+                    self.watchdog_stall_60_emitted = False
+                no_progress = now - self.watchdog_last_progress_at
+                sample = {
+                    "captured_at": snapshot.get("captured_at"),
+                    "progress": progress,
+                    "no_progress_seconds": round(no_progress, 3),
+                    "live_snapshot": snapshot.get("live_snapshot", {}),
+                    "metrics": snapshot.get("metrics", {}),
+                    "process_states": snapshot.get("process_states", {}),
+                }
+                self.watchdog_samples.append(sample)
+                if no_progress >= 30 and not self.watchdog_stall_30_emitted:
+                    self._watchdog_capture(30, snapshot)
+                    self.watchdog_stall_30_emitted = True
+                if no_progress >= 60 and not self.watchdog_stall_60_emitted:
+                    self._watchdog_capture(60, self._watchdog_snapshot(full=True))
+                    self.watchdog_stall_60_emitted = True
+            except Exception as exc:
+                self.watchdog_samples.append({
+                    "captured_at": _utc_now(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+    def _start_watchdog(self) -> None:
+        if self.watchdog_thread and self.watchdog_thread.is_alive():
+            return
+        self.watchdog_stop.clear()
+        self.watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="local-e2e-no-progress-watchdog",
+            daemon=True,
+        )
+        self.watchdog_thread.start()
+
+    def _stop_watchdog(self) -> None:
+        self.watchdog_stop.set()
+        thread = self.watchdog_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=5)
+        self.watchdog_thread = None
+
+    def _watchdog_report(self) -> dict:
+        return {
+            "status": "STALL_CAPTURED" if self.watchdog_events else "NO_STALL_CAPTURED",
+            "progress_last": self.watchdog_last_progress,
+            "samples": len(self.watchdog_samples),
+            "process_states_last": (
+                self.watchdog_samples[-1].get("process_states", {})
+                if self.watchdog_samples else {}
+            ),
+            "events": list(self.watchdog_events),
+            "diagnostics_dir": str(self.diagnostics_dir) if self.watchdog_events else None,
+        }
 
     def _upload_multipart(self, path: str, field: str, filename: str, content: bytes) -> Any:
         boundary = f"----MarketingCopilotE2E{uuid.uuid4().hex}"
@@ -642,7 +900,16 @@ class AcceptanceRunner:
 
         def done():
             events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"]
-            snapshot = self._live_snapshot()
+            if self.no_live_observer:
+                return len(events) >= self.expected_submit_events
+            now = time.monotonic()
+            if self.last_snapshot and now - self.last_snapshot_at < 0.8:
+                snapshot = self.last_snapshot
+            else:
+                snapshot = self._live_snapshot(timeout=2)
+                if snapshot:
+                    self.last_snapshot = snapshot
+                    self.last_snapshot_at = now
             self.last_snapshot = snapshot
             files_complete = snapshot.get("files", {}).get("completed", 0) >= len(self.file_manifests)
             tasks_ready = snapshot.get("task_total", 0) >= self.expected_tasks
@@ -668,7 +935,11 @@ class AcceptanceRunner:
                 return True
             return False
 
-        self._wait_until(done, self.timeout_seconds, f"business completion status={expected_status}")
+        self._wait_until(
+            done, self.timeout_seconds,
+            f"business completion status={expected_status}",
+            interval=1.0,
+        )
 
     def _restart_api(self) -> None:
         process = self.processes.get("api")
@@ -915,6 +1186,7 @@ class AcceptanceRunner:
             },
             "diagnostics": {
                 "last_snapshot": self.last_snapshot,
+                "watchdog": self._watchdog_report(),
                 "artifacts_dir": str(self.root),
                 "api_log": str(self.api_log),
                 "app_log": str(self.app_log),
@@ -936,6 +1208,7 @@ class AcceptanceRunner:
         try:
             _load_duckdb()
             self.start()
+            self._start_watchdog()
             self._provision()
             self._publish_inputs()
             self._wait_for_business()
@@ -951,6 +1224,7 @@ class AcceptanceRunner:
             # Stop the real writers before opening a second read-only DuckDB
             # connection for the final ledger.  This keeps the audit query
             # independent from the worker's last buffered result flush.
+            self._stop_watchdog()
             self.shutdown()
             report["reconciliation"] = self._reconcile()
             report["status"] = report["reconciliation"]["status"]
@@ -970,6 +1244,7 @@ class AcceptanceRunner:
                 # before opening the audit connection, otherwise DuckDB's
                 # single-writer lock can turn the diagnostic query into a
                 # second failure and hide the business evidence.
+                self._stop_watchdog()
                 self.shutdown()
                 report["reconciliation"] = self._reconcile()
             except Exception as reconcile_exc:
@@ -977,6 +1252,8 @@ class AcceptanceRunner:
         finally:
             report["finished_at"] = _utc_now()
             report["ports"] = {"api": self.api_port, "smsc": self.smsc_port}
+            self._stop_watchdog()
+            report["diagnostics"] = self._watchdog_report()
             report["artifacts_retained"] = report.get("status") != "PASS" or bool(self.args.keep_artifacts)
             self.shutdown()
             if report["artifacts_retained"]:
@@ -1066,6 +1343,14 @@ def main() -> int:
     parser.add_argument("--producer-chunk-delay", type=float, default=0.0)
     parser.add_argument("--max-memory-mb", type=int, default=0)
     parser.add_argument("--keep-artifacts", action="store_true")
+    parser.add_argument(
+        "--no-live-observer", action="store_true",
+        help="diagnostic isolation mode: do not poll API stats/metrics during the send wait",
+    )
+    parser.add_argument(
+        "--run-root", default="",
+        help="directory for isolated run artifacts; WSL can use an ext4 path such as /tmp",
+    )
     parser.add_argument("--output", default=str(REPO_ROOT / "Docs" / "local-e2e-acceptance-results.json"))
     args = parser.parse_args()
     try:

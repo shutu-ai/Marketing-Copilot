@@ -1,4 +1,5 @@
 import os
+import faulthandler
 import logging
 import threading
 import time
@@ -24,6 +25,13 @@ _write_holder = {
     "operation": "",
     "acquired_at": 0.0,
 }
+_stall_watchdog_stop = threading.Event()
+_stall_watchdog_thread = None
+_stall_watchdog_dir = ""
+_stall_watchdog_threshold = 30.0
+_stall_watchdog_emitted = False
+_stall_watchdog_started_at = 0.0
+_stall_watchdog_stack_handle = None
 
 try:
     _WRITE_LOCK_TIMEOUT_SECONDS = max(
@@ -45,6 +53,113 @@ except (TypeError, ValueError):
     _READ_RETRY_DELAY_SECONDS = 0.05
 
 _READ_ONLY_STATEMENTS = {"SELECT", "EXPLAIN", "DESCRIBE", "SHOW"}
+
+
+def start_stall_watchdog(directory=None, threshold_seconds=30.0):
+    """Start opt-in thread-stack capture for a local acceptance run.
+
+    The watchdog is deliberately disabled unless the caller supplies a
+    directory.  It never touches DuckDB and therefore remains useful when a
+    writer gate or DuckDB connection is the thing that is stalled.
+    """
+    global _stall_watchdog_thread, _stall_watchdog_dir
+    global _stall_watchdog_threshold, _stall_watchdog_emitted
+    global _stall_watchdog_started_at
+    global _stall_watchdog_stack_handle
+    if not directory:
+        return
+    if _stall_watchdog_thread and _stall_watchdog_thread.is_alive():
+        return
+    _stall_watchdog_dir = os.fspath(directory)
+    _stall_watchdog_threshold = max(1.0, float(threshold_seconds or 30.0))
+    os.makedirs(_stall_watchdog_dir, exist_ok=True)
+    _stall_watchdog_emitted = False
+    _stall_watchdog_started_at = time.monotonic()
+    _stall_watchdog_stop.clear()
+    try:
+        stack_path = os.path.join(_stall_watchdog_dir, "application-threads-timeout.txt")
+        _stall_watchdog_stack_handle = open(stack_path, "w", encoding="utf-8")
+        # The faulthandler timeout is independent of the Python watchdog
+        # thread and can still dump stacks when a C extension is holding the
+        # GIL.  That is exactly the failure mode this diagnostic is meant to
+        # expose.
+        faulthandler.dump_traceback_later(
+            int(_stall_watchdog_threshold),
+            repeat=False,
+            file=_stall_watchdog_stack_handle,
+        )
+    except Exception:
+        _stall_watchdog_stack_handle = None
+        logger.exception("Database stall watchdog faulthandler setup failed")
+    logger.info(
+        "Database stall watchdog started directory=%s threshold_seconds=%s",
+        _stall_watchdog_dir, _stall_watchdog_threshold,
+    )
+    _stall_watchdog_thread = threading.Thread(
+        target=_stall_watchdog_loop,
+        name="database-stall-watchdog",
+        daemon=True,
+    )
+    _stall_watchdog_thread.start()
+
+
+def stop_stall_watchdog(timeout=2.0):
+    global _stall_watchdog_thread, _stall_watchdog_stack_handle
+    _stall_watchdog_stop.set()
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+    thread = _stall_watchdog_thread
+    if thread and thread.is_alive():
+        thread.join(timeout=max(0.1, float(timeout or 2.0)))
+    _stall_watchdog_thread = None
+    if _stall_watchdog_stack_handle is not None:
+        try:
+            _stall_watchdog_stack_handle.close()
+        except Exception:
+            pass
+        _stall_watchdog_stack_handle = None
+
+
+def _stall_watchdog_loop():
+    global _stall_watchdog_emitted
+    while not _stall_watchdog_stop.wait(5.0):
+        status = write_lock_status()
+        lock_stalled = (
+            status.get("held")
+            and float(status.get("age_seconds") or 0.0) >= _stall_watchdog_threshold
+        )
+        run_stalled = (
+            _stall_watchdog_started_at
+            and time.monotonic() - _stall_watchdog_started_at >= _stall_watchdog_threshold
+        )
+        if not lock_stalled and not run_stalled:
+            continue
+        if _stall_watchdog_emitted:
+            continue
+        _stall_watchdog_emitted = True
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        stack_path = os.path.join(_stall_watchdog_dir, f"application-threads-{stamp}.txt")
+        state_path = os.path.join(_stall_watchdog_dir, f"application-write-lock-{stamp}.json")
+        try:
+            with open(stack_path, "w", encoding="utf-8") as handle:
+                faulthandler.dump_traceback(file=handle, all_threads=True)
+            with open(state_path, "w", encoding="utf-8") as handle:
+                import json
+                json.dump({
+                    "captured_at": time.time(),
+                    "threshold_seconds": _stall_watchdog_threshold,
+                    "write_lock": status,
+                    "reason": "write_lock_age" if lock_stalled else "local_run_age",
+                    "thread_dump": stack_path,
+                }, handle, ensure_ascii=False, indent=2)
+            logger.warning(
+                "Database stall watchdog captured write_lock operation=%s age=%.3fs state=%s",
+                status.get("operation"), status.get("age_seconds"), state_path,
+            )
+        except Exception:
+            logger.exception("Database stall watchdog capture failed")
 
 
 def is_transient_write_error(error: BaseException) -> bool:
