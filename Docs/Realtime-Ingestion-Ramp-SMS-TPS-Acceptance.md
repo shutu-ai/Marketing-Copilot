@@ -107,4 +107,4 @@ python backend/tools/local_e2e_acceptance.py --scenario stress-10k \
 
 本次改动仅涉及 backpressure admission、实时分批写入和 chunk 进度计数。回滚目标为基线 SHA；回滚会恢复已确认的 stale permit / 大 chunk 风险。未自动部署、重启生产服务或修改短信中心配置。
 
-在提交并推送前，报告中的 `IMPLEMENTATION_SHA` 和 `COMMIT_PUSH` 暂记为待同步；提交完成后必须更新机器可读结果并再提交一次文档同步。
+实现已提交为 `4a4e39d`。`git push origin main` 因当前环境连接 GitHub 443 超时而阻塞，报告因此明确记录 `COMMIT_PUSH: BLOCKED`，未把本地提交伪报为远端已推送。
