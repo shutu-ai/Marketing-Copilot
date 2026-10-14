@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-14T16:57:32Z",
+  "repository": {
+    "base_sha": "6b498a597aca9bf0d9a311f0cfac85b1087d4a51",
+    "implementation": "WORKTREE_UNCOMMITTED",
+    "commit_push": "NOT_REQUESTED_NOT_PUSHED",
+    "fetch_prune": "FAILED_NETWORK_ORIGIN_UNREACHABLE",
+    "live_environment": "UNVERIFIED"
+  },
+  "mode_contract": {
+    "default": "reliable",
+    "fast_opt_in": "MC_SMS_SEND_MODE=fast",
+    "startup_frozen": true,
+    "multi_instance_fast": "FAIL_CLOSED",
+    "unknown_policy": "unknown_no_automatic_resubmit"
+  },
+  "validation": {
+    "backend_tests": {"command": ".\\.p0-test-venv\\Scripts\\python.exe -m pytest backend/tests -q", "passed": 181, "skipped": 3, "status": "PASS"},
+    "frontend_build": {"command": "npm run build", "status": "PASS", "warnings": "Rolldown pure-annotation and chunk-size warnings"},
+    "python_compile": {"status": "PASS"},
+    "git_diff_check": {"status": "PASS"}
+  },
+  "functional_evidence": [
+    {
+      "id": "fast-quick-final",
+      "artifact": "Docs/fast-send-local-e2e-quick-final.json",
+      "mode": "fast",
+      "environment": "Windows local loopback-only SMSC",
+      "status": "PASS",
+      "tasks": 3,
+      "accepted": 3,
+      "submit_sm": 3,
+      "submit_sm_success": 3,
+      "duplicates": 0,
+      "unknown": 0,
+      "throughput_events_per_second": 125.744,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-drop-response",
+      "artifact": "Docs/fast-send-local-e2e-drop-response.json",
+      "mode": "fast",
+      "status": "PASS",
+      "tasks": 3,
+      "unknown": 3,
+      "submit_sm": 3,
+      "unknown_retry_violation": false,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-partial-submit",
+      "artifact": "Docs/fast-send-local-e2e-partial-submit.json",
+      "mode": "fast",
+      "status": "PASS",
+      "tasks": 1,
+      "partial": 1,
+      "submit_sm": 6,
+      "submit_sm_success": 1,
+      "submit_sm_rejected": 5,
+      "unknown_retry_violation": false,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-reject",
+      "artifact": "Docs/fast-send-local-e2e-reject.json",
+      "mode": "fast",
+      "status": "PASS",
+      "tasks": 5,
+      "failed": 5,
+      "submit_sm": 5,
+      "submit_sm_rejected": 5,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-restart",
+      "artifact": "Docs/fast-send-local-e2e-restart.json",
+      "mode": "fast",
+      "status": "PASS",
+      "tasks": 5,
+      "accepted": 5,
+      "duplicates": 0,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-dlr-delay",
+      "artifact": "Docs/fast-send-local-e2e-dlr-delay.json",
+      "mode": "fast",
+      "status": "PASS",
+      "tasks": 5,
+      "delivered": 5,
+      "dlr": 5,
+      "dlr_violation": false,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-stress-1k-tuned",
+      "artifact": "Docs/fast-send-local-e2e-stress-1k-tuned.json",
+      "mode": "fast",
+      "status": "FAIL",
+      "failure": "600s timeout waiting for accepted completion",
+      "input_rows": 1000,
+      "generated_tasks": 200,
+      "accepted": 119,
+      "sending": 61,
+      "queued": 20,
+      "submit_sm": 180,
+      "queue_backlog_max": 200,
+      "queue_backlog_final": 81,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-stress-1k-tuned-rerun",
+      "artifact": "Docs/fast-send-local-e2e-stress-1k-tuned-rerun.json",
+      "mode": "fast",
+      "status": "FAIL",
+      "failure": "600s timeout waiting for accepted completion after checkpoint batching optimization",
+      "input_rows": 1000,
+      "generated_tasks": 200,
+      "accepted": 80,
+      "sending": 20,
+      "queued": 100,
+      "submit_sm": 100,
+      "queue_backlog_max": 198,
+      "queue_backlog_final": 120,
+      "live_env_status": "LIVE_ENV_UNVERIFIED"
+    },
+    {
+      "id": "fast-regression",
+      "artifact": "backend/tests/test_fast_send.py",
+      "mode": "fast",
+      "status": "PASS",
+      "tests_passed": 10,
+      "scope": "claim/checkpoint/recovery/socket admission/stop fence"
+    }
+  ],
+  "acceptance_matrix": [
+    {"scale": 1000, "mode": "reliable", "repetitions": 3, "status": "NOT_RUN"},
+    {"scale": 1000, "mode": "fast", "repetitions": 3, "status": "FAIL", "note": "two exploratory tuned runs failed; three-run gate not satisfied"},
+    {"scale": 3000, "mode": "reliable", "repetitions": 3, "status": "NOT_RUN"},
+    {"scale": 3000, "mode": "fast", "repetitions": 3, "status": "NOT_RUN"},
+    {"scale": 10000, "mode": "reliable", "repetitions": 3, "status": "NOT_RUN"},
+    {"scale": 10000, "mode": "fast", "repetitions": 3, "status": "NOT_RUN"},
+    {"scale": 50000, "mode": "reliable", "repetitions": 3, "status": "NOT_RUN"},
+    {"scale": 50000, "mode": "fast", "repetitions": 3, "status": "NOT_RUN"}
+  ],
+  "gates": {
+    "functional_fault_paths": "PASS_WITH_LIMITATIONS",
+    "stop_fence": "PASS_LOCAL_UNIT_EVIDENCE",
+    "unknown_no_auto_retry": "PASS_LOCAL_E2E",
+    "equal_window_ab": "NOT_RUN",
+    "fast_high_throughput": "NO_GO",
+    "sles12sp5_canary": "NOT_RUN",
+    "real_smsc": "UNVERIFIED",
+    "long_soak": "NOT_RUN",
+    "production_cutover": "NOT_DONE",
+    "default_mode": "RELIABLE"
+  },
+  "final_status": "NO_GO_FOR_FAST_PERFORMANCE_WITH_FUNCTIONAL_LIMITATIONS",
+  "next_required_action": "Fix the 1K convergence/capacity failure, then run equal-window Reliable/Fast A/B at 1K/3K/10K/50K for three repetitions before any canary."
+}

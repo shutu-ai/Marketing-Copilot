@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 
-from services import metrics_service, sms_task_service
+from services import fast_send_service, metrics_service, sms_task_service
 from services.settings_service import get_setting
 from services.smpp_gateway import (
     gateway, SmppSubmitError, SmppDeliveryUnknownError, SmppPartialSubmitError,
@@ -26,6 +26,23 @@ def _async_send_complete(task, message_ids, error):
     """Finalize a task after the background SMPP response handler completes."""
     try:
         if error is None:
+            if fast_send_service.is_fast_task(task):
+                if not fast_send_service.record_success(task, message_ids):
+                    # The SMSC result is real, but a failed checkpoint cannot
+                    # be presented as accepted.  Isolate it as unknown; the
+                    # normal failure path is durable and never requeues this
+                    # task automatically.
+                    task["_fast_part_results"] = []
+                    task["_accepted_parts"] = 0
+                    sms_task_service.mark_send_failure(
+                        task,
+                        "Fast success checkpoint unavailable; submission is unconfirmed",
+                        status_code=-1, retryable=False,
+                        failure_class="delivery_unknown", wait=False,
+                    )
+                else:
+                    metrics_service.inc("marketing_copilot_tasks_submitted_total")
+                return
             sms_task_service.mark_submitted(
                 task["id"], message_ids,
                 task.get("_delivery_receipt_mode", "optional"),
@@ -41,6 +58,9 @@ def _async_send_complete(task, message_ids, error):
 
         if isinstance(error, SmppSubmitError):
             if isinstance(error, SmppSubmissionNotAllowedError):
+                if fast_send_service.is_fast_task(task) and not task.get("_fast_socket_submitted"):
+                    fast_send_service.abort_before_submit(task, str(error))
+                    return
                 # No submit_sm was written.  Re-check/finalize through the
                 # claim fence rather than manufacturing a transport failure
                 # or clearing evidence needed by a late callback.
@@ -68,6 +88,9 @@ def _async_send_complete(task, message_ids, error):
         metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": "transport"})
     except Exception:
         logger.exception("Failed to finalize async SMS task %s", task.get("id"))
+    finally:
+        if fast_send_service.is_fast_task(task):
+            fast_send_service.forget_task(task)
 
 
 def configured_worker_count():
@@ -136,7 +159,10 @@ def _claim_dispatch_loop(task_queue):
 
         try:
             claim_started = time.monotonic()
-            tasks = sms_task_service.claim_next_tasks(_claim_fetch_size())
+            if fast_send_service.freeze_mode() == fast_send_service.FAST_MODE:
+                tasks = sms_task_service.claim_next_fast_batch(_claim_fetch_size())
+            else:
+                tasks = sms_task_service.claim_next_tasks(_claim_fetch_size(), send_mode="reliable")
             metrics_service.observe_histogram(
                 "marketing_copilot_task_claim_seconds",
                 time.monotonic() - claim_started,
@@ -308,8 +334,11 @@ def start_worker():
     with _guard:
         if any(thread.is_alive() for thread in _workers.values()):
             return
+        mode = fast_send_service.freeze_mode()
         from services import realtime_campaign_service
         realtime_campaign_service.finalize_daily_tasks()
+        if mode == fast_send_service.FAST_MODE:
+            fast_send_service.start()
         _stop.clear(); _workers.clear(); _last_active.clear()
         capacity = max(100, min(1000, configured_worker_count() * 4))
         _task_queue = queue.Queue(maxsize=capacity)
@@ -345,5 +374,10 @@ def stop_worker(timeout: float = 8.0):
             _claim_dispatcher.join(timeout=remaining)
     with _guard:
         _workers.clear(); _last_active.clear()
+    if fast_send_service.mode() == fast_send_service.FAST_MODE:
+        try:
+            fast_send_service.stop(timeout=max(1.0, float(timeout)))
+        except Exception:
+            logger.exception("Fast Send checkpoint shutdown failed")
     _supervisor = None; _claim_dispatcher = None; _task_queue = None
     metrics_service.set_gauge("marketing_copilot_workers", 0)

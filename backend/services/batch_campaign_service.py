@@ -483,6 +483,7 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         else:
             fields["campaign_dir"] = _ensure_campaign_dir({**existing_dict, **fields})
     new_smpp_id = fields.get("smpp_config_id")
+    status_update = "status" in fields and fields["status"] != existing_dict.get("status")
 
     def write(conn):
         current = conn.execute(
@@ -525,7 +526,19 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         ).fetchone()
         return dict(row) if row else None
 
-    updated_campaign = _run_campaign_write("update", write)
+    from contextlib import nullcontext
+    from services import fast_send_service
+    barrier = (
+        fast_send_service.campaign_control_barrier("batch", campaign_id)
+        if status_update and fast_send_service.is_fast() else nullcontext()
+    )
+    with barrier:
+        updated_campaign = _run_campaign_write("update", write)
+        if status_update and fast_send_service.is_fast() and updated_campaign:
+            fast_send_service.publish_campaign_state(
+                "batch", campaign_id, updated_campaign.get("status", ""),
+                int(updated_campaign.get("dispatch_generation") or 0),
+            )
     if updated_campaign is None:
         return None
     if fields.get("status") is not None:

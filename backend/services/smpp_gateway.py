@@ -8,7 +8,7 @@ import uuid
 from typing import Callable
 
 from database import read_transaction
-from services import metrics_service, sms_task_service
+from services import fast_send_service, metrics_service, sms_task_service
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -441,6 +441,22 @@ class _SmppConnection:
         self._window.release()
         failed = next((item for item in outcomes if not item["ok"]), None)
         accepted_parts = sum(1 for item in outcomes if item["ok"])
+        if fast_send_service.is_fast_task(submission.task):
+            submission.task["_fast_part_results"] = [
+                {
+                    "part_no": index + 1,
+                    "sequence": int(sequence),
+                    "ok": bool(item.get("ok")),
+                    "status": int(item.get("status") or 0),
+                    "message_id": str(item.get("message_id") or ""),
+                }
+                for index, (sequence, item) in enumerate(
+                    zip(submission.sequences, outcomes)
+                )
+            ]
+            submission.task["_fast_accepted_parts"] = accepted_parts
+            submission.task["_accepted_parts"] = accepted_parts
+            submission.task["_fast_socket_submitted"] = True
         error = None
         if failed:
             error = (
@@ -964,10 +980,16 @@ class _SmppConnection:
             if task_id is None:
                 raise ValueError("SMPP async submission requires a task id")
             persist_message_ids = self._persist_message_ids(task)
-            attempt_token = sms_task_service.record_send_intent(
-                task, self.config["id"], self.slot, len(parts),
-                self._connection_generation,
-            )
+            if fast_send_service.is_fast_task(task):
+                attempt_token = fast_send_service.prepare_task(
+                    task, len(parts),
+                    sms_task_service.smpp_source_namespace(self.config["id"]),
+                )
+            else:
+                attempt_token = sms_task_service.record_send_intent(
+                    task, self.config["id"], self.slot, len(parts),
+                    self._connection_generation,
+                )
             if not attempt_token:
                 raise SmppSubmissionNotAllowedError(
                     task.pop("_submit_gate_reason", None)
@@ -994,20 +1016,23 @@ class _SmppConnection:
                     )
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
-                with self._send_lock:
-                    metrics_service.observe_histogram(
-                        "marketing_copilot_smpp_send_lock_wait_seconds",
-                        time.monotonic() - send_lock_started,
-                        labels=self._metric_labels(),
-                    )
-                    pdu = self.client.send_message(
-                        source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
-                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
-                        source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
-                        dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
-                        short_message=part, data_coding=coding, esm_class=esm_class,
-                        registered_delivery=(self.config.get("delivery_receipt_mode") or "optional") != "disabled",
-                    )
+                with fast_send_service.socket_admission(task):
+                    with self._send_lock:
+                        metrics_service.observe_histogram(
+                            "marketing_copilot_smpp_send_lock_wait_seconds",
+                            time.monotonic() - send_lock_started,
+                            labels=self._metric_labels(),
+                        )
+                        pdu = self.client.send_message(
+                            source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
+                            source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
+                            source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
+                            dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
+                            short_message=part, data_coding=coding, esm_class=esm_class,
+                            registered_delivery=(self.config.get("delivery_receipt_mode") or "optional") != "disabled",
+                        )
+                if fast_send_service.is_fast_task(task):
+                    task["_fast_socket_submitted"] = True
                 sent_at = time.monotonic()
                 metrics_service.inc(
                     "marketing_copilot_smpp_submit_sm_sent_total",
@@ -1080,7 +1105,19 @@ class _SmppConnection:
                 self._dispatch_async_completion(*completion)
         except Exception as exc:
             error = exc
-            if submitted_any and not isinstance(error, SmppSubmitError):
+            if isinstance(error, fast_send_service.FastSendAdmissionDenied):
+                error = SmppSubmissionNotAllowedError(str(error))
+            if (fast_send_service.is_fast_task(task)
+                    and task.get("_fast_socket_admitted")
+                    and not isinstance(error, SmppDeliveryUnknownError)):
+                error = SmppDeliveryUnknownError(
+                    "Fast submit_sm write outcome is ambiguous; automatic resend is unsafe"
+                )
+            if submitted_any and isinstance(error, SmppSubmissionNotAllowedError):
+                error = SmppDeliveryUnknownError(
+                    "Fast campaign stop fence closed after one or more submit_sm writes"
+                )
+            elif submitted_any and not isinstance(error, SmppSubmitError):
                 error = SmppDeliveryUnknownError(f"connection lost after submit: {exc}")
             with self._condition:
                 for sequence in sequences:

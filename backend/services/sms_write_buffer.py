@@ -50,6 +50,10 @@ _KIND_QUEUE = {
     "send_intent": "task_status",
     "part_result": "smpp_response",
     "submitted": "smpp_response",
+    # Fast Send coalesces many normal successes into one journal event and
+    # one bounded database transaction.  Failures still use the ordinary
+    # task-status path and remain individually durable.
+    "fast_checkpoint": "smpp_response",
     "send_failure": "task_status",
     "message_id": "message_id",
     "receipt": "dlr",

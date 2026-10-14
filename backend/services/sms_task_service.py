@@ -6,6 +6,7 @@ import re
 import threading
 import uuid
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Iterable, Optional
 
@@ -276,8 +277,61 @@ def _unstarted_attempt_predicate(task_alias: str = "sms_tasks") -> str:
             WHERE a.task_id={task_alias}.id
               AND a.claim_token={task_alias}.claim_token
               AND a.state IN ('intent','authorized','responding','partial')
-        ))
+        )) OR
+        ({task_alias}.status='sending' AND {task_alias}.claim_token='')
     )"""
+
+
+def _fast_pre_submit_claims(conn, campaign_type: str, campaign_id: int):
+    from services import fast_send_service
+    if not fast_send_service.is_fast():
+        return []
+    candidates = conn.execute(
+        """SELECT t.id,t.claim_token
+           FROM sms_tasks t
+           JOIN sms_fast_batch_items fi
+             ON fi.task_id=t.id AND fi.claim_token=t.claim_token
+           WHERE t.campaign_type=? AND t.campaign_id=? AND t.status='sending'
+             AND fi.state='claimed' AND fi.planned_parts=0""",
+        (campaign_type, campaign_id),
+    ).fetchall()
+    return list(fast_send_service.safe_pre_submit_claims(candidates))
+
+
+def _update_fast_pre_submit_tasks(
+    conn, claims, target_status: str, generation: int, message: str,
+):
+    updated = []
+    for task_id, claim_token in claims:
+        row = conn.execute(
+            """UPDATE sms_tasks SET status=?,
+                       attempts=CASE WHEN ?='queued' THEN GREATEST(attempts-1,0) ELSE attempts END,
+                       claim_token='',dispatch_generation=?,error_msg=?,
+                       next_attempt_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND status='sending' AND claim_token=?
+               RETURNING id""",
+            (target_status, target_status, int(generation), str(message or ""),
+             int(task_id), str(claim_token)),
+        ).fetchone()
+        if row:
+            updated.append((int(task_id), str(claim_token)))
+    return updated
+
+
+def _close_fast_pre_submit_attempts(conn, claims, item_state: str, message: str):
+    for task_id, claim_token in claims:
+        conn.execute(
+            """UPDATE sms_send_attempts AS a SET state='cancelled',lease_until=NULL,
+                       updated_at=CURRENT_TIMESTAMP
+               FROM sms_fast_batch_items fi
+               WHERE fi.task_id=? AND fi.claim_token=? AND a.attempt_token=fi.attempt_token""",
+            (int(task_id), str(claim_token)),
+        )
+        conn.execute(
+            """UPDATE sms_fast_batch_items SET state=?,last_error=?,updated_at=CURRENT_TIMESTAMP
+               WHERE task_id=? AND claim_token=? AND state='claimed' AND planned_parts=0""",
+            (item_state, str(message or ""), int(task_id), str(claim_token)),
+        )
 
 
 def reconcile_campaign_state_in_transaction(
@@ -314,13 +368,24 @@ def reconcile_campaign_state_in_transaction(
                WHERE campaign_type=? AND campaign_id=? AND status IN ('queued','retrying')""",
             (generation, campaign_type, campaign_id),
         )
-        count = len(rows)
+        fast_claims = _fast_pre_submit_claims(conn, campaign_type, campaign_id)
+        fast_updated = _update_fast_pre_submit_tasks(
+            conn, fast_claims, "queued", generation,
+            message or "campaign paused",
+        )
+        count = len(rows) + len(fast_updated)
         if count:
+            event_ids = [int(row["id"]) for row in rows]
+            event_ids.extend(task_id for task_id, _claim_token in fast_updated)
             _add_task_event_batch_summary(
                 conn, campaign_type, campaign_id, None,
                 "campaign_paused", "sending", "queued", count,
-                rows[0]["id"], rows[-1]["id"], {"message": message or "campaign paused"},
+                min(event_ids), max(event_ids),
+                {"message": message or "campaign paused"},
             )
+        _close_fast_pre_submit_attempts(
+            conn, fast_updated, "deferred", message or "campaign paused",
+        )
         return {"requeued": count, "terminated": 0}
 
     if target_status == "in_progress":
@@ -347,13 +412,23 @@ def reconcile_campaign_state_in_transaction(
             RETURNING id""",
         (terminal_status, terminal_message, generation, campaign_type, campaign_id),
     ).fetchall()
-    count = len(rows)
+    fast_claims = _fast_pre_submit_claims(conn, campaign_type, campaign_id)
+    fast_target = "cancelled" if terminal_status == "cancelled" else "expired"
+    fast_updated = _update_fast_pre_submit_tasks(
+        conn, fast_claims, fast_target, generation, terminal_message,
+    )
+    count = len(rows) + len(fast_updated)
     if count:
+        event_ids = [int(row["id"]) for row in rows]
+        event_ids.extend(task_id for task_id, _claim_token in fast_updated)
         _add_task_event_batch_summary(
             conn, campaign_type, campaign_id, None,
             "campaign_terminated", "active", terminal_status, count,
-            rows[0]["id"], rows[-1]["id"], {"message": terminal_message},
+            min(event_ids), max(event_ids), {"message": terminal_message},
         )
+    _close_fast_pre_submit_attempts(
+        conn, fast_updated, fast_target, terminal_message,
+    )
     return {"requeued": 0, "terminated": count}
 
 
@@ -393,9 +468,21 @@ def transition_campaign_status(
         )
         return {"campaign": dict(updated), "tasks": task_summary}
 
-    result = write_transaction(
-        write, attempts=3, operation="campaign.status.transition", base_delay=0.1,
+    from services import fast_send_service
+    barrier = (
+        fast_send_service.campaign_control_barrier(campaign_type, campaign_id)
+        if fast_send_service.is_fast() else nullcontext()
     )
+    with barrier:
+        result = write_transaction(
+            write, attempts=3, operation="campaign.status.transition", base_delay=0.1,
+        )
+        if fast_send_service.is_fast():
+            fast_send_service.publish_campaign_state(
+                campaign_type, campaign_id,
+                result["campaign"].get("status", ""),
+                int(result["campaign"].get("dispatch_generation") or 0),
+            )
     invalidate_campaign_cache(campaign_type, campaign_id)
     return result
 
@@ -957,14 +1044,21 @@ def _campaign_task_eligibility_sql() -> str:
     return _task_campaign_fence_sql("t")
 
 
-def claim_next_tasks(limit: int = 20) -> list:
+def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
     limit = max(1, int(limit or 20))
+    from services import fast_send_service
+    selected_mode = send_mode or fast_send_service.mode()
+    if selected_mode not in {"reliable", "fast"}:
+        raise ValueError(f"unsupported SMS send mode: {selected_mode}")
+    fast_mode = selected_mode == "fast"
     # DuckDB allows concurrent readers, but concurrent UPDATE ... RETURNING
     # claims can conflict before the explicit commit when many task workers
     # select the same queue head. Serialize only this short claim transaction
     # and retry conflicts caused by unrelated writers.
     with _TASK_CLAIM_LOCK:
         token = uuid.uuid4().hex
+        fast_batch_id = uuid.uuid4().hex if fast_mode else ""
+        fast_lease_id = uuid.uuid4().hex if fast_mode else ""
 
         def claim(conn):
             global _FAIR_DISABLED_WARNING_EMITTED
@@ -1064,6 +1158,17 @@ def claim_next_tasks(limit: int = 20) -> list:
             claimed_by_id = {int(row["id"]): dict(row) for row in claimed_rows}
             # DuckDB UPDATE RETURNING order is not a scheduling contract.
             tasks = [claimed_by_id[task_id] for task_id in selected_ids if task_id in claimed_by_id]
+            if fast_mode and tasks:
+                _create_fast_batch_in_transaction(
+                    conn, fast_batch_id, fast_lease_id, token, tasks,
+                )
+                for task in tasks:
+                    task["_fast_mode"] = True
+                    task["_fast_batch_id"] = fast_batch_id
+                    task["_fast_lease_id"] = fast_lease_id
+                    task["_fast_campaign_status"] = "in_progress"
+                    task["_attempt_token"] = f"fast:{fast_batch_id}:{task['id']}"
+                    fast_send_service.observe_claimed_task(task)
             for task in tasks:
                 metrics_service.inc(
                     "marketing_copilot_campaign_tasks_claimed_total",
@@ -1104,12 +1209,381 @@ def claim_next_tasks(limit: int = 20) -> list:
                 )
             return tasks
 
-        return write_transaction(claim, attempts=3, operation="sms_tasks.claim")
+        return write_transaction(
+            claim, attempts=3,
+            operation="sms_tasks.fast_claim" if fast_mode else "sms_tasks.claim",
+        )
 
 
 def claim_next_task() -> Optional[dict]:
     tasks = claim_next_tasks(1)
     return tasks[0] if tasks else None
+
+
+def claim_next_fast_batch(limit: int = 20) -> list:
+    """Claim a bounded Fast batch with a durable uncertain-after-claim fence."""
+    from services import fast_send_service
+    if fast_send_service.freeze_mode() != "fast":
+        raise RuntimeError("claim_next_fast_batch requires MC_SMS_SEND_MODE=fast")
+    return claim_next_tasks(limit, send_mode="fast")
+
+
+def _create_fast_batch_in_transaction(conn, batch_id: str, lease_id: str,
+                                      claim_token: str, tasks: list) -> None:
+    """Persist compact batch ownership and one attempt identity per task."""
+    conn.execute(
+        """INSERT INTO sms_fast_batches
+           (batch_id,lease_id,claim_token,mode,state,task_count,lease_until)
+           VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP + INTERVAL '5 minutes')""",
+        (str(batch_id), str(lease_id), str(claim_token), "fast", "claimed", len(tasks)),
+    )
+    item_values = []
+    item_params = []
+    attempt_values = []
+    attempt_params = []
+    campaign_schedule = {}
+    for task in tasks:
+        task_id = int(task["id"])
+        attempt_token = f"fast:{batch_id}:{task_id}"
+        route_id = task.get("transport_smpp_config_id") or task.get("smpp_config_id")
+        campaign_key = (str(task.get("campaign_type") or ""), int(task.get("campaign_id") or 0))
+        if campaign_key not in campaign_schedule:
+            table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(campaign_key[0])
+            campaign_schedule[campaign_key] = None
+            if table:
+                campaign_schedule[campaign_key] = dict(conn.execute(
+                    f"SELECT start_time,end_time,send_start_time,send_end_time FROM {table} WHERE id=?",
+                    (campaign_key[1],),
+                ).fetchone() or {})
+        deadline = _fast_campaign_window_deadline(campaign_schedule[campaign_key])
+        if deadline is not None:
+            task["_fast_window_deadline_epoch"] = deadline
+        item_values.append("(?,?,?,?,?,?,?,?,?,'claimed','[]','',CURRENT_TIMESTAMP,NULL,CURRENT_TIMESTAMP)")
+        item_params.extend([
+            str(batch_id), str(lease_id), task_id, str(claim_token), attempt_token,
+            int(task.get("dispatch_generation") or 0), route_id, 0, 0,
+        ])
+        attempt_values.append("(?,?,?,?,?,?,?,?,'authorized',CURRENT_TIMESTAMP + INTERVAL '5 minutes',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
+        attempt_params.extend([
+            attempt_token, task_id, str(claim_token),
+            f"smpp:{int(route_id)}" if route_id is not None else "legacy",
+            route_id, -1, 0, 0,
+        ])
+    if item_values:
+        conn.execute(
+            """INSERT INTO sms_fast_batch_items
+               (batch_id,lease_id,task_id,claim_token,attempt_token,
+                dispatch_generation,route_id,planned_parts,accepted_parts,state,
+                message_ids,last_error,created_at,checkpointed_at,updated_at)
+               VALUES """ + ",".join(item_values), item_params,
+        )
+        conn.execute(
+            """INSERT INTO sms_send_attempts
+               (attempt_token,task_id,claim_token,source_namespace,smpp_config_id,
+                slot,planned_parts,accepted_parts,state,lease_until,created_at,updated_at)
+               VALUES """ + ",".join(attempt_values), attempt_params,
+        )
+    grouped = {}
+    for task in tasks:
+        key = (task["campaign_type"], task["campaign_id"], task.get("batch_id"))
+        grouped.setdefault(key, []).append(task["id"])
+    for (campaign_type, campaign_id, batch_id), task_ids in grouped.items():
+        _add_task_event_batch(
+            conn, campaign_type, campaign_id, batch_id,
+            "fast_batch_claimed", "queued", "sending", task_ids,
+            {"batch_id": str(batch_id), "lease_id": str(lease_id),
+             "claim_token": str(claim_token), "mode": "fast"},
+        )
+
+
+def _fast_campaign_window_deadline(campaign: dict) -> Optional[float]:
+    """Compute a local deadline for the already-validated send window.
+
+    This is only a short-lived socket-admission guard.  Durable campaign
+    generation/status remains authoritative; the value prevents a bounded
+    prefetched task from starting after its current time window closes.
+    """
+    if not campaign:
+        return None
+    now = datetime.now().astimezone()
+    deadlines = []
+    end_time = str(campaign.get("end_time") or "").strip()
+    if end_time:
+        try:
+            parsed = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=now.tzinfo)
+            deadlines.append(parsed.astimezone().timestamp())
+        except ValueError:
+            pass
+    start = str(campaign.get("send_start_time") or "").strip()[:5]
+    end = str(campaign.get("send_end_time") or "").strip()[:5]
+    if start and end and ":" in start and ":" in end:
+        try:
+            start_minutes = int(start[:2]) * 60 + int(start[3:5])
+            end_minutes = int(end[:2]) * 60 + int(end[3:5])
+            current_minutes = now.hour * 60 + now.minute
+            end_date = now.date()
+            if start_minutes > end_minutes and current_minutes >= start_minutes:
+                from datetime import timedelta
+                end_date += timedelta(days=1)
+            end_dt = datetime.combine(
+                end_date, datetime.min.time(), tzinfo=now.tzinfo,
+            ).replace(hour=end_minutes // 60, minute=end_minutes % 60)
+            deadlines.append(end_dt.timestamp())
+        except (TypeError, ValueError):
+            pass
+    return min(deadlines) if deadlines else None
+
+
+def recover_fast_claims_on_startup() -> int:
+    """Conservatively isolate Fast claims left across a process restart."""
+    def recover(conn):
+        rows = conn.execute(
+            """SELECT i.batch_id,i.task_id,i.claim_token,i.attempt_token,
+                      t.status,t.campaign_type,t.campaign_id
+               FROM sms_fast_batch_items i
+               JOIN sms_fast_batches b ON b.batch_id=i.batch_id
+               JOIN sms_tasks t ON t.id=i.task_id
+               WHERE b.mode='fast'
+                 AND b.state IN ('claimed','active','checkpoint_pending')
+                 AND i.state IN ('claimed','sending','checkpoint_pending')
+                 AND t.status='sending'"""
+        ).fetchall()
+        if not rows:
+            return 0
+        conn.execute(
+            """UPDATE sms_tasks AS t SET
+                   status='unknown', failure_class='delivery_unknown',
+                   error_msg='Fast Send claim survived restart; submission is unconfirmed',
+                   updated_at=CURRENT_TIMESTAMP
+               FROM sms_fast_batch_items i
+               JOIN sms_fast_batches b ON b.batch_id=i.batch_id
+               WHERE t.id=i.task_id AND t.status='sending'
+                 AND b.mode='fast'
+                 AND b.state IN ('claimed','active','checkpoint_pending')
+                 AND i.state IN ('claimed','sending','checkpoint_pending')"""
+        )
+        conn.execute(
+            """UPDATE sms_send_attempts AS a SET
+                   state='unknown', lease_until=NULL, updated_at=CURRENT_TIMESTAMP
+               FROM sms_fast_batch_items i
+               JOIN sms_fast_batches b ON b.batch_id=i.batch_id
+               WHERE a.attempt_token=i.attempt_token
+                 AND b.mode='fast'
+                 AND b.state IN ('claimed','active','checkpoint_pending')
+                 AND i.state IN ('claimed','sending','checkpoint_pending')"""
+        )
+        conn.execute(
+            """UPDATE sms_fast_batch_items AS i SET
+                   state='unknown',
+                   last_error='Fast Send claim survived restart; no automatic resubmit',
+                   updated_at=CURRENT_TIMESTAMP
+               FROM sms_fast_batches b
+               WHERE b.batch_id=i.batch_id AND b.mode='fast'
+                 AND b.state IN ('claimed','active','checkpoint_pending')
+                 AND i.state IN ('claimed','sending','checkpoint_pending')"""
+        )
+        touched_batches = {str(row["batch_id"]) for row in rows}
+        for batch_id in touched_batches:
+            conn.execute(
+                """UPDATE sms_fast_batches SET state='recovered_unknown',
+                       unresolved_count=(SELECT COUNT(*) FROM sms_fast_batch_items
+                                         WHERE batch_id=? AND state='unknown'),
+                       updated_at=CURRENT_TIMESTAMP,last_error='restart recovery'
+                   WHERE batch_id=?""",
+                (batch_id, batch_id),
+            )
+        for row in rows:
+            _add_task_event(
+                conn, int(row["task_id"]), "recovered_unknown", "sending", "unknown",
+                "Fast Send claim survived restart; not automatically resubmitted",
+                {"batch_id": str(row["batch_id"]), "attempt_token": str(row["attempt_token"] or "")},
+            )
+        return len(rows)
+
+    recovered = write_transaction(
+        recover, attempts=3, operation="sms_tasks.fast_startup_recovery",
+    )
+    if recovered:
+        logger.warning("Fast Send isolated %s uncertain-after-claim tasks on startup", recovered)
+    return int(recovered or 0)
+
+
+def abort_fast_task_before_submit(task: dict, reason: str) -> None:
+    """Close a Fast attempt that was stopped before its first socket write."""
+    def abort(conn):
+        row = conn.execute(
+            """SELECT t.status,t.claim_token,c.status campaign_status
+               FROM sms_tasks t
+               LEFT JOIN batch_campaigns c
+                 ON t.campaign_type='batch' AND c.id=t.campaign_id
+               LEFT JOIN realtime_campaigns r
+                 ON t.campaign_type='realtime' AND r.id=t.campaign_id
+               WHERE t.id=? AND t.claim_token=?""",
+            (int(task["id"]), str(task.get("claim_token") or "")),
+        ).fetchone()
+        if not row:
+            return False
+        campaign_status = str(row["campaign_status"] or "")
+        if not campaign_status:
+            realtime_row = conn.execute(
+                """SELECT r.status FROM realtime_campaigns r
+                   JOIN sms_tasks t ON t.campaign_type='realtime' AND t.campaign_id=r.id
+                   WHERE t.id=?""", (int(task["id"]),),
+            ).fetchone()
+            campaign_status = str(realtime_row["status"] or "") if realtime_row else ""
+        # Requeue is safe only because this method is called by the socket
+        # fence before any submit_sm write.  Stopped/ended campaigns remain
+        # terminal and are never returned to the queue.
+        target = "queued" if campaign_status in {"in_progress", "paused", ""} else (
+            "cancelled" if campaign_status == "cancelled" else "expired"
+        )
+        conn.execute(
+            """UPDATE sms_tasks SET status=?, attempts=CASE WHEN ?='queued'
+                       THEN GREATEST(attempts-1,0) ELSE attempts END,
+                   error_msg=?, next_attempt_at=CURRENT_TIMESTAMP,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND status='sending' AND claim_token=?""",
+            (target, target, str(reason)[:2000], int(task["id"]),
+             str(task.get("claim_token") or "")),
+        )
+        conn.execute(
+            """UPDATE sms_send_attempts SET state='cancelled',lease_until=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE attempt_token=? AND task_id=? AND claim_token=?""",
+            (str(task.get("_attempt_token") or ""), int(task["id"]),
+             str(task.get("claim_token") or "")),
+        )
+        conn.execute(
+            """UPDATE sms_fast_batch_items SET state=?,last_error=?,updated_at=CURRENT_TIMESTAMP
+               WHERE batch_id=? AND task_id=? AND claim_token=?""",
+            ("deferred" if target == "queued" else target,
+             str(reason)[:2000], str(task.get("_fast_batch_id") or ""),
+             int(task["id"]), str(task.get("claim_token") or "")),
+        )
+        conn.execute(
+            """UPDATE sms_fast_batches SET updated_at=CURRENT_TIMESTAMP,
+                   last_error=? WHERE batch_id=?""",
+            (str(reason)[:2000], str(task.get("_fast_batch_id") or "")),
+        )
+        return True
+
+    write_transaction(abort, attempts=3, operation="sms_tasks.fast_abort_pre_submit")
+
+
+def _apply_fast_checkpoint(conn, payloads) -> None:
+    """Fold a bounded group of normal Fast successes into durable state.
+
+    The SMPP response path has already proved that every part in each payload
+    was accepted.  This function is called by the existing journal-backed
+    writer, so replay is fenced by ``sms_result_events.event_id`` before this
+    function runs.  Task updates and Fast batch-item updates therefore remain
+    idempotent even when the process stops between database commit and the
+    journal terminal marker.
+    """
+    if not payloads:
+        return
+    latest = {}
+    for payload in payloads:
+        task_id = int(payload.get("task_id") or 0)
+        if task_id:
+            latest[task_id] = dict(payload)
+    if not latest:
+        return
+    submitted = []
+    for payload in latest.values():
+        submitted.append({
+            "task_id": int(payload["task_id"]),
+            "message_ids": list(payload.get("message_ids") or []),
+            "delivery_receipt_mode": payload.get("delivery_receipt_mode") or "optional",
+            "transport_smpp_config_id": payload.get("transport_smpp_config_id"),
+            "submit_sm_parts": payload.get("submit_sm_parts"),
+            "claim_token": str(payload.get("claim_token") or ""),
+            "attempt_token": str(payload.get("attempt_token") or ""),
+            "source_namespace": str(payload.get("source_namespace") or "legacy"),
+        })
+    _apply_submitted_batch(conn, submitted)
+
+    values = []
+    params = []
+    for payload in latest.values():
+        values.append("(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)")
+        params.extend([
+            str(payload.get("batch_id") or ""),
+            str(payload.get("lease_id") or ""),
+            int(payload["task_id"]),
+            max(1, int(payload.get("submit_sm_parts") or 1)),
+            int(payload.get("accepted_parts") or payload.get("submit_sm_parts") or 1),
+            json.dumps(list(payload.get("message_ids") or [])),
+            str(payload.get("claim_token") or ""),
+            str(payload.get("attempt_token") or ""),
+        ])
+    if values:
+        conn.execute(
+            """UPDATE sms_fast_batch_items AS i SET
+                   planned_parts=v.planned_parts,
+                   accepted_parts=v.accepted_parts,
+                   state='checkpointed', message_ids=v.message_ids,
+                   last_error='', checkpointed_at=CURRENT_TIMESTAMP,
+                   updated_at=CURRENT_TIMESTAMP
+               FROM (VALUES """ + ",".join(values) + """) AS v(
+                   batch_id,lease_id,task_id,planned_parts,accepted_parts,
+                   message_ids,claim_token,attempt_token,checkpointed_at)
+               WHERE i.batch_id=v.batch_id AND i.task_id=v.task_id
+                 AND i.claim_token=v.claim_token
+                 AND i.attempt_token=v.attempt_token""",
+            params,
+        )
+
+    attempt_values = []
+    attempt_params = []
+    for payload in latest.values():
+        attempt_values.append("(?,?,?,?,?)")
+        attempt_params.extend([
+            str(payload.get("attempt_token") or ""),
+            int(payload["task_id"]),
+            str(payload.get("claim_token") or ""),
+            max(1, int(payload.get("submit_sm_parts") or 1)),
+            int(payload.get("accepted_parts") or payload.get("submit_sm_parts") or 1),
+        ])
+    if attempt_values:
+        conn.execute(
+            """UPDATE sms_send_attempts AS a SET
+                   planned_parts=v.planned_parts,
+                   accepted_parts=v.accepted_parts,
+                   state='accepted', lease_until=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+               FROM (VALUES """ + ",".join(attempt_values) + """) AS v(
+                   attempt_token,task_id,claim_token,planned_parts,accepted_parts)
+               WHERE a.attempt_token=v.attempt_token AND a.task_id=v.task_id
+                 AND a.claim_token=v.claim_token""",
+            attempt_params,
+        )
+
+    batch_ids = sorted({str(item.get("batch_id") or "") for item in latest.values() if item.get("batch_id")})
+    for batch_id in batch_ids:
+        conn.execute(
+            """UPDATE sms_fast_batches AS b SET
+                   checkpointed_count=(SELECT COUNT(*) FROM sms_fast_batch_items i
+                                       WHERE i.batch_id=b.batch_id AND i.state='checkpointed'),
+                   unresolved_count=(SELECT COUNT(*) FROM sms_fast_batch_items i
+                                     WHERE i.batch_id=b.batch_id
+                                       AND i.state IN ('unknown','partial','failed')),
+                   state=CASE WHEN NOT EXISTS (
+                              SELECT 1 FROM sms_fast_batch_items i
+                              WHERE i.batch_id=b.batch_id
+                                AND i.state IN ('claimed','sending','checkpoint_pending')
+                          ) THEN 'completed' ELSE 'active' END,
+                   checkpointed_at=CASE WHEN NOT EXISTS (
+                              SELECT 1 FROM sms_fast_batch_items i
+                              WHERE i.batch_id=b.batch_id
+                                AND i.state IN ('claimed','sending','checkpoint_pending')
+                          ) THEN CAST(CURRENT_TIMESTAMP AS VARCHAR) ELSE b.checkpointed_at END,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE b.batch_id=?""",
+            (batch_id,),
+        )
 
 
 def apply_buffered_writes(conn, items) -> None:
@@ -1118,6 +1592,7 @@ def apply_buffered_writes(conn, items) -> None:
     # All changes share the caller's explicit transaction and event-id fence.
     stage_started = time.perf_counter()
     intent_count = 0
+    fast_checkpoints = []
     for item in items:
         if item.kind == "send_intent":
             _apply_send_intent(conn, **item.payload)
@@ -1125,7 +1600,13 @@ def apply_buffered_writes(conn, items) -> None:
         elif item.kind == "part_result":
             _apply_part_result(conn, **item.payload)
             intent_count += 1
+        elif item.kind == "fast_checkpoint":
+            fast_checkpoints.extend(item.payload.get("items") or [])
     _observe_result_stage("intent_and_part_result", stage_started, intent_count)
+    if fast_checkpoints:
+        stage_started = time.perf_counter()
+        _apply_fast_checkpoint(conn, fast_checkpoints)
+        _observe_result_stage("fast_checkpoint", stage_started, len(fast_checkpoints))
     # The buffer polls its per-kind queues fairly, so message_id entries can be
     # interleaved with submitted/receipt entries. Collect them across the whole
     # transaction; otherwise each interleaved item breaks the batch and turns
@@ -1183,7 +1664,9 @@ def apply_buffered_writes(conn, items) -> None:
     secondary_count = 0
     for item in items:
         payload = item.payload
-        if item.kind in {"message_id", "submitted", "send_intent", "part_result"}:
+        if item.kind in {
+            "message_id", "submitted", "send_intent", "part_result", "fast_checkpoint",
+        }:
             continue
         if item.kind == "send_failure":
             _apply_send_failure(conn, **payload)
@@ -1379,6 +1862,12 @@ def _apply_send_intent(conn, task_id: int, claim_token: str, attempt_token: str,
 def record_part_result(task: dict, part_no: int, sequence: int, ok: bool,
                        status: int, message_id: str, smpp_config_id: int,
                        connection_generation: str = "") -> None:
+    if task.get("_fast_mode"):
+        from services import fast_send_service
+        fast_send_service.record_part_result(
+            task, part_no, sequence, ok, status, message_id,
+        )
+        return
     from services import sms_write_buffer
     # Successful no-DLR responses carry no later correlation value and the
     # task-level accepted event is sufficient.  Keep failures durable so an
@@ -1937,7 +2426,8 @@ def mark_send_failure(task: dict, error: str, status_code: Optional[int] = None,
             "id", "attempts", "max_attempts", "batch_id", "campaign_type",
             "campaign_id", "status", "claim_token", "smsc_message_ids",
             "_attempt_token", "_source_namespace", "_submit_sm_parts",
-            "_transport_smpp_config_id", "_accepted_parts",
+            "_transport_smpp_config_id", "_accepted_parts", "_fast_mode",
+            "_fast_batch_id", "_fast_lease_id", "_fast_part_results",
         )
     }
     sms_write_buffer.submit(
@@ -1952,6 +2442,37 @@ def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int]
                         retryable: bool = True, failure_class: str = "transport"):
     attempt_token = str(task.get("_attempt_token") or "")
     accepted_parts = int(task.get("_accepted_parts") or 0)
+    # Fast mode keeps successful part responses in memory while the task is
+    # still a candidate for a normal success checkpoint.  If the multipart
+    # submission fails, materialize that small exceptional evidence before
+    # folding the task result so partial is never inferred from a counter
+    # alone and can be audited after restart.
+    fast_part_results = list(task.get("_fast_part_results") or [])
+    if attempt_token and task.get("_fast_mode") and fast_part_results:
+        for result in fast_part_results:
+            conn.execute(
+                """INSERT INTO sms_send_parts
+                   (attempt_token,part_no,sequence,connection_generation,
+                    source_namespace,response_status,smsc_message_id,state,
+                    sent_at,responded_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                   ON CONFLICT(attempt_token,part_no) DO UPDATE SET
+                     sequence=excluded.sequence,
+                     source_namespace=excluded.source_namespace,
+                     response_status=excluded.response_status,
+                     smsc_message_id=excluded.smsc_message_id,
+                     state=excluded.state,
+                     responded_at=excluded.responded_at,
+                     updated_at=excluded.updated_at""",
+                (
+                    attempt_token, int(result.get("part_no") or 0),
+                    int(result.get("sequence") or 0), "",
+                    str(task.get("_source_namespace") or "legacy"),
+                    int(result.get("status") or 0),
+                    str(result.get("message_id") or ""),
+                    "accepted" if result.get("ok") else "rejected",
+                ),
+            )
     if attempt_token:
         part_row = conn.execute(
             """SELECT COUNT(*) count FROM sms_send_parts
@@ -2013,6 +2534,30 @@ def _apply_send_failure(conn, task: dict, error: str, status_code: Optional[int]
                    WHERE attempt_token=? AND task_id=? AND claim_token=?""",
                 (status, attempt_token, int(task["id"]),
                  str(task.get("claim_token") or "")),
+            )
+        if task.get("_fast_mode") and task.get("_fast_batch_id"):
+            item_state = status if status in {
+                "retrying", "failed", "partial", "unknown", "cancelled", "expired",
+            } else "failed"
+            conn.execute(
+                """UPDATE sms_fast_batch_items SET state=?,accepted_parts=?,
+                       planned_parts=GREATEST(planned_parts,?),last_error=?,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE batch_id=? AND task_id=? AND claim_token=?""",
+                (
+                    item_state, accepted_parts,
+                    int(task.get("_submit_sm_parts") or len(fast_part_results) or 1),
+                    str(error)[:2000], str(task.get("_fast_batch_id") or ""),
+                    int(task["id"]), str(task.get("claim_token") or ""),
+                ),
+            )
+            conn.execute(
+                """UPDATE sms_fast_batches SET unresolved_count=(
+                       SELECT COUNT(*) FROM sms_fast_batch_items
+                       WHERE batch_id=? AND state IN ('unknown','partial','failed')),
+                       updated_at=CURRENT_TIMESTAMP,last_error=? WHERE batch_id=?""",
+                (str(task.get("_fast_batch_id") or ""), str(error)[:2000],
+                 str(task.get("_fast_batch_id") or "")),
             )
         if status in {"failed", "partial", "unknown"} and task.get("batch_id"):
             conn.execute(

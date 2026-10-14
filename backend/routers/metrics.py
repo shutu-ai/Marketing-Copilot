@@ -12,6 +12,7 @@ from services import (
     metrics_service, backpressure_service, ingestion_job_service,
     campaign_capacity_service,
 )
+from services import fast_send_service
 from services.smpp_gateway import gateway
 from services.task_worker import worker_status
 
@@ -89,6 +90,7 @@ def capacity_status():
     return {'workers': workers, 'smpp': smpp,
             'ingestion': ingestion,
             'backpressure': backpressure,
+            'fast_send': fast_send_service.status(),
             'scheduler': campaign_capacity_service.status(),
             'database': {'write_lock': write_lock_status()},
             'metrics': metrics_service.snapshot(),

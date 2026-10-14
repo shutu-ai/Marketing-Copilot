@@ -196,6 +196,13 @@ class AcceptanceRunner:
         self.delivery_receipt_mode = str(
             args.delivery_receipt_mode or self.spec.get("delivery_receipt_mode") or "disabled"
         )
+        self.send_mode = str(
+            getattr(args, "send_mode", None)
+            or self.spec.get("send_mode")
+            or os.environ.get("MC_SMS_SEND_MODE", "reliable")
+        ).strip().lower()
+        if self.send_mode not in {"reliable", "fast"}:
+            raise ValueError("send mode must be reliable or fast")
         self.pool_size = max(1, int(getattr(args, "pool_size", 1) or 1))
         self.flash_sms = bool(getattr(args, "flash_sms", False))
 
@@ -274,6 +281,7 @@ class AcceptanceRunner:
             "MC_SMPP_WINDOW_SIZE": str(max(1, self.args.smpp_window)),
             "MC_SMPP_SEND_QUEUE_CAPACITY": str(max(1, self.args.smpp_send_queue_capacity)),
             "MC_TASK_ARCHIVE_ENABLED": "false",
+            "MC_SMS_SEND_MODE": self.send_mode,
         })
         return env
 
@@ -901,6 +909,7 @@ class AcceptanceRunner:
                 "window_size": max(1, self.args.smpp_window),
                 "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
                 "delivery_receipt_mode": self.delivery_receipt_mode,
+                "send_mode": self.send_mode,
                 "flash_sms": self.flash_sms,
                 "live_env_status": "LIVE_ENV_UNVERIFIED",
             },
@@ -1038,6 +1047,10 @@ def main() -> int:
     parser.add_argument("--smsc-receipt-delay", type=float)
     parser.add_argument("--smsc-disconnect-after", type=int)
     parser.add_argument("--delivery-receipt-mode", choices=("disabled", "optional", "required"))
+    parser.add_argument(
+        "--send-mode", choices=("reliable", "fast"), default=None,
+        help="send pipeline for the isolated run; default is reliable",
+    )
     parser.add_argument("--flash-sms", action="store_true", help="create the loopback campaign with Flash SMS enabled")
     parser.add_argument("--task-workers", type=int, default=2)
     parser.add_argument("--ingest-workers", type=int, default=2)
