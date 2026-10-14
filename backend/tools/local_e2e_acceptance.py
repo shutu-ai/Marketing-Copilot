@@ -5,8 +5,10 @@ activity scheduler, realtime ingestion worker, SMS worker and SMPP gateway)
 and a loopback-only SMPP simulator.  Only the external producer is simulated:
 input files are published through the local watch-directory contract.
 
-The runner intentionally uses HTTP APIs for setup and read-only DuckDB queries
-for reconciliation.  It never writes business rows directly to DuckDB.
+The runner intentionally uses HTTP APIs for normal setup and read-only DuckDB
+queries for reconciliation.  The explicit ``sender-only`` gate is the one
+exception: it stops the API before seeding pre-generated tasks into the
+isolated database, then restarts the real service for the sender proof.
 """
 
 from __future__ import annotations
@@ -159,6 +161,9 @@ class AcceptanceRunner:
         self.args = args
         self.spec = dict(spec)
         self.scenario = args.scenario
+        self.gate = str(getattr(args, "gate", "full") or "full").strip().lower()
+        if self.gate not in {"full", "ingest-only", "sender-only"}:
+            raise ValueError("gate must be full, ingest-only, or sender-only")
         # Some managed Windows images expose a temp directory whose child
         # ACLs are stricter than its parent.  Keep the run isolated but place
         # it under the writable repository root by default.  WSL callers may
@@ -173,7 +178,7 @@ class AcceptanceRunner:
             if configured_run_root else REPO_ROOT / ".local-e2e-runs"
         )
         run_parent.mkdir(parents=True, exist_ok=True)
-        self.root = run_parent / f"marketing-copilot-{self.scenario}-{uuid.uuid4().hex[:8]}"
+        self.root = run_parent / f"marketing-copilot-{self.scenario}-{self.gate}-{uuid.uuid4().hex[:8]}"
         self.root.mkdir(parents=True, exist_ok=False)
         self.db_path = self.root / "marketing_copilot.duckdb"
         self.watch_dir = self.root / "watch"
@@ -200,6 +205,7 @@ class AcceptanceRunner:
         self.started_at = time.time()
         self.last_snapshot: dict = {}
         self.last_snapshot_at = 0.0
+        self.last_watchdog_metrics: dict = {}
         self.last_runtime_snapshot_at = 0.0
         self.diagnostics_dir = self.root / "diagnostics"
         self.watchdog_stop = threading.Event()
@@ -210,6 +216,8 @@ class AcceptanceRunner:
         self.watchdog_last_progress_at = time.monotonic()
         self.watchdog_stall_30_emitted = False
         self.watchdog_stall_60_emitted = False
+        self.task_worker_disabled = self.gate in {"ingest-only", "sender-only"}
+        self.sender_seed: dict[str, Any] = {}
         # Keep the venv launcher path intact.  On Linux a venv's python is
         # commonly a symlink to the system interpreter; resolving it here
         # would make child API/SMSC processes lose the venv dependencies.
@@ -300,6 +308,7 @@ class AcceptanceRunner:
             "MC_REALTIME_COPY_WORKERS": str(min(8, max(1, self.args.workers))),
             "MC_REALTIME_INGEST_WORKERS": str(min(16, max(1, self.args.ingest_workers))),
             "MC_TASK_WORKERS": str(min(32, max(1, self.args.task_workers))),
+            "MC_DISABLE_TASK_WORKER": "1" if self.task_worker_disabled else "0",
             "MC_CLAIM_BATCH": str(min(500, max(1, self.args.claim_batch))),
             "MC_SMPP_RESPONSE_ERROR_LOG_INTERVAL": "0",
             "MC_SMPP_WINDOW_SIZE": str(max(1, self.args.smpp_window)),
@@ -590,6 +599,9 @@ class AcceptanceRunner:
 
     def _watchdog_snapshot(self, full: bool = False) -> dict:
         live = {} if self.no_live_observer else self._live_snapshot(timeout=2)
+        metrics = self._watchdog_metrics()
+        if metrics and not metrics.get("error"):
+            self.last_watchdog_metrics = metrics
         submit_events = [
             item for item in _read_jsonl(self.smsc_event_log)
             if item.get("event_type") == "submit_sm"
@@ -616,7 +628,7 @@ class AcceptanceRunner:
             "captured_at": _utc_now(),
             "progress": progress,
             "live_snapshot": live,
-            "metrics": self._watchdog_metrics(),
+            "metrics": metrics,
             "process_states": process_states,
             "processes": [
                 _safe_process_snapshot(process.pid, role)
@@ -768,6 +780,7 @@ class AcceptanceRunner:
                 if self.watchdog_samples else {}
             ),
             "events": list(self.watchdog_events),
+            "metrics_last": self.last_watchdog_metrics,
             "diagnostics_dir": str(self.diagnostics_dir) if self.watchdog_events else None,
         }
 
@@ -784,6 +797,12 @@ class AcceptanceRunner:
         if status < 200 or status >= 300:
             raise RuntimeError(f"upload {path} -> HTTP {status}: {value}")
         return value
+
+    def _wait_for_smpp(self) -> None:
+        self._wait_until(
+            lambda: bool((self._api_json("GET", "/api/health").get("smpp") or {}).get("connected")),
+            self.timeout_seconds, "SMPP bind connected",
+        )
 
     def _provision(self) -> None:
         smpp = self._api_json("POST", "/api/smpp/configs", {
@@ -859,10 +878,8 @@ class AcceptanceRunner:
             lambda: self._api_json("GET", f"/api/realtime-campaigns/{self.realtime_campaign_id}").get("status") == "in_progress",
             self.timeout_seconds, "realtime campaign active",
         )
-        self._wait_until(
-            lambda: bool((self._api_json("GET", "/api/health").get("smpp") or {}).get("connected")),
-            self.timeout_seconds, "SMPP bind connected",
-        )
+        if not self.task_worker_disabled:
+            self._wait_for_smpp()
 
     def _build_input_rows(self) -> None:
         if self.scenario == "quick":
@@ -891,6 +908,128 @@ class AcceptanceRunner:
                 chunk_size=self.args.producer_chunk_size,
                 chunk_delay=self.args.producer_chunk_delay,
             ))
+
+    def _stop_api_process(self) -> None:
+        process = self.processes.get("api")
+        if not process or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def _seed_sender_only_tasks(self) -> None:
+        """Insert a bounded pre-generated task set while the API is stopped."""
+        duckdb = _load_duckdb()
+        if not self.db_path.exists():
+            raise RuntimeError("sender-only seed database does not exist")
+        message = str(
+            self.spec.get("message")
+            or "Marketing Copilot sender-only event={event_id} msisdn={msisdn}"
+        )
+        message *= max(1, int(self.spec.get("repeat_message", 1)))
+        conn = duckdb.connect(str(self.db_path))
+        try:
+            campaign_cursor = conn.execute(
+                """SELECT name,dispatch_generation,flash_sms,smpp_config_id,sms_template_id
+                   FROM realtime_campaigns WHERE id=?""",
+                (self.realtime_campaign_id,),
+            )
+            campaign_row = campaign_cursor.fetchone()
+            campaign = (
+                dict(zip([item[0] for item in campaign_cursor.description], campaign_row))
+                if campaign_row else None
+            )
+            if campaign is None:
+                raise RuntimeError("sender-only campaign was not found")
+            campaign_name = str(campaign["name"] or "")
+            dispatch_generation = int(campaign["dispatch_generation"] or 0)
+            task_rows = []
+            for row in self.rows:
+                content = message
+                for key, value in row.items():
+                    content = content.replace("{" + str(key) + "}", str(value))
+                task_rows.append((
+                    "realtime", int(self.realtime_campaign_id), None, campaign_name,
+                    str(row["msisdn"]), str(row.get("language") or "English"),
+                    int(campaign["sms_template_id"] or self.template_id or 0),
+                    int(campaign["smpp_config_id"] or self.smpp_config_id or 0),
+                    bool(campaign["flash_sms"]), content, "E2E",
+                    json.dumps(row, ensure_ascii=False), "sender-only-preloaded",
+                    datetime.now(timezone.utc).date().isoformat(),
+                    f"sender-only:{self.realtime_campaign_id}:{row['msisdn']}",
+                    dispatch_generation,
+                ))
+            conn.execute("BEGIN TRANSACTION")
+            conn.executemany(
+                """INSERT INTO sms_tasks
+                   (campaign_type,campaign_id,batch_id,campaign_name,msisdn,language,
+                    sms_template_id,smpp_config_id,flash_sms,content,source_addr,payload,
+                    source_file,task_date,dedupe_key,dispatch_generation)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                task_rows,
+            )
+            task_ids = [int(row[0]) for row in conn.execute(
+                """SELECT id FROM sms_tasks
+                   WHERE campaign_type='realtime' AND campaign_id=?
+                     AND source_file='sender-only-preloaded'
+                   ORDER BY id""",
+                (self.realtime_campaign_id,),
+            ).fetchall()]
+            if task_ids:
+                conn.execute(
+                    """INSERT INTO task_event_batches
+                       (campaign_type,campaign_id,batch_id,event_type,from_status,to_status,
+                        event_count,first_task_id,last_task_id,detail)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        "realtime", int(self.realtime_campaign_id), None, "created", "",
+                        "queued", len(task_ids), min(task_ids), max(task_ids),
+                        json.dumps({"gate": "sender-only", "pre_generated": True}),
+                    ),
+                )
+            conn.commit()
+            self.sender_seed = {
+                "source": "isolated DuckDB seed while API stopped",
+                "tasks_inserted": len(task_ids),
+                "task_ids": {"first": min(task_ids) if task_ids else None,
+                             "last": max(task_ids) if task_ids else None},
+                "source_file": "sender-only-preloaded",
+            }
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def _wait_for_ingestion_only(self) -> None:
+        if self.no_live_observer:
+            raise RuntimeError("ingest-only gate requires the live observer for its completion check")
+
+        def done():
+            snapshot = self._live_snapshot(timeout=2)
+            if snapshot:
+                self.last_snapshot = snapshot
+                self.last_snapshot_at = time.monotonic()
+            events = [
+                item for item in _read_jsonl(self.smsc_event_log)
+                if item.get("event_type") == "submit_sm"
+            ]
+            return bool(
+                snapshot.get("files", {}).get("completed", 0) >= len(self.file_manifests)
+                and snapshot.get("task_total", 0) >= self.expected_tasks
+                and not events
+            )
+
+        self._wait_until(
+            done, self.timeout_seconds,
+            "ingestion-only file/task completion", interval=1.0,
+        )
 
     def _expected_terminal_status(self) -> str:
         return str(self.spec.get("expected_terminal_status") or "accepted")
@@ -942,14 +1081,7 @@ class AcceptanceRunner:
         )
 
     def _restart_api(self) -> None:
-        process = self.processes.get("api")
-        if process and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+        self._stop_api_process()
         self._spawn(
             "api",
             [str(self.python_executable), "-m", "uvicorn", "main:app",
@@ -1029,6 +1161,104 @@ class AcceptanceRunner:
             "SELECT * FROM ingestion_files WHERE campaign_type='realtime' AND campaign_id=? ORDER BY id",
             (self.realtime_campaign_id or -1,),
         )
+        file_breakdown = [
+            {
+                key: row.get(key)
+                for key in (
+                    "id", "filename", "status", "phase", "total_rows",
+                    "processed_rows", "created_tasks", "duplicate_rows",
+                    "excluded_rows", "invalid_rows", "no_template_rows",
+                    "last_progress_at", "last_error", "owner_id", "lease_token",
+                )
+                if key in row
+            }
+            for row in file_rows
+        ]
+        if self.gate == "ingest-only":
+            file_statuses = Counter(str(row.get("status") or "") for row in file_rows)
+            created = sum(int(row.get("created_tasks") or 0) for row in file_rows)
+            excluded = sum(int(row.get("excluded_rows") or 0) for row in file_rows)
+            invalid = sum(int(row.get("invalid_rows") or 0) for row in file_rows)
+            no_template = sum(int(row.get("no_template_rows") or 0) for row in file_rows)
+            db_status = self._db_query(
+                "SELECT key,value FROM app_settings WHERE key IN ('system_mode','detail_logging')"
+            )
+            smpp_rows = self._db_query(
+                "SELECT id,host,port FROM smpp_configs WHERE id=?", (self.smpp_config_id or -1,)
+            )
+            system_mode = {str(item["key"]): str(item["value"]) for item in db_status}.get("system_mode")
+            loopback = bool(smpp_rows and smpp_rows[0].get("host") in {"127.0.0.1", "localhost", "::1"})
+            queued = statuses.get("queued", 0)
+            ingest_ok = (
+                len(file_rows) == len(self.file_manifests)
+                and file_statuses.get("completed", 0) == len(self.file_manifests)
+                and len(tasks) == self.expected_tasks
+                and created == self.expected_tasks
+                and queued == self.expected_tasks
+                and not submit_events
+                and not attempts
+            )
+            return {
+                "status": "PASS" if ingest_ok else "FAIL",
+                "gate": self.gate,
+                "expected_terminal_status": "queued",
+                "delivery_receipt_mode": self.delivery_receipt_mode,
+                "input_files": len(self.file_manifests),
+                "input_rows": len(self.rows),
+                "valid_events_expected": self.expected_tasks,
+                "generated_tasks": len(tasks),
+                "task_statuses": dict(statuses),
+                "smsc_submit_sm": len(submit_events),
+                "smsc_submit_sm_success": len(accepted_events),
+                "smsc_submit_sm_rejected": len(submit_events) - len(accepted_events),
+                "duplicate_send_tasks": [int(item["task_id"]) for item in attempts],
+                "lost_submit_mappings": [],
+                "misdelivered": [],
+                "unknown_retry_violation": False,
+                "dlr_violation": bool(dlr_events),
+                "stage_counts": {
+                    "input_rows": len(self.rows),
+                    "filtered_excluded": excluded,
+                    "filtered_invalid": invalid,
+                    "filtered_no_template": no_template,
+                    "tasks_created": created,
+                    "tasks_queued": queued,
+                    "socket_submit_sm": len(submit_events),
+                    "submit_sm_resp_observed": len(accepted_events),
+                    "tasks_accepted": statuses.get("accepted", 0),
+                },
+                "files": file_breakdown,
+                "file_statuses": dict(file_statuses),
+                "pre_generated_tasks": {},
+                "observability": self.last_watchdog_metrics,
+                "throughput": {
+                    "events_per_second": None,
+                    "submit_sm_per_second": None,
+                    "queue_backlog_max": max(self.backlog_samples or [0]),
+                    "queue_backlog_final": queued,
+                },
+                "environment": {
+                    "system_mode": system_mode,
+                    "smpp_host": smpp_rows[0].get("host") if smpp_rows else None,
+                    "smpp_port": smpp_rows[0].get("port") if smpp_rows else None,
+                    "smpp_loopback_only": loopback,
+                    "pool_size": self.pool_size,
+                    "window_size": max(1, self.args.smpp_window),
+                    "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
+                    "delivery_receipt_mode": self.delivery_receipt_mode,
+                    "send_mode": self.send_mode,
+                    "live_env_status": "LIVE_ENV_UNVERIFIED",
+                },
+                "diagnostics": {
+                    "last_snapshot": self.last_snapshot,
+                    "watchdog": self._watchdog_report(),
+                    "artifacts_dir": str(self.root),
+                    "api_log": str(self.api_log),
+                    "app_log": str(self.app_log),
+                    "smsc_log": str(self.smsc_log),
+                    "smsc_event_log": str(self.smsc_event_log),
+                },
+            }
         event_rows = self._db_query(
             "SELECT task_id,event_type,created_at FROM task_events WHERE task_id IN (SELECT id FROM sms_tasks WHERE campaign_type='realtime' AND campaign_id=?) ORDER BY id",
             (self.realtime_campaign_id or -1,),
@@ -1126,6 +1356,7 @@ class AcceptanceRunner:
         )
         return {
             "status": "PASS" if expected_ok else "FAIL",
+            "gate": self.gate,
             "expected_terminal_status": expected_status,
             "delivery_receipt_mode": self.delivery_receipt_mode,
             "input_files": len(self.file_manifests),
@@ -1133,6 +1364,8 @@ class AcceptanceRunner:
             "valid_events_expected": self.expected_tasks,
             "generated_tasks": len(tasks),
             "task_statuses": dict(statuses),
+            "files": file_breakdown,
+            "file_statuses": dict(Counter(str(row.get("status") or "") for row in file_rows)),
             "smsc_submit_sm": len(submit_events),
             "smsc_submit_sm_success": len(accepted_events),
             "smsc_submit_sm_rejected": len(submit_events) - len(accepted_events),
@@ -1149,6 +1382,25 @@ class AcceptanceRunner:
             "unknown_submit_ids": unknown_submit_ids,
             "misdelivered": misdelivered,
             "unknown_retry_violation": unknown_retry_violation,
+            "stage_counts": {
+                "input_rows": len(self.rows),
+                "filtered_excluded": sum(int(row.get("excluded_rows") or 0) for row in file_rows),
+                "filtered_invalid": sum(int(row.get("invalid_rows") or 0) for row in file_rows),
+                "filtered_no_template": sum(int(row.get("no_template_rows") or 0) for row in file_rows),
+                "tasks_created": len(tasks),
+                "tasks_queued": statuses.get("queued", 0),
+                "tasks_sending": statuses.get("sending", 0),
+                "tasks_accepted": statuses.get("accepted", 0),
+                "tasks_unknown": statuses.get("unknown", 0),
+                "tasks_partial": statuses.get("partial", 0),
+                "socket_submit_sm": len(submit_events),
+                "submit_sm_resp_observed": len(submit_events) - sum(
+                    1 for item in submit_events if item.get("response_dropped", False)
+                ),
+                "submit_sm_resp_success": len(accepted_events),
+            },
+            "pre_generated_tasks": dict(self.sender_seed),
+            "observability": self.last_watchdog_metrics,
             "latency_ms": {
                 "file_discovery_to_ingestion_start": _percentiles(file_to_db),
                 "ingestion_to_task_creation": _percentiles(ingest_to_task),
@@ -1198,6 +1450,7 @@ class AcceptanceRunner:
     def run(self) -> dict:
         report = {
             "scenario": self.scenario,
+            "gate": self.gate,
             "started_at": _utc_now(),
             "git_commit": self._git_commit(),
             "command": " ".join([str(item) for item in sys.argv]),
@@ -1210,8 +1463,22 @@ class AcceptanceRunner:
             self.start()
             self._start_watchdog()
             self._provision()
-            self._publish_inputs()
-            self._wait_for_business()
+            if self.gate == "sender-only":
+                # Provisioning intentionally ran with the task worker disabled.
+                # Stop the API before the direct seed so the gate cannot race
+                # a live DuckDB writer, then restart the real sender path.
+                self._stop_api_process()
+                self._seed_sender_only_tasks()
+                self.task_worker_disabled = False
+                self._restart_api()
+                self._wait_for_smpp()
+                self._wait_for_business()
+            else:
+                self._publish_inputs()
+                if self.gate == "ingest-only":
+                    self._wait_for_ingestion_only()
+                else:
+                    self._wait_for_business()
             if self.scenario == "restart":
                 before = len([item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"])
                 self._restart_api()
@@ -1310,6 +1577,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", default="quick")
     parser.add_argument("--scenario-file", default=str(DEFAULT_SCENARIOS))
+    parser.add_argument(
+        "--gate", choices=("full", "ingest-only", "sender-only"), default="full",
+        help="acceptance phase: full E2E, ingestion-only, or pre-generated sender-only",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--events", type=int)
     parser.add_argument("--files", type=int)
@@ -1359,6 +1630,7 @@ def main() -> int:
     except Exception as exc:
         report = {
             "scenario": args.scenario,
+            "gate": getattr(args, "gate", "full"),
             "status": "BLOCKED_ENV" if isinstance(exc, (BlockedEnv, FileNotFoundError)) else "FAIL",
             "local_e2e_status": "BLOCKED_ENV" if isinstance(exc, (BlockedEnv, FileNotFoundError)) else "LOCAL_E2E_FAIL",
             "live_env_status": "LIVE_ENV_UNVERIFIED",

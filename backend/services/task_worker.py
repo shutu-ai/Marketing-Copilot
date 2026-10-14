@@ -331,6 +331,11 @@ def _start_claim_dispatcher():
 
 def start_worker():
     global _supervisor, _claim_dispatcher, _task_queue
+    disabled = str(os.environ.get("MC_DISABLE_TASK_WORKER", "0")).strip().lower()
+    if disabled in {"1", "true", "yes", "on"}:
+        logger.info("SMS task worker disabled by MC_DISABLE_TASK_WORKER")
+        metrics_service.set_gauge("marketing_copilot_workers", 0)
+        return
     with _guard:
         if any(thread.is_alive() for thread in _workers.values()):
             return
