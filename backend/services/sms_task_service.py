@@ -129,12 +129,10 @@ def _cached_campaign(conn, campaign_type: str, campaign_id: int) -> Optional[dic
     table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(campaign_type)
     if not table:
         return None
-    owns_conn = conn is None
-    if owns_conn:
-        conn = get_connection()
-    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (campaign_id,)).fetchone()
-    if owns_conn:
-        conn.close()
+    def read(conn):
+        return conn.execute(f"SELECT * FROM {table} WHERE id=?", (campaign_id,)).fetchone()
+
+    row = read_transaction(read, operation="sms_tasks.campaign_cache") if conn is None else read(conn)
     if not row:
         return None
     campaign = dict(row)
@@ -925,39 +923,68 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 json.dumps(payload, ensure_ascii=False), source_file, task_date, dedupe_key,
                 int(campaign.get("dispatch_generation") or 0),
             ))
-        if ingestion_lease:
-            # Fence at the actual task insertion boundary, not before
-            # potentially slow parsing/template expansion. No file IO in tx.
-            from services import realtime_ingestion_state
-            conn.execute("BEGIN TRANSACTION")
-            realtime_ingestion_state.assert_owned(conn, *ingestion_lease)
-        if task_rows:
-            created = _bulk_insert_tasks(conn, task_rows)
-            result["duplicate"] += len(task_rows) - len(created)
-            result["created"] += len(created)
-            created_keys = {dedupe for _task_id, dedupe in created}
-            result["created_msisdns"].extend(
-                row[4] for row in task_rows if row[-2] in created_keys
-            )
-            _add_task_event_batch(
-                conn, campaign_type, campaign["id"], batch_id,
-                "created", "", "queued",
-                [task_id for task_id, _dedupe in created],
-                {"source_file": source_file},
-            )
-        if ingestion_chunk:
-            if ingestion_chunk_progress:
-                realtime_ingestion_state.record_chunk_progress_in_transaction(
-                    conn, ingestion_lease[0], ingestion_chunk, result, ingestion_lease[1],
+        # The staging connection is intentionally closed before the durable
+        # task/result phase.  Preparation can be CPU-heavy, while the actual
+        # task insert, idempotent event append, and ingestion-chunk fence are a
+        # short logical transaction that can safely replay from a fresh
+        # connection after an OCC conflict.
+        conn.close()
+        conn = None
+
+        def persist(conn):
+            if ingestion_lease:
+                # Fence at the actual task insertion boundary, not before
+                # potentially slow parsing/template expansion. No file IO in tx.
+                from services import realtime_ingestion_state
+                realtime_ingestion_state.assert_owned(conn, *ingestion_lease)
+            created = _bulk_insert_tasks(conn, task_rows) if task_rows else []
+            persist_result = {
+                **result,
+                "created": len(created),
+                "duplicate": int(result.get("duplicate", 0) or 0)
+                + len(task_rows) - len(created),
+            }
+            if task_rows:
+                _add_task_event_batch(
+                    conn, campaign_type, campaign["id"], batch_id,
+                    "created", "", "queued",
+                    [task_id for task_id, _dedupe in created],
+                    {"source_file": source_file},
                 )
-                result["chunk_progress_committed"] = True
-            else:
-                realtime_ingestion_state.complete_chunk_in_transaction(
-                    conn, ingestion_lease[0], ingestion_chunk, result, ingestion_lease[1],
-                )
-                result["chunk_committed"] = True
-        conn.execute("DROP TABLE IF EXISTS ingest_task_stage")
-        conn.commit()
+            chunk_committed = False
+            chunk_progress_committed = False
+            if ingestion_chunk:
+                from services import realtime_ingestion_state
+                if ingestion_chunk_progress:
+                    realtime_ingestion_state.record_chunk_progress_in_transaction(
+                        conn, ingestion_lease[0], ingestion_chunk,
+                        persist_result, ingestion_lease[1],
+                    )
+                    chunk_progress_committed = True
+                else:
+                    realtime_ingestion_state.complete_chunk_in_transaction(
+                        conn, ingestion_lease[0], ingestion_chunk,
+                        persist_result, ingestion_lease[1],
+                    )
+                    chunk_committed = True
+            return created, chunk_committed, chunk_progress_committed
+
+        created, chunk_committed, chunk_progress_committed = write_transaction(
+            persist,
+            attempts=3,
+            operation=f"sms_tasks.enqueue.{campaign_type}",
+            lock_timeout=1.0,
+        )
+        result["duplicate"] += len(task_rows) - len(created)
+        result["created"] += len(created)
+        created_keys = {dedupe for _task_id, dedupe in created}
+        result["created_msisdns"].extend(
+            row[4] for row in task_rows if row[-2] in created_keys
+        )
+        if chunk_committed:
+            result["chunk_committed"] = True
+        if chunk_progress_committed:
+            result["chunk_progress_committed"] = True
         if result["created"] and campaign_type == "realtime":
             metrics_service.inc(
                 "realtime_sms_tasks_created_total", result["created"],
@@ -978,7 +1005,8 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
         )
         return result
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def _campaign_eligibility_sql(alias: str) -> str:
@@ -2154,9 +2182,8 @@ def create_external_task(campaign_id: int, campaign_name: str, msisdn: str,
                          language: str, content: str, source_addr: str,
                          payload: Optional[dict] = None) -> dict:
     """Create a directly-consumed task so all SMS paths share task accounting."""
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = write_transaction(
+        lambda conn: conn.execute(
             """INSERT INTO sms_tasks
                (campaign_type,campaign_id,campaign_name,msisdn,language,content,
                 source_addr,payload,source_file,dedupe_key,status,attempts,max_attempts)
@@ -2165,11 +2192,11 @@ def create_external_task(campaign_id: int, campaign_name: str, msisdn: str,
             (int(campaign_id), campaign_name or "", msisdn or "", language or "",
              content or "", source_addr or "", json.dumps(payload or {}, ensure_ascii=False),
              f"rabbitmq:{uuid.uuid4().hex}"),
-        ).fetchone()
-        conn.commit()
-        return dict(row)
-    finally:
-        conn.close()
+        ).fetchone(),
+        attempts=3,
+        operation="sms_tasks.external_create",
+    )
+    return dict(row)
 
 
 def mark_submitted(task_id: int, message_ids: list[str], delivery_receipt_mode: str = "optional",
@@ -2598,19 +2625,7 @@ def requeue_transport_failures() -> int:
     and no durable attempt that has started responding.  Ambiguous failures
     remain ``unknown`` and are never requeued here.
     """
-    conn = get_connection()
-    count = conn.execute(
-        """SELECT COUNT(*) count FROM sms_tasks
-           WHERE status='failed' AND failure_class='transport'
-             AND COALESCE(smsc_message_ids,'[]')='[]'
-             AND submitted_at IS NULL AND delivered_at IS NULL
-             AND NOT EXISTS (
-                 SELECT 1 FROM sms_send_attempts a
-                 WHERE a.task_id=sms_tasks.id
-                   AND a.state IN ('authorized','responding','partial','accepted')
-             )"""
-    ).fetchone()["count"]
-    if count:
+    def recover(conn):
         by_batch = conn.execute(
             """SELECT batch_id,COUNT(*) count FROM sms_tasks
                WHERE status='failed' AND failure_class='transport'
@@ -2624,6 +2639,21 @@ def requeue_transport_failures() -> int:
                  AND batch_id IS NOT NULL
                GROUP BY batch_id"""
         ).fetchall()
+        count = sum(int(row["count"] or 0) for row in by_batch)
+        unbatched = conn.execute(
+            """SELECT COUNT(*) count FROM sms_tasks
+               WHERE status='failed' AND failure_class='transport'
+                 AND COALESCE(smsc_message_ids,'[]')='[]'
+                 AND submitted_at IS NULL AND delivered_at IS NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM sms_send_attempts a
+                     WHERE a.task_id=sms_tasks.id
+                       AND a.state IN ('authorized','responding','partial','accepted')
+                 ) AND batch_id IS NULL"""
+        ).fetchone()["count"]
+        count += int(unbatched or 0)
+        if not count:
+            return 0
         conn.execute(
             """UPDATE sms_tasks SET status='queued', attempts=0, error_msg='',
                 claim_token='', last_smpp_status=NULL, next_attempt_at=CURRENT_TIMESTAMP,
@@ -2644,9 +2674,13 @@ def requeue_transport_failures() -> int:
                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (row["count"], row["batch_id"]),
             )
-        conn.commit()
-    conn.close()
-    return int(count or 0)
+        return int(count)
+
+    return write_transaction(
+        recover,
+        attempts=3,
+        operation="sms_tasks.requeue_transport_failures",
+    )
 
 
 def record_receipt(message_id: str, state: str, raw: str,
@@ -2839,38 +2873,42 @@ def cleanup_task_retention() -> int:
     if archive_enabled:
         from services import task_archive_service
         archived_count = task_archive_service.archive_terminal_tasks(cutoff, cleanup_batch)["archived"]
-    conn = get_connection()
     active = "('queued','sending','retrying','submitted','accepted')"
-    rows = [] if archive_enabled else conn.execute(
-        f"""SELECT id FROM sms_tasks
-             WHERE created_at < ? AND status NOT IN {active}
-             ORDER BY id LIMIT ?""",
-        (cutoff, cleanup_batch),
-    ).fetchall()
-    ids = [row["id"] for row in rows]
-    if ids:
-        placeholders = ",".join("?" for _ in ids)
-        conn.execute(f"DELETE FROM sms_task_message_ids WHERE task_id IN ({placeholders})", ids)
-        conn.execute(f"DELETE FROM delivery_receipts WHERE task_id IN ({placeholders})", ids)
-        conn.execute(f"DELETE FROM task_events WHERE task_id IN ({placeholders})", ids)
-        conn.execute(f"DELETE FROM sms_tasks WHERE id IN ({placeholders})", ids)
-    old_event_rows = conn.execute(
-        "SELECT id FROM task_event_batches WHERE created_at < ? ORDER BY id LIMIT ?",
-        (cutoff, cleanup_batch),
-    ).fetchall()
-    old_event_ids = [row["id"] for row in old_event_rows]
-    if old_event_ids:
-        event_placeholders = ",".join("?" for _ in old_event_ids)
-        conn.execute(
-            f"DELETE FROM task_event_batches WHERE id IN ({event_placeholders})",
-            old_event_ids,
-        )
-    if ids or old_event_ids:
-        conn.commit()
-    conn.close()
-    if ids:
-        logger.info("SMS task retention cleanup deleted=%s retention_days=%s", len(ids), retention_days)
-    return archived_count if archive_enabled else len(ids)
+    def cleanup(conn):
+        rows = [] if archive_enabled else conn.execute(
+            f"""SELECT id FROM sms_tasks
+                 WHERE created_at < ? AND status NOT IN {active}
+                 ORDER BY id LIMIT ?""",
+            (cutoff, cleanup_batch),
+        ).fetchall()
+        ids = [row["id"] for row in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(f"DELETE FROM sms_task_message_ids WHERE task_id IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM delivery_receipts WHERE task_id IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM task_events WHERE task_id IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM sms_tasks WHERE id IN ({placeholders})", ids)
+        old_event_rows = conn.execute(
+            "SELECT id FROM task_event_batches WHERE created_at < ? ORDER BY id LIMIT ?",
+            (cutoff, cleanup_batch),
+        ).fetchall()
+        old_event_ids = [row["id"] for row in old_event_rows]
+        if old_event_ids:
+            event_placeholders = ",".join("?" for _ in old_event_ids)
+            conn.execute(
+                f"DELETE FROM task_event_batches WHERE id IN ({event_placeholders})",
+                old_event_ids,
+            )
+        return len(ids)
+
+    deleted_count = write_transaction(
+        cleanup,
+        attempts=3,
+        operation="sms_tasks.retention_cleanup",
+    )
+    if deleted_count:
+        logger.info("SMS task retention cleanup deleted=%s retention_days=%s", deleted_count, retention_days)
+    return archived_count if archive_enabled else deleted_count
 
 def _cached_task_count(conn, where: str, params: list) -> int:
     now = time.monotonic()
@@ -2979,35 +3017,34 @@ def task_stats() -> dict:
         now = time.monotonic()
         if _TASK_STATS_CACHE is not None and now - _TASK_STATS_CACHE_AT < _TASK_STATS_CACHE_TTL:
             return dict(_TASK_STATS_CACHE)
-        conn = get_connection()
-        try:
-            rows = conn.execute(
+        rows = read_transaction(
+            lambda conn: conn.execute(
                 """SELECT status, COUNT(*) AS count,
                           SUM(CASE WHEN CAST(created_at AS DATE)=CURRENT_DATE THEN 1 ELSE 0 END) AS today_count
                    FROM sms_tasks
                    GROUP BY status"""
-            ).fetchall()
-            raw = {r["status"]: int(r["count"] or 0) for r in rows}
-            today_raw = {r["status"]: int(r["today_count"] or 0) for r in rows}
-            result = dict(raw)
-            for status in ("queued", "sending", "submitted", "accepted", "delivered",
-                           "retrying", "failed", "partial", "unknown", "expired",
-                           "cancelled", "archived"):
-                result.setdefault(status, 0)
-            # Keep delivery semantics strict. ``accepted`` means the SMSC
-            # accepted submit_sm; it is not a handset delivery receipt.
-            result["accepted_or_delivered"] = raw.get("accepted", 0) + raw.get("delivered", 0)
-            result["today_total"] = sum(today_raw.values())
-            for status in ("queued", "sending", "submitted", "accepted", "delivered",
-                           "retrying", "failed", "partial", "unknown", "expired",
-                           "cancelled", "archived"):
-                result[f"today_{status}"] = today_raw.get(status, 0)
-            result["today_accepted_or_delivered"] = (
-                today_raw.get("accepted", 0) + today_raw.get("delivered", 0)
-            )
-            result["total"] = sum(raw.values())
-        finally:
-            conn.close()
+            ).fetchall(),
+            operation="sms_tasks.stats",
+        )
+        raw = {r["status"]: int(r["count"] or 0) for r in rows}
+        today_raw = {r["status"]: int(r["today_count"] or 0) for r in rows}
+        result = dict(raw)
+        for status in ("queued", "sending", "submitted", "accepted", "delivered",
+                       "retrying", "failed", "partial", "unknown", "expired",
+                       "cancelled", "archived"):
+            result.setdefault(status, 0)
+        # Keep delivery semantics strict. ``accepted`` means the SMSC
+        # accepted submit_sm; it is not a handset delivery receipt.
+        result["accepted_or_delivered"] = raw.get("accepted", 0) + raw.get("delivered", 0)
+        result["today_total"] = sum(today_raw.values())
+        for status in ("queued", "sending", "submitted", "accepted", "delivered",
+                       "retrying", "failed", "partial", "unknown", "expired",
+                       "cancelled", "archived"):
+            result[f"today_{status}"] = today_raw.get(status, 0)
+        result["today_accepted_or_delivered"] = (
+            today_raw.get("accepted", 0) + today_raw.get("delivered", 0)
+        )
+        result["total"] = sum(raw.values())
         _TASK_STATS_CACHE = result
         _TASK_STATS_CACHE_AT = now
         return dict(result)

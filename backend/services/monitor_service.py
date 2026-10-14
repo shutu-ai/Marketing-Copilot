@@ -1,6 +1,6 @@
 import shutil
 import json
-from database import get_connection, is_transient_write_error, read_transaction, write_transaction
+from database import is_transient_write_error, read_transaction, write_transaction
 import os
 import stat
 import pandas as pd
@@ -86,13 +86,12 @@ def update_config(config_id: int, data: dict) -> Optional[dict]:
     if "directory_path" in fields:
         fields["directory_path"] = os.path.abspath(fields["directory_path"])
     if not fields:
-        conn = get_connection()
-        try:
-            row = conn.execute(
+        row = read_transaction(
+            lambda conn: conn.execute(
                 "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone(),
+            operation="monitor.config.get",
+        )
         return _enrich_config(dict(row)) if row else None
 
     def write(conn):
@@ -170,13 +169,16 @@ def _distribute_to_targets(source_path: str, target_dirs: list) -> tuple:
     return destinations, first_dest is not None
 
 
-def _redistribute_pending(conn, directory_path: str, target_dirs: list, config_id: int) -> list:
+def _redistribute_pending(directory_path: str, target_dirs: list, config_id: int) -> list:
     """Attempt to distribute existing pending files whose source still exists."""
     updated = []
-    rows = conn.execute(
-        "SELECT * FROM monitor_files WHERE directory_path=? AND monitor_config_id=? AND status IN ('pending','processing')",
-        (directory_path, config_id)
-    ).fetchall()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM monitor_files WHERE directory_path=? AND monitor_config_id=? AND status IN ('pending','processing')",
+            (directory_path, config_id),
+        ).fetchall(),
+        operation="monitor.redistribute.pending",
+    )
     for r in rows:
         f = dict(r)
         src = os.path.join(f["directory_path"], f["filename"])
@@ -184,11 +186,17 @@ def _redistribute_pending(conn, directory_path: str, target_dirs: list, config_i
             continue
         moved_dirs, _ = _distribute_to_targets(src, target_dirs)
         if moved_dirs:
-            conn.execute(
-                "UPDATE monitor_files SET status='distributed', updated_at=datetime('now','localtime') WHERE id=?",
-                (f["id"],)
-            )
             updated.append(f["id"])
+    if updated:
+        write_transaction(
+            lambda conn: conn.executemany(
+                "UPDATE monitor_files SET status='distributed', updated_at=datetime('now','localtime') WHERE id=?",
+                [(file_id,) for file_id in updated],
+            ),
+            attempts=3,
+            operation="monitor.redistribute.status",
+            base_delay=0.1,
+        )
     return updated
 
 
@@ -202,21 +210,14 @@ def scan_directory(config_id: int, directory_path: str) -> dict:
     if not os.path.isdir(directory_path):
         raise FileNotFoundError(f"Directory does not exist: {directory_path}")
 
-    conn = get_connection()
-    try:
-        config_row = conn.execute(
+    config_row = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM monitor_configs WHERE id=?", (config_id,)
-        ).fetchone()
-        target_dirs = _parse_targets(
-            config_row["target_directories"] if config_row else ""
-        )
-        moved_count = 0
-        if target_dirs:
-            redone = _redistribute_pending(conn, directory_path, target_dirs, config_id)
-            moved_count += len(redone)
-            conn.commit()
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="monitor.scan.config",
+    )
+    target_dirs = _parse_targets(config_row["target_directories"] if config_row else "")
+    moved_count = len(_redistribute_pending(directory_path, target_dirs, config_id)) if target_dirs else 0
 
     new_files = []
     for fname in os.listdir(directory_path):
@@ -225,14 +226,13 @@ def scan_directory(config_id: int, directory_path: str) -> dict:
         fpath = os.path.join(directory_path, fname)
         if not os.path.isfile(fpath):
             continue
-        probe = get_connection()
-        try:
-            existing = probe.execute(
+        existing = read_transaction(
+            lambda conn: conn.execute(
                 "SELECT id, status FROM monitor_files WHERE filename=? AND directory_path=?",
                 (fname, directory_path),
-            ).fetchone()
-        finally:
-            probe.close()
+            ).fetchone(),
+            operation="monitor.scan.file_probe",
+        )
         if existing:
             continue
 
@@ -292,17 +292,22 @@ def scan_directory(config_id: int, directory_path: str) -> dict:
 
 
 def distribute_file(file_id: int) -> dict:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM monitor_files WHERE id=?", (file_id,)).fetchone()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM monitor_files WHERE id=?", (file_id,)
+        ).fetchone(),
+        operation="monitor.file.get",
+    )
     if not row:
-        conn.close()
         return {"success": False, "message": "File not found"}
     file_info = dict(row)
-
-    config_row = conn.execute(
-        "SELECT * FROM monitor_configs WHERE id=?", (file_info.get("monitor_config_id"),)
-    ).fetchone()
-    conn.close()
+    config_row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM monitor_configs WHERE id=?",
+            (file_info.get("monitor_config_id"),),
+        ).fetchone(),
+        operation="monitor.file.config",
+    )
     if not config_row:
         return {"success": False, "message": "Monitor config not found"}
     config = dict(config_row)
@@ -345,13 +350,12 @@ def get_files(status: Optional[str] = None, directory_path: Optional[str] = None
 
 def sync_source_files() -> dict:
     """Check source files against monitor_files; mark as distributed if missing."""
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM monitor_files WHERE status='pending' OR status='processing'"
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="monitor.files.sync_snapshot",
+    )
     missing_ids = []
     for r in rows:
         f = dict(r)
@@ -451,46 +455,58 @@ def get_realtime_monitor(
     processed_page_size: int = 50,
 ) -> dict:
     source_files = []
-    conn = get_connection()
-    all_campaign_rows = conn.execute(
-        "SELECT id,name,status,watch_source,watch_dir,watch_filename_prefix,sftp_host,sftp_port,sftp_username FROM realtime_campaigns ORDER BY created_at DESC"
-    ).fetchall()
-    if campaign_id:
-        campaign_rows = conn.execute(
-            "SELECT * FROM realtime_campaigns WHERE id=? AND COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC",
-            (campaign_id,),
-        ).fetchall()
-    else:
-        campaign_rows = conn.execute(
-            "SELECT * FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC"
-        ).fetchall()
-    active_campaigns = conn.execute("SELECT COUNT(*) AS count FROM realtime_campaigns WHERE status='in_progress'").fetchone()
     processed_where = "campaign_type='realtime'"
     processed_params = []
     if campaign_id:
         processed_where += " AND campaign_id=?"
         processed_params.append(campaign_id)
-    processed_total = conn.execute(
-        f"SELECT COUNT(*) cnt FROM processed_files WHERE {processed_where}",
-        tuple(processed_params),
-    ).fetchone()["cnt"]
     processed_offset = max(0, processed_page - 1) * processed_page_size
-    processed_rows = conn.execute(
-        f"""SELECT * FROM processed_files
-            WHERE {processed_where}
-            ORDER BY detected_at DESC LIMIT ? OFFSET ?""",
-        tuple(processed_params + [processed_page_size, processed_offset]),
-    ).fetchall()
     ingestion_where = "campaign_type='realtime'"
     ingestion_params = []
     if campaign_id:
         ingestion_where += " AND campaign_id=?"
         ingestion_params.append(campaign_id)
-    ingestion_rows = conn.execute(
-        f"""SELECT * FROM ingestion_files WHERE {ingestion_where}
-            ORDER BY updated_at DESC LIMIT 100""", tuple(ingestion_params),
-    ).fetchall()
-    conn.close()
+
+    def read_snapshot(conn):
+        all_campaign_rows = conn.execute(
+            "SELECT id,name,status,watch_source,watch_dir,watch_filename_prefix,sftp_host,sftp_port,sftp_username FROM realtime_campaigns ORDER BY created_at DESC"
+        ).fetchall()
+        if campaign_id:
+            campaign_rows = conn.execute(
+                "SELECT * FROM realtime_campaigns WHERE id=? AND COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC",
+                (campaign_id,),
+            ).fetchall()
+        else:
+            campaign_rows = conn.execute(
+                "SELECT * FROM realtime_campaigns WHERE COALESCE(watch_dir,'')<>'' ORDER BY created_at DESC"
+            ).fetchall()
+        active_campaigns = conn.execute(
+            "SELECT COUNT(*) AS count FROM realtime_campaigns WHERE status='in_progress'"
+        ).fetchone()
+        processed_total = conn.execute(
+            f"SELECT COUNT(*) cnt FROM processed_files WHERE {processed_where}",
+            tuple(processed_params),
+        ).fetchone()["cnt"]
+        processed_rows = conn.execute(
+            f"""SELECT * FROM processed_files
+                WHERE {processed_where}
+                ORDER BY detected_at DESC LIMIT ? OFFSET ?""",
+            tuple(processed_params + [processed_page_size, processed_offset]),
+        ).fetchall()
+        ingestion_rows = conn.execute(
+            f"""SELECT * FROM ingestion_files WHERE {ingestion_where}
+                ORDER BY updated_at DESC LIMIT 100""", tuple(ingestion_params),
+        ).fetchall()
+        return all_campaign_rows, campaign_rows, active_campaigns, processed_total, processed_rows, ingestion_rows
+
+    (
+        all_campaign_rows,
+        campaign_rows,
+        active_campaigns,
+        processed_total,
+        processed_rows,
+        ingestion_rows,
+    ) = read_transaction(read_snapshot, operation="monitor.realtime.snapshot")
     ingestion_by_key = {(int(item["campaign_id"]), item["filename"]): item["id"] for item in (dict(row) for row in ingestion_rows)}
     processed_items = []
     for row in processed_rows:
@@ -659,21 +675,25 @@ def scan_realtime_watch_dir(
 
 def retry_realtime_file(file_id: int) -> Optional[dict]:
     from services import ingestion_job_service
-    conn = get_connection()
-    try:
-        row = conn.execute("SELECT * FROM ingestion_files WHERE id=? AND campaign_type='realtime'", (file_id,)).fetchone()
-    finally:
-        conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM ingestion_files WHERE id=? AND campaign_type='realtime'",
+            (file_id,),
+        ).fetchone(),
+        operation="monitor.realtime_file.get",
+    )
     if not row:
         return None
     job = dict(row)
     if job["status"] not in ("failed", "quarantined", "retrying"):
         return {"success": False, "message": "only failed or quarantined files can be retried"}
-    campaign = get_connection()
-    try:
-        campaign_row = campaign.execute("SELECT campaign_dir FROM realtime_campaigns WHERE id=?", (job["campaign_id"],)).fetchone()
-    finally:
-        campaign.close()
+    campaign_row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT campaign_dir FROM realtime_campaigns WHERE id=?",
+            (job["campaign_id"],),
+        ).fetchone(),
+        operation="monitor.realtime_file.campaign_dir",
+    )
     campaign_dir = campaign_row["campaign_dir"] if campaign_row else ""
     inbox_path = os.path.join(campaign_dir, "inbox", job["filename"])
     if not os.path.isfile(inbox_path):
@@ -723,21 +743,28 @@ def retry_realtime_files(file_ids: list[int]) -> dict:
 
 def archive_realtime_file(file_id: int) -> Optional[dict]:
     """Archive a terminal realtime file without deleting its audit metadata."""
-    conn = get_connection()
-    try:
+    def read_archive_snapshot(conn):
         row = conn.execute(
             "SELECT * FROM ingestion_files WHERE id=? AND campaign_type='realtime'", (file_id,)
         ).fetchone()
         if not row:
-            return None
+            return None, None
         job = dict(row)
         if job["status"] not in ("failed", "quarantined"):
-            return {"success": False, "message": "only failed or quarantined files can be archived"}
+            return job, "invalid"
         campaign = conn.execute(
             "SELECT campaign_dir FROM realtime_campaigns WHERE id=?", (job["campaign_id"],)
         ).fetchone()
-    finally:
-        conn.close()
+        return job, dict(campaign) if campaign else None
+
+    job, campaign = read_transaction(
+        read_archive_snapshot,
+        operation="monitor.realtime_file.archive_snapshot",
+    )
+    if job is None:
+        return None
+    if campaign == "invalid":
+        return {"success": False, "message": "only failed or quarantined files can be archived"}
     campaign_dir = campaign["campaign_dir"] if campaign else ""
     candidates = [job.get("file_path", ""),
                   os.path.join(campaign_dir, "inbox", job["filename"]),

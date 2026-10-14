@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.0",
+  "decision": "MORE_EVIDENCE_NEEDED",
+  "generated_at": "2026-10-14",
+  "baseline_sha": "45a258ea56632762d7f732b3c7f3b1b78875800b",
+  "submission_revision": "WORKTREE_UNCOMMITTED@45a258ea56632762d7f732b3c7f3b1b78875800b",
+  "default_mode": "serialized",
+  "opt_in_mode": "occ",
+  "single_owner_required": true,
+  "real_smsc_used": false,
+  "runtime_artifacts_included": false,
+  "environment": {
+    "observed_host": "Windows worktree",
+    "python": "3.13.x",
+    "duckdb": "1.2.0",
+    "target_linux_ext4_verified": false,
+    "sles12sp5_verified": false
+  },
+  "implementation": {
+    "transaction_coordinator": "backend/database.py",
+    "maintenance_boundary": "maintenance_exclusive",
+    "complete_write_retry": "write_transaction",
+    "realtime_callsite_migration": true,
+    "result_writer_idempotency_preserved": true,
+    "capacity_and_backpressure_preserved": true,
+    "loopback_harness": "backend/tools/duckdb_occ_loopback_acceptance.py",
+    "benchmark_harness": "backend/tools/duckdb_occ_benchmark.py"
+  },
+  "gates": {
+    "G1_contract_and_static_audit": {
+      "status": "PASS_LOCAL",
+      "evidence": [
+        "Docs/DuckDB-Global-Writer-Lock-Callsite-Audit.md",
+        "py_compile for changed Python modules"
+      ]
+    },
+    "G2_occ_correctness_and_maintenance": {
+      "status": "PASS_LOCAL",
+      "evidence": [
+        "backend/tests/test_duckdb_occ_coordinator.py: 4 passed",
+        "duckdb_occ_loopback_acceptance.py --mode occ: errors=[]",
+        "duckdb_occ_loopback_acceptance.py --mode serialized: errors=[]",
+        "maintenance requested, new admission blocked, active transactions after=0"
+      ]
+    },
+    "G3_single_campaign_equal_window": {
+      "status": "PENDING",
+      "required": "Current OCC build, Linux local ext4, 1k/10k equal-window stress with no loss/duplicate/late-task violation"
+    },
+    "G4_mixed_campaign_capacity_fairness": {
+      "status": "PENDING",
+      "required": "Current OCC build, equal-window mixed campaigns/routes, per-campaign and per-route isolation evidence"
+    },
+    "G5_failure_injection_recovery": {
+      "status": "PENDING",
+      "required": "Current OCC build with owner/I/O/WAL/worker/SMSC controlled failures and recovery proof"
+    },
+    "SLES12SP5_offline_package": {
+      "status": "PENDING",
+      "required": "Build and validate target offline runtime/package without runtime data"
+    },
+    "real_smsc_canary": {
+      "status": "PENDING",
+      "required": "Controlled real SMSC stop-fence, DLR, disconnect, duplicate, and rollback evidence"
+    }
+  },
+  "local_regressions": [
+    {
+      "scope": "complete backend suite",
+      "result": "187 passed, 3 skipped, 4 warnings",
+      "command": ".\\.p0-test-venv\\Scripts\\python.exe -m pytest backend/tests -q"
+    },
+    {
+      "scope": "frontend production build",
+      "result": "passed; Vite emitted dependency annotation and chunk-size warnings",
+      "command": "npm run build (from frontend/)"
+    },
+    {
+      "scope": "OCC coordinator",
+      "result": "4 passed",
+      "command": ".\\.p0-test-venv\\Scripts\\python.exe -m pytest backend/tests/test_duckdb_occ_coordinator.py -q"
+    },
+    {
+      "scope": "realtime ingestion and scheduling",
+      "result": "46 passed",
+      "command": "test_realtime_progress_batches.py test_realtime_ingestion_optimization.py test_realtime_scheduling_reliability.py"
+    },
+    {
+      "scope": "hot path and ingestion",
+      "result": "55 passed, 2 skipped",
+      "command": "test_phase1_streaming.py test_phase2_write_reduction.py test_phase3_single_host_scale.py test_flash_sms_regression.py test_realtime_progress_batches.py"
+    },
+    {
+      "scope": "lock/backup/realtime regression",
+      "result": "21 passed, 1 skipped",
+      "command": "existing lock/backup/progress regression selection"
+    }
+  ],
+  "benchmark": {
+    "workload": "4 workers x 20 independent-row transactions, 1ms callback hold, temporary database",
+    "serialized": {
+      "elapsed_seconds": 0.260572,
+      "operations_per_second": 307.017,
+      "sum_value": 80,
+      "expected_sum": 80
+    },
+    "occ": {
+      "elapsed_seconds": 0.078694,
+      "operations_per_second": 1016.596,
+      "sum_value": 80,
+      "expected_sum": 80
+    },
+    "interpretation": "Local functional comparison only; not Linux/ext4 or SMSC throughput certification"
+  },
+  "historical_evidence_policy": "Existing fast-send, WSL, and prior local JSON files are tagged reference-only and are not counted as current post-refactor G3/G4/G5 evidence."
+}

@@ -11,7 +11,7 @@ from typing import Optional
 import duckdb
 import pandas as pd
 
-from database import get_connection, write_transaction
+from database import read_transaction, write_transaction
 from services import ingestion_job_service, operations_service, sms_task_service, settings_service
 
 logger = logging.getLogger(__name__)
@@ -158,37 +158,36 @@ def _source_row_count(path: str) -> int:
 
 
 def active_version(campaign_id: int) -> Optional[dict]:
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             """SELECT v.* FROM realtime_whitelist_versions v
                JOIN realtime_campaigns c ON c.active_whitelist_version_id=v.id
                WHERE c.id=? AND v.status='ready'""", (campaign_id,),
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="whitelist.active_version",
+    )
+    return dict(row) if row else None
 
 
 def get_version(version_id: int) -> Optional[dict]:
-    conn = get_connection()
-    try:
-        row = conn.execute("SELECT * FROM realtime_whitelist_versions WHERE id=?", (version_id,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_whitelist_versions WHERE id=?", (version_id,)
+        ).fetchone(),
+        operation="whitelist.version.get",
+    )
+    return dict(row) if row else None
 
 
 def latest_version(campaign_id: int) -> Optional[dict]:
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM realtime_whitelist_versions WHERE campaign_id=? ORDER BY version_no DESC LIMIT 1",
             (campaign_id,),
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="whitelist.version.latest",
+    )
+    return dict(row) if row else None
 
 
 def get_index_status(campaign: dict) -> dict:
@@ -288,14 +287,13 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
     version = get_version(version_id)
     if not version:
         return False
-    conn = get_connection()
-    try:
-        campaign = conn.execute(
+    campaign = read_transaction(
+        lambda conn: conn.execute(
             "SELECT active_whitelist_version_id,customer_list_path FROM realtime_campaigns WHERE id=?",
             (version["campaign_id"],),
-        ).fetchone()
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="whitelist.rebuild.campaign",
+    )
     if not campaign:
         return False
     active_version_id = int(campaign["active_whitelist_version_id"] or 0)
@@ -427,9 +425,8 @@ def recover_transient_failure(version_id: int) -> str:
 
 def repair_active_failed(limit: int = 1) -> int:
     """Queue repair for active failed indexes without changing the binding."""
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT v.id,v.error_detail FROM realtime_whitelist_versions v
                JOIN realtime_campaigns c ON c.id=v.campaign_id
                WHERE v.status='failed'
@@ -439,9 +436,9 @@ def repair_active_failed(limit: int = 1) -> int:
                           WHERE v2.campaign_id=v.campaign_id)))
                ORDER BY v.created_at,v.id LIMIT ?""",
             (max(1, int(limit)),),
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="whitelist.repair.failed_candidates",
+    )
     repaired = 0
     for row in rows:
         if is_transient_database_error(row["error_detail"]):
@@ -470,15 +467,14 @@ def repair_active_binding(limit: int = 10) -> int:
     repair, not a rollback: the candidate must have a higher version number
     than the failed active version (or the campaign must have no binding).
     """
-    conn = get_connection()
-    try:
-        campaigns = conn.execute(
+    campaigns = read_transaction(
+        lambda conn: conn.execute(
             """SELECT id,active_whitelist_version_id FROM realtime_campaigns
                WHERE use_whitelist=TRUE ORDER BY id LIMIT ?""",
             (max(1, int(limit)),),
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="whitelist.repair.binding_candidates",
+    )
     restored = 0
     for campaign in campaigns:
         campaign_id = int(campaign["id"])
@@ -486,16 +482,15 @@ def repair_active_binding(limit: int = 10) -> int:
         active = get_version(active_id) if active_id else None
         if active and active.get("status") == "ready" and os.path.isfile(active.get("index_path") or ""):
             continue
-        conn = get_connection()
-        try:
-            candidates = conn.execute(
+        candidates = read_transaction(
+            lambda conn: conn.execute(
                 """SELECT * FROM realtime_whitelist_versions
                    WHERE campaign_id=? AND status IN ('ready','retired','failed')
                    ORDER BY version_no DESC""",
                 (campaign_id,),
-            ).fetchall()
-        finally:
-            conn.close()
+            ).fetchall(),
+            operation="whitelist.repair.binding_versions",
+        )
         candidate = None
         for row in candidates:
             index_path = row["index_path"] or ""
@@ -524,8 +519,7 @@ def repair_active_binding(limit: int = 10) -> int:
             # Never fall back to an older version when the current version is
             # damaged or missing. It must be repaired from its own source.
             continue
-        conn = get_connection()
-        try:
+        def restore(conn):
             conn.execute(
                 """UPDATE realtime_whitelist_versions
                    SET status='ready',retired_at=NULL,error_detail=''
@@ -561,9 +555,11 @@ def repair_active_binding(limit: int = 10) -> int:
                               OR last_error_class IN ('WAITING_DEPENDENCY','WHITELIST_INDEX'))""",
                     (candidate["id"], campaign_id),
                 )
-            conn.commit()
-        finally:
-            conn.close()
+        write_transaction(
+            restore,
+            attempts=3,
+            operation="whitelist.repair.binding_restore",
+        )
         restored += 1
         logger.warning(
             "Realtime active whitelist binding restored campaign=%s from_version=%s to_version=%s",
@@ -600,11 +596,13 @@ def build_version(version_id: int) -> dict:
         message = "whitelist source file is missing"
         _set_status(version_id, "failed", error_detail=message)
         raise FileNotFoundError(message)
-    campaign = get_connection()
-    try:
-        campaign_row = campaign.execute("SELECT campaign_dir FROM realtime_campaigns WHERE id=?", (version["campaign_id"],)).fetchone()
-    finally:
-        campaign.close()
+    campaign_row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT campaign_dir FROM realtime_campaigns WHERE id=?",
+            (version["campaign_id"],),
+        ).fetchone(),
+        operation="whitelist.build.campaign_dir",
+    )
     campaign_dir = campaign_row["campaign_dir"] if campaign_row else ""
     index_dir = os.path.join(campaign_dir, "whitelist", INDEX_DIRNAME)
     os.makedirs(index_dir, exist_ok=True)
@@ -727,14 +725,13 @@ def build_version(version_id: int) -> dict:
 
 
 def build_pending(limit: int = 1) -> int:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             "SELECT id FROM realtime_whitelist_versions WHERE status='building' ORDER BY created_at,id LIMIT ?",
             (max(1, limit),),
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="whitelist.build.pending",
+    )
     built = 0
     for row in rows:
         try:
@@ -751,9 +748,8 @@ def migrate_legacy_versions(limit: int = 1) -> int:
     Hashing/copying is intentionally performed by the ingestion worker, never by
     the scheduler or HTTP request, so an old 4M-row whitelist cannot pause intake.
     """
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT id,campaign_dir,customer_list_filename,customer_list_path
                FROM realtime_campaigns
                WHERE use_whitelist=TRUE AND active_whitelist_version_id IS NULL
@@ -761,9 +757,9 @@ def migrate_legacy_versions(limit: int = 1) -> int:
                  AND NOT EXISTS (SELECT 1 FROM realtime_whitelist_versions v
                                  WHERE v.campaign_id=realtime_campaigns.id AND v.status='building')
                ORDER BY updated_at,id LIMIT ?""", (max(1, limit),)
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="whitelist.migrate.legacy_candidates",
+    )
     migrated = 0
     for row in rows:
         source_path = row["customer_list_path"]
@@ -812,8 +808,7 @@ def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
         )))
     except (TypeError, ValueError):
         retention_days = 7
-    conn = get_connection()
-    try:
+    def snapshot(conn):
         where = "WHERE v.status IN ('ready','retired')"
         params = []
         if campaign_id:
@@ -823,7 +818,8 @@ def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
             f"""SELECT v.*,c.active_whitelist_version_id FROM realtime_whitelist_versions v
                 JOIN realtime_campaigns c ON c.id=v.campaign_id {where}""", params
         ).fetchall()
-        retired = removed = 0
+        ready_ids = []
+        removable = []
         for row in candidates:
             if row["id"] == row["active_whitelist_version_id"]:
                 continue
@@ -835,11 +831,7 @@ def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
             if int(bound or 0):
                 continue
             if row["status"] == "ready":
-                conn.execute(
-                    "UPDATE realtime_whitelist_versions SET status='retired',retired_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (row["id"],),
-                )
-                retired += 1
+                ready_ids.append(row["id"])
                 continue
             old_enough = conn.execute(
                 """SELECT CAST(COALESCE(retired_at,created_at) AS TIMESTAMP)
@@ -847,32 +839,73 @@ def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
                    FROM realtime_whitelist_versions WHERE id=?""",
                 (retention_days, row["id"]),
             ).fetchone()["old_enough"]
-            if not old_enough:
+            if old_enough:
+                removable.append((row["id"], row["index_path"], row["source_path"]))
+        return ready_ids, removable
+
+    ready_ids, removable = read_transaction(
+        snapshot,
+        operation="whitelist.cleanup.snapshot",
+    )
+
+    # Retired files are removed outside the database admission. Only clear
+    # paths for rows whose filesystem cleanup completed, so an I/O failure is
+    # recoverable on the next retention pass.
+    removable_ids = []
+    for version_id, index_path, source_path in removable:
+        cleanup_ok = True
+        for path in (index_path, source_path):
+            if not path or not os.path.isfile(path):
                 continue
-            for path in (row["index_path"], row["source_path"]):
-                if path and os.path.isfile(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        logger.warning("Unable to remove retired whitelist file path=%s", path)
+            try:
+                os.remove(path)
+            except OSError:
+                cleanup_ok = False
+                logger.warning("Unable to remove retired whitelist file path=%s", path)
+        if cleanup_ok:
+            removable_ids.append(version_id)
+
+    def finalize(conn):
+        retired = 0
+        for version_id in ready_ids:
             conn.execute(
-                "UPDATE realtime_whitelist_versions SET index_path='',source_path='',error_detail=? WHERE id=?",
-                (f"retired files removed after {retention_days} days", row["id"]),
+                """UPDATE realtime_whitelist_versions SET status='retired',retired_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND status='ready' AND id<>COALESCE((
+                       SELECT active_whitelist_version_id FROM realtime_campaigns c
+                       JOIN realtime_whitelist_versions v ON v.campaign_id=c.id WHERE v.id=?
+                   ),0)""",
+                (version_id, version_id),
+            )
+            retired += 1
+        removed = 0
+        for version_id in removable_ids:
+            conn.execute(
+                """UPDATE realtime_whitelist_versions AS v SET index_path='',source_path='',error_detail=?
+                   WHERE v.id=? AND v.status='retired'
+                     AND v.id<>COALESCE((SELECT active_whitelist_version_id FROM realtime_campaigns c
+                                        WHERE c.id=v.campaign_id),0)
+                     AND NOT EXISTS (SELECT 1 FROM ingestion_files f
+                                     WHERE f.whitelist_version_id=v.id
+                                       AND f.status NOT IN ('completed','failed','quarantined'))""",
+                (f"retired files removed after {retention_days} days", version_id),
             )
             removed += 1
-        if retired or removed:
-            conn.commit()
         return {"retired": retired, "removed": removed}
-    finally:
-        conn.close()
+
+    return write_transaction(
+        finalize,
+        attempts=3,
+        operation="whitelist.cleanup.finalize",
+    )
 
 
 def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
-    campaign = get_connection()
-    try:
-        row = campaign.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    finally:
-        campaign.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone(),
+        operation="whitelist.upload.campaign",
+    )
     if not row:
         return {"success": False, "message": "Campaign not found"}
     campaign = dict(row)
@@ -925,10 +958,11 @@ def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
 
 
 def get_version_by_hash(campaign_id: int, source_hash: str) -> Optional[dict]:
-    conn = get_connection()
-    try:
-        row = conn.execute("SELECT * FROM realtime_whitelist_versions WHERE campaign_id=? AND source_hash=?",
-                           (campaign_id, source_hash)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_whitelist_versions WHERE campaign_id=? AND source_hash=?",
+            (campaign_id, source_hash),
+        ).fetchone(),
+        operation="whitelist.version.by_hash",
+    )
+    return dict(row) if row else None

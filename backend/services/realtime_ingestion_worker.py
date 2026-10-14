@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from database import get_connection
+from database import read_transaction, write_transaction
 from services import backpressure_service
 from services import ingestion_job_service, operations_service, realtime_campaign_service, realtime_whitelist_service
 from services import realtime_ingestion_state
@@ -35,31 +35,29 @@ def _configured_worker_count() -> int:
 
 
 def _processed_id(campaign_id: int, filename: str):
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             "SELECT id FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
             (campaign_id, filename),
-        ).fetchone()
-        return row["id"] if row else None
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="realtime.ingestion.processed_file_lookup",
+    )
+    return row["id"] if row else None
 
 
 def _discard_expired_queued_files(include_processing: bool = False):
     """Expire old-date jobs before the worker selects the next queue item."""
-    conn = get_connection()
-    try:
-        active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
-        rows = conn.execute(
+    active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT f.id, f.campaign_id, f.filename, f.file_path,
                       c.campaign_dir, c.watch_filename_prefix
                FROM ingestion_files f
                JOIN realtime_campaigns c ON c.id=f.campaign_id
                WHERE f.campaign_type='realtime' AND f.status IN """ + active_statuses
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime.ingestion.expired_file_scan",
+    )
 
     today = datetime.now().date()
     expired_jobs = []
@@ -82,18 +80,16 @@ def _discard_expired_queued_files(include_processing: bool = False):
     if not expired_ids:
         return
     discarded_jobs = [job for job in expired_jobs if job["id"] in expired_ids]
-    conn = get_connection()
-    try:
-        conn.executemany(
+    write_transaction(
+        lambda conn: conn.executemany(
             """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
                processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
                completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
                WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
             ((reason, job["campaign_id"], job["filename"]) for job in discarded_jobs),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        ),
+        operation="realtime.ingestion.expired_processed_files",
+    )
 
     for job in discarded_jobs:
         try:
@@ -110,9 +106,8 @@ def _discard_expired_queued_files(include_processing: bool = False):
 
 def _discard_inactive_campaign_files() -> None:
     """Batch-cancel queued files whose campaign was disabled or removed."""
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT f.id,f.campaign_id,f.filename,f.file_path,
                       c.id AS matched_campaign_id
                FROM ingestion_files f
@@ -120,9 +115,9 @@ def _discard_inactive_campaign_files() -> None:
                WHERE f.campaign_type='realtime'
                  AND f.status IN ('pending','retrying')
                  AND (c.id IS NULL OR c.status <> 'in_progress')"""
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime.ingestion.inactive_file_scan",
+    )
     if not rows:
         return
 
@@ -141,19 +136,17 @@ def _discard_inactive_campaign_files() -> None:
     if not discarded_jobs:
         return
 
-    conn = get_connection()
-    try:
-        conn.executemany(
+    write_transaction(
+        lambda conn: conn.executemany(
             """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
                processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
                completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
                WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
             (("campaign not found" if job.get("matched_campaign_id") is None else "campaign is not enabled",
               job["campaign_id"], job["filename"]) for job in discarded_jobs),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+        ),
+        operation="realtime.ingestion.inactive_processed_files",
+    )
 
     for job in discarded_jobs:
         try:
@@ -214,15 +207,14 @@ def _cleanup_orphaned_intermediate_files():
                 logger.warning("Realtime scratch cleanup failed file=%s error=%s", path, exc)
     except OSError as exc:
         logger.warning("Realtime scratch directory scan failed dir=%s error=%s", temp_dir, exc)
-    conn = get_connection()
-    try:
-        campaign_dirs = [
+    campaign_dirs = read_transaction(
+        lambda conn: [
             row["campaign_dir"] for row in conn.execute(
                 "SELECT campaign_dir FROM realtime_campaigns WHERE COALESCE(campaign_dir,'')<>''"
             ).fetchall()
-        ]
-    finally:
-        conn.close()
+        ],
+        operation="realtime.ingestion.scratch_campaign_dirs",
+    )
     for campaign_dir in campaign_dirs:
         inbox_dir = os.path.join(campaign_dir, "inbox")
         try:
@@ -338,11 +330,12 @@ def _process_claimed_file(job, worker_id):
     processed_id = None
     started = time.monotonic()
     try:
-        conn = get_connection()
-        try:
-            campaign_row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (job["campaign_id"],)).fetchone()
-        finally:
-            conn.close()
+        campaign_row = read_transaction(
+            lambda conn: conn.execute(
+                "SELECT * FROM realtime_campaigns WHERE id=?", (job["campaign_id"],)
+            ).fetchone(),
+            operation="realtime.ingestion.campaign_lookup",
+        )
         if not campaign_row:
             raise ValueError("campaign not found")
         campaign = dict(campaign_row)

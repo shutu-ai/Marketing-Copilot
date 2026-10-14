@@ -410,34 +410,36 @@ def save_state(state: dict) -> None:
 
 
 def active_business() -> dict:
-    from database import get_connection
+    from database import read_transaction
 
-    conn = get_connection()
-    row = conn.execute(
-        """SELECT
-             (SELECT COUNT(*) FROM batch_campaigns WHERE status='in_progress') AS batch_in_progress,
-             (SELECT COUNT(*) FROM realtime_campaigns WHERE status='in_progress') AS realtime_in_progress,
-             (SELECT COUNT(*) FROM sms_tasks WHERE status='sending') AS sending_tasks,
-             (SELECT COUNT(*) FROM sms_tasks WHERE status IN ('queued','retrying')
-                AND TRY_CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE) <= CURRENT_TIMESTAMP) AS pending_tasks"""
-    ).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM batch_campaigns WHERE status='in_progress') AS batch_in_progress,
+                 (SELECT COUNT(*) FROM realtime_campaigns WHERE status='in_progress') AS realtime_in_progress,
+                 (SELECT COUNT(*) FROM sms_tasks WHERE status='sending') AS sending_tasks,
+                 (SELECT COUNT(*) FROM sms_tasks WHERE status IN ('queued','retrying')
+                    AND TRY_CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE) <= CURRENT_TIMESTAMP) AS pending_tasks"""
+        ).fetchone(),
+        operation="update.active_business",
+    )
     return dict(row)
 
 
 def drain_business() -> dict:
     """Requeue in-flight tasks and stop workers/scheduler before an update."""
-    from database import get_connection
+    from database import write_transaction
 
-    conn = get_connection()
-    conn.execute(
-        """UPDATE sms_tasks
-           SET status='retrying', error_msg='update maintenance; requeued',
-               next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-           WHERE status='sending'"""
+    write_transaction(
+        lambda conn: conn.execute(
+            """UPDATE sms_tasks
+               SET status='retrying', error_msg='update maintenance; requeued',
+                   next_attempt_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+               WHERE status='sending'"""
+        ),
+        attempts=3,
+        operation="update.drain_business",
     )
-    conn.commit()
-    conn.close()
     from services.activity_scheduler import stop_scheduler
     from services.task_worker import stop_worker
 
@@ -710,16 +712,17 @@ HISTORY_RETENTION_DAYS = 365
 def prune_history() -> None:
     """Remove update-history rows older than the one-year retention window."""
     try:
-        from database import get_connection
+        from database import write_transaction
 
-        conn = get_connection()
-        conn.execute(
-            f"""DELETE FROM update_history
-               WHERE try_cast(created_at AS TIMESTAMP)
-                     < CURRENT_TIMESTAMP - INTERVAL '{HISTORY_RETENTION_DAYS} days'"""
+        write_transaction(
+            lambda conn: conn.execute(
+                f"""DELETE FROM update_history
+                   WHERE try_cast(created_at AS TIMESTAMP)
+                         < CURRENT_TIMESTAMP - INTERVAL '{HISTORY_RETENTION_DAYS} days'"""
+            ),
+            attempts=3,
+            operation="update.history.prune",
         )
-        conn.commit()
-        conn.close()
     except Exception:
         logger.exception("failed to prune update history")
 
@@ -732,33 +735,34 @@ def record_pending_result() -> None:
         return
     run_id = state.get("run_id") or f"{state.get('action', 'update')}-{state.get('backup_ts', '')}"
     try:
-        from database import get_connection
+        from database import write_transaction
 
-        conn = get_connection()
-        conn.execute(
-            """INSERT INTO update_history
-               (run_id, action, version, previous_version, status, operator, detail)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(run_id) DO UPDATE SET
-                 version=excluded.version,
-                 previous_version=excluded.previous_version,
-                 status=excluded.status,
-                 detail=excluded.detail""",
-            (
-                run_id,
-                state.get("action", ""),
-                result.get("version") or state.get("version", ""),
-                state.get("previous_version", ""),
-                result.get("status", "failed"),
-                state.get("operator", "system"),
-                json.dumps(
-                    {"message": result.get("message", ""), "db_backup": state.get("db_backup", "")},
-                    ensure_ascii=False,
+        write_transaction(
+            lambda conn: conn.execute(
+                """INSERT INTO update_history
+                   (run_id, action, version, previous_version, status, operator, detail)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                     version=excluded.version,
+                     previous_version=excluded.previous_version,
+                     status=excluded.status,
+                     detail=excluded.detail""",
+                (
+                    run_id,
+                    state.get("action", ""),
+                    result.get("version") or state.get("version", ""),
+                    state.get("previous_version", ""),
+                    result.get("status", "failed"),
+                    state.get("operator", "system"),
+                    json.dumps(
+                        {"message": result.get("message", ""), "db_backup": state.get("db_backup", "")},
+                        ensure_ascii=False,
+                    ),
                 ),
             ),
+            attempts=3,
+            operation="update.history.record",
         )
-        conn.commit()
-        conn.close()
     except Exception:
         logger.exception("failed to record update history")
 
@@ -766,13 +770,15 @@ def record_pending_result() -> None:
 def list_history(limit: int = 50) -> list:
     try:
         prune_history()
-        from database import get_connection
+        from database import read_transaction
 
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT * FROM update_history ORDER BY created_at DESC, id DESC LIMIT ?", (int(limit),)
-        ).fetchall()
-        conn.close()
+        rows = read_transaction(
+            lambda conn: conn.execute(
+                "SELECT * FROM update_history ORDER BY created_at DESC, id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall(),
+            operation="update.history.list",
+        )
         return [dict(r) for r in rows]
     except Exception:
         return []

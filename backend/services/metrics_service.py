@@ -5,7 +5,7 @@ import time
 import urllib.request
 from collections import defaultdict, deque
 
-from database import get_connection, read_transaction
+from database import read_transaction, write_transaction
 
 _lock = threading.Lock()
 _counters = defaultdict(float)
@@ -202,6 +202,27 @@ def observe_runtime_state(worker_count=0, allow_cached: bool = False):
         lock = write_lock_status()
         set_gauge("marketing_copilot_database_write_lock_held", 1 if lock["held"] else 0)
         set_gauge("marketing_copilot_database_write_lock_age_seconds", lock["age_seconds"])
+        mode = str(lock.get("mode") or "serialized")
+        set_gauge(
+            "marketing_copilot_database_transaction_active",
+            lock.get("active_transactions", 0),
+            labels={"mode": mode},
+        )
+        set_gauge(
+            "marketing_copilot_database_maintenance_requested",
+            1 if lock.get("maintenance_requested") else 0,
+            labels={"mode": mode},
+        )
+        set_gauge(
+            "marketing_copilot_database_maintenance_active",
+            1 if lock.get("maintenance_active") else 0,
+            labels={"mode": mode},
+        )
+        set_gauge(
+            "marketing_copilot_database_transaction_oldest_age_seconds",
+            lock.get("oldest_transaction_age_seconds", 0),
+            labels={"mode": mode},
+        )
     except Exception:
         pass
     try:
@@ -407,15 +428,22 @@ def _notify_alert(event: str, code: str, message: str, severity: str, context=No
 
 
 def _open_alert(code: str, message: str, severity: str = "warning", context=None):
-    conn = get_connection()
-    existing = conn.execute("SELECT id FROM system_events WHERE code=? AND resolved=0 LIMIT 1", (code,)).fetchone()
-    if not existing:
-        conn.execute("INSERT INTO system_events(category,severity,code,message,context) VALUES ('capacity',?,?,?,?,?)".replace("?,?,?,?,?", "?,?,?,?"),
-                     (severity, code, message, json.dumps(context or {}, ensure_ascii=False)))
-        conn.commit()
+    def open_alert(conn):
+        existing = conn.execute(
+            "SELECT id FROM system_events WHERE code=? AND resolved=0 LIMIT 1",
+            (code,),
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            "INSERT INTO system_events(category,severity,code,message,context) VALUES ('capacity',?,?,?,?)",
+            (severity, code, message, json.dumps(context or {}, ensure_ascii=False)),
+        )
+        return True
+
+    if write_transaction(open_alert, operation="metrics.alert.open"):
         inc("marketing_copilot_alerts_total", labels={"code": code, "severity": severity})
         _notify_alert("firing", code, message, severity, context)
-    conn.close()
 
 
 def evaluate_alerts(worker_count: int = 0, gateway_status=None) -> list:
@@ -433,18 +461,21 @@ def evaluate_alerts(worker_count: int = 0, gateway_status=None) -> list:
     if gateway_status and gateway_status.get("enabled_configs", 0) and not gateway_status.get("connected"):
         alerts.append(("ALL_SMSC_DOWN", "All enabled SMSC connections are unavailable", gateway_status))
     try:
-        conn = get_connection()
-        realtime_pending = conn.execute(
-            """SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime'
-               AND status IN ('pending','retrying')"""
-        ).fetchone()["count"]
-        stale = conn.execute(
-            """SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime'
-               AND status='processing' AND last_progress_at IS NOT NULL
-               AND CAST(last_progress_at AS TIMESTAMP) < CURRENT_TIMESTAMP - (? * INTERVAL '1 second')""",
-            (max(60, int(os.environ.get("MC_REALTIME_NO_PROGRESS_SECONDS", "900"))),),
-        ).fetchone()["count"]
-        conn.close()
+        realtime_pending, stale = read_transaction(
+            lambda conn: (
+                conn.execute(
+                    """SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime'
+                       AND status IN ('pending','retrying')"""
+                ).fetchone()["count"],
+                conn.execute(
+                    """SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime'
+                       AND status='processing' AND last_progress_at IS NOT NULL
+                       AND CAST(last_progress_at AS TIMESTAMP) < CURRENT_TIMESTAMP - (? * INTERVAL '1 second')""",
+                    (max(60, int(os.environ.get("MC_REALTIME_NO_PROGRESS_SECONDS", "900"))),),
+                ).fetchone()["count"],
+            ),
+            operation="metrics.alert.realtime_backlog",
+        )
         realtime_limit = max(1, int(os.environ.get("MC_ALERT_REALTIME_PENDING_FILES", "100")))
         if int(realtime_pending or 0) >= realtime_limit:
             alerts.append(("REALTIME_INBOX_BACKLOG_HIGH",
@@ -458,16 +489,22 @@ def evaluate_alerts(worker_count: int = 0, gateway_status=None) -> list:
         pass
     for code, message, context in alerts:
         _open_alert(code, message, "error" if code == "ALL_SMSC_DOWN" else "warning", context)
-    conn = get_connection()
-    previous = {row["code"]: dict(row) for row in conn.execute(
-        "SELECT code,message,severity,context FROM system_events WHERE category='capacity' AND resolved=0").fetchall()}
     active_codes = [code for code, _, _ in alerts]
-    if active_codes:
-        placeholders = ",".join("?" for _ in active_codes)
-        conn.execute(f"UPDATE system_events SET resolved=1 WHERE category='capacity' AND resolved=0 AND code NOT IN ({placeholders})", active_codes)
-    else:
-        conn.execute("UPDATE system_events SET resolved=1 WHERE category='capacity' AND resolved=0")
-    conn.commit(); conn.close()
+    def resolve_alerts(conn):
+        previous = {row["code"]: dict(row) for row in conn.execute(
+            "SELECT code,message,severity,context FROM system_events WHERE category='capacity' AND resolved=0"
+        ).fetchall()}
+        if active_codes:
+            placeholders = ",".join("?" for _ in active_codes)
+            conn.execute(
+                f"UPDATE system_events SET resolved=1 WHERE category='capacity' AND resolved=0 AND code NOT IN ({placeholders})",
+                active_codes,
+            )
+        else:
+            conn.execute("UPDATE system_events SET resolved=1 WHERE category='capacity' AND resolved=0")
+        return previous
+
+    previous = write_transaction(resolve_alerts, operation="metrics.alert.resolve")
     for code in previous.keys() - set(active_codes):
         item = previous[code]
         try: context = json.loads(item.get("context") or "{}")

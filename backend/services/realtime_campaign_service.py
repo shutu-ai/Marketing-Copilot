@@ -15,7 +15,7 @@ import time
 import duckdb
 import tempfile
 import threading
-from database import get_connection, read_transaction, write_transaction
+from database import read_transaction, write_transaction
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
 from services import metrics_service
@@ -466,14 +466,13 @@ def public_campaign(campaign: Optional[dict]) -> Optional[dict]:
 
 
 def get_sftp_password(campaign_id: int) -> str:
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             "SELECT sftp_password FROM realtime_campaigns WHERE id=?", (campaign_id,)
-        ).fetchone()
-        return (row["sftp_password"] or "") if row else ""
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="realtime_campaign.sftp_password",
+    )
+    return (row["sftp_password"] or "") if row else ""
 
 
 def get_all() -> list:
@@ -556,13 +555,12 @@ def create(data: RealtimeCampaignCreate) -> dict:
 
 
 def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
-    probe = get_connection()
-    try:
-        existing = probe.execute(
+    existing = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
-        ).fetchone()
-    finally:
-        probe.close()
+        ).fetchone(),
+        operation="realtime_campaign.update_probe",
+    )
     if not existing:
         return None
     existing_dict = dict(existing)
@@ -714,13 +712,12 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
 
 
 def delete(campaign_id: int) -> bool:
-    probe = get_connection()
-    try:
-        row = probe.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
-        ).fetchone()
-    finally:
-        probe.close()
+        ).fetchone(),
+        operation="realtime_campaign.delete_probe",
+    )
     if not row:
         return False
     _run_campaign_write(
@@ -809,9 +806,12 @@ def upload_customer_list(campaign_id: int, file_path: str, original_filename: st
     result = realtime_whitelist_service.upload(campaign_id, file_path, original_filename)
     if not result.get("success"):
         return None
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone(),
+        operation="realtime_campaign.whitelist_refresh",
+    )
     sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
     return {**(dict(row) if row else {}),
             "whitelist_version_id": result.get("whitelist_version_id"),
@@ -948,11 +948,10 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     campaign = get_one(campaign_id)
     if not campaign:
         return None
-    conn = get_connection()
-    try:
-        task_counts = _realtime_task_status_counts(conn, campaign_id)
-    finally:
-        conn.close()
+    task_counts = read_transaction(
+        lambda conn: _realtime_task_status_counts(conn, campaign_id),
+        operation="realtime_campaign.detail_stats",
+    )
     campaign["reached_users"] = task_counts["delivered"]
     campaign["task_created_users"] = task_counts["task_created"]
     campaign["accepted_users"] = task_counts["accepted"]
@@ -981,9 +980,8 @@ def _task_msisdn_for_campaign(value, campaign: dict) -> str:
 
 
 def _inbox_capacity_snapshot(campaign_id: int) -> dict:
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             """SELECT
                  SUM(CASE WHEN campaign_id=? THEN 1 ELSE 0 END) AS campaign_count,
                  COUNT(*) AS total_count,
@@ -991,9 +989,9 @@ def _inbox_capacity_snapshot(campaign_id: int) -> dict:
                FROM ingestion_files
                WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')""",
             (campaign_id,),
-        ).fetchone()
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="realtime_campaign.inbox_capacity",
+    )
     return {
         "campaign_count": int(row["campaign_count"] or 0),
         "total_count": int(row["total_count"] or 0),
@@ -1285,17 +1283,17 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                  ingestion_file_id: Optional[int] = None,
                  whitelist_version_id: Optional[int] = None,
                  worker_id: str = "", lease_token: str = "", stop_event=None) -> dict:
-    conn = get_connection()
-    campaign = conn.execute(
-        "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
-    ).fetchone()
+    campaign = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone(),
+        operation="realtime_campaign.receive_campaign",
+    )
     if not campaign:
-        conn.close()
         return {"success": False, "message": "Campaign not found"}
     campaign = dict(campaign)
     # Do not retain a long-lived DuckDB snapshot while chunk state and tasks are
     # committed through their own short transactions.
-    conn.close()
     realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
     # A previous attempt may have moved the file but failed its final DB commit.
     # Replay completed chunk checkpoints from received, not a missing inbox path.
@@ -1746,34 +1744,38 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
 
 
 def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
-    conn = get_connection()
-    total = conn.execute(
-        "SELECT COUNT(*) cnt FROM realtime_campaign_files WHERE campaign_id=?",
-        (campaign_id,),
-    ).fetchone()["cnt"]
-    rows = conn.execute(
-        """SELECT * FROM realtime_campaign_files
-           WHERE campaign_id=?
-           ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        (campaign_id, page_size, max(0, page - 1) * page_size),
-    ).fetchall()
-    filenames = [str(row["filename"] or "") for row in rows if row["filename"]]
-    task_counts = {}
-    if filenames:
-        placeholders = ",".join("?" for _ in filenames)
-        task_rows = conn.execute(
-            f"""SELECT source_file, status, COUNT(*) AS count
-                FROM sms_tasks
-                WHERE campaign_type='realtime' AND campaign_id=?
-                  AND source_file IN ({placeholders})
-                GROUP BY source_file, status""",
-            [campaign_id, *filenames],
+    def read(conn):
+        total = conn.execute(
+            "SELECT COUNT(*) cnt FROM realtime_campaign_files WHERE campaign_id=?",
+            (campaign_id,),
+        ).fetchone()["cnt"]
+        rows = conn.execute(
+            """SELECT * FROM realtime_campaign_files
+               WHERE campaign_id=?
+               ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+            (campaign_id, page_size, max(0, page - 1) * page_size),
         ).fetchall()
-        for task_row in task_rows:
-            task_counts.setdefault(str(task_row["source_file"] or ""), {})[
-                str(task_row["status"] or "")
-            ] = int(task_row["count"] or 0)
-    conn.close()
+        filenames = [str(row["filename"] or "") for row in rows if row["filename"]]
+        task_counts = {}
+        if filenames:
+            placeholders = ",".join("?" for _ in filenames)
+            task_rows = conn.execute(
+                f"""SELECT source_file, status, COUNT(*) AS count
+                    FROM sms_tasks
+                    WHERE campaign_type='realtime' AND campaign_id=?
+                      AND source_file IN ({placeholders})
+                    GROUP BY source_file, status""",
+                [campaign_id, *filenames],
+            ).fetchall()
+            for task_row in task_rows:
+                task_counts.setdefault(str(task_row["source_file"] or ""), {})[
+                    str(task_row["status"] or "")
+                ] = int(task_row["count"] or 0)
+        return total, rows, task_counts
+
+    total, rows, task_counts = read_transaction(
+        read, operation="realtime_campaign.files_page"
+    )
     items = []
     for row in rows:
         item = dict(row)
@@ -2000,17 +2002,16 @@ def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 
             if re.match(r"^\d{8}\.csv$", fname)
         }
 
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT CAST(created_at AS DATE) AS report_date, status, COUNT(*) AS count
                FROM sms_tasks
                WHERE campaign_type='realtime' AND campaign_id=?
                GROUP BY CAST(created_at AS DATE), status""",
             (campaign_id,),
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime_campaign.sent_records",
+    )
 
     by_date = {}
     for row in rows:
@@ -2052,25 +2053,33 @@ def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 
 
 def get_realtime_stats(campaign_id: int) -> dict:
     today = datetime.now().strftime("%Y-%m-%d")
-    conn = get_connection()
-    campaign = conn.execute(
-        "SELECT campaign_dir FROM realtime_campaigns WHERE id=?",
-        (campaign_id,),
-    ).fetchone()
-    row = conn.execute(
-        "SELECT COUNT(*) AS file_count, COALESCE(SUM(total_msisdn),0) AS total_msisdn_sum, COALESCE(SUM(matched_count),0) AS total_matched FROM realtime_campaign_files WHERE campaign_id=?",
-        (campaign_id,)
-    ).fetchone()
-    today_row = conn.execute(
-        """SELECT COUNT(*) AS file_count, COALESCE(SUM(total_msisdn),0) AS total_msisdn_sum,
-                  COALESCE(SUM(matched_count),0) AS total_matched
-           FROM realtime_campaign_files
-           WHERE campaign_id=? AND CAST(created_at AS DATE)=CAST(? AS DATE)""",
-        (campaign_id, today),
-    ).fetchone()
-    task_counts = _realtime_task_status_counts(conn, campaign_id)
-    today_task_counts = _realtime_task_status_counts(conn, campaign_id, today)
-    conn.close()
+    def read(conn):
+        campaign = conn.execute(
+            "SELECT campaign_dir FROM realtime_campaigns WHERE id=?",
+            (campaign_id,),
+        ).fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) AS file_count, COALESCE(SUM(total_msisdn),0) AS total_msisdn_sum, COALESCE(SUM(matched_count),0) AS total_matched FROM realtime_campaign_files WHERE campaign_id=?",
+            (campaign_id,)
+        ).fetchone()
+        today_row = conn.execute(
+            """SELECT COUNT(*) AS file_count, COALESCE(SUM(total_msisdn),0) AS total_msisdn_sum,
+                      COALESCE(SUM(matched_count),0) AS total_matched
+               FROM realtime_campaign_files
+               WHERE campaign_id=? AND CAST(created_at AS DATE)=CAST(? AS DATE)""",
+            (campaign_id, today),
+        ).fetchone()
+        return (
+            campaign,
+            row,
+            today_row,
+            _realtime_task_status_counts(conn, campaign_id),
+            _realtime_task_status_counts(conn, campaign_id, today),
+        )
+
+    campaign, row, today_row, task_counts, today_task_counts = read_transaction(
+        read, operation="realtime_campaign.stats"
+    )
     result = dict(row) if row else {"file_count": 0, "total_msisdn_sum": 0, "total_matched": 0}
     today_result = dict(today_row) if today_row else {
         "file_count": 0, "total_msisdn_sum": 0, "total_matched": 0,
@@ -2147,12 +2156,13 @@ def _watch_file_matches_campaign(filename: str, campaign: dict, now: Optional[da
 
 
 def _processed_file_record(campaign_id: int, filename: str) -> Optional[dict]:
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT * FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
-        (campaign_id, filename),
-    ).fetchone()
-    conn.close()
+    row = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
+            (campaign_id, filename),
+        ).fetchone(),
+        operation="realtime_campaign.processed_file",
+    )
     return dict(row) if row else None
 
 
@@ -2175,15 +2185,14 @@ def _processed_file_records(campaign_id: int) -> dict[str, dict]:
 
 
 def _completed_processed_filenames(campaign_id: int) -> set[str]:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT filename FROM processed_files
                WHERE campaign_type='realtime' AND campaign_id=? AND status='completed'""",
             (campaign_id,),
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime_campaign.completed_files",
+    )
     return {str(row["filename"]) for row in rows if row["filename"]}
 
 
@@ -2299,10 +2308,12 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
     today = now.date().isoformat()
     with _daily_finalize_lock:
         new_day = _daily_finalize_date != today
-        finalized_windows = set() if new_day else _daily_finalized_windows
-        started_windows = set() if new_day else _daily_started_windows
-        conn = get_connection()
-        try:
+        # Work on copies so a transaction conflict cannot publish partially
+        # updated in-memory fences before the database commit succeeds.
+        finalized_windows = set() if new_day else set(_daily_finalized_windows)
+        started_windows = set() if new_day else set(_daily_started_windows)
+
+        def finalize(conn):
             campaigns = conn.execute(
                 "SELECT id,status,send_start_time,send_end_time,send_days FROM realtime_campaigns"
             ).fetchall()
@@ -2326,7 +2337,16 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
             # the scheduler at midnight; task_date is independently enforced by
             # the worker. Run it once per local calendar day.
             if not new_day and not due_campaigns and not started_campaigns:
-                return 0
+                return {
+                    "cancelled": 0,
+                    "stale_cancelled": 0,
+                    "campaign_cancelled": {},
+                    "due_campaigns": [],
+                    "started_campaigns": [],
+                    "finalized_windows": finalized_windows,
+                    "started_windows": started_windows,
+                    "no_work": True,
+                }
             cancelled = 0
             stale_cancelled = 0
             campaign_cancelled = {}
@@ -2399,13 +2419,31 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
                     "cancelled": int(daily_count or 0),
                 }
                 finalized_windows.add(key)
-            if cancelled:
-                conn.commit()
-            _daily_finalize_date = today
-            _daily_finalized_windows = finalized_windows
-            _daily_started_windows = started_windows
-        finally:
-            conn.close()
+            return {
+                "cancelled": cancelled,
+                "stale_cancelled": stale_cancelled,
+                "campaign_cancelled": campaign_cancelled,
+                "due_campaigns": due_campaigns,
+                "started_campaigns": started_campaigns,
+                "finalized_windows": finalized_windows,
+                "started_windows": started_windows,
+                "no_work": False,
+            }
+
+        result = write_transaction(
+            finalize,
+            attempts=3,
+            operation="realtime.daily_finalize",
+            lock_timeout=1.0,
+        )
+        cancelled = int(result["cancelled"])
+        stale_cancelled = int(result["stale_cancelled"])
+        campaign_cancelled = result["campaign_cancelled"]
+        due_campaigns = result["due_campaigns"]
+        started_campaigns = result["started_campaigns"]
+        _daily_finalize_date = today
+        _daily_finalized_windows = result["finalized_windows"]
+        _daily_started_windows = result["started_windows"]
         for campaign in started_campaigns:
             logger.info(
                 "Realtime daily window started campaign=%s date=%s send_start=%s send_end=%s",
@@ -2442,13 +2480,12 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
 def has_active_realtime_campaigns(now: Optional[datetime] = None) -> bool:
     """Return whether the scheduler needs to scan realtime watch/inbox paths."""
     now = now or datetime.now()
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM realtime_campaigns WHERE status='in_progress'"
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime.scheduler.active_campaigns",
+    )
     for row in rows:
         campaign = dict(row)
         if _daily_window_ended(campaign, now):
@@ -2463,31 +2500,30 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
                                          include_processing: bool = False) -> int:
     """Discard unstarted realtime file jobs after that day's send window closes."""
     now = now or datetime.now()
-    conn = get_connection()
-    try:
-        campaigns = conn.execute(
+    campaigns = read_transaction(
+        lambda conn: conn.execute(
             """SELECT id,send_start_time,send_end_time,campaign_dir
                FROM realtime_campaigns WHERE campaign_dir<>''"""
-        ).fetchall()
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime.ingestion.closed_window_campaigns",
+    )
 
     discarded = 0
     for row in campaigns:
         campaign = dict(row)
         if not _daily_window_ended(campaign, now):
             continue
-        conn = get_connection()
-        try:
-            active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
-            jobs = [dict(item) for item in conn.execute(
+        active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
+        jobs = read_transaction(
+            lambda conn: conn.execute(
                 """SELECT id,campaign_id,filename,file_path FROM ingestion_files
                    WHERE campaign_type='realtime' AND campaign_id=?
                      AND status IN """ + active_statuses,
                 (campaign["id"],),
-            ).fetchall()]
-        finally:
-            conn.close()
+            ).fetchall(),
+            operation="realtime.ingestion.closed_window_jobs",
+        )
+        jobs = [dict(item) for item in jobs]
 
         reason = "daily send window ended"
         expired_jobs = []
@@ -2498,8 +2534,7 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
             )
             expired_jobs = [job for job in jobs if job["id"] in expired_ids]
             if expired_jobs:
-                conn = get_connection()
-                try:
+                def mark_processed_failed(conn):
                     conn.executemany(
                         """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
                            processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
@@ -2507,9 +2542,12 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
                            WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
                         ((reason, job["campaign_id"], job["filename"]) for job in expired_jobs),
                     )
-                    conn.commit()
-                finally:
-                    conn.close()
+                write_transaction(
+                    mark_processed_failed,
+                    attempts=3,
+                    operation="realtime.ingestion.closed_window_processed_files",
+                    lock_timeout=1.0,
+                )
         for job in expired_jobs:
             try:
                 path = job.get("file_path", "")
@@ -2528,17 +2566,17 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
 def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
                                enqueue_only: bool = False):
     global _watch_campaign_cursor
-    conn = get_connection()
-    if campaign_id:
-        rows = conn.execute(
-            "SELECT * FROM realtime_campaigns WHERE id=? AND status='in_progress' AND COALESCE(watch_dir,'')<>'' AND COALESCE(watch_source,'local')='local'",
-            (campaign_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
+    def read_campaigns(conn):
+        if campaign_id:
+            return conn.execute(
+                "SELECT * FROM realtime_campaigns WHERE id=? AND status='in_progress' AND COALESCE(watch_dir,'')<>'' AND COALESCE(watch_source,'local')='local'",
+                (campaign_id,),
+            ).fetchall()
+        return conn.execute(
             "SELECT * FROM realtime_campaigns WHERE status='in_progress' AND COALESCE(watch_dir,'')<>'' AND COALESCE(watch_source,'local')='local'"
         ).fetchall()
-    conn.close()
+
+    rows = read_transaction(read_campaigns, operation="realtime.watch.local_campaigns")
     if now is None:
         now = datetime.now()
     rows = list(rows)
@@ -2566,10 +2604,15 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
         if not campaign_dir:
             campaign_dir = _ensure_campaign_dir(campaign)
             _ensure_realtime_dirs(campaign_dir)
-            conn2 = get_connection()
-            conn2.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign["id"]))
-            conn2.commit()
-            conn2.close()
+            write_transaction(
+                lambda conn: conn.execute(
+                    "UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?",
+                    (campaign_dir, campaign["id"]),
+                ),
+                attempts=3,
+                operation="realtime.watch.local_campaign_dir",
+                lock_timeout=1.0,
+            )
         inbox_dir = os.path.join(campaign_dir, "inbox")
         os.makedirs(inbox_dir, exist_ok=True)
         prefix = campaign.get("watch_filename_prefix", "Android_4G_Switch_Somali_")
@@ -2717,12 +2760,13 @@ def sync_watch_dirs_to_inboxes(now=None, campaign_id=None, force: bool = False,
 
 def sync_sftp_watch_dirs_to_inboxes(now=None):
     """Poll configured SFTP folders and atomically download eligible files."""
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM realtime_campaigns WHERE status='in_progress' "
-        "AND watch_source='sftp' AND COALESCE(watch_dir,'')<>''"
-    ).fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT * FROM realtime_campaigns WHERE status='in_progress' "
+            "AND watch_source='sftp' AND COALESCE(watch_dir,'')<>''"
+        ).fetchall(),
+        operation="realtime.watch.sftp_campaigns",
+    )
     # Local-watch deployments do not need the optional Paramiko dependency;
     # avoid turning the SFTP poller into a repeating error loop when there are
     # no configured remote campaigns.  A configured SFTP campaign still gets
@@ -2755,10 +2799,15 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
             campaign_dir = campaign.get("campaign_dir", "") or _ensure_campaign_dir(campaign)
             _ensure_realtime_dirs(campaign_dir)
             if not campaign.get("campaign_dir"):
-                update_conn = get_connection()
-                update_conn.execute("UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?", (campaign_dir, campaign["id"]))
-                update_conn.commit()
-                update_conn.close()
+                write_transaction(
+                    lambda conn: conn.execute(
+                        "UPDATE realtime_campaigns SET campaign_dir=? WHERE id=?",
+                        (campaign_dir, campaign["id"]),
+                    ),
+                    attempts=3,
+                    operation="realtime.watch.sftp_campaign_dir",
+                    lock_timeout=1.0,
+                )
             inbox_dir = os.path.join(campaign_dir, "inbox")
             os.makedirs(inbox_dir, exist_ok=True)
             prefix = campaign.get("watch_filename_prefix") or "Android_4G_Switch_Somali_"
@@ -2861,17 +2910,17 @@ def sync_sftp_watch_dirs_to_inboxes(now=None):
 
 def process_realtime_inboxes(campaign_id: Optional[int] = None):
     cleanup_closed_window_ingestion_files()
-    conn = get_connection()
-    if campaign_id:
-        rows = conn.execute(
-            "SELECT * FROM realtime_campaigns WHERE id=? AND status='in_progress' AND campaign_dir<>''",
-            (campaign_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
+    def read_campaigns(conn):
+        if campaign_id:
+            return conn.execute(
+                "SELECT * FROM realtime_campaigns WHERE id=? AND status='in_progress' AND campaign_dir<>''",
+                (campaign_id,),
+            ).fetchall()
+        return conn.execute(
             "SELECT * FROM realtime_campaigns WHERE status='in_progress' AND campaign_dir<>''"
         ).fetchall()
-    conn.close()
+
+    rows = read_transaction(read_campaigns, operation="realtime.inbox.campaigns")
     results = {"processed": 0, "queued": 0, "errors": []}
     for row in rows:
         campaign = dict(row)
@@ -2883,18 +2932,15 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
             continue
         if not os.path.isdir(inbox_dir):
             continue
-        processing_conn = get_connection()
-        try:
-            processing_files = {
-                item["filename"]
-                for item in processing_conn.execute(
-                    """SELECT filename FROM ingestion_files
-                       WHERE campaign_type='realtime' AND campaign_id=? AND status='processing'""",
-                    (campaign["id"],),
-                ).fetchall()
-            }
-        finally:
-            processing_conn.close()
+        processing_rows = read_transaction(
+            lambda conn: conn.execute(
+                """SELECT filename FROM ingestion_files
+                   WHERE campaign_type='realtime' AND campaign_id=? AND status='processing'""",
+                (campaign["id"],),
+            ).fetchall(),
+            operation="realtime.inbox.processing_files",
+        )
+        processing_files = {item["filename"] for item in processing_rows}
         for fname in sorted(os.listdir(inbox_dir)):
             src = os.path.join(inbox_dir, fname)
             if not os.path.isfile(src):
@@ -2980,13 +3026,12 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
                         ingestion_job_service.release_realtime_capacity(reservation_token)
                 if not duplicate:
                     results["queued"] += 1
-                    depth_conn = get_connection()
-                    try:
-                        depth = depth_conn.execute(
+                    depth = read_transaction(
+                        lambda conn: conn.execute(
                             "SELECT COUNT(*) count FROM ingestion_files WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')"
-                        ).fetchone()["count"]
-                    finally:
-                        depth_conn.close()
+                        ).fetchone()["count"],
+                        operation="realtime.inbox.queue_depth",
+                    )
                     logger.info("Realtime file queued campaign=%s file=%s queue_depth=%s",
                                 campaign["id"], fname, int(depth or 0))
             except Exception as e:
@@ -3001,18 +3046,27 @@ def cleanup_realtime_retention():
     output_retention_days = max(1, int(settings_service.get_setting("realtime_output_retention_days", os.environ.get("MC_REALTIME_OUTPUT_RETENTION_DAYS", "30"))))
     input_cutoff_ts = (datetime.now() - timedelta(days=input_retention_days)).timestamp()
     output_cutoff_ts = (datetime.now() - timedelta(days=output_retention_days)).timestamp()
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT id, campaign_dir FROM realtime_campaigns WHERE campaign_dir<>''"
-    ).fetchall()
-    protected_paths = {
-        os.path.abspath(row["file_path"])
-        for row in conn.execute(
-            """SELECT file_path FROM ingestion_files
-               WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')
-                 AND COALESCE(file_path,'')<>''"""
+
+    def read_retention_snapshot(conn):
+        rows = conn.execute(
+            "SELECT id, campaign_dir FROM realtime_campaigns WHERE campaign_dir<>''"
         ).fetchall()
-    }
+        protected_paths = {
+            os.path.abspath(row["file_path"])
+            for row in conn.execute(
+                """SELECT file_path FROM ingestion_files
+                   WHERE campaign_type='realtime' AND status IN ('pending','processing','retrying')
+                     AND COALESCE(file_path,'')<>''"""
+            ).fetchall()
+        }
+        return rows, protected_paths
+
+    # Snapshot the database quickly, then release the admission before doing
+    # potentially slow directory traversal and unlink operations.
+    rows, protected_paths = read_transaction(
+        read_retention_snapshot,
+        operation="realtime.retention.snapshot",
+    )
     deleted = 0
     for row in rows:
         campaign_dir = row["campaign_dir"]
@@ -3034,11 +3088,14 @@ def cleanup_realtime_retention():
                 except OSError:
                     pass
     db_cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute(
-        "DELETE FROM realtime_campaign_files WHERE created_at < ?", (db_cutoff,),
+    write_transaction(
+        lambda conn: conn.execute(
+            "DELETE FROM realtime_campaign_files WHERE created_at < ?", (db_cutoff,)
+        ),
+        attempts=3,
+        operation="realtime.retention.database_rows",
+        lock_timeout=1.0,
     )
-    conn.commit()
-    conn.close()
     logger.info(
         "Realtime file retention cleanup completed input_retention_days=%s output_retention_days=%s deleted=%s",
         input_retention_days, output_retention_days, deleted,

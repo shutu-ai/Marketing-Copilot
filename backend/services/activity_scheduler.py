@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 
-from database import get_connection, is_transient_write_error
+from database import is_transient_write_error, read_transaction
 from services import (batch_campaign_service, realtime_campaign_service, sms_task_service,
                       p1_service, ingestion_job_service)
 
@@ -87,14 +87,13 @@ def _batch_worker():
         with _batch_state_lock:
             _batch_job_active = True
         try:
-            conn = get_connection()
-            try:
-                row = conn.execute(
+            row = read_transaction(
+                lambda conn: conn.execute(
                     "SELECT batch_size FROM batch_campaigns WHERE id=? AND status='in_progress'",
                     (campaign_id,),
-                ).fetchone()
-            finally:
-                conn.close()
+                ).fetchone(),
+                operation="scheduler.batch_worker.campaign",
+            )
             if row:
                 # Generation and processing each receive a bounded quantum.
                 # The worker returns to the campaign selector after one turn,
@@ -131,14 +130,13 @@ def _process_batches():
         _batch_campaign_cursor = (_batch_campaign_cursor + 1) % len(campaign_ids)
         # Activity eligibility is checked again immediately before processing;
         # this filter only avoids spending the turn on a closed campaign.
-        conn = get_connection()
-        try:
-            rows = conn.execute(
+        rows = read_transaction(
+            lambda conn: conn.execute(
                 "SELECT * FROM batch_campaigns WHERE id IN (" +
                 ",".join("?" for _ in ordered) + ")", ordered,
-            ).fetchall()
-        finally:
-            conn.close()
+            ).fetchall(),
+            operation="scheduler.batch_campaign_selector",
+        )
         by_id = {int(row["id"]): dict(row) for row in rows}
         for campaign_id in ordered:
             candidate = by_id.get(int(campaign_id))

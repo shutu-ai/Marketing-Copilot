@@ -8,7 +8,7 @@ import errno
 import logging
 import threading
 from datetime import datetime
-from database import get_connection, read_transaction, write_transaction
+from database import read_transaction, write_transaction
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
 from typing import Optional
 import shutil
@@ -414,13 +414,12 @@ def create(data: BatchCampaignCreate) -> dict:
 
 
 def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
-    probe = get_connection()
-    try:
-        existing = probe.execute(
+    existing = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
-        ).fetchone()
-    finally:
-        probe.close()
+        ).fetchone(),
+        operation="batch_campaign.update_probe",
+    )
     if not existing:
         return None
 
@@ -599,13 +598,12 @@ def get_prospects(campaign_id: int, search: str = "", field: str = "", value: st
 
 
 def delete(campaign_id: int) -> bool:
-    probe = get_connection()
-    try:
-        row = probe.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (campaign_id,)
-        ).fetchone()
-    finally:
-        probe.close()
+        ).fetchone(),
+        operation="batch_campaign.delete_probe",
+    )
     if not row:
         return False
 
@@ -693,68 +691,71 @@ def reset_batches_for_today(campaign_id: int) -> bool:
     from previous days are expired first so they cannot send late and duplicate
     the new day's batch.
     """
-    conn = get_connection()
     today = datetime.now().strftime("%Y-%m-%d")
-    existing = conn.execute(
-        "SELECT 1 FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=? LIMIT 1",
-        (campaign_id, today),
-    ).fetchone()
-    if existing:
-        conn.close()
-        return False
-    conn.execute(
-        """UPDATE sms_tasks SET status='expired', error_msg='superseded by next daily batch',
-           updated_at=CURRENT_TIMESTAMP
-           WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying')
-             AND CAST(created_at AS DATE) < ?""",
-        (campaign_id, today),
-    )
-    count = conn.execute(
-        """SELECT COUNT(*) cnt FROM batch_campaign_batches
-           WHERE campaign_id=? AND status IN ('queued','sent','skipped','failed')""",
-        (campaign_id,),
-    ).fetchone()["cnt"]
-    if not count:
-        conn.close()
-        return False
-    conn.execute(
-        """UPDATE batch_campaign_batches
-           SET status='pending',task_count=0,delivered_count=0,failed_count=0,
-               updated_at=CURRENT_TIMESTAMP WHERE campaign_id=?""",
-        (campaign_id,),
-    )
-    conn.execute(
-        """UPDATE ingestion_chunks SET status='pending',lease_token='',lease_expires_at=NULL,
-           created_tasks=0,duplicate_rows=0,excluded_rows=0,invalid_rows=0,no_template_rows=0,
-           error_detail='',completed_at=NULL,updated_at=CURRENT_TIMESTAMP
-           WHERE source_batch_id IN
-             (SELECT id FROM batch_campaign_batches WHERE campaign_id=?)""",
-        (campaign_id,),
-    )
-    conn.execute(
-        """UPDATE ingestion_files SET status='pending',completed_chunks=0,created_tasks=0,
-           error_detail='',completed_at=NULL,updated_at=CURRENT_TIMESTAMP
-           WHERE campaign_type='batch' AND campaign_id=?""",
-        (campaign_id,),
-    )
-    conn.commit()
-    conn.close()
-    return True
+    def reset(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=? LIMIT 1",
+            (campaign_id, today),
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            """UPDATE sms_tasks SET status='expired', error_msg='superseded by next daily batch',
+               updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying')
+                 AND CAST(created_at AS DATE) < ?""",
+            (campaign_id, today),
+        )
+        count = conn.execute(
+            """SELECT COUNT(*) cnt FROM batch_campaign_batches
+               WHERE campaign_id=? AND status IN ('queued','sent','skipped','failed')""",
+            (campaign_id,),
+        ).fetchone()["cnt"]
+        if not count:
+            return False
+        conn.execute(
+            """UPDATE batch_campaign_batches
+               SET status='pending',task_count=0,delivered_count=0,failed_count=0,
+                   updated_at=CURRENT_TIMESTAMP WHERE campaign_id=?""",
+            (campaign_id,),
+        )
+        conn.execute(
+            """UPDATE ingestion_chunks SET status='pending',lease_token='',lease_expires_at=NULL,
+               created_tasks=0,duplicate_rows=0,excluded_rows=0,invalid_rows=0,no_template_rows=0,
+               error_detail='',completed_at=NULL,updated_at=CURRENT_TIMESTAMP
+               WHERE source_batch_id IN
+                 (SELECT id FROM batch_campaign_batches WHERE campaign_id=?)""",
+            (campaign_id,),
+        )
+        conn.execute(
+            """UPDATE ingestion_files SET status='pending',completed_chunks=0,created_tasks=0,
+               error_detail='',completed_at=NULL,updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type='batch' AND campaign_id=?""",
+            (campaign_id,),
+        )
+        return True
+
+    return bool(write_transaction(
+        reset,
+        attempts=3,
+        operation="batch_campaign.reset_today",
+    ))
 
 
 def reset_daily_batches() -> int:
     """Reset batches of in-progress batch campaigns that have not run yet today."""
-    conn = get_connection()
     today = datetime.now().strftime("%Y-%m-%d")
-    rows = conn.execute(
-        """SELECT c.id FROM batch_campaigns c
-           WHERE c.status='in_progress' AND c.customer_list_path <> ''
-             AND EXISTS (SELECT 1 FROM batch_campaign_batches b WHERE b.campaign_id=c.id)
-             AND NOT EXISTS (SELECT 1 FROM batch_campaign_daily_stats d
-                             WHERE d.campaign_id=c.id AND d.stats_date=?)""",
-        (today,),
-    ).fetchall()
-    conn.close()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT c.id FROM batch_campaigns c
+               WHERE c.status='in_progress' AND c.customer_list_path <> ''
+                 AND EXISTS (SELECT 1 FROM batch_campaign_batches b WHERE b.campaign_id=c.id)
+                 AND NOT EXISTS (SELECT 1 FROM batch_campaign_daily_stats d
+                                 WHERE d.campaign_id=c.id AND d.stats_date=?)""",
+            (today,),
+        ).fetchall(),
+        operation="batch_campaign.reset_candidates",
+    )
     reset = 0
     for row in rows:
         if reset_batches_for_today(row["id"]):
@@ -1227,56 +1228,64 @@ def _get_today_sent_msisdns(campaign_dir: str) -> set:
 
 
 def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[dict] = None) -> dict:
-    conn = get_connection()
-    row = conn.execute("SELECT * FROM batch_campaign_batches WHERE id=?", (batch_id,)).fetchone()
-    if not row:
-        conn.close()
-        return {"success": False, "message": "Batch not found"}
-    batch = dict(row)
-    campaign_id = batch["campaign_id"]
+    def read_batch(conn):
+        row = conn.execute(
+            "SELECT * FROM batch_campaign_batches WHERE id=?", (batch_id,)
+        ).fetchone()
+        if not row:
+            return None, None, None
+        active_manifest = conn.execute(
+            "SELECT active_manifest_id FROM batch_campaigns WHERE id=?",
+            (row["campaign_id"],),
+        ).fetchone()
+        return dict(row), row["campaign_id"], (
+            active_manifest["active_manifest_id"] if active_manifest else None
+        )
 
-    active_manifest = conn.execute(
-        "SELECT active_manifest_id FROM batch_campaigns WHERE id=?", (campaign_id,)
-    ).fetchone()
-    active_manifest_id = active_manifest["active_manifest_id"] if active_manifest else None
+    batch, campaign_id, active_manifest_id = read_transaction(
+        read_batch,
+        operation="batch.process.snapshot",
+    )
+    if not batch:
+        return {"success": False, "message": "Batch not found"}
     if active_manifest_id is not None and int(batch.get("manifest_id") or 0) != int(active_manifest_id):
-        conn.close()
         return {"success": False, "message": "Batch belongs to an inactive manifest"}
 
     if batch["status"] not in {"pending", "failed"}:
-        conn.close()
         return {"success": False, "message": "Batch is already processing or queued"}
 
     if batch_rows is None:
         campaign_probe = get_one(campaign_id)
         if campaign_probe and campaign_probe.get("customer_list_path"):
-            conn.close()
             return process_pending_batches(campaign_id, batch_id)
 
     chunk_job = ingestion_job_service.claim_chunk(source_batch_id=batch_id)
     if chunk_job and chunk_job.get("status") == "completed":
-        conn.close()
         return {"success": True, "message": "Chunk already completed", "queued_count": 0,
                 "resumed": True}
     if chunk_job is None:
-        mapped = conn.execute(
-            "SELECT id FROM ingestion_chunks WHERE source_batch_id=?", (batch_id,)
-        ).fetchone()
+        mapped = read_transaction(
+            lambda conn: conn.execute(
+                "SELECT id FROM ingestion_chunks WHERE source_batch_id=?", (batch_id,)
+            ).fetchone(),
+            operation="batch.process.chunk_lease_check",
+        )
         if mapped:
-            conn.close()
             return {"success": False, "message": "Chunk lease is held by another worker"}
 
-    conn.execute(
-        "UPDATE batch_campaign_batches SET status='processing', updated_at=datetime('now','localtime') WHERE id=?",
-        (batch_id,)
+    write_transaction(
+        lambda conn: conn.execute(
+            "UPDATE batch_campaign_batches SET status='processing', updated_at=datetime('now','localtime') WHERE id=?",
+            (batch_id,),
+        ),
+        attempts=3,
+        operation="batch.process.mark_processing",
     )
-    conn.commit()
     try:
         campaign = campaign_override or get_one(campaign_id)
         path = campaign.get("customer_list_path", "") if campaign else ""
         if not path or not os.path.isfile(path):
             raise Exception("Customer list file not found")
-        ext = os.path.splitext(path)[1].lower()
         if batch_rows is None:
             raise RuntimeError("batch rows must be supplied by the sequential ingestion reader")
 
@@ -1291,53 +1300,59 @@ def process_batch(batch_id: int, batch_rows=None, campaign_override: Optional[di
             raise Exception(enqueue_result.get("message", "Unable to enqueue batch"))
         queued = enqueue_result["created"]
         batch_status = "queued" if queued > 0 else "skipped"
-        conn.execute(
-            """UPDATE batch_campaign_batches
-               SET status=?,task_count=?,delivered_count=0,failed_count=0,
-                   updated_at=datetime('now','localtime') WHERE id=?""",
-            (batch_status, queued, batch_id)
-        )
 
-        # Update daily stats
-        stats_date = datetime.now().strftime("%Y-%m-%d")
-        total_prospects = campaign.get("row_count", 0) if campaign else 0
-        existing_stats = conn.execute(
-            "SELECT id, sent_count FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",
-            (campaign_id, stats_date)
-        ).fetchone()
-        if existing_stats:
+        def complete(conn):
             conn.execute(
-                "UPDATE batch_campaign_daily_stats SET updated_at=datetime('now','localtime') WHERE id=?",
-                (existing_stats["id"],)
+                """UPDATE batch_campaign_batches
+                   SET status=?,task_count=?,delivered_count=0,failed_count=0,
+                       updated_at=datetime('now','localtime') WHERE id=?""",
+                (batch_status, queued, batch_id),
             )
-        else:
-            conn.execute(
-                "INSERT INTO batch_campaign_daily_stats (campaign_id, stats_date, total_prospects, sent_count) VALUES (?, ?, ?, ?)",
-                (campaign_id, stats_date, total_prospects, 0)
-            )
-        if chunk_job:
-            ingestion_job_service.complete_chunk_in_transaction(
-                conn, chunk_job["id"], enqueue_result
-            )
-        conn.commit()
-        conn.close()
+            # Update daily stats in the same short commit as the batch state.
+            stats_date = datetime.now().strftime("%Y-%m-%d")
+            total_prospects = campaign.get("row_count", 0) if campaign else 0
+            existing_stats = conn.execute(
+                "SELECT id, sent_count FROM batch_campaign_daily_stats WHERE campaign_id=? AND stats_date=?",
+                (campaign_id, stats_date),
+            ).fetchone()
+            if existing_stats:
+                conn.execute(
+                    "UPDATE batch_campaign_daily_stats SET updated_at=datetime('now','localtime') WHERE id=?",
+                    (existing_stats["id"],),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO batch_campaign_daily_stats (campaign_id, stats_date, total_prospects, sent_count) VALUES (?, ?, ?, ?)",
+                    (campaign_id, stats_date, total_prospects, 0),
+                )
+            if chunk_job:
+                ingestion_job_service.complete_chunk_in_transaction(
+                    conn, chunk_job["id"], enqueue_result,
+                )
+
+        write_transaction(
+            complete,
+            attempts=3,
+            operation="batch.process.complete",
+        )
         return {"success": True, "message": f"Queued {queued} messages",
                 "queued_count": queued, "filter_result": enqueue_result}
     except Exception as e:
         if is_transient_write_error(e):
-            try:
-                conn.rollback()
-            finally:
-                conn.close()
             raise
-        conn.execute(
-            "UPDATE batch_campaign_batches SET status='failed', updated_at=datetime('now','localtime') WHERE id=?",
-            (batch_id,)
+        def fail(conn):
+            conn.execute(
+                "UPDATE batch_campaign_batches SET status='failed', updated_at=datetime('now','localtime') WHERE id=?",
+                (batch_id,),
+            )
+            if chunk_job:
+                ingestion_job_service.fail_chunk_in_transaction(conn, chunk_job["id"], e)
+
+        write_transaction(
+            fail,
+            attempts=3,
+            operation="batch.process.fail",
         )
-        if chunk_job:
-            ingestion_job_service.fail_chunk_in_transaction(conn, chunk_job["id"], e)
-        conn.commit()
-        conn.close()
         return {"success": False, "message": str(e)}
 
 
@@ -1356,8 +1371,7 @@ def process_pending_batches(campaign_id: Optional[int] = None, target_batch_id: 
     if campaign_id is None:
         return {"success": True, "processed": 0}
 
-    conn = get_connection()
-    try:
+    def read_pending(conn):
         campaign_row = conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=? AND status='in_progress'", (campaign_id,)
         ).fetchone()
@@ -1372,8 +1386,12 @@ def process_pending_batches(campaign_id: Optional[int] = None, target_batch_id: 
             ).fetchall()
         else:
             batches = []
-    finally:
-        conn.close()
+        return campaign_row, batches
+
+    campaign_row, batches = read_transaction(
+        read_pending,
+        operation="batch_campaign.pending_snapshot",
+    )
     campaign = _enrich(dict(campaign_row)) if campaign_row else None
     if not campaign:
         return {"success": False, "message": "Campaign not found", "processed": 0}
@@ -1489,13 +1507,14 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     campaign["daily_stats"] = get_daily_stats(campaign_id)
     _attach_daily_smpp(campaign_id, campaign["daily_stats"])
     campaign["batches"] = get_batches(campaign_id)
-    conn = get_connection()
-    reached = conn.execute(
-        """SELECT COUNT(DISTINCT msisdn) cnt FROM sms_tasks
-           WHERE campaign_type='batch' AND campaign_id=? AND status IN ('delivered','accepted')""",
-        (campaign_id,),
-    ).fetchone()
-    conn.close()
+    reached = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT COUNT(DISTINCT msisdn) cnt FROM sms_tasks
+               WHERE campaign_type='batch' AND campaign_id=? AND status IN ('delivered','accepted')""",
+            (campaign_id,),
+        ).fetchone(),
+        operation="batch_campaign.detail.reached",
+    )
     campaign["reached_users"] = reached["cnt"] if reached else 0
     campaign["sms_templates"] = _get_campaign_templates(campaign_id)
     return campaign
@@ -1505,19 +1524,20 @@ def _attach_daily_smpp(campaign_id: int, daily_stats: list) -> None:
     """Attach the SMSC label(s) used per stats date, derived from sms_tasks."""
     if not daily_stats:
         return
-    conn = get_connection()
-    rows = conn.execute(
-        """SELECT CAST(created_at AS DATE) AS d, smpp_config_id
-           FROM sms_tasks
-           WHERE campaign_type='batch' AND campaign_id=?
-           GROUP BY d, smpp_config_id""",
-        (campaign_id,),
-    ).fetchall()
-    configs = {
-        r["id"]: r
-        for r in conn.execute("SELECT id, name, host, port FROM smpp_configs").fetchall()
-    }
-    conn.close()
+    rows, config_rows = read_transaction(
+        lambda conn: (
+            conn.execute(
+                """SELECT CAST(created_at AS DATE) AS d, smpp_config_id
+                   FROM sms_tasks
+                   WHERE campaign_type='batch' AND campaign_id=?
+                   GROUP BY d, smpp_config_id""",
+                (campaign_id,),
+            ).fetchall(),
+            conn.execute("SELECT id, name, host, port FROM smpp_configs").fetchall(),
+        ),
+        operation="batch_campaign.detail.smpp",
+    )
+    configs = {r["id"]: r for r in config_rows}
 
     def label(config_id):
         if config_id is None:

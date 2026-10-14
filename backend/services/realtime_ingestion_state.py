@@ -2,14 +2,11 @@
 
 import logging
 import os
-import random
 import threading
 import time
 import uuid
 
-import duckdb
-
-from database import get_connection
+from database import is_transient_write_error, read_transaction, write_transaction
 from services import ingestion_job_service, metrics_service
 
 logger = logging.getLogger(__name__)
@@ -20,27 +17,20 @@ class LeaseLost(RuntimeError):
 
 
 def transient(error):
-    return isinstance(error, (TimeoutError, duckdb.TransactionException))
+    # A progress update may be coalesced on any bounded admission timeout,
+    # while actual transaction retries are delegated to the database
+    # coordinator (which excludes external-owner/I/O failures).
+    return isinstance(error, TimeoutError) or is_transient_write_error(error)
 
 
 def transaction(callback, attempts=3, lock_timeout=None):
-    """Retry the whole transaction with a new connection, sleeping only after close."""
-    for attempt in range(attempts):
-        conn = get_connection()
-        conn.write_lock_timeout = lock_timeout
-        try:
-            conn.execute("BEGIN TRANSACTION")
-            result = callback(conn)
-            conn.commit()
-            return result
-        except BaseException as exc:
-            conn.rollback()
-            if not transient(exc) or attempt + 1 == attempts:
-                raise
-        finally:
-            conn.close()
-        metrics_service.inc("realtime_state_transaction_retries_total")
-        time.sleep(0.025 * (attempt + 1) + random.uniform(0, 0.025))
+    """Run the DB-only state transaction through the shared coordinator."""
+    return write_transaction(
+        callback,
+        attempts=max(1, min(5, int(attempts or 1))),
+        operation="realtime.ingestion.state",
+        lock_timeout=lock_timeout,
+    )
 
 
 def assert_owned(conn, file_id, token):
@@ -57,11 +47,10 @@ def assert_owned(conn, file_id, token):
 
 def check_owned(file_id, token):
     if token:
-        conn = get_connection()
-        try:
-            assert_owned(conn, file_id, token)
-        finally:
-            conn.close()
+        read_transaction(
+            lambda conn: assert_owned(conn, file_id, token),
+            operation="realtime.ingestion.lease_check",
+        )
 
 
 def register_processed(campaign_id, path, filename, file_id, token):

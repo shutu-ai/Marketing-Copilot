@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
-from database import get_connection, write_transaction
+from database import read_transaction, write_transaction
 
 
 DEFAULT_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_CHUNK_LEASE_SECONDS", "300")))
@@ -20,16 +20,15 @@ _RETRY_DUE_SQL = "(next_retry_at IS NULL OR TRY_CAST(next_retry_at AS TIMESTAMPT
 
 
 def get_file(campaign_type: str, campaign_id: int, filename: str) -> Optional[dict]:
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             """SELECT * FROM ingestion_files
                WHERE campaign_type=? AND campaign_id=? AND filename=?""",
             (campaign_type, campaign_id, os.path.basename(filename)),
-        ).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="ingestion_file.get",
+    )
+    return dict(row) if row else None
 
 
 def register_file(campaign_type: str, campaign_id: int, filename: str, file_path: str,
@@ -231,8 +230,7 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
     """
     token = uuid.uuid4().hex
     worker_id = worker_id or f"realtime-ingestion-{os.getpid()}"
-    conn = get_connection()
-    try:
+    def claim(conn):
         campaign_clause = "" if campaign_id is None else " AND campaign_id=?"
         select_params = [campaign_type]
         if campaign_id is not None:
@@ -286,11 +284,14 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
                 # Fairness telemetry must never turn a correctly fenced lease
                 # into a failed claim.
                 pass
-            conn.commit()
             return dict(claimed)
         return None
-    finally:
-        conn.close()
+    return write_transaction(
+        claim,
+        attempts=3,
+        operation="realtime.ingestion.file_claim",
+        lock_timeout=1.0,
+    )
 
 
 def pending_campaign_ids(campaign_type: str = "realtime") -> list[int]:
@@ -300,9 +301,8 @@ def pending_campaign_ids(campaign_type: str = "realtime") -> list[int]:
     next campaign and then calls ``claim_file(..., campaign_id=...)`` so the
     actual lease remains an atomic UPDATE transaction.
     """
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             """SELECT DISTINCT f.campaign_id
                FROM ingestion_files f
                WHERE f.campaign_type=?
@@ -315,10 +315,10 @@ def pending_campaign_ids(campaign_type: str = "realtime") -> list[int]:
                  ))
                ORDER BY f.campaign_id""",
             (campaign_type,),
-        ).fetchall()
-        return [int(row["campaign_id"]) for row in rows]
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime.ingestion.pending_campaigns",
+    )
+    return [int(row["campaign_id"]) for row in rows]
 
 
 def update_progress(file_id: int, phase: str, processed_rows: Optional[int] = None,
@@ -334,18 +334,14 @@ def update_progress(file_id: int, phase: str, processed_rows: Optional[int] = No
             fields.append(f"{column}=?")
             values.append(value)
     values.append(file_id)
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(f"UPDATE ingestion_files SET {','.join(fields)} WHERE id=?", values)
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(write, attempts=1, operation="realtime.ingestion.progress", lock_timeout=0.5)
 
 
 def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int,
                    allow_unbounded: bool = False) -> dict:
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute("SELECT retry_count,max_retry_count FROM ingestion_files WHERE id=?", (file_id,)).fetchone()
         if not row:
             return {"scheduled": False, "retry_count": 0, "max_retry_count": 0}
@@ -360,16 +356,13 @@ def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int,
                updated_at=CURRENT_TIMESTAMP,error_detail=? WHERE id=?""",
             (retry_count, error_class, int(max(1, delay_seconds)), str(error)[:4000], file_id),
         )
-        conn.commit()
         return {"scheduled": True, "retry_count": retry_count, "max_retry_count": max_retry_count}
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.schedule_retry")
 
 
 def requeue_waiting_whitelist_files(campaign_id: int) -> int:
     """Immediately retry realtime files held only by a whitelist dependency."""
-    conn = get_connection()
-    try:
+    def write(conn):
         count = conn.execute(
             """SELECT COUNT(*) AS count FROM ingestion_files
                WHERE campaign_type='realtime' AND campaign_id=?
@@ -386,45 +379,38 @@ def requeue_waiting_whitelist_files(campaign_id: int) -> int:
                  AND status IN ('retrying','failed','quarantined')""",
             (campaign_id,),
         )
-        conn.commit()
         return int(count or 0)
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.requeue_whitelist")
 
 
 def count_waiting_whitelist_files(campaign_id: int) -> int:
-    conn = get_connection()
-    try:
-        row = conn.execute(
+    row = read_transaction(
+        lambda conn: conn.execute(
             """SELECT COUNT(*) AS count FROM ingestion_files
                WHERE campaign_type='realtime' AND campaign_id=?
                  AND last_error_class='WAITING_DEPENDENCY'
                  AND status IN ('pending','retrying','failed','quarantined')""",
             (campaign_id,),
-        ).fetchone()
-        return int(row["count"] or 0)
-    finally:
-        conn.close()
+        ).fetchone(),
+        operation="realtime.ingestion.count_whitelist_waiters",
+    )
+    return int(row["count"] or 0)
 
 
 def fail_file(file_id: int, error_class: str, error: str, status: str = "failed") -> None:
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             """UPDATE ingestion_files SET status=?,processing_phase=?,last_error_class=?,
                last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,lease_token='',lease_expires_at=NULL,
                worker_id='',error_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (status, "quarantined" if status == "quarantined" else "failed", error_class, str(error)[:4000], file_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(write, operation="realtime.ingestion.fail_file")
 
 
 def expire_file(file_id: int, error: str, include_processing: bool = False) -> bool:
     """Mark an out-of-date realtime file terminal so it no longer occupies the queue."""
-    conn = get_connection()
-    try:
+    def write(conn):
         active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
         conn.execute(
             """UPDATE ingestion_files SET status='failed',processing_phase='failed',
@@ -445,10 +431,8 @@ def expire_file(file_id: int, error: str, include_processing: bool = False) -> b
                    WHERE file_id=? AND status IN ('pending','processing','retrying')""",
                 (str(error)[:4000], file_id),
             )
-        conn.commit()
         return expired
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.expire_file")
 
 
 def expire_files(file_ids: Iterable[int], error: str,
@@ -459,8 +443,7 @@ def expire_files(file_ids: Iterable[int], error: str,
         return set()
     placeholders = ",".join("?" for _ in ids)
     active_statuses = "('pending','retrying','processing')" if include_processing else "('pending','retrying')"
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             """UPDATE ingestion_files SET status='failed',processing_phase='failed',
                last_error_class='EXPIRED_FILE',last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,
@@ -484,29 +467,23 @@ def expire_files(file_ids: Iterable[int], error: str,
                      AND status IN ('pending','processing','retrying')""",
                 (str(error)[:4000], *sorted(expired_ids)),
             )
-        conn.commit()
         return expired_ids
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.expire_files")
 
 
 def complete_file(file_id: int) -> None:
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             """UPDATE ingestion_files SET status='completed',processing_phase='completed',
                next_retry_at=NULL,lease_token='',lease_expires_at=NULL,worker_id='',
                completed_at=CURRENT_TIMESTAMP,last_progress_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
                WHERE id=?""", (file_id,),
         )
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(write, operation="realtime.ingestion.complete_file")
 
 
 def requeue_file(file_id: int) -> Optional[dict]:
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute("SELECT * FROM ingestion_files WHERE id=?", (file_id,)).fetchone()
         if not row or row["status"] not in ("failed", "quarantined", "retrying"):
             return dict(row) if row else None
@@ -516,16 +493,13 @@ def requeue_file(file_id: int) -> Optional[dict]:
                lease_token='',lease_expires_at=NULL,worker_id='',updated_at=CURRENT_TIMESTAMP
                WHERE id=? RETURNING *""", (file_id,),
         ).fetchone()
-        conn.commit()
         return dict(updated) if updated else None
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.requeue_file")
 
 
 def ensure_chunk(file_id: int, chunk_index: int, start_row: int, end_row: int,
                  source_batch_id: Optional[int] = None) -> dict:
-    conn = get_connection()
-    try:
+    def write(conn):
         conn.execute(
             """INSERT INTO ingestion_chunks
                (file_id,source_batch_id,chunk_index,start_row,end_row)
@@ -537,14 +511,12 @@ def ensure_chunk(file_id: int, chunk_index: int, start_row: int, end_row: int,
                total_rows=GREATEST(total_rows,?),updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (chunk_index + 1, end_row, file_id),
         )
-        conn.commit()
         row = conn.execute(
             "SELECT * FROM ingestion_chunks WHERE file_id=? AND chunk_index=?",
             (file_id, chunk_index),
         ).fetchone()
         return dict(row)
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.ensure_chunk")
 
 
 def claim_chunk(file_id: Optional[int] = None, chunk_index: Optional[int] = None,
@@ -556,8 +528,7 @@ def claim_chunk(file_id: Optional[int] = None, chunk_index: Optional[int] = None
         where, params = "source_batch_id=?", [source_batch_id]
     else:
         where, params = "file_id=? AND chunk_index=?", [file_id, chunk_index]
-    conn = get_connection()
-    try:
+    def write(conn):
         row = conn.execute(
             f"SELECT * FROM ingestion_chunks WHERE {where}", params
         ).fetchone()
@@ -578,11 +549,14 @@ def claim_chunk(file_id: Optional[int] = None, chunk_index: Optional[int] = None
                 "UPDATE ingestion_files SET status='processing',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (claimed["file_id"],),
             )
-            conn.commit()
             return dict(claimed)
         return None
-    finally:
-        conn.close()
+    return write_transaction(
+        write,
+        attempts=3,
+        operation="realtime.ingestion.chunk_claim",
+        lock_timeout=1.0,
+    )
 
 
 def record_chunk_progress_in_transaction(conn, chunk_id: int, result: dict) -> None:
@@ -638,12 +612,10 @@ def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:
 
 
 def complete_chunk(chunk_id: int, result: dict) -> None:
-    conn = get_connection()
-    try:
-        complete_chunk_in_transaction(conn, chunk_id, result)
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(
+        lambda conn: complete_chunk_in_transaction(conn, chunk_id, result),
+        operation="realtime.ingestion.chunk_complete",
+    )
 
 
 def fail_chunk_in_transaction(conn, chunk_id: int, error) -> None:
@@ -661,17 +633,14 @@ def fail_chunk_in_transaction(conn, chunk_id: int, error) -> None:
 
 
 def fail_chunk(chunk_id: int, error) -> None:
-    conn = get_connection()
-    try:
-        fail_chunk_in_transaction(conn, chunk_id, error)
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(
+        lambda conn: fail_chunk_in_transaction(conn, chunk_id, error),
+        operation="realtime.ingestion.chunk_fail",
+    )
 
 
 def finish_file(file_id: int, status: str = "completed", error: str = "") -> None:
-    conn = get_connection()
-    try:
+    def write(conn):
         counts = conn.execute(
             """SELECT COUNT(*) total,
                       SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed,
@@ -690,14 +659,11 @@ def finish_file(file_id: int, status: str = "completed", error: str = "") -> Non
             (final_status, counts["total"], counts["completed"] or 0, counts["created"],
              str(error)[:4000], final_status, file_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
+    write_transaction(write, operation="realtime.ingestion.finish_file")
 
 
 def recover_expired_chunks() -> int:
-    conn = get_connection()
-    try:
+    def write(conn):
         rows = conn.execute(
             """UPDATE ingestion_chunks SET status='pending',lease_token='',lease_expires_at=NULL,
                error_detail='lease expired; recovered after restart',updated_at=CURRENT_TIMESTAMP
@@ -712,16 +678,12 @@ def recover_expired_chunks() -> int:
                 f"WHERE id IN ({placeholders}) AND status='processing'",
                 batch_ids,
             )
-        if rows:
-            conn.commit()
         return len(rows)
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.recover_chunks")
 
 
 def recover_expired_files() -> int:
-    conn = get_connection()
-    try:
+    def write(conn):
         rows = conn.execute(
             """UPDATE ingestion_files SET status='pending',processing_phase='queued',
                lease_token='',lease_expires_at=NULL,worker_id='',
@@ -729,20 +691,16 @@ def recover_expired_files() -> int:
                WHERE status='processing' AND lease_expires_at IS NOT NULL
                  AND CAST(lease_expires_at AS TIMESTAMP)<=CURRENT_TIMESTAMP RETURNING id"""
         ).fetchall()
-        if rows:
-            conn.commit()
         return len(rows)
-    finally:
-        conn.close()
+    return write_transaction(write, operation="realtime.ingestion.recover_files")
 
 
 def status() -> dict:
-    conn = get_connection()
-    try:
-        rows = conn.execute(
+    rows = read_transaction(
+        lambda conn: conn.execute(
             "SELECT status,COUNT(*) count FROM ingestion_chunks GROUP BY status"
-        ).fetchall()
-        counts = {row["status"]: int(row["count"]) for row in rows}
-        return {"chunks": counts, "pending": counts.get("pending", 0) + counts.get("failed", 0)}
-    finally:
-        conn.close()
+        ).fetchall(),
+        operation="realtime.ingestion.status",
+    )
+    counts = {row["status"]: int(row["count"]) for row in rows}
+    return {"chunks": counts, "pending": counts.get("pending", 0) + counts.get("failed", 0)}

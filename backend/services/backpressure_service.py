@@ -136,6 +136,14 @@ def snapshot(include_task_depth: bool = True, refresh_database: bool = True) -> 
     with _lock:
         values["paused"] = dict(_paused)
     values["ingestion_ramp"] = _ramp_snapshot()
+    # Maintenance is a global safety boundary, not ordinary workload
+    # pressure. Expose it separately so callers can fail closed while keeping
+    # campaign/route soft pressure isolated.
+    try:
+        values["database"] = write_lock_status()
+    except Exception:
+        values["database"] = {"mode": "unknown", "maintenance_requested": True,
+                               "maintenance_active": True}
     return values
 
 
@@ -355,6 +363,7 @@ def reasons(producing_chunks: bool = False, refresh_database: bool = True) -> tu
                 raise
             state = snapshot()
     disk = state["disk"]
+    database_state = state.get("database") or {}
     with _lock:
         _paused["tasks"] = (
             state["task_depth"] > (TASK_LOW if _paused["tasks"] else TASK_HIGH)
@@ -378,6 +387,8 @@ def reasons(producing_chunks: bool = False, refresh_database: bool = True) -> tu
         else:
             _paused["disk"] = disk["used_pct"] >= DISK_HIGH or disk["free_bytes"] < MIN_FREE_BYTES
         active = [name for name, paused in _paused.items() if paused]
+        if database_state.get("maintenance_requested") or database_state.get("maintenance_active"):
+            active.append("database_maintenance")
         state["paused"] = dict(_paused)
     return active, state
 
@@ -408,7 +419,9 @@ def wait_for_delivery(stop_event=None, interval: float = 0.05) -> bool:
     """Pause new claims while preserving capacity to drain received results."""
     while True:
         active, _state = reasons(producing_chunks=False)
-        blocking = [reason for reason in active if reason in {"writes", "disk", "results"}]
+        blocking = [reason for reason in active if reason in {
+            "writes", "disk", "results", "database_maintenance",
+        }]
         if not blocking:
             return stop_event is None or not stop_event.is_set()
         if stop_event is not None and stop_event.is_set():

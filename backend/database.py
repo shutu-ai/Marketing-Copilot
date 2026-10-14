@@ -1,6 +1,7 @@
 import os
 import faulthandler
 import logging
+import random
 import threading
 import time
 from contextlib import contextmanager
@@ -9,14 +10,10 @@ import duckdb
 
 logger = logging.getLogger(__name__)
 
-# Serialize mutations, but allow independent read connections to run while the
-# SMS writer is committing. Every WrappedConnection is still protected against
-# simultaneous use by multiple Python threads.
-#
-# The lock is re-entrant because a writer transaction holds it across all of
-# its statements and commit/rollback.  Locking only one execute() at a time
-# allowed two transactions to interleave and made DuckDB's optimistic
-# write-write conflicts much more likely.
+# ``_write_lock`` is the compatibility/fallback gate for the default
+# ``serialized`` mode. It is deliberately not used for normal DML when
+# ``MC_DUCKDB_WRITE_CONCURRENCY=occ``. The object remains for diagnostics and
+# for the safe rollback path while the opt-in mode is being validated.
 _write_lock = threading.RLock()
 _write_state_lock = threading.Lock()
 _write_holder = {
@@ -32,6 +29,284 @@ _stall_watchdog_threshold = 30.0
 _stall_watchdog_emitted = False
 _stall_watchdog_started_at = 0.0
 _stall_watchdog_stack_handle = None
+
+_WRITE_CONCURRENCY_MODES = {"serialized", "occ"}
+_WRITE_CONCURRENCY = str(
+    os.environ.get("MC_DUCKDB_WRITE_CONCURRENCY", "serialized")
+).strip().lower()
+if _WRITE_CONCURRENCY not in _WRITE_CONCURRENCY_MODES:
+    logger.warning(
+        "Unsupported MC_DUCKDB_WRITE_CONCURRENCY=%r; using serialized",
+        _WRITE_CONCURRENCY,
+    )
+    _WRITE_CONCURRENCY = "serialized"
+
+# The process mode is read at import time and becomes immutable after the
+# first coordinator use. A running owner must never switch storage semantics
+# without an explicit process restart.
+_WRITE_CONCURRENCY_FROZEN = False
+
+try:
+    _TRANSACTION_ADMISSION_TIMEOUT_SECONDS = max(
+        0.1,
+        float(os.environ.get("MC_DUCKDB_TRANSACTION_ADMISSION_TIMEOUT_SECONDS", "5")),
+    )
+except (TypeError, ValueError):
+    _TRANSACTION_ADMISSION_TIMEOUT_SECONDS = 5.0
+
+try:
+    _OCC_RETRY_JITTER_SECONDS = max(
+        0.0,
+        float(os.environ.get("MC_DUCKDB_OCC_RETRY_JITTER_MS", "25")) / 1000.0,
+    )
+except (TypeError, ValueError):
+    _OCC_RETRY_JITTER_SECONDS = 0.025
+
+
+class _AdmissionToken:
+    """One tracked transaction admission held by a WrappedConnection."""
+
+    __slots__ = ("_coordinator", "operation", "read_only", "acquired_at", "released")
+
+    def __init__(self, coordinator, operation: str, read_only: bool, acquired_at: float):
+        self._coordinator = coordinator
+        self.operation = str(operation or "transaction")
+        self.read_only = bool(read_only)
+        self.acquired_at = float(acquired_at)
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self._coordinator._release(self)
+
+
+class TransactionCoordinator:
+    """Coordinate admission without serializing ordinary OCC DML.
+
+    Shared admission counts every connection-level read/write transaction so
+    maintenance can establish a real quiescent boundary. In ``occ`` mode it
+    is a condition-variable counter, not a writer mutex. The serialized
+    compatibility mode still uses the historical Python writer gate for
+    normal writes.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition(threading.RLock())
+        self._active = 0
+        self._active_by_operation = {}
+        self._active_started = {}
+        self._maintenance_requested = False
+        self._maintenance_active = False
+        self._maintenance_operation = ""
+        self._maintenance_started = 0.0
+        self._maintenance_wait_started = 0.0
+        self._local = threading.local()
+
+    @property
+    def mode(self) -> str:
+        return _WRITE_CONCURRENCY
+
+    def _mark_mode_used(self) -> None:
+        global _WRITE_CONCURRENCY_FROZEN
+        _WRITE_CONCURRENCY_FROZEN = True
+
+    def _deadline(self, timeout=None, deadline=None) -> float | None:
+        if deadline is not None:
+            try:
+                return float(deadline)
+            except (TypeError, ValueError):
+                raise ValueError("transaction deadline must be a monotonic timestamp")
+        if timeout is None:
+            timeout = _TRANSACTION_ADMISSION_TIMEOUT_SECONDS
+        return time.monotonic() + max(0.0, float(timeout))
+
+    def _wait_seconds(self, deadline: float | None, operation: str) -> float:
+        if deadline is None:
+            return 0.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            status = self.status()
+            _inc_database_metric(
+                "marketing_copilot_database_transaction_admission_timeouts_total",
+                labels={"operation": str(operation), "mode": self.mode},
+            )
+            raise TimeoutError(
+                f"DuckDB transaction admission timeout during {operation}; "
+                f"active={status['active_transactions']} "
+                f"maintenance={status['maintenance_requested']}"
+            )
+        return remaining
+
+    def acquire(self, operation: str = "transaction", *, read_only: bool = False,
+                timeout=None, deadline=None) -> _AdmissionToken:
+        self._mark_mode_used()
+        operation = str(operation or "transaction")
+        started = time.perf_counter()
+        deadline_at = self._deadline(timeout, deadline)
+        with self._condition:
+            while self._maintenance_requested or self._maintenance_active:
+                self._condition.wait(self._wait_seconds(deadline_at, operation))
+            acquired_at = time.monotonic()
+            token = _AdmissionToken(self, operation, read_only, acquired_at)
+            self._active += 1
+            self._active_by_operation[operation] = self._active_by_operation.get(operation, 0) + 1
+            self._active_started[id(token)] = (acquired_at, operation)
+            self._local.admission_depth = getattr(self._local, "admission_depth", 0) + 1
+        waited = time.perf_counter() - started
+        _observe_database_metric(
+            "marketing_copilot_database_transaction_admission_wait_seconds",
+            waited,
+            labels={"operation": operation, "mode": self.mode},
+        )
+        _observe_database_metric(
+            "marketing_copilot_database_transaction_wait_seconds",
+            waited,
+            labels={"operation": operation, "mode": self.mode},
+        )
+        return token
+
+    def _release(self, token: _AdmissionToken) -> None:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            count = self._active_by_operation.get(token.operation, 0)
+            if count <= 1:
+                self._active_by_operation.pop(token.operation, None)
+            else:
+                self._active_by_operation[token.operation] = count - 1
+            self._active_started.pop(id(token), None)
+            self._condition.notify_all()
+            depth = getattr(self._local, "admission_depth", 0)
+            self._local.admission_depth = max(0, depth - 1)
+        _observe_database_metric(
+            "marketing_copilot_database_transaction_hold_seconds",
+            max(0.0, time.monotonic() - token.acquired_at),
+            labels={"operation": token.operation, "mode": self.mode},
+        )
+
+    @contextmanager
+    def transaction(self, kind: str = "transaction", deadline=None,
+                    isolation: str = "occ", read_only: bool = False):
+        """Admit a DB transaction for explicit coordinator users.
+
+        The yielded value is an admission token. Application code should use
+        ``write_transaction``/``read_transaction`` when it also needs a
+        connection lifecycle; this lower-level API is useful for maintenance
+        aware integrations and correctness harnesses.
+        """
+        del isolation  # DuckDB isolation is selected by the process mode.
+        token = self.acquire(kind, read_only=read_only, deadline=deadline)
+        try:
+            yield token
+        finally:
+            token.release()
+
+    @contextmanager
+    def maintenance_exclusive(self, kind: str = "maintenance", deadline=None,
+                              timeout=None):
+        """Stop new admissions and drain active transactions before maintenance."""
+        self._mark_mode_used()
+        operation = str(kind or "maintenance")
+        if getattr(self._local, "admission_depth", 0):
+            raise RuntimeError(
+                f"maintenance admission cannot be upgraded from an active transaction: {operation}"
+            )
+        started = time.perf_counter()
+        deadline_at = self._deadline(timeout, deadline)
+        with self._condition:
+            while self._maintenance_requested or self._maintenance_active:
+                self._condition.wait(self._wait_seconds(deadline_at, operation))
+            self._maintenance_requested = True
+            self._maintenance_operation = operation
+            self._maintenance_wait_started = time.monotonic()
+            try:
+                while self._active:
+                    self._condition.wait(self._wait_seconds(deadline_at, operation))
+                self._maintenance_active = True
+                self._maintenance_started = time.monotonic()
+            except BaseException:
+                self._maintenance_requested = False
+                self._maintenance_operation = ""
+                self._maintenance_wait_started = 0.0
+                self._condition.notify_all()
+                raise
+        _observe_database_metric(
+            "marketing_copilot_database_maintenance_wait_seconds",
+            time.perf_counter() - started,
+            labels={"operation": operation, "mode": self.mode},
+        )
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._maintenance_active = False
+                self._maintenance_requested = False
+                self._maintenance_operation = ""
+                self._maintenance_started = 0.0
+                self._maintenance_wait_started = 0.0
+                self._condition.notify_all()
+
+    def status(self) -> dict:
+        with self._condition:
+            active = int(self._active)
+            by_operation = dict(self._active_by_operation)
+            maintenance_requested = bool(self._maintenance_requested)
+            maintenance_active = bool(self._maintenance_active)
+            operation = self._maintenance_operation
+            maintenance_started = self._maintenance_started
+            wait_started = self._maintenance_wait_started
+            oldest = min(
+                (started for started, _op in self._active_started.values()),
+                default=0.0,
+            )
+        now = time.monotonic()
+        return {
+            "mode": self.mode,
+            "active_transactions": active,
+            "active_by_operation": by_operation,
+            "oldest_transaction_age_seconds": round(
+                max(0.0, now - oldest) if oldest else 0.0, 3
+            ),
+            "maintenance_requested": maintenance_requested,
+            "maintenance_active": maintenance_active,
+            "maintenance_operation": operation,
+            "maintenance_age_seconds": round(
+                max(0.0, now - maintenance_started) if maintenance_started else 0.0, 3
+            ),
+            "maintenance_wait_seconds": round(
+                max(0.0, now - wait_started)
+                if wait_started and not maintenance_active else 0.0,
+                3,
+            ),
+        }
+
+
+coordinator = TransactionCoordinator()
+
+
+@contextmanager
+def maintenance_exclusive(kind: str = "maintenance", deadline=None, timeout=None):
+    """Public maintenance boundary used by backup, schema and update paths."""
+    with coordinator.maintenance_exclusive(kind, deadline=deadline, timeout=timeout):
+        yield
+
+
+def write_concurrency_mode() -> str:
+    """Return the immutable process-level DuckDB write mode."""
+    return _WRITE_CONCURRENCY
+
+
+def configure_write_concurrency(mode: str) -> str:
+    """Configure the mode before first use; running processes cannot switch it."""
+    global _WRITE_CONCURRENCY
+    normalized = str(mode or "").strip().lower()
+    if normalized not in _WRITE_CONCURRENCY_MODES:
+        raise ValueError("DuckDB write concurrency mode must be serialized or occ")
+    if _WRITE_CONCURRENCY_FROZEN:
+        raise RuntimeError("DuckDB write concurrency mode is frozen for this process")
+    _WRITE_CONCURRENCY = normalized
+    return _WRITE_CONCURRENCY
 
 try:
     _WRITE_LOCK_TIMEOUT_SECONDS = max(
@@ -162,24 +437,17 @@ def _stall_watchdog_loop():
             logger.exception("Database stall watchdog capture failed")
 
 
-def is_transient_write_error(error: BaseException) -> bool:
-    """Return whether *error* is safe to retry as a whole write transaction.
+def is_occ_conflict_error(error: BaseException) -> bool:
+    """Return whether *error* is a same-process DuckDB OCC conflict.
 
-    DuckDB can surface contention as either the Python-side writer-gate
-    timeout or a transaction conflict.  Keep this predicate in one place so
-    HTTP handlers, upload services and background workers classify the same
-    failures consistently.  We deliberately do not classify arbitrary
-    ``TimeoutError`` instances (for example a whitelist build timeout) as a
-    database failure.
+    File-owner locks, WAL replay failures and I/O errors are intentionally
+    excluded. Retrying those blindly can amplify an instance/configuration
+    failure and is not equivalent to retrying a rolled-back OCC transaction.
     """
     seen = set()
     current = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, TimeoutError):
-            text = str(current).lower()
-            if "duckdb write lock timeout" in text or "database write lock" in text:
-                return True
         if isinstance(current, duckdb.TransactionException):
             text = str(current).lower()
             if any(marker in text for marker in (
@@ -191,14 +459,52 @@ def is_transient_write_error(error: BaseException) -> bool:
                 return True
         text = str(current).lower()
         if any(marker in text for marker in (
-            "could not set lock on file",
-            "database is locked",
-            "database busy",
             "write-write conflict",
             "transaction conflict",
+            "transactioncontext error",
+            "conflict on update",
+            "conflict with concurrent transaction",
         )):
             return True
         current = current.__cause__ or current.__context__
+    return False
+
+
+def is_external_owner_error(error: BaseException) -> bool:
+    """Return whether a failure indicates another process/file owner."""
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).lower()
+        if any(marker in text for marker in (
+            "could not set lock on file",
+            "conflicting lock is held",
+            "database is locked",
+            "database busy",
+            "file is locked",
+        )):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_transient_write_error(error: BaseException) -> bool:
+    """Return whether *error* is safe to retry as a whole write transaction.
+
+    In OCC mode this means only a DuckDB write-write conflict. In serialized
+    compatibility mode the legacy in-process writer-gate timeout remains
+    retryable. An external owner/file lock is an instance-safety failure and
+    is never silently retried by this predicate.
+    """
+    if is_occ_conflict_error(error):
+        return True
+    if isinstance(error, TimeoutError):
+        text = str(error).lower()
+        return (
+            _WRITE_CONCURRENCY == "serialized"
+            and ("duckdb write lock timeout" in text or "database write lock" in text)
+        )
     return False
 
 
@@ -288,7 +594,8 @@ def write_busy_message(error: BaseException) -> str:
 
 
 def write_transaction(callback, attempts: int = 3, operation: str = "write",
-                      lock_timeout=None, base_delay: float = 0.05):
+                      lock_timeout=None, base_delay: float = 0.05,
+                      deadline=None, retry_jitter: float = None):
     """Run a complete short write transaction with bounded retry.
 
     The callback must not call ``commit`` or ``close``.  Retrying the whole
@@ -297,22 +604,37 @@ def write_transaction(callback, attempts: int = 3, operation: str = "write",
     operation missing or partially committed.
     """
     attempts = max(1, min(5, int(attempts or 1)))
+    if deadline is not None:
+        try:
+            deadline = float(deadline)
+        except (TypeError, ValueError):
+            raise ValueError("write transaction deadline must be a monotonic timestamp")
+    jitter = _OCC_RETRY_JITTER_SECONDS if retry_jitter is None else max(0.0, float(retry_jitter))
     for attempt in range(1, attempts + 1):
         conn = None
         transaction_started = time.perf_counter()
         transaction_result = "error"
         try:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"DuckDB write transaction deadline exceeded: {operation}")
             # Connection acquisition can itself fail while DuckDB is replaying
             # a WAL or another process briefly owns the file lock. Keep it
-            # inside the retry scope so Web writes do not fail before the
-            # transaction retry policy gets a chance to run.
+            # inside the operation scope, but do not classify file-owner errors
+            # as OCC retries.
             conn = get_connection()
             if hasattr(conn, "set_operation"):
                 conn.set_operation(operation)
             conn.write_lock_timeout = lock_timeout
+            conn.transaction_deadline = deadline
             conn.execute("BEGIN TRANSACTION")
             result = callback(conn)
+            commit_started = time.perf_counter()
             conn.commit()
+            _observe_database_metric(
+                "marketing_copilot_database_transaction_commit_seconds",
+                time.perf_counter() - commit_started,
+                labels={"operation": operation, "mode": _WRITE_CONCURRENCY},
+            )
             transaction_result = "success"
             return result
         except BaseException as exc:
@@ -321,17 +643,45 @@ def write_transaction(callback, attempts: int = 3, operation: str = "write",
                     conn.rollback()
                 except Exception:
                     logger.debug("DuckDB rollback failed after write error", exc_info=True)
-            if not is_transient_write_error(exc) or attempt >= attempts:
+            conflict = is_occ_conflict_error(exc)
+            retryable = is_transient_write_error(exc)
+            if conflict:
+                _inc_database_metric(
+                    "marketing_copilot_database_occ_conflicts_total",
+                    labels={"operation": operation, "mode": _WRITE_CONCURRENCY},
+                )
+            if not retryable or attempt >= attempts:
+                if conflict:
+                    _inc_database_metric(
+                        "marketing_copilot_database_occ_failures_total",
+                        labels={"operation": operation, "mode": _WRITE_CONCURRENCY},
+                    )
                 raise
             _inc_database_metric(
                 "marketing_copilot_database_write_transaction_retries_total",
-                labels={"operation": operation},
+                labels={"operation": operation, "mode": _WRITE_CONCURRENCY},
+            )
+            _inc_database_metric(
+                "marketing_copilot_database_occ_retries_total",
+                labels={"operation": operation, "mode": _WRITE_CONCURRENCY},
             )
             logger.warning(
-                "DuckDB write transaction busy; retrying operation=%s attempt=%s/%s",
+                "DuckDB OCC conflict; retrying complete transaction operation=%s "
+                "attempt=%s/%s",
                 operation, attempt + 1, attempts,
             )
-            time.sleep(max(0.0, float(base_delay)) * attempt)
+            delay = max(0.0, float(base_delay)) * (2 ** (attempt - 1))
+            if jitter:
+                delay += random.uniform(0.0, jitter)
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            _observe_database_metric(
+                "marketing_copilot_database_occ_backoff_seconds",
+                delay,
+                labels={"operation": operation, "mode": _WRITE_CONCURRENCY},
+            )
+            if delay:
+                time.sleep(delay)
         finally:
             _observe_database_metric(
                 "marketing_copilot_database_write_transaction_seconds",
@@ -474,38 +824,67 @@ def _clear_write_holder() -> None:
             })
 
 
+def _transaction_control(sql: str) -> str:
+    """Return the top-level transaction control keyword, if any."""
+    statement = str(sql or "").lstrip()
+    while statement.startswith("--"):
+        _, separator, remainder = statement.partition("\n")
+        if not separator:
+            return ""
+        statement = remainder.lstrip()
+    token = statement.split(None, 1)[0].upper() if statement else ""
+    if token == "START" and statement.upper().startswith("START TRANSACTION"):
+        return "BEGIN"
+    if token in {"BEGIN", "COMMIT", "ROLLBACK", "END"}:
+        return "COMMIT" if token == "END" else token
+    return ""
+
+
 @contextmanager
 def write_gate(operation: str = "write", timeout=None):
-    """Hold the process writer gate across a multi-step file operation.
+    """Hold the maintenance boundary across a multi-step file operation.
 
-    Some operations, such as an online backup, must checkpoint and then copy
-    the database after the DuckDB connection is closed (Windows keeps the
-    file handle locked while a connection is open).  This helper keeps other
-    application writers fenced during that gap without holding a DuckDB file
-    handle itself.
+    The compatibility name is kept for callers that have not migrated yet.
+    In OCC mode it is a real maintenance-exclusive admission: new reads and
+    writes are blocked and existing tracked transactions drain before the
+    caller reaches CHECKPOINT/copy. In serialized mode it additionally holds
+    the historical Python writer gate.
     """
-    _acquire_write_lock(operation, timeout)
-    try:
-        yield
-    finally:
-        _clear_write_holder()
-        _write_lock.release()
+    with coordinator.maintenance_exclusive(operation, timeout=timeout):
+        gate_acquired = False
+        try:
+            if _WRITE_CONCURRENCY == "serialized":
+                _acquire_write_lock(operation, timeout)
+                gate_acquired = True
+            yield
+        finally:
+            if gate_acquired:
+                _clear_write_holder()
+                _write_lock.release()
 
 
 def write_lock_status() -> dict:
-    """Return non-sensitive diagnostics for the process-wide writer gate."""
+    """Return non-sensitive writer/admission diagnostics.
+
+    ``held`` remains for existing dashboards, but in OCC mode it describes an
+    active maintenance boundary rather than falsely claiming a global writer
+    mutex is held by ordinary DML.
+    """
     with _write_state_lock:
         thread_id = _write_holder["thread_id"]
         thread_name = _write_holder["thread_name"]
         operation = _write_holder["operation"]
         acquired_at = _write_holder["acquired_at"]
     age = max(0.0, time.monotonic() - acquired_at) if acquired_at else 0.0
+    admission = coordinator.status()
+    maintenance_age = float(admission.get("maintenance_age_seconds") or 0.0)
     return {
-        "held": bool(thread_id),
+        "held": bool(thread_id) or bool(admission.get("maintenance_active")),
         "thread_id": thread_id,
         "thread_name": thread_name,
         "operation": operation,
-        "age_seconds": round(age, 3),
+        "age_seconds": round(max(age, maintenance_age), 3),
+        **admission,
     }
 
 
@@ -606,26 +985,59 @@ class WrappedConnection:
         self._operation = ""
         self._connection_lock = threading.RLock()
         self._write_lock_held = False
+        self._admission_token = None
+        self._explicit_transaction = False
         # Keep the business operation captured at first gate acquisition.
         # Later execute/commit phases must not relabel a long transaction as
         # merely ``commit`` in contention diagnostics.
         self._write_operation = ""
         self.write_lock_timeout = None
+        self.transaction_deadline = None
 
     def set_operation(self, operation: str):
         """Attach a bounded business operation name to subsequent DB writes."""
         self._operation = str(operation or "")
         return self
 
+    def _ensure_admission(self, operation: str, read_only: bool = False) -> float:
+        operation = self._operation or operation
+        if self._admission_token is not None:
+            if not read_only:
+                self._admission_token.read_only = False
+            return 0.0
+        timeout = self.write_lock_timeout
+        token = coordinator.acquire(
+            operation,
+            read_only=read_only,
+            timeout=timeout,
+            deadline=self.transaction_deadline,
+        )
+        self._admission_token = token
+        return max(0.0, time.monotonic() - token.acquired_at)
+
     def _ensure_write_lock(self, operation: str) -> float:
         operation = self._operation or operation
+        admission_wait = self._ensure_admission(operation, read_only=False)
         if self._write_lock_held:
             _update_write_holder(self._write_operation or operation)
-            return 0.0
-        waited = _acquire_write_lock(operation, self.write_lock_timeout)
+            return admission_wait
+        if _WRITE_CONCURRENCY != "serialized":
+            self._write_operation = operation
+            return admission_wait
+        try:
+            waited = _acquire_write_lock(operation, self.write_lock_timeout)
+        except BaseException:
+            token = self._admission_token
+            self._admission_token = None
+            if token is not None:
+                token.release()
+            raise
         self._write_lock_held = True
         self._write_operation = operation
-        return waited
+        return admission_wait + waited
+
+    def _ensure_read_admission(self, operation: str) -> float:
+        return self._ensure_admission(operation, read_only=True)
 
     def _release_write_lock(self) -> None:
         if self._write_lock_held:
@@ -641,7 +1053,11 @@ class WrappedConnection:
                 )
             _clear_write_holder()
             _write_lock.release()
-            self._write_operation = ""
+        self._write_operation = ""
+        token = self._admission_token
+        self._admission_token = None
+        if token is not None:
+            token.release()
 
     def _rollback_underlying(self) -> None:
         """Rollback without masking the original DuckDB exception."""
@@ -657,10 +1073,15 @@ class WrappedConnection:
         sql = sql.replace("datetime('now','localtime')", "CURRENT_TIMESTAMP")
         self._last_sql = sql
         read_only = _is_read_only_statement(sql)
+        control = _transaction_control(sql)
         write_wait = 0.0
         with self._connection_lock:
-            if not read_only:
+            if read_only:
+                write_wait = self._ensure_read_admission("read")
+            else:
                 write_wait = self._ensure_write_lock("execute")
+            if control == "BEGIN":
+                self._explicit_transaction = True
             execution_started = time.perf_counter()
             try:
                 if params is not None:
@@ -681,6 +1102,18 @@ class WrappedConnection:
                 raise
             finally:
                 execution_seconds = time.perf_counter() - execution_started
+            if control in {"COMMIT", "ROLLBACK"}:
+                self._explicit_transaction = False
+                self._release_write_lock()
+            elif (
+                not read_only
+                and _WRITE_CONCURRENCY == "occ"
+                and not self._explicit_transaction
+            ):
+                # Legacy callers often issue one DML statement without BEGIN.
+                # DuckDB auto-commits that statement; do not hold a shared
+                # admission token until an unrelated connection close.
+                self._release_write_lock()
         kind = "read" if read_only else "write"
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
@@ -702,6 +1135,8 @@ class WrappedConnection:
                 raise
             finally:
                 execution_seconds = time.perf_counter() - execution_started
+            if _WRITE_CONCURRENCY == "occ" and not self._explicit_transaction:
+                self._release_write_lock()
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": "write"},
@@ -772,6 +1207,7 @@ class WrappedConnection:
             finally:
                 execution_seconds = time.perf_counter() - execution_started
                 self._release_write_lock()
+                self._explicit_transaction = False
         _observe_database_metric(
             "marketing_copilot_database_statement_seconds", execution_seconds,
             labels={"kind": "commit"},
@@ -783,6 +1219,7 @@ class WrappedConnection:
                 self._rollback_underlying()
             finally:
                 self._release_write_lock()
+                self._explicit_transaction = False
             _observe_database_metric(
                 "marketing_copilot_database_rollback_seconds",
                 time.perf_counter() - started,
@@ -791,7 +1228,7 @@ class WrappedConnection:
     def close(self):
         try:
             with self._connection_lock:
-                if self._write_lock_held:
+                if self._admission_token is not None:
                     self._rollback_underlying()
                     self._release_write_lock()
                 self.conn.close()
@@ -802,7 +1239,7 @@ class WrappedConnection:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if exc_type is not None and self._write_lock_held:
+        if exc_type is not None and self._admission_token is not None:
             self.rollback()
         self.close()
         return False

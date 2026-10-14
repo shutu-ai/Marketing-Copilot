@@ -162,11 +162,12 @@ def backup_database(target_dir: str = "", *, resolve_database: bool = True) -> s
     destination_dir.mkdir(parents=True, exist_ok=True)
     from datetime import datetime
     target = destination_dir / f"{source.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{source.suffix}"
-    # Keep the application writer gate held from CHECKPOINT through the file
-    # copy.  The raw DuckDB connection is closed before copying because
-    # Windows otherwise keeps an exclusive file handle open even after the
-    # checkpoint has completed.
-    with database.write_gate("backup.database"):
+    # Establish a real maintenance boundary from CHECKPOINT through the file
+    # copy.  This drains tracked readers/writers before opening the raw
+    # checkpoint connection and blocks new admissions until the copy is done.
+    # The raw DuckDB connection is closed before copying because Windows
+    # otherwise keeps an exclusive file handle open after CHECKPOINT.
+    with database.maintenance_exclusive("backup.database"):
         conn = database.duckdb.connect(
             str(source), config=database.duckdb_connection_config()
         )
