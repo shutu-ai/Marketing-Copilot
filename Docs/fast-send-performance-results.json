@@ -3,8 +3,10 @@
   "generated_at": "2026-10-14T18:24:00Z",
   "repository": {
     "base_sha": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9",
-    "implementation": "WORKTREE_UNCOMMITTED_TASK_CHANGES",
-    "commit_push": "REQUESTED_PENDING",
+    "as_of_sha": "65060c4e3e67267d15cd5e8f6bf06e190b5e7e7c",
+    "verified_remote_sha": "65060c4e3e67267d15cd5e8f6bf06e190b5e7e7c",
+    "implementation": "65060c4e3e67267d15cd5e8f6bf06e190b5e7e7c",
+    "commit_push": "65060c4e3e67267d15cd5e8f6bf06e190b5e7e7c pushed to origin/main",
     "fetch_prune": "FAILED_NETWORK_ORIGIN_UNREACHABLE",
     "live_environment": "UNVERIFIED"
   },
