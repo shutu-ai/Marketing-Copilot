@@ -1,0 +1,189 @@
+{
+  "report": "OCC equal-window 2x2 G3/G4/G5 acceptance evidence index",
+  "generated_at": "2026-10-15T00:20:00+02:00",
+  "source_sha": "c9890a76040f92dabd50c4b50754d44716d6daca",
+  "evidence_sha": "c9890a76040f92dabd50c4b50754d44716d6daca",
+  "evidence_sha_semantics": "Exact source revision synchronized into the ext4 harness; the harness archive had no .git metadata and therefore reported git_commit=unknown.",
+  "local_status": "MORE_EVIDENCE_NEEDED",
+  "production_decision": "NO_GO",
+  "environment": {
+    "os": "AlmaLinux-8 WSL",
+    "filesystem": "ext4 /tmp",
+    "python": "CPython 3.11",
+    "duckdb": "1.2.0",
+    "loopback_smsc": true,
+    "live_env_status": "LIVE_ENV_UNVERIFIED",
+    "sles12sp5_access": false,
+    "real_smsc_access": false
+  },
+  "equal_window_conditions": {
+    "pool_size": 4,
+    "smpp_window": 50,
+    "route_tps": 200,
+    "task_workers": 8,
+    "ingest_workers": 2,
+    "watch_copy_workers": 2,
+    "smpp_send_queue_capacity": 2000,
+    "delivery_receipt_mode": "disabled",
+    "scenario": "stress-1k",
+    "minimum_independent_runs_per_arm": 3
+  },
+  "mode_matrix": {
+    "serialized_reliable": {
+      "runs": [
+        {
+          "run_id": "g3-serialized-reliable-final-1",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-serialized-reliable-final-1.json",
+          "note": "Historical pass; SHA is recorded as the source revision used by the archived result and is not current evidence."
+        },
+        {
+          "run_id": "g3-serialized-reliable-final-2",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-serialized-reliable-final-2.json"
+        },
+        {
+          "run_id": "g3-serialized-reliable-final-3",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-serialized-reliable-final-3.json"
+        }
+      ],
+      "current_arm_status": "NOT_RUN"
+    },
+    "occ_reliable": {
+      "runs": [
+        {
+          "run_id": "g3-occ-reliable-final-1",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-occ-reliable-final-1.json"
+        },
+        {
+          "run_id": "g3-occ-reliable-final-2",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-occ-reliable-final-2.json"
+        },
+        {
+          "run_id": "g3-occ-reliable-final-3",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-occ-reliable-final-3.json"
+        }
+      ],
+      "current_arm_status": "NOT_RUN"
+    },
+    "serialized_fast": {
+      "runs": [
+        {
+          "run_id": "g3-serialized-fast-final-1",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-serialized-fast-final-1.json"
+        },
+        {
+          "run_id": "g3-serialized-fast-final-2",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-serialized-fast-final-2.json"
+        },
+        {
+          "run_id": "g3-serialized-fast-final-3",
+          "status": "PASS",
+          "source_sha": "1511d4c",
+          "current_evidence": false,
+          "raw_result": "/tmp/mc-occ-2x2-giYoXB/results/g3-serialized-fast-final-3.json"
+        }
+      ],
+      "current_arm_status": "NOT_RUN"
+    },
+    "occ_fast": {
+      "runs": [
+        {
+          "run_id": "g3-occ-fast-lock-1",
+          "status": "FAIL",
+          "source_sha": "c9890a76040f92dabd50c4b50754d44716d6daca",
+          "current_evidence": true,
+          "raw_run_dir": "/tmp/mc-occ-2x2-giYoXB/runs/marketing-copilot-stress-1k-full-5f52f748",
+          "stdout": "/tmp/mc-occ-2x2-giYoXB/results/g3-occ-fast-lock-1.stdout.log",
+          "failure": "OCC/fast did not converge: processed-file rows were missing after state conflicts and the accepted/task backlog did not close."
+        },
+        {
+          "run_id": "g3-occ-fast-current-1",
+          "status": "DIAGNOSTIC_NOT_CURRENT",
+          "source_sha": "WORKTREE_PROBE_NOT_COMMITTED",
+          "current_evidence": false,
+          "raw_run_dir": "/tmp/mc-occ-2x2-giYoXB/runs/marketing-copilot-stress-1k-full-b07c18d3",
+          "stdout": "/tmp/mc-occ-2x2-giYoXB/results/g3-occ-fast-current-1.stdout.log",
+          "note": "A discarded worktree probe after additional uncommitted guard changes; not part of the acceptance decision."
+        },
+        {
+          "run_id": "g3-occ-fast-guarded-1",
+          "status": "DIAGNOSTIC_NOT_CURRENT",
+          "source_sha": "WORKTREE_PROBE_NOT_COMMITTED",
+          "current_evidence": false,
+          "raw_run_dir": "/tmp/mc-occ-2x2-giYoXB/runs/marketing-copilot-stress-1k-full-cafb5f49",
+          "note": "A discarded worktree probe; not part of the acceptance decision."
+        }
+      ],
+      "current_arm_status": "FAIL"
+    }
+  },
+  "gates": {
+    "G0": {
+      "status": "PASS",
+      "evidence": ["source SHA recorded", "harness CLI help passed", "AlmaLinux-8 ext4 environment established"]
+    },
+    "G3": {
+      "status": "FAIL",
+      "evidence": ["current OCC/fast run failed to close", "historical PASS artifacts are explicitly excluded from current evidence"]
+    },
+    "G4": {
+      "status": "NOT_RUN",
+      "reason": "No current-source concurrent cross-campaign isolation run was completed."
+    },
+    "G5": {
+      "status": "NOT_RUN",
+      "reason": "No current-source fault matrix plus effective 600-second soak was completed."
+    },
+    "SLES12SP5": {
+      "status": "NOT_RUN",
+      "reason": "No SLES12SP5 host/package execution evidence was available."
+    },
+    "REAL_SMSC": {
+      "status": "NOT_RUN",
+      "reason": "Only loopback simulator evidence exists; no real SMSC canary was executed."
+    }
+  },
+  "invariants": {
+    "duplicate_send": {
+      "status": "NOT_VERIFIED",
+      "detail": "The current failing arm did not reach authoritative final reconciliation."
+    },
+    "lost_mapping": {
+      "status": "FAIL",
+      "detail": "Current OCC/fast diagnostics show missing processed-file rows after state conflicts."
+    },
+    "unknown_auto_retry": {
+      "status": "FAIL",
+      "detail": "The current arm logged UNKNOWN retries caused by missing processed-file state."
+    },
+    "late_submit_after_stop": {
+      "status": "NOT_RUN",
+      "detail": "No current-source stop-fence fault run was completed."
+    }
+  },
+  "historical_artifacts_are_current_evidence": false,
+  "raw_artifacts_policy": "Raw logs, DuckDB files, JSONL protocol traces, temporary worktrees, caches, and build outputs remain outside Git under /tmp and are referenced by path only."
+}
