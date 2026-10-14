@@ -64,6 +64,21 @@ def test_claim_and_event_are_one_transaction(isolated_db, monkeypatch):
     assert dict(row) == {"status": "queued", "attempts": 0, "claim_token": ""}
 
 
+def test_claim_does_not_write_advisory_fairness_row(isolated_db, monkeypatch):
+    task_id = _insert_task(102, 1)
+
+    def fail_advisory_write(*_args, **_kwargs):
+        raise AssertionError("advisory fairness must not be part of task claim")
+
+    monkeypatch.setattr(
+        campaign_capacity_service, "record_activity_event", fail_advisory_write,
+    )
+
+    claimed = sms_task_service.claim_next_tasks(1)
+
+    assert [int(task["id"]) for task in claimed] == [task_id]
+
+
 def test_fair_claim_does_not_let_large_campaign_hide_small_campaign(isolated_db):
     for index in range(100):
         _insert_task(201, index)

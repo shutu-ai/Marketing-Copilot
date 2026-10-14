@@ -1216,24 +1216,12 @@ def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
                     {"claim_token": token, "attempt_min": min(task["attempts"] for task in items),
                      "attempt_max": max(task["attempts"] for task in items)},
                 )
-            fairness_groups = {}
-            for task in tasks:
-                route_id = int(
-                    task.get("transport_smpp_config_id")
-                    or task.get("smpp_config_id") or 0
-                )
-                key = (str(task["campaign_type"]), int(task["campaign_id"]), route_id)
-                fairness_groups[key] = fairness_groups.get(key, 0) + 1
-            for (campaign_type, campaign_id, route_id), _count in fairness_groups.items():
-                # The fairness backlog is advisory display state.  The claim
-                # scheduler uses the candidate rows and durable cursor, not
-                # this value, so do not rescan sms_tasks inside every claim
-                # write transaction.  The capacity snapshot still computes
-                # authoritative task counts when it is requested.
-                campaign_capacity_service.record_activity_event(
-                    conn, campaign_type, campaign_id, "task", route_id=route_id,
-                    backlog=None,
-                )
+            # ``campaign_fairness_state`` is advisory display state.  The
+            # claim scheduler uses candidate rows and the durable cursor, not
+            # this table, while the capacity snapshot computes authoritative
+            # task counts when requested.  Do not upsert its shared campaign
+            # row inside the claim transaction: concurrent task workers would
+            # otherwise turn an observability write into an OCC hot-row fence.
             return tasks
 
         claimed_tasks = write_transaction(
