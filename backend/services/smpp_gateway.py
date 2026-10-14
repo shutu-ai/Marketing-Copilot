@@ -235,6 +235,11 @@ class _SmppConnection:
         self._send_lock = threading.Lock()
         self._window = threading.BoundedSemaphore(self.window_size)
         self._connection_generation = uuid.uuid4().hex
+        # A control action records the newest durable activity generation here
+        # as a best-effort queue accelerator. The database generation/attempt
+        # fence remains authoritative if this process is restarted.
+        self._campaign_invalidations = {}
+        self._campaign_invalidation_lock = threading.Lock()
 
     @staticmethod
     def _text(value) -> str:
@@ -248,6 +253,23 @@ class _SmppConnection:
 
     def _metric_labels(self):
         return {"config_id": self.config["id"], "slot": self.slot}
+
+    def invalidate_campaign(self, campaign_type: str, campaign_id: int,
+                            dispatch_generation: int) -> None:
+        key = (str(campaign_type), int(campaign_id))
+        generation = int(dispatch_generation or 0)
+        with self._campaign_invalidation_lock:
+            self._campaign_invalidations[key] = max(
+                generation, int(self._campaign_invalidations.get(key, -1))
+            )
+
+    def _is_invalidated_campaign_task(self, task: dict) -> bool:
+        key = (str(task.get("campaign_type") or ""), int(task.get("campaign_id") or 0))
+        with self._campaign_invalidation_lock:
+            generation = self._campaign_invalidations.get(key)
+        if generation is None:
+            return False
+        return int(task.get("dispatch_generation") or 0) < int(generation)
 
     def _response_latency_locked(self, sequence, outcome):
         """Return response latency once, including the early-response race."""
@@ -298,6 +320,22 @@ class _SmppConnection:
             except queue.Empty:
                 continue
             try:
+                if self._is_invalidated_campaign_task(task):
+                    metrics_service.inc(
+                        "marketing_copilot_campaign_queue_invalidated_total",
+                        labels={
+                            "campaign_type": task.get("campaign_type", ""),
+                            "campaign_id": task.get("campaign_id", 0),
+                        },
+                    )
+                    self._dispatch_async_completion(
+                        task, [],
+                        SmppSubmissionNotAllowedError(
+                            "campaign dispatch generation was invalidated before socket write"
+                        ),
+                        callback,
+                    )
+                    continue
                 self._send_windowed_async(task, callback)
             except Exception:
                 logger.exception(
@@ -716,6 +754,13 @@ class _SmppConnection:
             # configured route TPS instead of converting normal low-TPS load
             # into a retryable 0x45 task failure and another DB claim cycle.
             self._send_queue.put((task, callback), timeout=queue_wait_timeout)
+            metrics_service.inc(
+                "marketing_copilot_campaign_tasks_slot_queued_total",
+                labels={
+                    "campaign_type": task.get("campaign_type", ""),
+                    "campaign_id": task.get("campaign_id", 0),
+                },
+            )
             metrics_service.observe_histogram(
                 "marketing_copilot_smpp_send_queue_wait_seconds",
                 time.monotonic() - queue_wait_started,
@@ -1229,6 +1274,16 @@ class SmppGateway:
                     connection.disconnect()
             if config_id is None:
                 self._active_config_id = None
+
+    def invalidate_campaign(self, campaign_type: str, campaign_id: int,
+                            dispatch_generation: int) -> None:
+        """Fast-drop pre-authorization queue entries for one activity."""
+        with self._lock:
+            pools = [connection for pool in self._pools.values() for connection in pool]
+        for connection in pools:
+            connection.invalidate_campaign(
+                campaign_type, campaign_id, dispatch_generation,
+            )
 
     def recover(self, config_id=None):
         """Immediately rebuild the live pool after an operator confirms recovery."""

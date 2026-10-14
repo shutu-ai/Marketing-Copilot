@@ -119,6 +119,14 @@ def _insert_queued_task(campaign_id, index, content="short"):
 def test_sms_candidate_cursor_reaches_campaign_outside_active_window(isolated_db, monkeypatch):
     monkeypatch.setenv("MC_FAIR_ACTIVE_CAMPAIGNS", "4")
     monkeypatch.setenv("MC_FAIR_CLAIM_PER_CAMPAIGN", "1")
+    conn = database.get_connection()
+    conn.executemany(
+        "INSERT INTO batch_campaigns(name,status,send_days) VALUES (?,?,?)",
+        [(f"fair-campaign-{campaign_id}", "in_progress", "[]")
+         for campaign_id in range(1, 131)],
+    )
+    conn.commit()
+    conn.close()
     for campaign_id in range(1, 131):
         _insert_queued_task(campaign_id, 0)
 

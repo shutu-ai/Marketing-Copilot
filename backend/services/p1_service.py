@@ -36,30 +36,35 @@ def campaign_action(campaign_type: str, campaign_id: int, action: str, automatic
     target = CAMPAIGN_TRANSITIONS.get(current, {}).get(action)
     if not target:
         raise ValueError(f"cannot {action} campaign from {current}")
-    updated = service.update(campaign_id, update_model(status=target))
+    if target == "in_progress" and action == "start":
+        # Preserve the existing readiness/template validation for the initial
+        # start. The service update itself now applies the generation fence and
+        # task reconciliation in its transaction.
+        updated = service.update(campaign_id, update_model(status=target))
+        task_summary = {"terminated": 0, "requeued": 0}
+    else:
+        transition = sms_task_service.transition_campaign_status(
+            campaign_type, campaign_id, current, target,
+        )
+        task_summary = transition["tasks"]
+        # Fetch the enriched/public representation only after the CAS commit;
+        # the activity and its task fence are already one durable state change.
+        updated = service.get_one(campaign_id)
+    if not updated:
+        raise LookupError("campaign not found")
     if campaign_type == "realtime":
         updated = realtime_campaign_service.public_campaign(updated)
-    def write(conn):
-        cancelled = 0
-        if target == "cancelled":
-            cancelled = sms_task_service.cancel_pending_campaign_tasks(
-                conn, campaign_type, campaign_id,
-            )
-        elif target == "completed":
-            conn.execute(
-                """UPDATE sms_tasks SET status='expired', error_msg='campaign completed',
-                   updated_at=CURRENT_TIMESTAMP WHERE campaign_type=? AND campaign_id=?
-                   AND status IN ('queued','retrying','sending')""",
-                (campaign_type, campaign_id),
-            )
-        return cancelled
-
-    cancelled_task_count = write_transaction(
-        write,
-        attempts=3,
-        operation="campaign.action.tasks",
-        base_delay=0.1,
-    )
+    cancelled_task_count = int(task_summary.get("terminated", 0) or 0)
+    try:
+        from services.smpp_gateway import gateway
+        gateway.invalidate_campaign(
+            campaign_type, campaign_id,
+            int(updated.get("dispatch_generation") or 0),
+        )
+    except Exception:
+        # Queue invalidation is an acceleration; the durable generation fence
+        # remains authoritative if the live gateway is not initialized.
+        logger.debug("Unable to invalidate live SMPP queues", exc_info=True)
     operations_service.audit(
         "campaign.auto_complete" if automatic else f"campaign.{action}",
         f"{campaign_type}_campaign", campaign_id,

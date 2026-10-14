@@ -64,6 +64,9 @@ def test_chunk_manifest_resumes_completed_work_and_recovers_expired_lease(isolat
 def test_concurrent_task_claims_do_not_conflict_or_duplicate_rows(isolated_db):
     conn = database.get_connection()
     conn.execute(
+        "INSERT INTO batch_campaigns(id,name,status,send_days) VALUES (1,'claim-lock','in_progress','[]')"
+    )
+    conn.execute(
         """INSERT INTO sms_tasks
            (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,status,task_date)
            SELECT 'batch',1,'claim-lock','251900'||CAST(i AS VARCHAR),'hello',

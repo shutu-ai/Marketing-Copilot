@@ -1,0 +1,85 @@
+{
+  "baseline_sha": "f391868",
+  "baseline_branch": "main",
+  "baseline_relation_to_origin_main": "ahead_by_4_smpp_hotpath_commits",
+  "existing_smpp_hotpath_task": "COMPLETE",
+  "implementation_sha": "UNCOMMITTED",
+  "track_a": {
+    "status": "PASS",
+    "evidence": [
+      {
+        "id": "EVD-A06",
+        "command": ".\\.p0-test-venv\\Scripts\\python.exe backend\\tools\\multi_campaign_isolation_acceptance.py --output .tmp\\track-a-50k --a-tasks 50000 --bc-tasks 1000 --claim-after-pause 200",
+        "result": "PASS",
+        "parameters": {"a_tasks": 50000, "bc_tasks_each": 1000, "smpp_slots": 4, "task_workers": 8},
+        "observed": {
+          "a_queued_after_pause": 50000,
+          "bc_claim_count_after_pause": 8,
+          "bc_campaigns_claimed_after_pause": [2, 3],
+          "pre_authorization_denied_after_pause": true,
+          "socket_writes": 0,
+          "smsc": "NOT_CONNECTED"
+        }
+      },
+      {
+        "id": "EVD-A07",
+        "test": "test_fake_socket_continues_b_after_a_pause_without_real_smsc",
+        "result": "PASS",
+        "observed": "A produced no fake socket write; B produced one fake socket write"
+      },
+      {
+        "id": "TEST-SUITE",
+        "command": ".\\.p0-test-venv\\Scripts\\python.exe -m pytest backend/tests -q",
+        "result": "171 passed, 3 skipped, 4 warnings"
+      }
+    ]
+  },
+  "track_b": {
+    "status": "MORE_EVIDENCE_NEEDED",
+    "arms": {
+      "D-1shard": {
+        "shard_count": 1,
+        "tasks_total": 72,
+        "elapsed_seconds": 1.021169,
+        "business_sms_per_second": 31.337,
+        "submit_sm_parts_per_second": 41.129,
+        "gate_wait_seconds_p50_p95_p99": [0.000002, 0.000002, 0.000002],
+        "gate_hold_seconds_p50_p95_p99": [0.084521, 0.185836, 0.185836],
+        "journal_replayed": 1,
+        "consistency_violations": 0,
+        "status": "PASS"
+      },
+      "D-4shard": {
+        "shard_count": 4,
+        "tasks_total": 72,
+        "elapsed_seconds": 1.275621,
+        "business_sms_per_second": 37.629,
+        "submit_sm_parts_per_second": 50.172,
+        "gate_wait_seconds_p50_p95_p99": [0.000002, 0.000002, 0.000002],
+        "gate_hold_seconds_p50_p95_p99": [0.008906, 0.104313, 0.104313],
+        "journal_replayed": 1,
+        "consistency_violations": 0,
+        "status": "PASS"
+      }
+    },
+    "comparison_status": "INCOMPARABLE_SMALL_POC_NOT_EQUAL_WINDOW",
+    "not_run": ["1K_CONTROLLED_AB", "3K_CONTROLLED_AB", "10K_SOAK", "CPU_RSS_DISK_IO", "SLES12SP5", "LIVE_SMSC", "CROSS_DB_STOP_FENCE"]
+  },
+  "gates": {
+    "PAUSE_CANCEL_RESUME_ISOLATION": "PASS",
+    "FAIR_AND_FIFO_ELIGIBILITY": "PASS",
+    "QUEUE_PURGE_AND_FENCING": "PASS",
+    "JOURNAL_CRASH_REPLAY": "PASS",
+    "MULTIPART_UNKNOWN_PARTIAL": "PASS",
+    "SHARD_CROSS_DB_STOP_FENCE": "NOT_RUN",
+    "EQUAL_WINDOW_AB": "NOT_RUN",
+    "SLES12SP5": "NOT_RUN",
+    "LIVE_SMSC": "UNVERIFIED",
+    "LONG_SOAK": "NOT_RUN"
+  },
+  "frontend_build": "PASS",
+  "commit_push": "NOT_DONE",
+  "production_deployment": "NOT_DONE",
+  "real_smsc": "NOT_CONNECTED",
+  "final_status": "PASS_WITH_LIMITATIONS"
+}

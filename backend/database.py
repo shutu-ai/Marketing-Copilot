@@ -828,6 +828,7 @@ def init_db():
            smpp_config_id INTEGER DEFAULT NULL,
            flash_sms BOOLEAN NOT NULL DEFAULT FALSE,
              active_manifest_id BIGINT DEFAULT NULL,
+           dispatch_generation BIGINT NOT NULL DEFAULT 0,
            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
@@ -902,6 +903,7 @@ def init_db():
             sms_template_id INTEGER DEFAULT NULL,
             smpp_config_id INTEGER DEFAULT NULL,
             flash_sms BOOLEAN NOT NULL DEFAULT FALSE,
+            dispatch_generation BIGINT NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
         )""",
@@ -968,7 +970,8 @@ def init_db():
             submitted_at TEXT,
             delivered_at TEXT,
             transport_smpp_config_id INTEGER,
-            submit_sm_parts INTEGER NOT NULL DEFAULT 0
+            submit_sm_parts INTEGER NOT NULL DEFAULT 0,
+            dispatch_generation BIGINT NOT NULL DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS delivery_receipts (
             id INTEGER DEFAULT nextval('seq_delivery_receipts') PRIMARY KEY,
@@ -1320,6 +1323,9 @@ def init_db():
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS flash_sms BOOLEAN DEFAULT FALSE",
          "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS active_manifest_id BIGINT",
+        "ALTER TABLE batch_campaigns ADD COLUMN IF NOT EXISTS dispatch_generation BIGINT DEFAULT 0",
+        "ALTER TABLE realtime_campaigns ADD COLUMN IF NOT EXISTS dispatch_generation BIGINT DEFAULT 0",
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS dispatch_generation BIGINT DEFAULT 0",
          "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS manifest_id BIGINT",
         "ALTER TABLE smpp_configs ADD COLUMN IF NOT EXISTS window_size INTEGER DEFAULT 10",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS task_count INTEGER DEFAULT 0",
@@ -1428,6 +1434,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_log_status ON sms_log(status)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_status ON sms_tasks(status, next_attempt_at)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_campaign ON sms_tasks(campaign_type, campaign_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sms_tasks_dispatch_eligibility ON sms_tasks(campaign_type, campaign_id, dispatch_generation, status, next_attempt_at, created_at, id)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_date ON sms_tasks(campaign_type, task_date, status, next_attempt_at)",
         "DROP INDEX IF EXISTS idx_delivery_message_id",
         "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(source_namespace,smsc_message_id)",

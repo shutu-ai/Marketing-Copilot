@@ -155,6 +155,13 @@ def _claim_dispatch_loop(task_queue):
                 enqueue_started = time.monotonic()
                 try:
                     task_queue.put(task, timeout=0.2)
+                    metrics_service.inc(
+                        "marketing_copilot_campaign_tasks_prefetched_total",
+                        labels={
+                            "campaign_type": task.get("campaign_type", ""),
+                            "campaign_id": task.get("campaign_id", 0),
+                        },
+                    )
                     metrics_service.observe_histogram(
                         "marketing_copilot_task_dispatch_queue_enqueue_wait_seconds",
                         time.monotonic() - enqueue_started,
@@ -179,9 +186,13 @@ def _process_task(task: dict, worker_index: int):
         metrics_service.inc("marketing_copilot_tasks_claimed_total", labels={"worker": worker_index + 1})
         active, reason = sms_task_service.validate_task_schedule(task)
         if not active:
-            expired = reason in {"campaign has ended", "campaign no longer exists", "campaign is not enabled", "task belongs to a previous day", "after daily send window"}
+            expired = reason in {
+                "campaign has ended", "campaign no longer exists",
+                "task belongs to a previous day",
+            }
             sms_task_service.defer_task(
-                task["id"], reason, expired, task.get("claim_token", "")
+                task["id"], reason, expired, task.get("claim_token", ""),
+                delay_seconds=0 if not expired else 300,
             )
             return
         if get_setting("system_mode", "production") == "development":

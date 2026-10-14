@@ -159,7 +159,7 @@ def _bulk_insert_tasks(conn, task_rows) -> list:
         return []
     columns = ("campaign_type", "campaign_id", "batch_id", "campaign_name", "msisdn", "language",
                "sms_template_id", "smpp_config_id", "flash_sms", "content", "source_addr", "payload",
-               "source_file", "task_date", "dedupe_key")
+               "source_file", "task_date", "dedupe_key", "dispatch_generation")
     placeholders = ",".join("?" for _ in columns)
     inserted = []
     for start in range(0, len(task_rows), DB_INSERT_BATCH_SIZE):
@@ -266,6 +266,138 @@ def _observe_result_stage(stage: str, started: float, item_count: int = 0) -> No
     except Exception:
         # Observability must never change result durability semantics.
         logger.debug("Failed to record SMS result stage metrics", exc_info=True)
+
+
+def _unstarted_attempt_predicate(task_alias: str = "sms_tasks") -> str:
+    return f"""(
+        {task_alias}.status IN ('queued','retrying') OR
+        ({task_alias}.status='sending' AND NOT EXISTS (
+            SELECT 1 FROM sms_send_attempts a
+            WHERE a.task_id={task_alias}.id
+              AND a.claim_token={task_alias}.claim_token
+              AND a.state IN ('intent','authorized','responding','partial')
+        ))
+    )"""
+
+
+def reconcile_campaign_state_in_transaction(
+    conn, campaign_type: str, campaign_id: int, target_status: str,
+    dispatch_generation: int, message: str = "",
+) -> dict:
+    """Apply the task side of an activity state transition in the same tx.
+
+    ``dispatch_generation`` is the durable stop fence.  A pause requeues only
+    claimed work that has no send attempt, while cancel/complete terminalize
+    only that same safe subset.  Authorized/responding/partial attempts are
+    deliberately retained for result reconciliation and are never inferred
+    to be safe to resend.
+    """
+    target_status = str(target_status or "")
+    generation = int(dispatch_generation or 0)
+    if target_status == "paused":
+        unstarted = _unstarted_attempt_predicate()
+        rows = conn.execute(
+            f"""UPDATE sms_tasks
+                SET status='queued', attempts=GREATEST(attempts-1,0),
+                    claim_token='', dispatch_generation=?,
+                    error_msg=?, next_attempt_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE campaign_type=? AND campaign_id=?
+                  AND status='sending' AND {unstarted}
+                RETURNING id""",
+            (generation, message or "campaign paused", campaign_type, campaign_id),
+        ).fetchall()
+        # Queued/retrying work is still durable; just move its fence to the
+        # new generation so it can resume without a five-minute defer delay.
+        conn.execute(
+            """UPDATE sms_tasks SET dispatch_generation=?,updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type=? AND campaign_id=? AND status IN ('queued','retrying')""",
+            (generation, campaign_type, campaign_id),
+        )
+        count = len(rows)
+        if count:
+            _add_task_event_batch_summary(
+                conn, campaign_type, campaign_id, None,
+                "campaign_paused", "sending", "queued", count,
+                rows[0]["id"], rows[-1]["id"], {"message": message or "campaign paused"},
+            )
+        return {"requeued": count, "terminated": 0}
+
+    if target_status == "in_progress":
+        conn.execute(
+            """UPDATE sms_tasks SET dispatch_generation=?,updated_at=CURRENT_TIMESTAMP
+               WHERE campaign_type=? AND campaign_id=? AND status IN ('queued','retrying')""",
+            (generation, campaign_type, campaign_id),
+        )
+        return {"requeued": 0, "terminated": 0}
+
+    if target_status not in {"cancelled", "completed", "expired"}:
+        return {"requeued": 0, "terminated": 0}
+
+    terminal_status = "cancelled" if target_status == "cancelled" else "expired"
+    terminal_message = message or (
+        "campaign cancelled" if terminal_status == "cancelled" else "campaign completed"
+    )
+    unstarted = _unstarted_attempt_predicate()
+    rows = conn.execute(
+        f"""UPDATE sms_tasks
+            SET status=?, error_msg=?, claim_token='', dispatch_generation=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE campaign_type=? AND campaign_id=? AND {unstarted}
+            RETURNING id""",
+        (terminal_status, terminal_message, generation, campaign_type, campaign_id),
+    ).fetchall()
+    count = len(rows)
+    if count:
+        _add_task_event_batch_summary(
+            conn, campaign_type, campaign_id, None,
+            "campaign_terminated", "active", terminal_status, count,
+            rows[0]["id"], rows[-1]["id"], {"message": terminal_message},
+        )
+    return {"requeued": 0, "terminated": count}
+
+
+def transition_campaign_status(
+    campaign_type: str, campaign_id: int, expected_status: str, target_status: str,
+) -> dict:
+    """CAS-update an activity and its dispatch fence in one DB transaction."""
+    table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(
+        str(campaign_type)
+    )
+    if not table:
+        raise ValueError("campaign_type must be batch or realtime")
+
+    def write(conn):
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE id=?", (int(campaign_id),)
+        ).fetchone()
+        if not row:
+            raise LookupError("campaign not found")
+        current = dict(row)
+        if (current.get("status") or "not_started") != expected_status:
+            raise ValueError(
+                f"campaign changed while {target_status} was being requested"
+            )
+        next_generation = int(current.get("dispatch_generation") or 0) + 1
+        updated = conn.execute(
+            f"""UPDATE {table}
+                SET status=?, dispatch_generation=?, updated_at=datetime('now','localtime')
+                WHERE id=? AND status=?
+                RETURNING *""",
+            (target_status, next_generation, int(campaign_id), expected_status),
+        ).fetchone()
+        if not updated:
+            raise ValueError("campaign changed while its state was being updated")
+        task_summary = reconcile_campaign_state_in_transaction(
+            conn, campaign_type, campaign_id, target_status, next_generation,
+        )
+        return {"campaign": dict(updated), "tasks": task_summary}
+
+    result = write_transaction(
+        write, attempts=3, operation="campaign.status.transition", base_delay=0.1,
+    )
+    invalidate_campaign_cache(campaign_type, campaign_id)
+    return result
 
 
 def cancel_pending_campaign_tasks(conn, campaign_type: str, campaign_id: int,
@@ -704,6 +836,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 bool(campaign.get("flash_sms")), content,
                 template.get("source_addr") or "",
                 json.dumps(payload, ensure_ascii=False), source_file, task_date, dedupe_key,
+                int(campaign.get("dispatch_generation") or 0),
             ))
         if ingestion_lease:
             # Fence at the actual task insertion boundary, not before
@@ -717,7 +850,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             result["created"] += len(created)
             created_keys = {dedupe for _task_id, dedupe in created}
             result["created_msisdns"].extend(
-                row[4] for row in task_rows if row[-1] in created_keys
+                row[4] for row in task_rows if row[-2] in created_keys
             )
             _add_task_event_batch(
                 conn, campaign_type, campaign["id"], batch_id,
@@ -761,6 +894,69 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
         conn.close()
 
 
+def _campaign_eligibility_sql(alias: str) -> str:
+    """Return the SQL-side activity fence used by every persistent claim.
+
+    The Python schedule validator remains the final pre-wire check.  This
+    predicate keeps stopped or not-yet-open campaigns out of both the
+    candidate scan and the conditional UPDATE, so a large paused backlog
+    cannot consume claim slots before being deferred.
+    """
+    now = "CURRENT_TIMESTAMP"
+    current_hhmm = f"strftime({now}, '%H:%M')"
+    current_day = "strftime(CURRENT_DATE, '%w')"
+    return f"""
+        {alias}.status='in_progress'
+        AND (NULLIF(COALESCE({alias}.start_time,''),'') IS NULL
+             OR TRY_CAST({alias}.start_time AS TIMESTAMP) <= {now})
+        AND (NULLIF(COALESCE({alias}.end_time,''),'') IS NULL
+             OR TRY_CAST({alias}.end_time AS TIMESTAMP) >= {now})
+        AND (COALESCE({alias}.send_days,'') IN ('','[]')
+             OR regexp_matches({alias}.send_days,
+                '(^|[^0-9])' || {current_day} || '([^0-9]|$)'))
+        AND (
+            COALESCE({alias}.send_start_time,'')=''
+            OR COALESCE({alias}.send_end_time,'')=''
+            OR (
+                {alias}.send_start_time <= {alias}.send_end_time
+                AND {current_hhmm} BETWEEN LEFT({alias}.send_start_time,5)
+                    AND LEFT({alias}.send_end_time,5)
+            )
+            OR (
+                {alias}.send_start_time > {alias}.send_end_time
+                AND ({current_hhmm} >= LEFT({alias}.send_start_time,5)
+                     OR {current_hhmm} <= LEFT({alias}.send_end_time,5))
+            )
+        )
+    """
+
+
+def _task_campaign_fence_sql(task_alias: str = "t") -> str:
+    """Return a type-safe EXISTS fence for a task row."""
+    return f"""
+        (
+            ({task_alias}.campaign_type='batch' AND EXISTS (
+                SELECT 1 FROM batch_campaigns c
+                WHERE c.id={task_alias}.campaign_id
+                  AND {task_alias}.dispatch_generation=c.dispatch_generation
+                  AND {_campaign_eligibility_sql('c')}
+            ))
+            OR
+            ({task_alias}.campaign_type='realtime' AND EXISTS (
+                SELECT 1 FROM realtime_campaigns c
+                WHERE c.id={task_alias}.campaign_id
+                  AND {task_alias}.dispatch_generation=c.dispatch_generation
+                  AND {_campaign_eligibility_sql('c')}
+            ))
+        )
+    """
+
+
+def _campaign_task_eligibility_sql() -> str:
+    """Compatibility alias for callers building a task candidate query."""
+    return _task_campaign_fence_sql("t")
+
+
 def claim_next_tasks(limit: int = 20) -> list:
     limit = max(1, int(limit or 20))
     # DuckDB allows concurrent readers, but concurrent UPDATE ... RETURNING
@@ -776,16 +972,17 @@ def claim_next_tasks(limit: int = 20) -> list:
             if campaign_capacity_service.enabled():
                 per_campaign = campaign_capacity_service.per_campaign_candidates()
                 active_groups = conn.execute(
-                    """SELECT campaign_type,campaign_id,
-                              COALESCE(transport_smpp_config_id,smpp_config_id,0) route_id,
-                              MIN(created_at) oldest
-                       FROM sms_tasks
-                       WHERE status IN ('queued','retrying')
-                         AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
-                         AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE)
-                       GROUP BY campaign_type,campaign_id,
-                                COALESCE(transport_smpp_config_id,smpp_config_id,0)
-                       ORDER BY oldest,campaign_type,campaign_id,route_id"""
+                    f"""SELECT t.campaign_type,t.campaign_id,
+                              COALESCE(t.transport_smpp_config_id,t.smpp_config_id,0) route_id,
+                              MIN(t.created_at) oldest
+                       FROM sms_tasks t
+                       WHERE t.status IN ('queued','retrying')
+                         AND CAST(t.next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+                         AND (t.campaign_type <> 'realtime' OR t.task_date=CURRENT_DATE)
+                         AND {_task_campaign_fence_sql('t')}
+                       GROUP BY t.campaign_type,t.campaign_id,
+                                COALESCE(t.transport_smpp_config_id,t.smpp_config_id,0)
+                       ORDER BY oldest,t.campaign_type,t.campaign_id,route_id"""
                 ).fetchall()
                 selected_groups = campaign_capacity_service.rotate_candidate_groups(
                     conn, (dict(row) for row in active_groups),
@@ -821,8 +1018,9 @@ def claim_next_tasks(limit: int = 20) -> list:
                              AND t.status IN ('queued','retrying')
                              AND CAST(t.next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
                              AND (t.campaign_type <> 'realtime' OR t.task_date=CURRENT_DATE)
+                             AND """ + _task_campaign_fence_sql("t") + """
                        )
-                       SELECT * EXCLUDE(fair_row) FROM ranked
+                       SELECT * FROM ranked
                        WHERE fair_row<=?
                        ORDER BY created_at,id LIMIT ?"""
                 candidates = conn.execute(
@@ -843,11 +1041,12 @@ def claim_next_tasks(limit: int = 20) -> list:
                     metrics_service.inc("marketing_copilot_fair_scheduler_disabled_total")
                 selected_ids = [
                     int(row["id"]) for row in conn.execute(
-                        """SELECT id FROM sms_tasks
-                           WHERE status IN ('queued','retrying')
-                             AND CAST(next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
-                             AND (campaign_type <> 'realtime' OR task_date=CURRENT_DATE)
-                           ORDER BY created_at,id LIMIT ?""",
+                        f"""SELECT t.id FROM sms_tasks t
+                           WHERE t.status IN ('queued','retrying')
+                             AND CAST(t.next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+                             AND (t.campaign_type <> 'realtime' OR t.task_date=CURRENT_DATE)
+                             AND {_task_campaign_fence_sql('t')}
+                           ORDER BY t.created_at,t.id LIMIT ?""",
                         (limit,),
                     ).fetchall()
                 ]
@@ -855,15 +1054,24 @@ def claim_next_tasks(limit: int = 20) -> list:
                 return []
             placeholders = ",".join("?" for _ in selected_ids)
             claimed_rows = conn.execute(
-                f"""UPDATE sms_tasks SET status='sending', attempts=attempts+1,
+                    f"""UPDATE sms_tasks SET status='sending', attempts=attempts+1,
                        claim_token=?,updated_at=CURRENT_TIMESTAMP
                     WHERE id IN ({placeholders}) AND status IN ('queued','retrying')
+                      AND {_task_campaign_fence_sql('sms_tasks')}
                     RETURNING *""",
                 [token, *selected_ids],
             ).fetchall()
             claimed_by_id = {int(row["id"]): dict(row) for row in claimed_rows}
             # DuckDB UPDATE RETURNING order is not a scheduling contract.
             tasks = [claimed_by_id[task_id] for task_id in selected_ids if task_id in claimed_by_id]
+            for task in tasks:
+                metrics_service.inc(
+                    "marketing_copilot_campaign_tasks_claimed_total",
+                    labels={
+                        "campaign_type": task.get("campaign_type", ""),
+                        "campaign_id": task.get("campaign_id", 0),
+                    },
+                )
             grouped = {}
             for task in tasks:
                 key = (task["campaign_type"], task["campaign_id"], task.get("batch_id"))
@@ -1011,7 +1219,8 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
 
     def authorize(conn):
         row = conn.execute(
-            """SELECT id,campaign_type,campaign_id,task_date,claim_token,status
+            """SELECT id,campaign_type,campaign_id,task_date,claim_token,status,
+                      dispatch_generation
                FROM sms_tasks
                WHERE id=? AND status='sending' AND claim_token=?""",
             (int(task["id"]), claim_token),
@@ -1031,6 +1240,10 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
             f"SELECT * FROM {table} WHERE id=?", (int(current["campaign_id"]),)
         ).fetchone()
         if not campaign_row:
+            return False
+        if int(current.get("dispatch_generation") or 0) != int(
+            dict(campaign_row).get("dispatch_generation") or 0
+        ):
             return False
         active, _reason = campaign_is_active(dict(campaign_row), datetime.now().astimezone())
         if not active:
@@ -1102,6 +1315,13 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
             "marketing_copilot_smpp_submit_authorize_denied_total",
             labels={"config_id": smpp_config_id, "slot": slot},
         )
+        metrics_service.inc(
+            "marketing_copilot_campaign_send_invalidated_total",
+            labels={
+                "campaign_type": task.get("campaign_type", ""),
+                "campaign_id": task.get("campaign_id", 0),
+            },
+        )
         task["_submit_gate_reason"] = (
             "task claim is no longer owned or the campaign send window is closed"
         )
@@ -1110,6 +1330,13 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
     metrics_service.inc(
         "marketing_copilot_smpp_submit_authorize_success_total",
         labels={"config_id": smpp_config_id, "slot": slot},
+    )
+    metrics_service.inc(
+        "marketing_copilot_campaign_tasks_authorized_total",
+        labels={
+            "campaign_type": task.get("campaign_type", ""),
+            "campaign_id": task.get("campaign_id", 0),
+        },
     )
     task["_attempt_token"] = attempt_token
     task["_source_namespace"] = source_namespace
@@ -2356,7 +2583,7 @@ def validate_task_schedule(task: dict) -> tuple[bool, str]:
 
 
 def defer_task(task_id: int, reason: str, expired: bool = False,
-               claim_token: str = ""):
+               claim_token: str = "", delay_seconds: int = 300):
     def write(conn):
         if expired:
             conn.execute(
@@ -2368,10 +2595,10 @@ def defer_task(task_id: int, reason: str, expired: bool = False,
         else:
             conn.execute(
                 """UPDATE sms_tasks SET status='queued', attempts=GREATEST(attempts-1,0),
-                    error_msg=?,next_attempt_at=CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+                    error_msg=?,next_attempt_at=CURRENT_TIMESTAMP + (? * INTERVAL '1 second'),
                     updated_at=CURRENT_TIMESTAMP
                     WHERE id=? AND status='sending' AND claim_token=?""",
-                (reason, task_id, str(claim_token or "")),
+                (reason, max(0, int(delay_seconds or 0)), task_id, str(claim_token or "")),
             )
 
     write_transaction(write, operation="sms_tasks.defer")

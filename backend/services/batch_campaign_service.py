@@ -496,11 +496,23 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
             ).fetchone()
             if not smpp:
                 raise ValueError("Associated SMPP configuration is missing or disabled")
+        current_dict = dict(current)
+        status_changed = "status" in fields and fields["status"] != current_dict.get("status")
+        next_generation = int(current_dict.get("dispatch_generation") or 0)
+        if status_changed:
+            next_generation += 1
         if fields:
-            set_clause = ", ".join(f"{key}=?" for key in fields)
+            write_fields = dict(fields)
+            if status_changed:
+                write_fields["dispatch_generation"] = next_generation
+            set_clause = ", ".join(f"{key}=?" for key in write_fields)
             conn.execute(
                 f"UPDATE batch_campaigns SET {set_clause}, updated_at=datetime('now','localtime') WHERE id=?",
-                (*fields.values(), campaign_id),
+                (*write_fields.values(), campaign_id),
+            )
+        if status_changed:
+            sms_task_service.reconcile_campaign_state_in_transaction(
+                conn, "batch", campaign_id, fields["status"], next_generation,
             )
         if new_smpp_id is not None:
             conn.execute(
@@ -516,6 +528,15 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
     updated_campaign = _run_campaign_write("update", write)
     if updated_campaign is None:
         return None
+    if fields.get("status") is not None:
+        try:
+            from services.smpp_gateway import gateway
+            gateway.invalidate_campaign(
+                "batch", campaign_id,
+                int(updated_campaign.get("dispatch_generation") or 0),
+            )
+        except Exception:
+            logger.debug("Unable to invalidate live batch SMPP queues", exc_info=True)
     sms_task_service.invalidate_campaign_cache("batch", campaign_id)
     updated_campaign = _enrich(updated_campaign)
     if data.use_custom_directory is not None:

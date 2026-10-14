@@ -25,6 +25,11 @@ def isolated_db(tmp_path):
 def _insert_task(campaign_id, index, content="hello", status="queued",
                  claim_token=""):
     conn = database.get_connection()
+    conn.execute(
+        """INSERT INTO batch_campaigns(id,name,status,send_days)
+           VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING""",
+        (campaign_id, f"reliability-{campaign_id}", "in_progress", "[]"),
+    )
     row = conn.execute(
         """INSERT INTO sms_tasks
            (campaign_type,campaign_id,campaign_name,msisdn,content,dedupe_key,
