@@ -522,15 +522,27 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         if validation_campaign.get("use_whitelist", True) and not validation_campaign.get("row_count", 0):
             raise ValueError("No whitelist uploaded - cannot start campaign")
     if existing_dict.get("status") == "ended":
-        only_allowed = all(
+        restart_only = data.status == "in_progress" and all(
             getattr(data, field, None) is None
             for field in [
-                "use_whitelist", "start_time", "status", "campaign_dir",
-                "use_custom_directory",
+                "name", "use_whitelist", "start_time", "end_time",
+                "send_start_time", "send_end_time", "send_days",
+                "campaign_dir", "use_custom_directory", "watch_source",
+                "watch_dir", "sftp_host", "sftp_port", "sftp_username",
+                "sftp_password", "watch_filename_prefix", "phone_prefix",
+                "sms_template_id", "smpp_config_id", "flash_sms",
             ]
         )
-        if not only_allowed:
-            raise ValueError("Ended campaign cannot edit runtime control fields")
+        if not restart_only:
+            only_allowed = all(
+                getattr(data, field, None) is None
+                for field in [
+                    "use_whitelist", "start_time", "status", "campaign_dir",
+                    "use_custom_directory",
+                ]
+            )
+            if not only_allowed:
+                raise ValueError("Ended campaign cannot edit runtime control fields")
     elif existing_dict.get("status") != "not_started":
         only_allowed = all(
             getattr(data, field, None) is None

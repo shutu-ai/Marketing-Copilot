@@ -123,7 +123,9 @@ def test_flash_save_only_changes_campaign_and_keeps_task_snapshots(isolated_db, 
     assert sql_updates == []
 
 
-def test_realtime_status_matrix_keeps_running_flash_immutable_and_ended_editable(isolated_db):
+def test_realtime_status_matrix_keeps_running_flash_immutable_and_ended_editable(
+    isolated_db, monkeypatch
+):
     smpp_one = _insert_smpp("realtime-smpp-one")
     smpp_two = _insert_smpp("realtime-smpp-two")
 
@@ -161,6 +163,21 @@ def test_realtime_status_matrix_keeps_running_flash_immutable_and_ended_editable
     )
     assert updated["name"] == "realtime-ended-renamed"
     assert updated["flash_sms"] is True
+    assert _task_snapshot("realtime", ended) == before
+
+    conn = database.get_connection()
+    conn.execute("UPDATE realtime_campaigns SET use_whitelist=FALSE WHERE id=?", (ended,))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        realtime_campaign_service.operations_service,
+        "validate_campaign",
+        lambda *_args, **_kwargs: [],
+    )
+    restarted = realtime_campaign_service.update(
+        ended, RealtimeCampaignUpdate(status="in_progress")
+    )
+    assert restarted["status"] == "in_progress"
     assert _task_snapshot("realtime", ended) == before
 
 
