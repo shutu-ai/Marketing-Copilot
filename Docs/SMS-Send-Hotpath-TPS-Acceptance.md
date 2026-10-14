@@ -36,7 +36,7 @@
 ## A/B 公平性
 
 - A：`398e0e8b0d06cd774480f8240333406857d01459`。
-- B：当前工作树实现；正式 SHA 在提交后填入 `sms-send-hotpath-tps-results.json`。
+- B：实现 commit `0e97e9790c83e3244a5d93c20b6e2dc4c2ec26d5`。
 - 已完成 benchmark 使用同一机器、同一独立 DuckDB、1000 历史任务和 50 次迭代，但只有一轮且 `planned_parts=1`；4-part 只验证 statement reduction。因此仅支持 `AUTHORIZATION_HOTPATH=PASS_WITH_LIMITATIONS`，不支持 `PERFORMANCE_AB`。
 - 未把 180 秒与 600 秒累计 accepted 数量混作 TPS；未把完整 SMS、parts、response 或 DLR delivered 混为一个指标。
 
