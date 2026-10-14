@@ -196,6 +196,7 @@ class AcceptanceRunner:
         self.delivery_receipt_mode = str(
             args.delivery_receipt_mode or self.spec.get("delivery_receipt_mode") or "disabled"
         )
+        self.pool_size = max(1, int(getattr(args, "pool_size", 1) or 1))
         self.flash_sms = bool(getattr(args, "flash_sms", False))
 
         events = int(args.events if args.events is not None else self.spec.get("events", 5))
@@ -527,7 +528,7 @@ class AcceptanceRunner:
             "password": "test",
             "source_addr": "E2E",
             "bind_type": "transceiver",
-            "pool_size": 1,
+            "pool_size": self.pool_size,
             "window_size": max(1, self.args.smpp_window),
             "enquire_interval": 5,
             "timeout": 2 if self.faults.get("drop_response_ratio") else 10,
@@ -896,6 +897,10 @@ class AcceptanceRunner:
                 "smpp_host": smpp_rows[0].get("host") if smpp_rows else None,
                 "smpp_port": smpp_rows[0].get("port") if smpp_rows else None,
                 "smpp_loopback_only": loopback,
+                "pool_size": self.pool_size,
+                "window_size": max(1, self.args.smpp_window),
+                "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
+                "delivery_receipt_mode": self.delivery_receipt_mode,
                 "flash_sms": self.flash_sms,
                 "live_env_status": "LIVE_ENV_UNVERIFIED",
             },
@@ -1039,6 +1044,10 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=2, help="local watch-copy workers")
     parser.add_argument("--claim-batch", type=int, default=20)
     parser.add_argument("--smpp-window", type=int, default=10)
+    parser.add_argument(
+        "--pool-size", type=int, default=1,
+        help="number of loopback SMPP binds in the isolated acceptance run",
+    )
     parser.add_argument("--smpp-send-queue-capacity", type=int, default=100)
     parser.add_argument("--producer-chunk-size", type=int, default=0)
     parser.add_argument("--producer-chunk-delay", type=float, default=0.0)
