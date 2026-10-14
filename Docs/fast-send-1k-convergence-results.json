@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "as_of_sha": "65060c4e3e67267d15cd5e8f6bf06e190b5e7e7c",
-  "verified_remote_sha": "65060c4e3e67267d15cd5e8f6bf06e190b5e7e7c",
+  "as_of_sha": "3442ca92937f6ddf83c0d5ac639eac743dfce503",
+  "verified_remote_sha": "3442ca92937f6ddf83c0d5ac639eac743dfce503",
   "generated_at": "2026-10-14T18:24:00Z",
   "decision": {
     "local_ext4_equal_window": "PASS",
@@ -25,12 +25,44 @@
   },
   "gates": {
     "G0": "PASS_WITH_LIMITATIONS",
-    "G1_ingest_only": "NOT_RUN",
-    "G2_sender_only": "NOT_RUN",
+    "G1_ingest_only": "PASS_LOCAL_EXT4",
+    "G2_sender_only": "PASS_LOCAL_EXT4",
     "G3_fast_1k_x3": "PASS_LOCAL_EXT4",
     "G3_reliable_1k_x3": "PASS_LOCAL_EXT4",
     "G4_equal_window_ab": "PASS_LOCAL_EXT4",
-    "G5_stop_fault_restart_soak": "PARTIAL"
+    "G5_stop_fault_restart_soak": "PARTIAL_STOPPED"
+  },
+  "dedicated_gates": {
+    "G1_ingest_only": {
+      "status": "PASS_LOCAL_EXT4",
+      "artifact": "/tmp/mc-e2e-gates-final/g1-ingest-only.json",
+      "git_commit": "3442ca92937f6ddf83c0d5ac639eac743dfce503",
+      "input_files": 10,
+      "input_rows": 1000,
+      "completed_files": 10,
+      "generated_tasks": 1000,
+      "task_statuses": {"queued": 1000},
+      "socket_submit_sm": 0,
+      "watchdog": "NO_STALL_CAPTURED",
+      "observability_keys": ["workers", "smpp", "ingestion", "backpressure", "fast_send", "scheduler", "database", "metrics", "calculated_at"]
+    },
+    "G2_sender_only": {
+      "status": "PASS_LOCAL_EXT4",
+      "artifacts": [
+        "/tmp/mc-e2e-gates-final/g2-sender-only-pool4.json",
+        "/tmp/mc-e2e-gates-final/g2-sender-only-pool1.json"
+      ],
+      "git_commit": "3442ca92937f6ddf83c0d5ac639eac743dfce503",
+      "pre_generated_tasks": 1000,
+      "pool_sizes": [4, 1],
+      "socket_submit_sm": "1000/1000 in each run",
+      "submit_sm_responses": "1000/1000 in each run",
+      "accepted": "1000/1000 in each run",
+      "duplicates": 0,
+      "unknown_retry_violation": false,
+      "watchdog": "NO_STALL_CAPTURED",
+      "observability_keys": ["workers", "smpp", "ingestion", "backpressure", "fast_send", "scheduler", "database", "metrics", "calculated_at"]
+    }
   },
   "runs": [
     {"id": "wsl-ext4-fast-1", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 38.096, "queue_backlog_max": 400, "watchdog": "NO_STALL_CAPTURED"},
@@ -51,5 +83,5 @@
     "unknown_retry_violation": false,
     "dlr_violation": false
   },
-  "not_run": ["real_smsc", "sles12sp5_canary", "dedicated_G1", "dedicated_G2", "complete_G5_soak"]
+  "not_run": ["real_smsc", "sles12sp5_canary", "complete_G5_live_soak_stopped_by_user", "complete_G5_live_b_c_socket_matrix"]
 }

@@ -60,6 +60,7 @@ The authoritative post-shutdown reconciliation found 980 accepted and 20 sending
 - Materialized whitelist upload sources before publishing a build row and added a race-prevention test.
 - Added opt-in 30-second watchdog and 60-second full snapshots, process-exit capture, bounded API thread-stack diagnostics, and `faulthandler` application stacks.
 - Added `--run-root` to the local acceptance harness so WSL ext4 and DrvFS behavior can be compared explicitly.
+- Added isolated `ingest-only` and pre-generated-task `sender-only` acceptance gates, including an opt-in task-worker disable switch for the ingest phase and structured reconciliation/observability output.
 - Added a fenced-out callback warning without weakening claim/attempt fences.
 
 No production default was changed, no backpressure guard was disabled, and no queue/worker expansion was used as a fix.
@@ -69,8 +70,8 @@ No production default was changed, no backpressure guard was disabled, and no qu
 The following remain open and prevent a production Fast cutover:
 
 - no real SMSC or SLES12SP5 canary was run;
-- G1 ingest-only and G2 sender-only dedicated gates were not run by the current harness;
-- G5 long soak/fault/restart acceptance was not completed in this task;
+- dedicated G1 ingest-only and G2 sender-only gates now pass on WSL ext4 at commit `3442ca9` (G2 repeated with pool=4 and pool=1);
+- the 50K multi-campaign isolation track passed offline, but G5 long soak/fault/restart acceptance was not completed; the new 600-second stability run was stopped before completion;
 - Windows native and WSL DrvFS storage behavior remain blocked/unsafe for this evidence path.
 
-Use `reliable` in production. Fast remains explicit opt-in and `NO_GO` for production performance until the dedicated G1/G2/G5 gates, target SLES validation, and live-SMSC evidence are complete.
+Use `reliable` in production. Fast remains explicit opt-in and `NO_GO` for production performance until the remaining G5 gates, target SLES validation, and live-SMSC evidence are complete.

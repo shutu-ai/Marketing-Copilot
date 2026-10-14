@@ -36,6 +36,7 @@ This keeps the useful serialization boundary while eliminating the Claim × Paus
 - `test_fast_claim_publishes_local_fence_after_db_commit`: blocks local observation, starts pause, and asserts control completes before observation is released.
 - Fast checkpoint, stop-fence, callback-fence, recovery, and DuckDB reliability tests pass in the full backend suite.
 - WSL ext4 equal-window 1K runs pass 3/3 in both Fast and Reliable with pool 4, window 50, route TPS 200, 8 task workers, 2 ingestion workers, and a 2000 send queue.
+- Dedicated WSL ext4 G1 ingest-only and G2 sender-only gates pass at commit `3442ca9`; G2 was repeated with pool=4 and pool=1 and accepted all 1000 pre-generated tasks in both runs.
 - A separate WSL `/mnt/d` run captured a result-journal fsync timeout; it is documented as an environment/storage limitation and is not used to claim a lock-order regression.
 
 ## Non-goals
