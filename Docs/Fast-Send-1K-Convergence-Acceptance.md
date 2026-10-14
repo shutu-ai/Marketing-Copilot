@@ -44,3 +44,11 @@ Observed loopback throughput was approximately 37.947–39.479 events/s for Fast
 ## Release decision
 
 Keep `MC_SMS_SEND_MODE=reliable` as the production default. Fast remains an explicit experimental opt-in. Do not auto-cut over or call the local simulator throughput a production SLA. Before a canary, complete the remaining G5 soak/fault matrix, validate the actual SLES12SP5 runtime and deployment package, and run the live SMSC acceptance matrix.
+
+## Final verification summary
+
+- `DONE`: RCA and Claim/Pause lock-order fix; G0 regression/build/compile checks; dedicated G1 ingest-only; dedicated G2 sender-only with pool=1 and pool=4; equal-window 1K Fast/Reliable x3 on WSL ext4; existing local fault-path evidence.
+- `BLOCKED_ENV`: Windows-native DuckDB probe and WSL `/mnt/d` durability path; no real SMSC or SLES12SP5 canary was attempted.
+- `FAIL`: the historical WSL `/mnt/d` Fast run remains 980 accepted / 20 sending after journal fsync timeout and is not overwritten by the ext4 result.
+- `NOT_RUN`: 3K/10K/50K equal-window expansion, live B/C socket G5 matrix, and the SLES12SP5/real-SMSC canary.
+- `PARTIAL_STOPPED`: the requested 600-second local stability run was stopped before completion; its missing final report is recorded as `MISSING_ARTIFACT` and is not a pass.

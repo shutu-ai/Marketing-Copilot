@@ -38,6 +38,7 @@ This keeps the useful serialization boundary while eliminating the Claim × Paus
 - WSL ext4 equal-window 1K runs pass 3/3 in both Fast and Reliable with pool 4, window 50, route TPS 200, 8 task workers, 2 ingestion workers, and a 2000 send queue.
 - Dedicated WSL ext4 G1 ingest-only and G2 sender-only gates pass at commit `3442ca9`; G2 was repeated with pool=4 and pool=1 and accepted all 1000 pre-generated tasks in both runs.
 - A separate WSL `/mnt/d` run captured a result-journal fsync timeout; it is documented as an environment/storage limitation and is not used to claim a lock-order regression.
+- The stopped 600-second stability probe has no final report and is recorded as `MISSING_ARTIFACT`; it does not weaken the deterministic lock-order proof or turn G5 into a pass.
 
 ## Non-goals
 

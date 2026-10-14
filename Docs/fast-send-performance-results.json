@@ -8,7 +8,29 @@
     "implementation": "3442ca92937f6ddf83c0d5ac639eac743dfce503",
     "commit_push": "3442ca92937f6ddf83c0d5ac639eac743dfce503 pushed to origin/main; documentation revision follows",
     "fetch_prune": "FAILED_NETWORK_ORIGIN_UNREACHABLE",
-    "live_environment": "UNVERIFIED"
+    "live_environment": "UNVERIFIED",
+    "historical_snapshot": {
+      "source_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9",
+      "generated_at": "2026-10-14T16:57:32Z",
+      "base_sha": "6b498a597aca9bf0d9a311f0cfac85b1087d4a51",
+      "implementation": "WORKTREE_UNCOMMITTED",
+      "commit_push": "NOT_REQUESTED_NOT_PUSHED",
+      "fetch_prune": "FAILED_NETWORK_ORIGIN_UNREACHABLE",
+      "backend_tests_passed": 181,
+      "backend_tests_skipped": 3,
+      "acceptance_matrix": {
+        "1000_reliable": "NOT_RUN",
+        "1000_fast": "FAIL",
+        "3000_reliable": "NOT_RUN",
+        "3000_fast": "NOT_RUN",
+        "10000_reliable": "NOT_RUN",
+        "10000_fast": "NOT_RUN",
+        "50000_reliable": "NOT_RUN",
+        "50000_fast": "NOT_RUN"
+      },
+      "final_status": "NO_GO_FOR_FAST_PERFORMANCE_WITH_FUNCTIONAL_LIMITATIONS",
+      "historical_results_unchanged": true
+    }
   },
   "mode_contract": {
     "default": "reliable",

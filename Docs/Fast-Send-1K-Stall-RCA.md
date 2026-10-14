@@ -74,4 +74,6 @@ The following remain open and prevent a production Fast cutover:
 - the 50K multi-campaign isolation track passed offline, but G5 long soak/fault/restart acceptance was not completed; the new 600-second stability run was stopped before completion;
 - Windows native and WSL DrvFS storage behavior remain blocked/unsafe for this evidence path.
 
+The stopped stability run has no final result JSON (`MISSING_ARTIFACT`), so it is deliberately absent from the pass counts. The retained offline 50K track is only an isolation/scheduling result: `smsc=NOT_CONNECTED` and `socket_writes=0`.
+
 Use `reliable` in production. Fast remains explicit opt-in and `NO_GO` for production performance until the remaining G5 gates, target SLES validation, and live-SMSC evidence are complete.
