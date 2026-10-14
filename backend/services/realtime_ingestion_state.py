@@ -1,15 +1,61 @@
 """Short, fenced transactions for realtime file state (never file IO)."""
 
+from contextlib import contextmanager
 import logging
 import os
 import threading
 import time
 import uuid
 
+import database as database_module
 from database import is_transient_write_error, read_transaction, write_transaction
 from services import ingestion_job_service, metrics_service
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses msvcrt below.
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX uses fcntl above.
+    msvcrt = None
+
 logger = logging.getLogger(__name__)
+_PROCESSED_FILES_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _processed_files_guard():
+    """Serialize the non-authoritative processed-file mirror across workers.
+
+    DuckDB 1.2.0 can corrupt a unique-index update when independent OCC
+    transactions concurrently update this mirror table.  The authoritative
+    ingestion lease/chunk tables remain OCC-concurrent; only this audit/UI
+    mirror uses a short cross-process file lock.
+    """
+    lock_path = f"{database_module.DATABASE_FILE}.processed-files.lock"
+    with _PROCESSED_FILES_THREAD_LOCK:
+        handle = open(lock_path, "a+b")
+        try:
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            elif msvcrt is not None:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            yield
+        finally:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                handle.close()
 
 
 class LeaseLost(RuntimeError):
@@ -31,6 +77,12 @@ def transaction(callback, attempts=3, lock_timeout=None):
         operation="realtime.ingestion.state",
         lock_timeout=lock_timeout,
     )
+
+
+def processed_transaction(callback, attempts=3, lock_timeout=None):
+    """Run a state transaction while protecting the processed-file mirror."""
+    with _processed_files_guard():
+        return transaction(callback, attempts=attempts, lock_timeout=lock_timeout)
 
 
 def assert_owned(conn, file_id, token):
@@ -90,7 +142,7 @@ def register_processed(campaign_id, path, filename, file_id, token):
                error_detail='',completed_at=NULL WHERE id=?""", (digest, path, size, row["id"]),
         )
         return row["id"], False
-    return transaction(write)
+    return processed_transaction(write)
 
 
 def finish_processed(file_id, processed_id, token, status, path, error):
@@ -101,7 +153,7 @@ def finish_processed(file_id, processed_id, token, status, path, error):
                completed_at=CURRENT_TIMESTAMP,last_progress_at=CURRENT_TIMESTAMP WHERE id=?""",
             (status, status, path, str(error)[:4000], processed_id),
         )
-    transaction(write)
+    processed_transaction(write)
 
 
 class FileLease:
@@ -174,7 +226,10 @@ class Progress:
             return False
         self.last_attempt = now
         try:
-            transaction(self._write, attempts=3 if force else 1, lock_timeout=None if force else 0.1)
+            processed_transaction(
+                self._write, attempts=3 if force else 1,
+                lock_timeout=None if force else 0.1,
+            )
         except Exception as exc:
             if force or not transient(exc):
                 raise
@@ -320,7 +375,7 @@ def transition(file_id, processed_id, token, status, error_class="", error="", d
                    error_detail=?,updated_at=CURRENT_TIMESTAMP WHERE file_id=? AND status='processing'""",
                 (str(error)[:4000], file_id),
             )
-    transaction(write)
+    processed_transaction(write)
 
 
 def recover_expired_files():
@@ -342,4 +397,4 @@ def recover_expired_files():
                 (row["campaign_id"], row["filename"]),
             )
         return len(expired)
-    return transaction(write)
+    return processed_transaction(write)
