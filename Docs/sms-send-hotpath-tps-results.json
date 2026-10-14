@@ -1,8 +1,13 @@
 {
   "task": "Marketing_Copilot_SMPP_Send_Hotpath_TPS_Optimization_Codex_Task.md",
   "baseline_sha": "398e0e8b0d06cd774480f8240333406857d01459",
-  "implementation_sha": "0e97e9790c83e3244a5d93c20b6e2dc4c2ec26d5",
-  "commit_push": "COMMITTED_NOT_PUSHED",
+  "implementation_sha": "fa9aca5c1dfa08deab996c8edb151a43212e026e",
+  "implementation_commits": [
+    "0e97e9790c83e3244a5d93c20b6e2dc4c2ec26d5",
+    "8815a92",
+    "fa9aca5c1dfa08deab996c8edb151a43212e026e"
+  ],
+  "COMMIT_PUSH": "NOT_DONE",
   "overall_status": "PASS_WITH_LIMITATIONS",
   "production_safety": {
     "real_smsc_connected": false,
@@ -77,6 +82,73 @@
     },
     "evidence": ".tmp/smpp-hotpath-e2e-stress1k-final-20261014.json",
     "formal_throughput_target": "NOT_PROVEN"
+  },
+  "formal_ab_attempt_round_1": {
+    "status": "NOT_PROVEN",
+    "scenario": "stress-1k",
+    "pool_size": 4,
+    "window_size": 10,
+    "task_workers": 8,
+    "ingestion_workers": 4,
+    "route_tps": 1000,
+    "dlr_mode": "disabled",
+    "timeout_seconds": 600,
+    "baseline": {
+      "status": "LOCAL_E2E_FAIL",
+      "generated_tasks": 200,
+      "accepted_tasks": 27,
+      "submit_sm": 32,
+      "submit_sm_per_second": 18.359,
+      "evidence": ".tmp/smpp-hotpath-ab-results/baseline-1k-r1.json"
+    },
+    "current": {
+      "status": "LOCAL_E2E_FAIL",
+      "generated_tasks": 400,
+      "accepted_tasks": 81,
+      "submit_sm": 99,
+      "submit_sm_per_second": 18.349,
+      "evidence": ".tmp/smpp-hotpath-ab-results/current-1k-r1.json"
+    },
+    "formal_rounds_completed": 1,
+    "formal_ab": "NOT_PROVEN",
+    "reason": "Both sides timed out before the same business completion gate; no 3K/10K or three-round TPS claim is valid."
+  },
+  "loopback_fault_regression": {
+    "status": "PASS_WITH_LIMITATIONS",
+    "pool_size": 4,
+    "drop_response": {
+      "status": "PASS",
+      "unknown_tasks": 3,
+      "submit_sm": 3,
+      "evidence": ".tmp/smpp-hotpath-e2e-drop-final-20261014.json"
+    },
+    "partial_submit": {
+      "status": "PASS",
+      "multipart_parts": 6,
+      "accepted_parts": 1,
+      "rejected_parts": 5,
+      "final_status": "partial",
+      "evidence": ".tmp/smpp-hotpath-e2e-partial-final-20261014.json"
+    },
+    "restart": {
+      "status": "PASS",
+      "accepted_tasks": 5,
+      "submit_sm": 5,
+      "duplicate_send_tasks": 0,
+      "evidence": ".tmp/smpp-hotpath-e2e-restart-final-20261014.json"
+    },
+    "flash": {
+      "status": "PASS",
+      "accepted_tasks": 3,
+      "data_coding": 240,
+      "evidence": ".tmp/smpp-hotpath-e2e-flash-final-20261014.json"
+    },
+    "required_dlr": {
+      "status": "PASS",
+      "delivered_tasks": 5,
+      "dlr": 5,
+      "evidence": ".tmp/smpp-hotpath-e2e-dlr-final-20261014.json"
+    }
   },
   "acceptance_gates": {
     "SEND_CORRECTNESS": "PASS_WITH_LIMITATIONS",

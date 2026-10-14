@@ -4,7 +4,7 @@
 
 ## 范围与安全边界
 
-- 执行基线：`398e0e8b0d06cd774480f8240333406857d01459`，当前工作树未提交实现。
+- 执行基线：`398e0e8b0d06cd774480f8240333406857d01459`；实现提交为 `0e97e9790c83e3244a5d93c20b6e2dc4c2ec26d5`，隔离工具补丁提交为 `fa9aca5c1dfa08deab996c8edb151a43212e026e`。
 - 所有自动化 SMPP 测试均使用 loopback-only fake SMSC、隔离 DuckDB 和虚拟号码；未连接真实 SMSC，未修改生产配置。
 - 现网 JSONL 指标路径 `paas-core01:/opt/marketing-copilot/mc-metrics-20261014-150142.jsonl` 是任务提供的外部证据，本环境未读取该主机，故相关数字标为 `EXTERNAL_PROVIDED_NOT_REPLAYED`。
 
@@ -60,6 +60,8 @@ per-route pool ── per-slot bounded send queue ── one sender thread/slot
 
 第一次 loopback `stress-1k`（fairness 写入仍在授权事务内）完成了 1000/1000 accepted、1000/1000 submit_sm、无重复/丢失，但吞吐只有 `3.558 SMS/s`，`task_creation_to_submit_sm_resp` P50 `122709.429 ms`、队列峰值 924；最终实现重跑为 `3.794 SMS/s`、P50 `118095.008 ms`、队列峰值 916。该差异只有一次运行且全部单 part，证明发送链路在高积压时受限，但不能当作正式 A/B 或 multipart 性能恢复。
 
+按任务要求补做的 `pool_size=4 / window=10 / task_workers=8 / ingestion_workers=4` 1K round 1 试验未完成：基线 600 秒后 32 `submit_sm`、27 accepted；当前实现 600 秒后 99 `submit_sm`、81 accepted。两组均在相同业务门禁 timeout，故只能作为 writer-gate 背压的诊断证据，不能报告 TPS 提升，也未继续把 3K/10K 失败累计数包装成正式 A/B。
+
 ### Top 3 阻塞原因
 
 | 排名 | 阻塞阶段 | 证据 | 可信度 | 可能收益 | 是否改代码 |
@@ -75,6 +77,7 @@ per-route pool ── per-slot bounded send queue ── one sender thread/slot
 - 授权新增总耗时、success/denied/timeout 指标；dispatcher 补 queue enqueue wait/full 指标。
 - route TPS 仍是共享上限；`MC_SMPP_INTERNAL_TPS_MULTIPLIER` 只允许降速，超过 1 被限制为 1，不能作为隐藏配额倍率。
 - API/UI 显式区分 `configured_route_tps`、`configured_per_bind_tps`、`effective_total_limit_tps`、`observed_parts_tps`，单位固定为 `submit_sm_parts/s`。无法证明 per-Bind 配额，保留 `route_shared`。
+- 隔离工具新增 `--pool-size`，使 A/B 能显式固定四 Bind；工具输出也记录 pool/window/route TPS/DLR mode，避免把默认单 Bind 结果误称为四 Bind 证据。
 
 ## 未采用方案
 
