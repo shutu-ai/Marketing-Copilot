@@ -114,6 +114,67 @@ def _realtime_chunk_size() -> int:
         return CHUNK_SIZE
 
 
+def _enqueue_realtime_with_admission(campaign: dict, records: list[dict], source_file: str,
+                                     ingestion_file_id: int, lease_token: str,
+                                     ingestion_chunk: dict, stop_event=None) -> dict:
+    """Enqueue one leased file chunk without turning recovery into a burst.
+
+    The normal path keeps the historical task-insert + chunk-checkpoint
+    transaction.  Once the shared recovery budget is active, the records are
+    admitted and committed in bounded sub-batches.  The chunk checkpoint is
+    then fenced and completed with the aggregate result, so lease ownership,
+    dedupe keys, and restart replay remain authoritative.
+    """
+    remaining = len(records)
+    offset = 0
+    aggregate = {
+        "success": True,
+        "created": 0,
+        "duplicate": 0,
+        "excluded": 0,
+        "invalid": 0,
+        "no_template": 0,
+        "created_msisdns": [],
+    }
+    while offset < remaining:
+        batch_size = backpressure_service.ingestion_batch_size(remaining - offset)
+        admitted_size = backpressure_service.admit_ingestion_batch(
+            batch_size, stop_event=stop_event,
+        )
+        if not admitted_size:
+            return {
+                "success": False,
+                "status": "stopped",
+                "message": "realtime ingestion stopped while waiting for recovery budget",
+            }
+        batch_size = min(batch_size, int(admitted_size))
+        batch = records[offset:offset + batch_size]
+        # Keep the original atomic path whenever the complete chunk fits in
+        # the current budget.  Split only when the budget is actually active.
+        final_atomic = offset == 0 and batch_size >= remaining
+        result = sms_task_service.enqueue_rows(
+            "realtime", campaign, batch, source_file,
+            ingestion_lease=(ingestion_file_id, lease_token),
+            ingestion_chunk=ingestion_chunk,
+            ingestion_chunk_progress=not final_atomic,
+        )
+        if not result.get("success"):
+            return result
+        for key in ("created", "duplicate", "excluded", "invalid", "no_template"):
+            aggregate[key] += int(result.get(key, 0) or 0)
+        aggregate["created_msisdns"].extend(result.get("created_msisdns", []))
+        if result.get("chunk_committed"):
+            aggregate["chunk_committed"] = True
+        offset += batch_size
+
+    if not aggregate.get("chunk_committed"):
+        realtime_ingestion_state.complete_chunk(
+            ingestion_file_id, ingestion_chunk, aggregate, lease_token,
+        )
+        aggregate["chunk_committed"] = True
+    return aggregate
+
+
 def _clean_text(value) -> str:
     if value is None:
         return ""
@@ -1460,20 +1521,12 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
                     if expired_reason:
                         return {"success": False, "status": "expired", "message": expired_reason}
-                    if not backpressure_service.wait_for_ingestion(
-                        stop_event=stop_event, producing_chunks=True,
-                        work_units=len(matched_records),
-                    ):
-                        return {
-                            "success": False,
-                            "status": "stopped",
-                            "message": "realtime ingestion stopped while waiting for recovery budget",
-                        }
-                    realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
-                    chunk_result = sms_task_service.enqueue_rows(
-                        "realtime", campaign, matched_records, original_filename,
-                        ingestion_lease=(ingestion_file_id, lease_token), ingestion_chunk=current_job,
+                    chunk_result = _enqueue_realtime_with_admission(
+                        campaign, matched_records, original_filename,
+                        ingestion_file_id, lease_token, current_job, stop_event,
                     )
+                    if chunk_result.get("status") == "stopped":
+                        return chunk_result
                     for key in ("created", "duplicate", "excluded", "invalid", "no_template"):
                         task_result[key] += chunk_result.get(key, 0)
                     if not chunk_result.get("success"):
@@ -1590,19 +1643,13 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                 expired_reason = _realtime_ingestion_expired_reason(campaign, filename=original_filename)
                 if expired_reason:
                     return {"success": False, "status": "expired", "message": expired_reason}
-                if matched_records and not backpressure_service.wait_for_ingestion(
-                    stop_event=stop_event, producing_chunks=True,
-                    work_units=len(matched_records),
-                ):
-                    return {
-                        "success": False,
-                        "status": "stopped",
-                        "message": "realtime ingestion stopped while waiting for recovery budget",
-                    }
-                task_result = sms_task_service.enqueue_rows(
-                    "realtime", campaign, matched_records, original_filename,
-                    ingestion_lease=(ingestion_file_id, lease_token), ingestion_chunk=excel_job,
-                )
+                if matched_records:
+                    task_result = _enqueue_realtime_with_admission(
+                        campaign, matched_records, original_filename,
+                        ingestion_file_id, lease_token, excel_job, stop_event,
+                    )
+                    if task_result.get("status") == "stopped":
+                        return task_result
             created_msisdns = set(task_result.get("created_msisdns", []))
             _append_realtime_output(campaign.get("campaign_dir", ""), [
                 {"msisdn": record["msisdn"], "send_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")}

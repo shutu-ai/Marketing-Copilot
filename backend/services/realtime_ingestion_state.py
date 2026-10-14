@@ -246,6 +246,14 @@ def complete_chunk_in_transaction(conn, file_id, chunk, result, token=""):
     ingestion_job_service.complete_chunk_in_transaction(conn, chunk["id"], result)
 
 
+def record_chunk_progress_in_transaction(conn, file_id, chunk, result, token=""):
+    assert_owned(conn, file_id, token)
+    row = conn.execute("SELECT status,lease_token FROM ingestion_chunks WHERE id=?", (chunk["id"],)).fetchone()
+    if not row or row["status"] != "processing" or row["lease_token"] != chunk["lease_token"]:
+        raise LeaseLost(f"realtime chunk lease lost: {chunk['id']}")
+    ingestion_job_service.record_chunk_progress_in_transaction(conn, chunk["id"], result)
+
+
 def complete_chunk(file_id, chunk, result, token=""):
     transaction(lambda conn: complete_chunk_in_transaction(conn, file_id, chunk, result, token))
 

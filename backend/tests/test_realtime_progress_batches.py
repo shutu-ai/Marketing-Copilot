@@ -12,6 +12,7 @@ from services import realtime_ingestion_state as state
 from services import realtime_ingestion_retry_service as retry
 from services import realtime_ingestion_worker as worker, sms_task_service
 from services import metrics_service
+from services import backpressure_service
 
 
 @pytest.fixture
@@ -342,6 +343,53 @@ def test_real_csv_pipeline_keeps_first_language_and_durable_task_totals(job, mon
         assert [x["language"] for x in tasks] == ["first", "en"]
         assert conn.execute("SELECT SUM(created_tasks) n FROM ingestion_chunks").fetchone()["n"] == 2
         assert conn.execute("SELECT COUNT(*) n FROM realtime_campaign_files").fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+def test_realtime_recovery_budget_splits_large_chunk_and_preserves_checkpoint(job, monkeypatch):
+    _template(job)
+    job["path"].write_text(
+        "msisdn,language\n" + "\n".join(
+            f"9000{index},en" for index in range(1, 6)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(campaigns, "_realtime_chunk_size", lambda: 10)
+    calls = []
+    progress_flags = []
+    original_enqueue = sms_task_service.enqueue_rows
+
+    def traced_enqueue(*args, **kwargs):
+        calls.append(len(args[2]))
+        progress_flags.append(bool(kwargs.get("ingestion_chunk_progress")))
+        return original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(sms_task_service, "enqueue_rows", traced_enqueue)
+    monkeypatch.setattr(
+        backpressure_service,
+        "admit_ingestion_batch",
+        lambda units, **_kwargs: min(int(units), 2),
+    )
+
+    result = campaigns.receive_file(
+        job["campaign_id"], str(job["path"]), job["filename"],
+        job["id"], worker_id="test-worker", lease_token=job["lease_token"],
+    )
+
+    assert result["success"] is True
+    assert result["task_result"]["created"] == 5
+    assert calls == [2, 2, 1]
+    assert progress_flags == [True, True, True]
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) n FROM sms_tasks").fetchone()["n"] == 5
+        chunk = conn.execute(
+            "SELECT status,created_tasks FROM ingestion_chunks WHERE file_id=?",
+            (job["id"],),
+        ).fetchone()
+        assert chunk["status"] == "completed"
+        assert chunk["created_tasks"] == 5
     finally:
         conn.close()
 

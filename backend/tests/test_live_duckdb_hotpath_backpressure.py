@@ -129,6 +129,103 @@ def test_ingestion_recovery_ramp_admits_shared_chunk_budget(monkeypatch):
     assert ramp["rate_tps"] >= backpressure_service._RAMP_INITIAL_TPS
 
 
+def test_ingestion_ramp_arms_from_cold_writer_pressure_and_bounds_large_chunks(monkeypatch):
+    monkeypatch.setattr(
+        backpressure_service,
+        "_ramp",
+        {
+            "rate": backpressure_service._RAMP_INITIAL_TPS,
+            "tokens": 0.0,
+            "last_at": backpressure_service.time.monotonic(),
+            "last_resume_at": 0.0,
+            "paused": False,
+            "seen_task_pause": False,
+            "seen_pressure": False,
+            "admitted": 0,
+            "throttled": 0,
+        },
+    )
+    pressured = {
+        "paused": {"tasks": False, "writes": False, "chunks": False, "disk": False, "results": False},
+        "write_depth": backpressure_service.WRITE_LOW + 1,
+        "write_oldest_seconds": 0.0,
+        "write_retry_depth": 0,
+    }
+    monkeypatch.setattr(backpressure_service, "reasons", lambda **_kwargs: ([], dict(pressured)))
+    monkeypatch.setattr(backpressure_service, "write_lock_status", lambda: {"held": False})
+
+    assert backpressure_service.wait_for_ingestion(producing_chunks=True)
+    ramp = backpressure_service._ramp_snapshot()
+    assert ramp["seen_pressure"] is True
+    capacity = ramp["batch_capacity"]
+    assert capacity == int(backpressure_service._RAMP_INITIAL_TPS * backpressure_service._RAMP_BURST_SECONDS)
+    assert all(
+        backpressure_service.ingestion_batch_size(units) <= capacity
+        for units in (1, 750, 1500, 5000)
+    )
+
+
+def test_ingestion_ramp_reduces_stale_permit_without_spinning(monkeypatch):
+    monkeypatch.setattr(
+        backpressure_service,
+        "_ramp",
+        {
+            "rate": backpressure_service._RAMP_INITIAL_TPS,
+            "tokens": 0.0,
+            "last_at": backpressure_service.time.monotonic(),
+            "last_resume_at": 0.0,
+            "paused": False,
+            "seen_task_pause": False,
+            "seen_pressure": True,
+            "admitted": 0,
+            "throttled": 0,
+        },
+    )
+    monkeypatch.setattr(backpressure_service, "reasons", lambda **_kwargs: ([], {}))
+    monkeypatch.setattr(backpressure_service, "_ingestion_pressure", lambda _state: 2.0)
+
+    granted = backpressure_service.admit_ingestion_batch(500, interval=0.01)
+
+    assert 0 < granted <= int(backpressure_service._RAMP_INITIAL_TPS * 0.5)
+    assert backpressure_service._ramp["admitted"] == granted
+
+
+def test_ramp_wait_uses_cached_depths_without_opening_read_connection(isolated_db, monkeypatch):
+    database_path = str(Path(database.get_database_file()).absolute())
+    monkeypatch.setattr(
+        backpressure_service,
+        "_depth_cache",
+        {
+            "at": backpressure_service.time.monotonic(),
+            "database": database_path,
+            "tasks": 0,
+            "chunks": 0,
+        },
+    )
+    monkeypatch.setattr(
+        backpressure_service,
+        "_ramp",
+        {
+            "rate": backpressure_service._RAMP_INITIAL_TPS,
+            "tokens": 1.0,
+            "last_at": backpressure_service.time.monotonic(),
+            "last_resume_at": 0.0,
+            "paused": False,
+            "seen_task_pause": False,
+            "seen_pressure": True,
+            "admitted": 0,
+            "throttled": 0,
+        },
+    )
+    monkeypatch.setattr(
+        backpressure_service,
+        "read_transaction",
+        lambda *_args, **_kwargs: pytest.fail("ramp wait must not refresh DuckDB depths"),
+    )
+
+    assert backpressure_service.admit_ingestion_batch(1, interval=0.01) == 1
+
+
 def test_stopped_capacity_wait_does_not_write_retry_state(isolated_db, monkeypatch):
     conn = database.get_connection()
     campaign_id = conn.execute(

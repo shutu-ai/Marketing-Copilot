@@ -60,15 +60,19 @@ _ramp = {
     "last_resume_at": 0.0,
     "paused": False,
     "seen_task_pause": False,
+    "seen_pressure": False,
+    "last_pressure_at": 0.0,
     "admitted": 0,
     "throttled": 0,
 }
 
 
-def _database_depths() -> tuple[int, int]:
+def _database_depths(refresh: bool = True) -> tuple[int, int]:
     now = time.monotonic()
     database_path = os.path.abspath(get_database_file())
     with _lock:
+        if not refresh and _depth_cache["database"] == database_path:
+            return int(_depth_cache["tasks"]), int(_depth_cache["chunks"])
         if _depth_cache["database"] == database_path and now - _depth_cache["at"] < 1.0:
             return int(_depth_cache["tasks"]), int(_depth_cache["chunks"])
     tasks, chunks = read_transaction(
@@ -112,12 +116,12 @@ def _disk_state() -> dict:
     return dict(value)
 
 
-def snapshot(include_task_depth: bool = True) -> dict:
+def snapshot(include_task_depth: bool = True, refresh_database: bool = True) -> dict:
     from services import sms_write_buffer
 
     writes = sms_write_buffer.status()
     disk = _disk_state()
-    task_depth, chunk_depth = _database_depths()
+    task_depth, chunk_depth = _database_depths(refresh=refresh_database)
     values = {
         "task_depth": task_depth if include_task_depth else None,
         "chunk_depth": chunk_depth,
@@ -140,13 +144,45 @@ def _ramp_snapshot() -> dict:
         return {
             "enabled": _RAMP_ENABLED,
             "rate_tps": round(float(_ramp["rate"]), 3),
+            "batch_capacity": _ramp_capacity_locked(),
             "tokens": round(float(_ramp["tokens"]), 3),
             "paused": bool(_ramp["paused"]),
             "seen_task_pause": bool(_ramp["seen_task_pause"]),
+            "seen_pressure": bool(_ramp.get("seen_pressure", False)),
             "last_resume_at": float(_ramp["last_resume_at"]),
             "admitted": int(_ramp["admitted"]),
             "throttled": int(_ramp["throttled"]),
         }
+
+
+def _ramp_capacity_locked() -> int:
+    """Return the maximum work units one admission may release.
+
+    This is deliberately independent of the requested work size.  A caller
+    handling a 5,000-row input chunk must not turn that request into a 5,000
+    row burst merely because it asked for 5,000 units.
+    """
+    return max(1, int(float(_ramp["rate"]) * _RAMP_BURST_SECONDS))
+
+
+def _observe_recovery_pressure(state: dict) -> None:
+    """Arm recovery ramping from live pressure, including cold starts.
+
+    The existing hysteretic pauses remain the hard guard.  This only records
+    that a soft recovery budget is needed after the hard guard is released.
+    """
+    if not _RAMP_ENABLED or _ingestion_pressure(state) <= 0.0:
+        return
+    with _ramp_lock:
+        if _ramp.get("seen_pressure", False):
+            return
+        now = time.monotonic()
+        _ramp["seen_pressure"] = True
+        _ramp["rate"] = _RAMP_INITIAL_TPS
+        _ramp["tokens"] = 0.0
+        _ramp["last_resume_at"] = now
+        _ramp["last_at"] = now
+        _ramp["last_pressure_at"] = now
 
 
 def _ingestion_pressure(state: dict) -> float:
@@ -178,37 +214,34 @@ def _ingestion_pressure(state: dict) -> float:
     return score
 
 
-def _ramp_admit(work_units: int, state: dict, stop_event=None, interval: float = 0.25) -> bool:
-    """Admit a chunk through a shared recovery token bucket.
+def _ramp_admit_one(work_units: int, stop_event=None, interval: float = 0.25) -> int:
+    """Wait for one bounded recovery batch and return the granted units.
 
-    The bucket is activated only after the existing task high-watermark pause
-    has been observed.  Normal startup and steady-state ingestion therefore
-    keep the historical behavior, while all workers share one recovery budget.
+    Pressure can lower the rate while a caller is waiting.  The grant is
+    therefore recalculated from the current capacity instead of waiting for
+    a stale, larger request that the new token cap could never satisfy.
     """
     units = max(1, int(work_units or 0))
-    if not _RAMP_ENABLED:
-        return stop_event is None or not stop_event.is_set()
-    with _ramp_lock:
-        if _ramp["paused"]:
-            _ramp["paused"] = False
-            _ramp["rate"] = _RAMP_INITIAL_TPS
-            _ramp["tokens"] = 0.0
-            _ramp["last_resume_at"] = time.monotonic()
-            _ramp["last_at"] = _ramp["last_resume_at"]
-        if not _ramp["seen_task_pause"]:
-            return stop_event is None or not stop_event.is_set()
-
     while True:
-        active, current = reasons(producing_chunks=True)
+        # The file/worker boundary refreshes DuckDB depths.  Do not open a
+        # new DuckDB connection on every token wait: under writer pressure
+        # that read can block all ingestion workers and amplify the very
+        # contention this ramp is meant to relieve.  The one-second depth
+        # cache plus in-process writer/journal state is sufficient here;
+        # ``wait_for_ingestion`` performs the authoritative refresh before a
+        # new file/chunk is claimed.
+        active, current = reasons(producing_chunks=True, refresh_database=False)
         if active:
             with _ramp_lock:
                 if current.get("paused", {}).get("tasks"):
                     _ramp["paused"] = True
                     _ramp["seen_task_pause"] = True
+                    _ramp["seen_pressure"] = True
                     _ramp["rate"] = _RAMP_INITIAL_TPS
                     _ramp["tokens"] = 0.0
+                    _ramp["last_pressure_at"] = time.monotonic()
             if stop_event is not None and stop_event.is_set():
-                return False
+                return 0
             if hasattr(stop_event, "wait") and stop_event is not None:
                 stop_event.wait(max(0.02, min(0.25, interval)))
             else:
@@ -221,33 +254,106 @@ def _ramp_admit(work_units: int, state: dict, stop_event=None, interval: float =
             elapsed = max(0.0, now - float(_ramp["last_at"]))
             _ramp["last_at"] = now
             rate = float(_ramp["rate"])
+            pressure_elapsed = max(
+                0.0, now - float(_ramp.get("last_pressure_at", 0.0) or 0.0)
+            )
+            if pressure_elapsed >= 0.5:
+                _ramp["last_pressure_at"] = now
+                if pressure > 1.0:
+                    rate = max(_RAMP_MIN_TPS, rate * 0.5)
+                elif pressure <= 0.0 and elapsed >= 0.5:
+                    rate = min(_RAMP_MAX_TPS, rate * (1.0 + min(0.25, elapsed * 0.2)))
+            _ramp["rate"] = rate
+            capacity = max(1.0, rate * _RAMP_BURST_SECONDS)
+            grant = min(units, max(1, int(capacity)))
             _ramp["tokens"] = min(
-                max(units, rate * _RAMP_BURST_SECONDS),
+                capacity,
                 float(_ramp["tokens"]) + elapsed * rate,
             )
-            if pressure > 1.0:
-                rate = max(_RAMP_MIN_TPS, rate * 0.5)
-            elif pressure > 0.0:
-                rate = max(_RAMP_MIN_TPS, rate * 0.8)
-            elif elapsed >= 0.5:
-                rate = min(_RAMP_MAX_TPS, rate * (1.0 + min(0.25, elapsed * 0.2)))
-            _ramp["rate"] = rate
-            if _ramp["tokens"] >= units:
-                _ramp["tokens"] -= units
-                _ramp["admitted"] += units
-                return stop_event is None or not stop_event.is_set()
-            wait_seconds = (units - float(_ramp["tokens"])) / max(rate, _RAMP_MIN_TPS)
+            if _ramp["tokens"] >= grant:
+                _ramp["tokens"] -= grant
+                _ramp["admitted"] += grant
+                return grant
+            wait_seconds = (grant - float(_ramp["tokens"])) / max(rate, _RAMP_MIN_TPS)
             _ramp["throttled"] += 1
         if stop_event is not None and stop_event.is_set():
-            return False
+            return 0
         if hasattr(stop_event, "wait") and stop_event is not None:
             stop_event.wait(max(0.02, min(0.25, wait_seconds)))
         else:
             time.sleep(max(0.02, min(0.25, wait_seconds)))
 
 
-def reasons(producing_chunks: bool = False) -> tuple[list[str], dict]:
-    state = snapshot()
+def _ramp_admit(work_units: int, state: dict, stop_event=None, interval: float = 0.25) -> bool:
+    """Admit a chunk through a shared recovery token bucket.
+
+    The bucket is activated only after the existing task high-watermark pause
+    or live writer pressure has been observed.  Normal startup and
+    steady-state ingestion therefore keep the historical behavior, while all
+    workers share one recovery budget.  Large callers are internally divided
+    into bounded permits; realtime ingestion additionally uses
+    ``ingestion_batch_size`` so each actual DB write is bounded too.
+    """
+    units = max(1, int(work_units or 0))
+    if not _RAMP_ENABLED:
+        return stop_event is None or not stop_event.is_set()
+    with _ramp_lock:
+        if _ramp["paused"]:
+            _ramp["paused"] = False
+            _ramp["rate"] = _RAMP_INITIAL_TPS
+            _ramp["tokens"] = 0.0
+            _ramp["last_resume_at"] = time.monotonic()
+            _ramp["last_at"] = _ramp["last_resume_at"]
+            _ramp["last_pressure_at"] = _ramp["last_resume_at"]
+        if not (_ramp["seen_task_pause"] or _ramp.get("seen_pressure", False)):
+            return stop_event is None or not stop_event.is_set()
+    remaining = units
+    while remaining:
+        with _ramp_lock:
+            batch = min(remaining, _ramp_capacity_locked())
+        admitted = _ramp_admit_one(batch, stop_event=stop_event, interval=interval)
+        if not admitted:
+            return False
+        remaining -= admitted
+    return True
+
+
+def ingestion_batch_size(work_units: int) -> int:
+    """Return the bounded actual-write size for the current ramp state."""
+    units = max(1, int(work_units or 0))
+    if not _RAMP_ENABLED:
+        return units
+    with _ramp_lock:
+        if not (_ramp["seen_task_pause"] or _ramp.get("seen_pressure", False)):
+            return units
+        return min(units, _ramp_capacity_locked())
+
+
+def admit_ingestion_batch(work_units: int, stop_event=None, interval: float = 0.25) -> int:
+    """Admit and return one actual write size under the shared ramp budget."""
+    units = max(1, int(work_units or 0))
+    if not _RAMP_ENABLED:
+        return units if stop_event is None or not stop_event.is_set() else 0
+    with _ramp_lock:
+        if not (_ramp["seen_task_pause"] or _ramp.get("seen_pressure", False)):
+            return units if stop_event is None or not stop_event.is_set() else 0
+        capacity = min(units, _ramp_capacity_locked())
+    return _ramp_admit_one(capacity, stop_event=stop_event, interval=interval)
+
+
+def reasons(producing_chunks: bool = False, refresh_database: bool = True) -> tuple[list[str], dict]:
+    # Keep the default call compatible with existing tests/integrations that
+    # replace ``snapshot`` with a zero-argument callable.  The no-refresh path
+    # is an additive optimization used by the ramp wait loop.
+    if refresh_database:
+        state = snapshot()
+    else:
+        try:
+            state = snapshot(refresh_database=False)
+        except TypeError as exc:
+            if "refresh_database" not in str(exc):
+                raise
+            state = snapshot()
     disk = state["disk"]
     with _lock:
         _paused["tasks"] = (
@@ -284,6 +390,8 @@ def wait_for_ingestion(stop_event=None, producing_chunks: bool = False,
             with _ramp_lock:
                 _ramp["paused"] = True
                 _ramp["seen_task_pause"] = True
+                _ramp["seen_pressure"] = True
+        _observe_recovery_pressure(state)
         if not active:
             if work_units:
                 return _ramp_admit(work_units, state, stop_event=stop_event, interval=interval)

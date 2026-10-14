@@ -585,17 +585,48 @@ def claim_chunk(file_id: Optional[int] = None, chunk_index: Optional[int] = None
         conn.close()
 
 
-def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:
+def record_chunk_progress_in_transaction(conn, chunk_id: int, result: dict) -> None:
+    """Persist one idempotent-enqueue progress unit while the chunk is fenced."""
     row = conn.execute("SELECT file_id,status FROM ingestion_chunks WHERE id=?", (chunk_id,)).fetchone()
+    if not row or row["status"] == "completed":
+        return
+    conn.execute(
+        """UPDATE ingestion_chunks SET
+           created_tasks=COALESCE(created_tasks,0)+?,
+           duplicate_rows=COALESCE(duplicate_rows,0)+?,
+           excluded_rows=COALESCE(excluded_rows,0)+?,
+           invalid_rows=COALESCE(invalid_rows,0)+?,
+           no_template_rows=COALESCE(no_template_rows,0)+?,
+           updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='processing'""",
+        (int(result.get("created", 0)), int(result.get("duplicate", 0)),
+         int(result.get("excluded", 0)), int(result.get("invalid", 0)),
+         int(result.get("no_template", 0)), chunk_id),
+    )
+    conn.execute(
+        """UPDATE ingestion_files SET created_tasks=(
+             SELECT COALESCE(SUM(created_tasks),0) FROM ingestion_chunks WHERE file_id=?
+           ), updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+        (row["file_id"], row["file_id"]),
+    )
+
+
+def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:
+    row = conn.execute(
+        """SELECT file_id,status,created_tasks,duplicate_rows,excluded_rows,
+                  invalid_rows,no_template_rows FROM ingestion_chunks WHERE id=?""",
+        (chunk_id,),
+    ).fetchone()
     if not row or row["status"] == "completed":
         return
     conn.execute(
         """UPDATE ingestion_chunks SET status='completed',lease_token='',lease_expires_at=NULL,
            created_tasks=?,duplicate_rows=?,excluded_rows=?,invalid_rows=?,no_template_rows=?,
            completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-        (int(result.get("created", 0)), int(result.get("duplicate", 0)),
-         int(result.get("excluded", 0)), int(result.get("invalid", 0)),
-         int(result.get("no_template", 0)), chunk_id),
+        (max(int(row["created_tasks"] or 0), int(result.get("created", 0))),
+         max(int(row["duplicate_rows"] or 0), int(result.get("duplicate", 0))),
+         max(int(row["excluded_rows"] or 0), int(result.get("excluded", 0))),
+         max(int(row["invalid_rows"] or 0), int(result.get("invalid", 0))),
+         max(int(row["no_template_rows"] or 0), int(result.get("no_template", 0))), chunk_id),
     )
     conn.execute(
         """UPDATE ingestion_files SET

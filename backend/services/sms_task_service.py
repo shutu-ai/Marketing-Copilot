@@ -589,7 +589,8 @@ def _template_for(conn, campaign_type: str, campaign_id: int, language: str):
 def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], source_file: str = "",
                 batch_id: Optional[int] = None, validate_schedule: bool = True,
                 ingestion_lease: Optional[tuple] = None,
-                ingestion_chunk: Optional[dict] = None) -> dict:
+                ingestion_chunk: Optional[dict] = None,
+                ingestion_chunk_progress: bool = False) -> dict:
     if ingestion_chunk and not ingestion_lease:
         raise ValueError("ingestion_chunk requires ingestion_lease")
     if validate_schedule:
@@ -725,10 +726,16 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 {"source_file": source_file},
             )
         if ingestion_chunk:
-            realtime_ingestion_state.complete_chunk_in_transaction(
-                conn, ingestion_lease[0], ingestion_chunk, result, ingestion_lease[1],
-            )
-            result["chunk_committed"] = True
+            if ingestion_chunk_progress:
+                realtime_ingestion_state.record_chunk_progress_in_transaction(
+                    conn, ingestion_lease[0], ingestion_chunk, result, ingestion_lease[1],
+                )
+                result["chunk_progress_committed"] = True
+            else:
+                realtime_ingestion_state.complete_chunk_in_transaction(
+                    conn, ingestion_lease[0], ingestion_chunk, result, ingestion_lease[1],
+                )
+                result["chunk_committed"] = True
         conn.execute("DROP TABLE IF EXISTS ingest_task_stage")
         conn.commit()
         if result["created"] and campaign_type == "realtime":
