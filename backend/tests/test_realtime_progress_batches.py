@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import database
+from services import campaign_capacity_service
 from services import ingestion_job_service as jobs
 from services import operations_service, realtime_campaign_service as campaigns
 from services import realtime_ingestion_state as state
@@ -42,6 +43,30 @@ def rows(job):
                 dict(conn.execute("SELECT * FROM processed_files WHERE id=?", (job["processed_id"],)).fetchone()))
     finally:
         conn.close()
+
+
+def test_claim_file_does_not_write_advisory_fairness_row(job, monkeypatch):
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            """UPDATE ingestion_files SET status='pending',lease_token='',lease_expires_at=NULL,
+               worker_id='' WHERE id=?""",
+            (job["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fail_advisory_write(*_args, **_kwargs):
+        raise AssertionError("advisory fairness must not be part of file claim")
+
+    monkeypatch.setattr(
+        campaign_capacity_service, "record_activity_event", fail_advisory_write,
+    )
+
+    claimed = jobs.claim_file("realtime", "claim-regression-worker")
+
+    assert claimed and int(claimed["id"]) == int(job["id"])
 
 
 def test_progress_is_one_atomic_transaction_and_releases_gate(job):

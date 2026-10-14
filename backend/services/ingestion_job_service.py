@@ -268,22 +268,10 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
                RETURNING *""", claim_params,
         ).fetchone()
         if claimed:
-            try:
-                from services import campaign_capacity_service
-                backlog = conn.execute(
-                    """SELECT COUNT(*) count FROM ingestion_files
-                       WHERE campaign_type=? AND campaign_id=?
-                         AND status IN ('pending','processing','retrying')""",
-                    (campaign_type, int(claimed["campaign_id"])),
-                ).fetchone()["count"]
-                campaign_capacity_service.record_activity_event(
-                    conn, campaign_type, int(claimed["campaign_id"]),
-                    "file", backlog=int(backlog or 0),
-                )
-            except Exception:
-                # Fairness telemetry must never turn a correctly fenced lease
-                # into a failed claim.
-                pass
+            # ``campaign_fairness_state`` is advisory display state.  Keep it
+            # out of the fenced lease transaction: concurrent ingestion
+            # workers claiming files for one campaign would otherwise turn a
+            # telemetry UPSERT into an OCC conflict on the file claim.
             return dict(claimed)
         return None
     return write_transaction(
