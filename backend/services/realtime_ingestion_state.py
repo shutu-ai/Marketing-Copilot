@@ -60,23 +60,35 @@ def register_processed(campaign_id, path, filename, file_id, token):
         raise ValueError("unsupported file type")
     def write(conn):
         assert_owned(conn, file_id, token)
-        row = conn.execute(
-            "SELECT id,status FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
-            (campaign_id, os.path.basename(filename)),
+        safe_filename = os.path.basename(filename)
+        inserted = conn.execute(
+            """INSERT INTO processed_files
+                 (campaign_type,campaign_id,filename,file_hash,file_path,file_size,status)
+               VALUES (?,?,?,?,?,?,'validating')
+               ON CONFLICT (campaign_type,campaign_id,filename) DO NOTHING
+               RETURNING id""",
+            ("realtime", campaign_id, safe_filename, digest, path, size),
         ).fetchone()
-        if row:
-            if row["status"] == "completed":
-                return row["id"], True
-            conn.execute(
-                """UPDATE processed_files SET file_hash=?,file_path=?,file_size=?,status='validating',
-                   error_detail='',completed_at=NULL WHERE id=?""", (digest, path, size, row["id"]),
-            )
-            return row["id"], False
+        if inserted:
+            return inserted["id"], False
+
+        # A concurrent owner may have inserted the unique key after this
+        # transaction's snapshot.  Re-read it after the idempotent insert;
+        # the enclosing write_transaction retries if DuckDB reports an OCC
+        # conflict before the winner is visible.
         row = conn.execute(
-            """INSERT INTO processed_files(campaign_type,campaign_id,filename,file_hash,file_path,file_size,status)
-               VALUES ('realtime',?,?,?,?,?,'validating') RETURNING id""",
-            (campaign_id, os.path.basename(filename), digest, path, size),
+            """SELECT id,status FROM processed_files
+               WHERE campaign_type=? AND campaign_id=? AND filename=?""",
+            ("realtime", campaign_id, safe_filename),
         ).fetchone()
+        if not row:
+            raise LookupError(f"processed file registration disappeared: {safe_filename}")
+        if row["status"] == "completed":
+            return row["id"], True
+        conn.execute(
+            """UPDATE processed_files SET file_hash=?,file_path=?,file_size=?,status='validating',
+               error_detail='',completed_at=NULL WHERE id=?""", (digest, path, size, row["id"]),
+        )
         return row["id"], False
     return transaction(write)
 
