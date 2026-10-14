@@ -4,7 +4,8 @@
   "verified_remote_sha": "3442ca92937f6ddf83c0d5ac639eac743dfce503",
   "generated_at": "2026-10-14T18:24:00Z",
   "decision": {
-    "local_ext4_equal_window": "PASS",
+    "local_ext4_equal_window": "HISTORICAL_PRE_FIX_ONLY",
+    "current_commit_equal_window": "NOT_RUN",
     "production_fast_cutover": "NO_GO",
     "production_default": "reliable",
     "live_environment": "UNVERIFIED"
@@ -12,10 +13,10 @@
   "baseline_sha": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9",
   "ingestion_1k_complete": "PASS_LOCAL_EXT4",
   "sender_only_1k": "PASS_LOCAL_EXT4",
-  "full_e2e_1k": "PASS_LOCAL_EXT4",
+  "full_e2e_1k": "NOT_RUN_CURRENT_COMMIT",
   "claim_pause_lock_order": "PASS_LOCAL_UNIT_EVIDENCE",
   "cross_campaign_isolation": "PASS_OFFLINE_PARTIAL",
-  "equal_window_ab_1k_4bind": "PASS_LOCAL_EXT4",
+  "equal_window_ab_1k_4bind": "NOT_RUN_CURRENT_COMMIT",
   "equal_window_ab_3k_4bind": "NOT_RUN",
   "equal_window_ab_10k_4bind": "NOT_RUN",
   "live_smsc": "UNVERIFIED",
@@ -41,9 +42,9 @@
     "G0": "PASS_WITH_LIMITATIONS",
     "G1_ingest_only": "PASS_LOCAL_EXT4",
     "G2_sender_only": "PASS_LOCAL_EXT4",
-    "G3_fast_1k_x3": "PASS_LOCAL_EXT4",
-    "G3_reliable_1k_x3": "PASS_LOCAL_EXT4",
-    "G4_equal_window_ab": "PASS_LOCAL_EXT4",
+    "G3_fast_1k_x3": "NOT_RUN_CURRENT_COMMIT",
+    "G3_reliable_1k_x3": "NOT_RUN_CURRENT_COMMIT",
+    "G4_equal_window_ab": "NOT_RUN_CURRENT_COMMIT",
     "G5_stop_fault_restart_soak": "PARTIAL_STOPPED"
   },
   "dedicated_gates": {
@@ -113,12 +114,12 @@
     }
   },
   "runs": [
-    {"id": "wsl-ext4-fast-1", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 38.096, "queue_backlog_max": 400, "watchdog": "NO_STALL_CAPTURED"},
-    {"id": "wsl-ext4-fast-2", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 39.479, "queue_backlog_max": 340, "watchdog": "NO_STALL_CAPTURED"},
-    {"id": "wsl-ext4-fast-3", "mode": "fast", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 37.947, "queue_backlog_max": 419, "watchdog": "NO_STALL_CAPTURED"},
-    {"id": "wsl-ext4-reliable-1", "mode": "reliable", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.620, "queue_backlog_max": 722, "watchdog": "NO_STALL_CAPTURED"},
-    {"id": "wsl-ext4-reliable-2", "mode": "reliable", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.303, "queue_backlog_max": 744, "watchdog": "NO_STALL_CAPTURED"},
-    {"id": "wsl-ext4-reliable-3", "mode": "reliable", "status": "PASS", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.028, "queue_backlog_max": 741, "watchdog": "NO_STALL_CAPTURED"}
+    {"id": "wsl-ext4-fast-1", "mode": "fast", "status": "HISTORICAL_PASS_NOT_CURRENT", "evidence_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 38.096, "queue_backlog_max": 400, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-fast-2", "mode": "fast", "status": "HISTORICAL_PASS_NOT_CURRENT", "evidence_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 39.479, "queue_backlog_max": 340, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-fast-3", "mode": "fast", "status": "HISTORICAL_PASS_NOT_CURRENT", "evidence_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 37.947, "queue_backlog_max": 419, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-reliable-1", "mode": "reliable", "status": "HISTORICAL_PASS_NOT_CURRENT", "evidence_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.620, "queue_backlog_max": 722, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-reliable-2", "mode": "reliable", "status": "HISTORICAL_PASS_NOT_CURRENT", "evidence_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.303, "queue_backlog_max": 744, "watchdog": "NO_STALL_CAPTURED"},
+    {"id": "wsl-ext4-reliable-3", "mode": "reliable", "status": "HISTORICAL_PASS_NOT_CURRENT", "evidence_commit": "c29eefca5371ba8780f0f214c1e2cd7b07b06cc9", "accepted": 1000, "submitted": 1000, "throughput_events_per_second": 27.028, "queue_backlog_max": 741, "watchdog": "NO_STALL_CAPTURED"}
   ],
   "environment_limitations": [
     {"id": "wsl-drvfs-fast-1k", "status": "FAIL", "accepted": 980, "submitted": 1000, "sending": 20, "failure": "SMS result journal fsync timed out on /mnt/d; retained as environment/storage evidence"},
@@ -131,5 +132,5 @@
     "unknown_retry_violation": false,
     "dlr_violation": false
   },
-  "not_run": ["real_smsc", "sles12sp5_canary", "complete_G5_live_soak_stopped_by_user", "complete_G5_live_b_c_socket_matrix"]
+  "not_run": ["current_commit_g3_g4_1k", "real_smsc", "sles12sp5_canary", "complete_G5_live_soak_stopped_by_user", "complete_G5_live_b_c_socket_matrix"]
 }
