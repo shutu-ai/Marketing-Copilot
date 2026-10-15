@@ -635,7 +635,8 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         if new_dir and os.path.normcase(os.path.normpath(new_dir)) != os.path.normcase(os.path.normpath(old_dir)):
             raise ValueError("Cannot change campaign directory after a whitelist has been uploaded")
     new_smpp_id = fields.get("smpp_config_id")
-    status_update = "status" in fields and fields["status"] != existing_dict.get("status")
+    control_fields = {"status", "start_time", "end_time", "send_start_time", "send_end_time", "send_days"}
+    status_update = bool(control_fields.intersection(fields))
 
     def write(conn):
         current = conn.execute(
@@ -650,7 +651,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             if not smpp:
                 raise ValueError("Associated SMPP configuration is missing or disabled")
         current_dict = dict(current)
-        status_changed = "status" in fields and fields["status"] != current_dict.get("status")
+        status_changed = any(fields[key] != current_dict.get(key) for key in control_fields.intersection(fields))
         next_generation = int(current_dict.get("dispatch_generation") or 0)
         if status_changed:
             next_generation += 1
@@ -665,7 +666,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             )
         if status_changed:
             sms_task_service.reconcile_campaign_state_in_transaction(
-                conn, "realtime", campaign_id, fields["status"], next_generation,
+                conn, "realtime", campaign_id, fields.get("status", current_dict.get("status")), next_generation,
             )
         if new_smpp_id is not None:
             conn.execute(
@@ -682,11 +683,11 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
     from services import fast_send_service
     barrier = (
         fast_send_service.campaign_control_barrier("realtime", campaign_id)
-        if status_update and fast_send_service.is_fast() else nullcontext()
+        if status_update else nullcontext()
     )
     with barrier:
         updated = _run_campaign_write("update", write)
-        if status_update and fast_send_service.is_fast() and updated:
+        if status_update and updated:
             fast_send_service.publish_campaign_state(
                 "realtime", campaign_id, updated.get("status", ""),
                 int(updated.get("dispatch_generation") or 0),

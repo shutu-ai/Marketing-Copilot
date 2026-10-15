@@ -190,7 +190,7 @@ def test_same_name_different_hash_starts_a_new_manifest(authority_file):
     assert row["state_version"] > 0
 
 
-def test_invalid_replayed_chunk_status_is_replayable(authority_file):
+def test_invalid_chunk_status_is_preserved_and_fails_closed(authority_file):
     item = authority_file
     conn = database.get_connection()
     try:
@@ -203,18 +203,12 @@ def test_invalid_replayed_chunk_status_is_replayable(authority_file):
     finally:
         conn.close()
 
-    claimed = state.prepare_chunk(
-        item["file_id"], 0, 0, 1, item["job"]["lease_token"],
-    )
-    assert claimed["id"] == chunk_id
-    assert claimed["status"] == "processing"
-    state.complete_chunk(
-        item["file_id"], claimed, {}, item["job"]["lease_token"],
-    )
+    with pytest.raises(ValueError, match="completedcompleted"):
+        state.prepare_chunk(item["file_id"], 0, 0, 1, item["job"]["lease_token"])
     conn = database.get_connection()
     try:
         assert conn.execute(
             "SELECT status FROM ingestion_chunks WHERE id=?", (chunk_id,)
-        ).fetchone()["status"] == "completed"
+        ).fetchone()["status"] == "completedcompleted"
     finally:
         conn.close()

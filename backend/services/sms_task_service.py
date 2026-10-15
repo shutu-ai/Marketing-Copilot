@@ -467,20 +467,16 @@ def transition_campaign_status(
         return {"campaign": dict(updated), "tasks": task_summary}
 
     from services import fast_send_service
-    barrier = (
-        fast_send_service.campaign_control_barrier(campaign_type, campaign_id)
-        if fast_send_service.is_fast() else nullcontext()
-    )
+    barrier = fast_send_service.campaign_control_barrier(campaign_type, campaign_id)
     with barrier:
         result = write_transaction(
             write, attempts=3, operation="campaign.status.transition", base_delay=0.1,
         )
-        if fast_send_service.is_fast():
-            fast_send_service.publish_campaign_state(
-                campaign_type, campaign_id,
-                result["campaign"].get("status", ""),
-                int(result["campaign"].get("dispatch_generation") or 0),
-            )
+        fast_send_service.publish_campaign_state(
+            campaign_type, campaign_id,
+            result["campaign"].get("status", ""),
+            int(result["campaign"].get("dispatch_generation") or 0),
+        )
     invalidate_campaign_cache(campaign_type, campaign_id)
     return result
 
@@ -1294,10 +1290,11 @@ def _create_fast_batch_in_transaction(conn, batch_id: str, lease_id: str,
             campaign_schedule[campaign_key] = None
             if table:
                 campaign_schedule[campaign_key] = dict(conn.execute(
-                    f"SELECT start_time,end_time,send_start_time,send_end_time FROM {table} WHERE id=?",
+                    f"SELECT status,start_time,end_time,send_start_time,send_end_time,send_days FROM {table} WHERE id=?",
                     (campaign_key[1],),
                 ).fetchone() or {})
         deadline = _fast_campaign_window_deadline(campaign_schedule[campaign_key])
+        task["_socket_schedule"] = campaign_schedule[campaign_key]
         if deadline is not None:
             task["_fast_window_deadline_epoch"] = deadline
         item_values.append("(?,?,?,?,?,?,?,?,?,'claimed','[]','',CURRENT_TIMESTAMP,NULL,CURRENT_TIMESTAMP)")
@@ -1360,9 +1357,9 @@ def _fast_campaign_window_deadline(campaign: dict) -> Optional[float]:
             pass
     start = str(campaign.get("send_start_time") or "").strip()[:5]
     end = str(campaign.get("send_end_time") or "").strip()[:5]
-    if start and end and ":" in start and ":" in end:
+    if end and ":" in end:
         try:
-            start_minutes = int(start[:2]) * 60 + int(start[3:5])
+            start_minutes = int(start[:2]) * 60 + int(start[3:5]) if start else 0
             end_minutes = int(end[:2]) * 60 + int(end[3:5])
             current_minutes = now.hour * 60 + now.minute
             end_date = now.date()
@@ -1753,6 +1750,8 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
         if not row:
             return False
         current = dict(row)
+        if int(task.get("dispatch_generation") or 0) != int(current.get("dispatch_generation") or 0):
+            return False
         if current.get("campaign_type") == "realtime" and current.get("task_date") is not None:
             if str(current["task_date"])[:10] != datetime.now().astimezone().date().isoformat():
                 return False
@@ -1809,7 +1808,7 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
             {"claim_token": claim_token, "attempt_token": attempt_token,
              "planned_parts": planned_parts},
         )
-        return True
+        return dict(campaign_row)
 
     authorization_started = time.perf_counter()
     authorization_result = "error"
@@ -1865,6 +1864,12 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
     )
     task["_attempt_token"] = attempt_token
     task["_source_namespace"] = source_namespace
+    # The schedule snapshot came from the authorization transaction. Publish
+    # only after commit: control takes campaign gate -> DB, never DB -> gate.
+    task["_fast_window_deadline_epoch"] = _fast_campaign_window_deadline(authorized)
+    task["_socket_schedule"] = authorized
+    from services import fast_send_service
+    fast_send_service.observe_claimed_task(task)
     return attempt_token
 
 
@@ -1994,22 +1999,20 @@ def _apply_part_result(conn, task_id: int, claim_token: str, attempt_token: str,
 def _record_submit_activity(conn, activity_keys) -> None:
     """Persist dashboard submit timestamps at result-batch granularity.
 
-    This metadata is not an authorization or fairness fence.  Keep failures
-    best-effort as before, but avoid holding the sender's durable pre-wire
-    transaction for a write that is only consumed by the capacity snapshot.
+    This metadata is not an authorization or fairness fence. Once its SQL is
+    inside the result transaction, any error must escape to the whole-
+    transaction retry. WrappedConnection rolls back on statement failure;
+    swallowing it would falsely acknowledge a rolled-back result to Journal.
     """
     try:
         from services import campaign_capacity_service
     except Exception:
         return
     for campaign_type, campaign_id, route_id in activity_keys:
-        try:
-            campaign_capacity_service.record_activity_event(
-                conn, campaign_type, campaign_id, "submit", route_id=route_id,
-                backlog=None,
-            )
-        except Exception:
-            logger.debug("Unable to record buffered submit activity", exc_info=True)
+        campaign_capacity_service.record_activity_event(
+            conn, campaign_type, campaign_id, "submit", route_id=route_id,
+            backlog=None,
+        )
 
 
 def _apply_disabled_submitted_batch(conn, payloads) -> None:
@@ -2722,6 +2725,44 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
         if task_id is not None and not inserted:
             return
     if task_id:
+        # A receipt is evidence of an external submission, never proof that
+        # the whole SMS was not written. Resolve its attempt before changing
+        # the current task, including the explicit task_id replay path.
+        bindings = conn.execute(
+            """SELECT m.attempt_token,m.part_no,a.claim_token,a.planned_parts,a.created_at
+               FROM sms_message_bindings_v2 m
+               LEFT JOIN sms_send_attempts a ON a.attempt_token=m.attempt_token AND a.task_id=m.task_id
+               WHERE m.source_namespace=? AND m.smsc_message_id=? AND m.task_id=?""",
+            (str(source_namespace or "legacy"), message_id, task_id),
+        ).fetchall()
+        planned_parts = 0
+        if len(bindings) == 1 and bindings[0]["attempt_token"]:
+            binding = bindings[0]
+            if (binding["claim_token"] is None
+                    or binding["claim_token"] != task.get("claim_token")
+                    or conn.execute(
+                        """SELECT 1 FROM sms_send_attempts WHERE task_id=?
+                           AND attempt_token<>? AND created_at>=? LIMIT 1""",
+                        (task_id, binding["attempt_token"], binding["created_at"]),
+                    ).fetchone()):
+                return
+            planned_parts = int(binding["planned_parts"] or 0)
+        elif (len(bindings) > 1 or conn.execute(
+                "SELECT 1 FROM sms_send_attempts WHERE task_id=? LIMIT 1", (task_id,),
+        ).fetchone()):
+            return
+        elif not bindings:
+            # Pre-namespace legacy mappings are usable only without modern
+            # attempt ownership. An arbitrary task_id is not a message binding.
+            if source_namespace != "legacy" or not conn.execute(
+                "SELECT 1 FROM sms_task_message_ids WHERE task_id=? AND smsc_message_id=?",
+                (task_id, message_id),
+            ).fetchone():
+                return
+        if task.get("status") in {"unknown", "partial", "queued", "retrying", "sending", "cancelled", "expired"}:
+            # Retain the receipt fact above while preserving unresolved parts
+            # and claims. Submission replay handles receipts that arrived early.
+            return
         # accepted is a delivered-equivalent terminal state when the SMSC
         # configuration does not require a delivery receipt.
         was_delivered = task.get("status") in {"delivered", "accepted"}
@@ -2732,8 +2773,9 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
                 expected_ids = set()
             delivered_rows = conn.execute(
                 """SELECT DISTINCT smsc_message_id FROM delivery_receipts
-                    WHERE task_id=? AND message_state IN ('DELIVRD','DELIVERED','2')""",
-                (task_id,),
+                    WHERE task_id=? AND source_namespace=?
+                      AND message_state IN ('DELIVRD','DELIVERED','2')""",
+                (task_id, str(source_namespace or "legacy")),
             ).fetchall()
             delivered_ids = {r["smsc_message_id"] for r in delivered_rows}
             delivered_ids.add(message_id)
@@ -2745,17 +2787,16 @@ def _apply_receipt(conn, message_id: str, state: str, raw: str,
             all_parts_delivered = (
                 task.get("status") != "partial"
                 and bool(expected_ids)
+                and len(expected_ids) >= planned_parts
                 and expected_ids.issubset(delivered_ids)
             )
             status = "delivered" if all_parts_delivered else ("accepted" if task.get("status") == "accepted" else "submitted")
             delivered_sql = ", delivered_at=CURRENT_TIMESTAMP" if all_parts_delivered else ""
         elif normalized_state in {"ACCEPTD", "ENROUTE", "SCHEDULED", "1", "6", "7"}:
-            status = "accepted" if task.get("status") == "accepted" else "submitted"
+            status = task.get("status") if task.get("status") in {"accepted", "failed", "delivered"} else "submitted"
             delivered_sql = ""
         else:
-            temporary_receipt = normalized_state in {"UNKNOWN", "UNDELIV", "EXPIRED"}
-            can_retry = temporary_receipt and int(task.get("receipt_retry_count") or 0) < 1
-            status = "retrying" if can_retry else "failed"
+            status = "failed"
             delivered_sql = ""
         updated = conn.execute(
             f"UPDATE sms_tasks SET status=?, failure_class=?, receipt_retry_count=COALESCE(receipt_retry_count,0)+?, "

@@ -600,14 +600,8 @@ def record_chunk_progress_in_transaction(conn, chunk_id: int, result: dict) -> N
 
 
 def is_completed_chunk_status(status) -> bool:
-    """Recognize a completed checkpoint even if an OCC replay duplicated text."""
-    value = str(status or "")
-    # DuckDB 1.2.0 may preserve the previous value while replaying a
-    # variable-width update, producing values such as
-    # ``processingcompleted`` or ``completedcompleted``.  Both contain a
-    # durable completion marker and must be normalized idempotently rather
-    # than treated as a live lease.
-    return value == "completed" or "completed" in value
+    """Only the exact durable enum value proves checkpoint completion."""
+    return status == "completed"
 
 
 def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:
@@ -618,22 +612,8 @@ def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:
     ).fetchone()
     if not row or row["status"] == "completed":
         return
-    # A conflict replay can leave a repeated completed marker.  Normalize it
-    # and refresh the file aggregate instead of replaying the task insert.
-    if is_completed_chunk_status(row["status"]):
-        conn.execute(
-            """UPDATE ingestion_chunks SET status='completed',lease_token='',
-               lease_expires_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-            (chunk_id,),
-        )
-        conn.execute(
-            """UPDATE ingestion_files SET
-               completed_chunks=(SELECT COUNT(*) FROM ingestion_chunks WHERE file_id=? AND status='completed'),
-               created_tasks=(SELECT COALESCE(SUM(created_tasks),0) FROM ingestion_chunks WHERE file_id=?),
-               state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-            (row["file_id"], row["file_id"], row["file_id"]),
-        )
-        return
+    if row["status"] != "processing":
+        raise ValueError(f"Cannot complete ingestion chunk {chunk_id}: status={row['status']!r}")
     conn.execute(
         """UPDATE ingestion_chunks SET status='completed',lease_token='',lease_expires_at=NULL,
            created_tasks=?,duplicate_rows=?,excluded_rows=?,invalid_rows=?,no_template_rows=?,

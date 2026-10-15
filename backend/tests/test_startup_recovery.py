@@ -1,6 +1,7 @@
 """Regression tests for startup ordering around DuckDB write contention."""
 
 import pytest
+import database
 
 from services import activity_scheduler
 
@@ -18,10 +19,15 @@ def test_startup_recovery_defers_transient_writer_contention(monkeypatch, caplog
         locked_recovery,
     )
 
-    with caplog.at_level("WARNING"):
-        assert activity_scheduler._recover_expired_chunks_on_startup() == 0
-
-    assert "Startup ingestion recovery deferred" in caplog.text
+    if database.write_concurrency_mode() == "occ":
+        # The legacy Python writer gate does not exist in OCC mode. Its
+        # timeout text cannot be reclassified as an OCC write-write conflict.
+        with pytest.raises(TimeoutError):
+            activity_scheduler._recover_expired_chunks_on_startup()
+    else:
+        with caplog.at_level("WARNING"):
+            assert activity_scheduler._recover_expired_chunks_on_startup() == 0
+        assert "Startup ingestion recovery deferred" in caplog.text
 
 
 def test_startup_recovery_still_raises_non_transient_errors(monkeypatch):

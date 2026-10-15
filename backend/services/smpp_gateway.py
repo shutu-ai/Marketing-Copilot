@@ -841,13 +841,14 @@ class _SmppConnection:
                         time.monotonic() - send_lock_started,
                         labels=self._metric_labels(),
                     )
-                    pdu = self.client.send_message(
-                        source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
-                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
-                        source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
-                        dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
-                        short_message=part, data_coding=coding, esm_class=esm_class,
-                        registered_delivery=(self.config.get('delivery_receipt_mode') or 'optional') != 'disabled')
+                    with fast_send_service.socket_admission(task):
+                        pdu = self.client.send_message(
+                            source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
+                            source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
+                            source_addr=source_addr, dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
+                            dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN, destination_addr=task["msisdn"],
+                            short_message=part, data_coding=coding, esm_class=esm_class,
+                            registered_delivery=(self.config.get('delivery_receipt_mode') or 'optional') != 'disabled')
                 sent_at = time.monotonic()
                 metrics_service.inc(
                     "marketing_copilot_smpp_submit_sm_sent_total",
@@ -927,10 +928,18 @@ class _SmppConnection:
             metrics_service.inc("marketing_copilot_smpp_submitted_total",
                                 amount=len(parts), labels={"config_id": self.config["id"]})
             return [item["message_id"] for item in outcomes if item["message_id"]]
+        except fast_send_service.FastSendAdmissionDenied as exc:
+            if task.get("_socket_write_started"):
+                raise SmppDeliveryUnknownError("campaign fence closed after socket admission") from exc
+            raise SmppSubmissionNotAllowedError(str(exc)) from exc
+        except SmppSubmissionNotAllowedError as exc:
+            if task.get("_socket_write_started"):
+                raise SmppDeliveryUnknownError("submission stopped after socket admission") from exc
+            raise
         except (SmppSubmitError, SmppDeliveryUnknownError):
             raise
         except Exception as exc:
-            if submitted_any:
+            if task.get("_socket_write_started"):
                 raise SmppDeliveryUnknownError(f"connection lost after submit: {exc}") from exc
             raise
         finally:
@@ -1016,8 +1025,8 @@ class _SmppConnection:
                     )
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
-                with fast_send_service.socket_admission(task):
-                    with self._send_lock:
+                with self._send_lock:
+                    with fast_send_service.socket_admission(task):
                         metrics_service.observe_histogram(
                             "marketing_copilot_smpp_send_lock_wait_seconds",
                             time.monotonic() - send_lock_started,
@@ -1107,15 +1116,14 @@ class _SmppConnection:
             error = exc
             if isinstance(error, fast_send_service.FastSendAdmissionDenied):
                 error = SmppSubmissionNotAllowedError(str(error))
-            if (fast_send_service.is_fast_task(task)
-                    and task.get("_fast_socket_admitted")
-                    and not isinstance(error, SmppDeliveryUnknownError)):
+            if (task.get("_socket_write_started")
+                    and not isinstance(error, SmppSubmitError)):
                 error = SmppDeliveryUnknownError(
-                    "Fast submit_sm write outcome is ambiguous; automatic resend is unsafe"
+                    "submit_sm write outcome is ambiguous; automatic resend is unsafe"
                 )
             if submitted_any and isinstance(error, SmppSubmissionNotAllowedError):
                 error = SmppDeliveryUnknownError(
-                    "Fast campaign stop fence closed after one or more submit_sm writes"
+                    "campaign stop fence closed after one or more submit_sm writes"
                 )
             elif submitted_any and not isinstance(error, SmppSubmitError):
                 error = SmppDeliveryUnknownError(f"connection lost after submit: {exc}")

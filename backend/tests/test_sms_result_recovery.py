@@ -287,6 +287,9 @@ def task_db(monkeypatch):
     monkeypatch.setattr(sms_task_service, "_add_task_event", lambda *a: None)
     monkeypatch.setattr(sms_task_service, "_add_task_event_batch", lambda *a: None)
     monkeypatch.setattr(sms_task_service, "_insert_message_bindings", lambda *a: None)
+    # This unit fixture models only task/result tables. Real metadata writes
+    # and their rollback/retry contract are covered with a full schema in S0.
+    monkeypatch.setattr(sms_task_service, "_record_submit_activity", lambda *a: None)
     yield conn
     conn.close()
 

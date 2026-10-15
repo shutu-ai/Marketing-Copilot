@@ -179,10 +179,9 @@ def _get_fence(campaign_type: str, campaign_id: int) -> _CampaignFence:
 
 
 def observe_claimed_task(task: dict) -> None:
-    """Seed the local fence from a durably claimed Fast task."""
-    if not task.get("_fast_mode"):
-        return
-    _register_claimed_task(task)
+    """Observe durable ownership after commit, outside the database lock."""
+    if task.get("_fast_mode"):
+        _register_claimed_task(task)
     fence = _get_fence(task.get("campaign_type", ""), task.get("campaign_id", 0))
     with fence.lock:
         generation = int(task.get("dispatch_generation") or 0)
@@ -224,10 +223,7 @@ def publish_campaign_state(campaign_type: str, campaign_id: int,
 @contextmanager
 def socket_admission(task: dict) -> Iterator[None]:
     """Hold the per-campaign linearization gate only around socket I/O."""
-    if not task.get("_fast_mode"):
-        yield
-        return
-    if backpressure_active():
+    if task.get("_fast_mode") and backpressure_active():
         raise FastSendAdmissionDenied(
             "Fast Send checkpoint backlog is above its safety threshold"
         )
@@ -240,12 +236,25 @@ def socket_admission(task: dict) -> Iterator[None]:
             raise FastSendAdmissionDenied("campaign dispatch generation is stale")
         if fence.status and fence.status != "in_progress":
             raise FastSendAdmissionDenied(
-                f"campaign is {fence.status}; Fast socket admission is closed"
+                f"campaign is {fence.status}; socket admission is closed"
             )
         deadline = task.get("_fast_window_deadline_epoch")
         if deadline is not None and time.time() >= float(deadline):
             raise FastSendAdmissionDenied("campaign send window is closed")
-        mark_socket_admitted(task)
+        schedule = task.get("_socket_schedule")
+        if schedule:
+            from services import sms_task_service
+            from datetime import datetime
+            now = datetime.now().astimezone()
+            active, reason = sms_task_service.campaign_is_active(schedule, now)
+            if (task.get("campaign_type") == "realtime" and task.get("task_date")
+                    and str(task["task_date"])[:10] != now.date().isoformat()):
+                active, reason = False, "realtime task date expired"
+            if not active:
+                raise FastSendAdmissionDenied(reason)
+        if task.get("_fast_mode"):
+            mark_socket_admitted(task)
+        task["_socket_write_started"] = True
         yield
 
 
