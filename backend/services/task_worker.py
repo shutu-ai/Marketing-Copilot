@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 
-from services import fast_send_service, metrics_service, sms_task_service
+from services import bounded_dispatch_service, fast_send_service, metrics_service, sms_task_service
 from services.settings_service import get_setting
 from services.smpp_gateway import (
     gateway, SmppSubmitError, SmppDeliveryUnknownError, SmppPartialSubmitError,
@@ -24,6 +24,10 @@ _task_queue = None
 
 def _async_send_complete(task, message_ids, error):
     """Finalize a task after the background SMPP response handler completes."""
+    reservation = task.get("_dispatch_reservation")
+    if reservation and not reservation.pool.begin_completion(reservation):
+        return
+    failed = False
     try:
         if error is None:
             if fast_send_service.is_fast_task(task):
@@ -87,10 +91,13 @@ def _async_send_complete(task, message_ids, error):
         sms_task_service.mark_send_failure(task, str(error), wait=False)
         metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": "transport"})
     except Exception:
+        failed = True
         logger.exception("Failed to finalize async SMS task %s", task.get("id"))
     finally:
         if fast_send_service.is_fast_task(task):
             fast_send_service.forget_task(task)
+        if reservation:
+            reservation.pool.completed(reservation, failed=failed)
 
 
 def configured_worker_count():
@@ -114,8 +121,86 @@ def worker_status():
         items = [{"index": index + 1, "name": thread.name, "alive": thread.is_alive(),
                   "last_active": _last_active.get(index, 0)}
                  for index, thread in sorted(_workers.items())]
+    pool = _task_queue
     return {"configured": configured_worker_count(),
-            "running": sum(1 for item in items if item["alive"]), "workers": items}
+            "running": sum(1 for item in items if item["alive"]), "workers": items,
+            "dispatch": pool.status() if isinstance(pool, bounded_dispatch_service.ReadyPool)
+            else {"mode": bounded_dispatch_service.mode()}}
+
+
+def _fair_claim_once(pool):
+    """One bounded candidate/reserve/commit/publish cycle, with no nested locks."""
+    from services import campaign_capacity_service, sms_write_buffer
+    # Capture completed IDs BEFORE observing the external drain boundary. A
+    # concurrent later callback must not retire debt using an earlier sample.
+    completed = pool.result_candidates()
+    fast_pending = fast_send_service.status()["checkpoint_pending"]
+    results = sms_write_buffer.status()
+    if (not fast_pending and not results["pending_durable"]
+            and not results["quarantined"] and results["journal"].get("healthy", False)):
+        pool.retire_results(completed)
+    if pool.status()["failure"]:
+        return 0
+    configs = gateway._enabled_configs()
+    candidates = sms_task_service.fair_dispatch_candidates(
+        min(16, campaign_capacity_service.active_campaign_limit()), pool.limits.max_task_bytes,
+    )
+    reserved = []
+    try:
+        for task in campaign_capacity_service.select(candidates, len(candidates)) if candidates else []:
+            config = gateway.resolve_dispatch_route(task, configs)
+            if not config:
+                continue
+            parts = campaign_capacity_service.task_parts(task)
+            reservation = pool.reserve(task, config["id"], parts)
+            if reservation:
+                reserved.append((task, config, reservation))
+        if not reserved:
+            return 0
+        tasks = sms_task_service.claim_next_tasks(
+            len(reserved), send_mode=fast_send_service.mode(),
+            _reserved_tasks=[task for task, _config, _reservation in reserved],
+        )
+        claimed = {int(task["id"]): task for task in tasks}
+        count = 0
+        for _candidate, config, reservation in reserved:
+            task = claimed.get(reservation.task_id)
+            if task is None:
+                pool.release(reservation)
+                continue
+            task["_dispatch_route_revision"] = str(config.get("updated_at") or "")
+            task["_dispatch_resolved_route_id"] = int(config["id"])
+            # Publish failure deliberately leaves the durable claim intact.
+            # Recovery uses existing claim/attempt provenance, never cache absence.
+            pool.publish(reservation, task)
+            count += 1
+        return count
+    finally:
+        for _task, _config, reservation in reserved:
+            if reservation.state == "reserved":
+                pool.release(reservation)
+
+
+def _fair_claim_dispatch_loop(pool):
+    from services import backpressure_service
+    next_connect_check = 0.0
+    while not _stop.is_set():
+        if (get_setting("system_mode", "production") == "production"
+                and time.monotonic() >= next_connect_check):
+            next_connect_check = time.monotonic() + 5.0
+            try:
+                gateway.connect()
+            except Exception as exc:
+                logger.warning("Fair dispatch SMPP bind/reconnect failed: %s", exc)
+        if not backpressure_service.wait_for_delivery(_stop):
+            break
+        try:
+            count = _fair_claim_once(pool)
+        except Exception:
+            logger.exception("S1 claim/publish failed; durable claims retained for recovery")
+            count = 0
+        if not count:
+            _stop.wait(0.1)
 
 
 def _claim_fetch_size() -> int:
@@ -138,6 +223,8 @@ def _claim_fetch_size() -> int:
 
 
 def _claim_dispatch_loop(task_queue):
+    if isinstance(task_queue, bounded_dispatch_service.ReadyPool):
+        return _fair_claim_dispatch_loop(task_queue)
     logger.info(
         "SMS task claim dispatcher started workers=%s fetch_batch=%s queue_capacity=%s",
         configured_worker_count(), _claim_fetch_size(),
@@ -208,6 +295,8 @@ def _claim_dispatch_loop(task_queue):
 
 
 def _process_task(task: dict, worker_index: int):
+    if task.get("_dispatch_reservation"):
+        return _process_fair_task(task, worker_index)
     try:
         metrics_service.inc("marketing_copilot_tasks_claimed_total", labels={"worker": worker_index + 1})
         active, reason = sms_task_service.validate_task_schedule(task)
@@ -260,6 +349,46 @@ def _process_task(task: dict, worker_index: int):
         metrics_service.inc("marketing_copilot_task_failures_total", labels={"class": "transport"})
 
 
+def _process_fair_task(task, worker_index):
+    from services import backpressure_service
+    from services.smpp_gateway import _make_task_parts
+    reservation = task["_dispatch_reservation"]
+    pool = reservation.pool
+    handed = False
+    try:
+        active, reason = sms_task_service.validate_task_schedule(task)
+        if not active or _stop.is_set():
+            raise SmppSubmissionNotAllowedError(reason if not active else "worker stopping")
+        blocking, _state = backpressure_service.reasons(refresh_database=False)
+        if any(reason in {"writes", "disk", "results", "database_maintenance"} for reason in blocking):
+            if pool.retry_ready(reservation):
+                return
+            raise SmppSubmissionNotAllowedError("delivery safety admission closed")
+        prepared = _make_task_parts(task)
+        if len(prepared[0]) != reservation.cost["parts"]:
+            raise SmppSubmissionNotAllowedError("encoded parts differ from reserved cost")
+        task["_prepared_smpp_parts"] = prepared
+        if bounded_dispatch_service.cached_bytes(task) > reservation.cost["bytes"]:
+            raise SmppSubmissionNotAllowedError("prepared bytes exceed reservation")
+        if get_setting("system_mode", "production") == "development":
+            raise SmppSubmissionNotAllowedError("fair dispatch requires production transport semantics")
+        handed = gateway.try_send_async(task, _async_send_complete)
+        if handed:
+            pool.handoff(reservation)
+        elif not pool.retry_ready(reservation):
+            raise SmppSubmissionNotAllowedError("worker stopping before handoff")
+    except BaseException as exc:
+        # The fair worker has not written the socket. Handoff exceptions do
+        # not manufacture a retryable SMSC reject or consume another claim.
+        _async_send_complete(task, [], exc if isinstance(exc, SmppSubmitError)
+                             else SmppSubmissionNotAllowedError(str(exc)))
+        if not isinstance(exc, Exception):
+            raise
+    finally:
+        if not handed and reservation.preparing:
+            pool.handoff(reservation)
+
+
 def _run(worker_index):
     next_recovery = time.monotonic() + 60.0
     last_connect_check, gateway_was_connected = 0.0, gateway.connected
@@ -271,7 +400,8 @@ def _run(worker_index):
             if worker_index == 0 and time.monotonic() >= next_recovery:
                 next_recovery = time.monotonic() + 60.0
                 sms_task_service.recover_stale_tasks()
-            if (worker_index == 0 and get_setting("system_mode", "production") == "production"
+            if (not isinstance(_task_queue, bounded_dispatch_service.ReadyPool)
+                    and worker_index == 0 and get_setting("system_mode", "production") == "production"
                     and time.monotonic() >= last_connect_check):
                 last_connect_check = time.monotonic() + 5.0
                 try:
@@ -331,6 +461,7 @@ def _start_claim_dispatcher():
 
 def start_worker():
     global _supervisor, _claim_dispatcher, _task_queue
+    dispatch_mode = bounded_dispatch_service.freeze_mode()
     disabled = str(os.environ.get("MC_DISABLE_TASK_WORKER", "0")).strip().lower()
     if disabled in {"1", "true", "yes", "on"}:
         logger.info("SMS task worker disabled by MC_DISABLE_TASK_WORKER")
@@ -338,7 +469,11 @@ def start_worker():
         return
     with _guard:
         if any(thread.is_alive() for thread in _workers.values()):
+            if _stop.is_set():
+                raise RuntimeError("old SMS worker epoch has not stopped")
             return
+        if _claim_dispatcher and _claim_dispatcher.is_alive():
+            raise RuntimeError("old SMS claim dispatcher has not stopped")
         mode = fast_send_service.freeze_mode()
         from services import realtime_campaign_service
         realtime_campaign_service.finalize_daily_tasks()
@@ -346,7 +481,8 @@ def start_worker():
             fast_send_service.start()
         _stop.clear(); _workers.clear(); _last_active.clear()
         capacity = max(100, min(1000, configured_worker_count() * 4))
-        _task_queue = queue.Queue(maxsize=capacity)
+        _task_queue = (bounded_dispatch_service.ReadyPool()
+                       if dispatch_mode == "fair" else queue.Queue(maxsize=capacity))
         _claim_dispatcher = None
         _start_claim_dispatcher()
         for index in range(configured_worker_count()):
@@ -358,7 +494,11 @@ def start_worker():
 
 def stop_worker(timeout: float = 8.0):
     global _supervisor, _claim_dispatcher, _task_queue
-    _stop.set(); gateway.disconnect()
+    _stop.set()
+    pool = _task_queue
+    if isinstance(pool, bounded_dispatch_service.ReadyPool):
+        pool.close()
+    gateway.disconnect()
     with _guard:
         threads = list(_workers.values())
     deadline = time.monotonic() + max(0.5, float(timeout))
@@ -377,6 +517,10 @@ def stop_worker(timeout: float = 8.0):
         remaining = max(0.0, deadline - time.monotonic())
         if remaining > 0:
             _claim_dispatcher.join(timeout=remaining)
+    if (any(thread.is_alive() for thread in threads)
+            or (_claim_dispatcher and _claim_dispatcher.is_alive())
+            or (_supervisor and _supervisor.is_alive())):
+        raise RuntimeError("SMS shutdown incomplete; old epoch retained; restart refused")
     with _guard:
         _workers.clear(); _last_active.clear()
     if fast_send_service.mode() == fast_send_service.FAST_MODE:
@@ -384,5 +528,7 @@ def stop_worker(timeout: float = 8.0):
             fast_send_service.stop(timeout=max(1.0, float(timeout)))
         except Exception:
             logger.exception("Fast Send checkpoint shutdown failed")
+    if isinstance(pool, bounded_dispatch_service.ReadyPool):
+        pool.abandon()
     _supervisor = None; _claim_dispatcher = None; _task_queue = None
     metrics_service.set_gauge("marketing_copilot_workers", 0)

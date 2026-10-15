@@ -130,6 +130,8 @@ def _flash_data_coding(coding: int) -> int:
 
 
 def _make_task_parts(task: dict):
+    if task.get("_prepared_smpp_parts") is not None:
+        return task["_prepared_smpp_parts"]
     parts, coding, esm_class = _make_parts(task["content"])
     if task.get("flash_sms"):
         coding = _flash_data_coding(coding)
@@ -800,6 +802,16 @@ class _SmppConnection:
                 task, [], SmppWindowExhaustedError("SMPP async send queue full"), callback,
             )
 
+    def try_send_async(self, task: dict, callback: Callable) -> bool:
+        """S1 handoff: never wait for Slot FIFO capacity on a shared worker."""
+        self._start_async_sender()
+        self._start_async_reaper()
+        try:
+            self._send_queue.put_nowait((task, callback))
+            return True
+        except queue.Full:
+            return False
+
     def _send_windowed(self, task: dict) -> list[str]:
         self.connect()
         import smpplib.consts
@@ -833,6 +845,8 @@ class _SmppConnection:
                     raise SmppSubmissionNotAllowedError(
                         "SMPP submission stopped before socket write"
                     )
+                from services.bounded_dispatch_service import assert_delivery_safe
+                assert_delivery_safe(task)
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
@@ -1023,6 +1037,8 @@ class _SmppConnection:
                     raise SmppSubmissionNotAllowedError(
                         "SMPP submission stopped before socket write"
                     )
+                from services.bounded_dispatch_service import assert_delivery_safe
+                assert_delivery_safe(task)
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
@@ -1195,7 +1211,7 @@ class SmppGateway:
     def connected(self):
         return any(connection.connected for pool in self._pools.values() for connection in pool)
 
-    def _connection_for(self, config: dict):
+    def _connection_for(self, config: dict, *, connect=True):
         config_id = config["id"]
         with self._lock:
             pool = self._pools.setdefault(config_id, [])
@@ -1208,7 +1224,8 @@ class SmppGateway:
                 index = self._round_robin.get(config_id, 0) % len(pool)
                 connection = pool[index]
                 self._round_robin[config_id] = index + 1
-        connection.connect()
+        if connect:
+            connection.connect()
         return connection
 
     def connect(self):
@@ -1240,6 +1257,9 @@ class SmppGateway:
                 connection.disconnect()
 
     def send(self, task: dict) -> list[str]:
+        from services import bounded_dispatch_service
+        if bounded_dispatch_service.mode() == "fair":
+            raise SmppSubmissionNotAllowedError("direct synchronous sending is disabled in fair mode")
         configs = self._enabled_configs()
         if not configs:
             raise RuntimeError("No enabled SMPP configuration")
@@ -1280,6 +1300,9 @@ class SmppGateway:
 
     def send_async(self, task: dict, callback: Callable):
         """Queue a bounded SMPP submission and complete it from the response path."""
+        from services import bounded_dispatch_service
+        if bounded_dispatch_service.mode() == "fair":
+            raise SmppSubmissionNotAllowedError("fair sending requires a reserved bounded handoff")
         configs = self._enabled_configs()
         if not configs:
             callback(task, [], RuntimeError("No enabled SMPP configuration"))
@@ -1310,6 +1333,27 @@ class SmppGateway:
                 if target_id:
                     break
         callback(task, [], RuntimeError("All SMSC configurations unavailable: " + "; ".join(errors)))
+
+    def resolve_dispatch_route(self, task, configs):
+        target = task.get("transport_smpp_config_id") or task.get("smpp_config_id")
+        candidates = [c for c in configs if not target or c["id"] == target]
+        return next((c for c in candidates
+                     if time.monotonic() >= self._down_until.get(c["id"], 0)), None)
+
+    def try_send_async(self, task: dict, callback: Callable) -> bool:
+        reservation = task.get("_dispatch_reservation")
+        if reservation is None or reservation.state != "prepare":
+            raise SmppSubmissionNotAllowedError("missing active S1 preparation reservation")
+        configs = self._enabled_configs()
+        config = next((c for c in configs if c["id"] == reservation.group[2]), None)
+        if config is None or str(config.get("updated_at") or "") != task.get("_dispatch_route_revision"):
+            raise SmppSubmissionNotAllowedError("resolved route changed before handoff")
+        # Connection establishment belongs to the existing Slot sender. No
+        # connect(), throttle, window wait or FIFO wait on the SMS worker.
+        connection = self._connection_for(config, connect=False)
+        task["_delivery_receipt_mode"] = config.get("delivery_receipt_mode") or "optional"
+        task["_transport_smpp_config_id"] = config["id"]
+        return connection.try_send_async(task, callback)
 
     def disconnect(self, config_id=None):
         with self._lock:

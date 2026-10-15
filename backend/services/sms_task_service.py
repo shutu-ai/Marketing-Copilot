@@ -1085,7 +1085,69 @@ def _campaign_task_eligibility_sql() -> str:
     return _task_campaign_fence_sql("t")
 
 
-def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
+def fair_dispatch_candidates(window: int, max_task_bytes: int) -> list:
+    """Bounded keyset window; advance past full groups without claiming them.
+
+    This transaction only reads candidates and updates the existing durable
+    cursor. DRR selection and memory reservation happen after it commits.
+    """
+    window = max(1, min(128, int(window)))
+
+    def read(conn):
+        state = conn.execute(
+            "SELECT cursor_key FROM fair_scheduler_state WHERE stage='s1_dispatch'"
+        ).fetchone()
+        from services.campaign_capacity_service import _parse_cursor_key, _cursor_key
+        previous = _parse_cursor_key(state["cursor_key"] if state else "")
+        base = f"""FROM sms_tasks t
+            WHERE t.status IN ('queued','retrying')
+              AND CAST(t.next_attempt_at AS TIMESTAMP WITH TIME ZONE)<=CURRENT_TIMESTAMP
+              AND (t.campaign_type<>'realtime' OR t.task_date=CURRENT_DATE)
+              AND {_task_campaign_fence_sql('t')}"""
+        route = "COALESCE(t.transport_smpp_config_id,t.smpp_config_id,0)"
+        columns = f"t.campaign_type,t.campaign_id,{route}"
+        group_sql = f"SELECT {columns} route_id {base}"
+        after = f" AND (t.campaign_type,t.campaign_id,{route})>(?,?,?)" if previous else ""
+        groups = conn.execute(
+            group_sql + after + f" GROUP BY {columns} ORDER BY {columns} LIMIT ?",
+            [*(previous or ()), window],
+        ).fetchall()
+        if not groups and previous:
+            groups = conn.execute(
+                group_sql + f" GROUP BY {columns} ORDER BY {columns} LIMIT ?", [window],
+            ).fetchall()
+        if not groups:
+            return []
+        last = groups[-1]
+        conn.execute(
+            """INSERT INTO fair_scheduler_state(stage,cursor_key,rounds,updated_at)
+               VALUES ('s1_dispatch',?,1,CURRENT_TIMESTAMP)
+               ON CONFLICT(stage) DO UPDATE SET cursor_key=excluded.cursor_key,
+                 rounds=fair_scheduler_state.rounds+1,updated_at=excluded.updated_at""",
+            [_cursor_key((last["campaign_type"], last["campaign_id"], last["route_id"]))],
+        )
+        # One oldest task per group, with a SQL payload envelope before any
+        # Python object is materialized. Oversize work remains authoritative.
+        clause = " OR ".join(f"(t.campaign_type=? AND t.campaign_id=? AND {route}=?)" for _ in groups)
+        params = [v for group in groups for v in (group["campaign_type"], group["campaign_id"], group["route_id"])]
+        rows = conn.execute(
+            f"""SELECT * FROM (
+                SELECT t.*,p.weight scheduling_weight,p.max_parts_tps,
+                  ROW_NUMBER() OVER (PARTITION BY {columns} ORDER BY t.created_at,t.id) rn
+                {base.replace('FROM sms_tasks t', 'FROM sms_tasks t LEFT JOIN campaign_capacity_policies p ON p.campaign_type=t.campaign_type AND p.campaign_id=t.campaign_id AND p.enabled=1')}
+                  AND ({clause})
+                  AND OCTET_LENGTH(encode(COALESCE(t.content,'')))
+                    + OCTET_LENGTH(encode(COALESCE(t.payload,'')))<=?
+              ) candidates WHERE rn=1 LIMIT ?""",
+            [*params, int(max_task_bytes) // 4, window],
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    return write_transaction(read, attempts=3, operation="sms_tasks.s1_candidates")
+
+
+def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None,
+                     *, _reserved_tasks: Optional[list] = None) -> list:
     limit = max(1, int(limit or 20))
     from services import fast_send_service
     selected_mode = send_mode or fast_send_service.mode()
@@ -1104,7 +1166,18 @@ def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
         def claim(conn):
             global _FAIR_DISABLED_WARNING_EMITTED
             from services import campaign_capacity_service
-            if campaign_capacity_service.enabled():
+            if _reserved_tasks is not None:
+                # Memory admission already succeeded outside this transaction.
+                # Reject any descriptor whose durable payload/identity changed.
+                selected_ids = []
+                for expected in _reserved_tasks:
+                    current = conn.execute("SELECT * FROM sms_tasks WHERE id=?", [expected["id"]]).fetchone()
+                    fields = ("campaign_type", "campaign_id", "dispatch_generation", "content",
+                              "payload", "smpp_config_id", "transport_smpp_config_id", "msisdn",
+                              "source_addr", "flash_sms")
+                    if current and all(current[field] == expected.get(field) for field in fields):
+                        selected_ids.append(int(expected["id"]))
+            elif campaign_capacity_service.enabled():
                 per_campaign = campaign_capacity_service.per_campaign_candidates()
                 active_groups = conn.execute(
                     f"""SELECT t.campaign_type,t.campaign_id,
@@ -1227,7 +1300,8 @@ def claim_next_tasks(limit: int = 20, send_mode: Optional[str] = None) -> list:
                     "claimed", "queued", "sending",
                     [task["id"] for task in items],
                     {"claim_token": token, "attempt_min": min(task["attempts"] for task in items),
-                     "attempt_max": max(task["attempts"] for task in items)},
+                     "attempt_max": max(task["attempts"] for task in items),
+                     **({"dispatch_protocol": "s1_bounded_v1"} if _reserved_tasks is not None else {})},
                 )
             # ``campaign_fairness_state`` is advisory display state.  The
             # claim scheduler uses candidate rows and the durable cursor, not

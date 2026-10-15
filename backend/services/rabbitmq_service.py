@@ -123,6 +123,10 @@ def publish(routing_key: str, message: dict) -> bool:
 def start_consumer(callback: Callable):
     global _consumer_thread, _consumer_running
 
+    from services import bounded_dispatch_service
+    if bounded_dispatch_service.mode() == "fair":
+        raise RuntimeError("RabbitMQ consumer is disabled in fair dispatch mode")
+
     if _consumer_running:
         logger.warning("Consumer already running")
         return

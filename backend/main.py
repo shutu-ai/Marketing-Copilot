@@ -172,6 +172,8 @@ def _start_background_services():
 
 @app.on_event("startup")
 def startup():
+    from services import bounded_dispatch_service
+    bounded_dispatch_service.freeze_mode()
     acquire_instance_lock()
     from services import db_config as db_config_service
     from database import get_database_file, set_database_file

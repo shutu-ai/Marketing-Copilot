@@ -16,6 +16,9 @@ def process_message(routing_key: str, message: dict):
     Called by RabbitMQ consumer when a message arrives.
     Uses the message language to find the campaign template and sends SMS.
     """
+    from services import bounded_dispatch_service
+    if bounded_dispatch_service.mode() == "fair":
+        raise RuntimeError("RabbitMQ direct sending is not supported in fair dispatch mode")
     msisdn = str(message.get("msisdn", "")).strip()
     if not msisdn:
         logger.warning(f"No msisdn in message: {message}")
