@@ -90,10 +90,10 @@ class Ledger:
             self._audit()
             return credit
 
-    def event(self, size, parent=None):
+    def event(self, size, parent=None, owner="emergency"):
         amount = charge(size)
         if parent is None:
-            return self.acquire(amount)
+            return self.acquire(amount, owner)
         with self.lock:
             if (self.live.get(parent.id) is not parent or parent.closed
                     or parent.used + amount > parent.amount):
@@ -123,7 +123,9 @@ class Ledger:
             if credit.parent:
                 credit.parent.used -= delta
             else:
-                bucket = "terminal" if credit.owner == "terminal" else "emergency"
+                bucket = "normal" if credit.owner == "dispatch" else (
+                    "terminal" if credit.owner == "terminal" else "emergency"
+                )
                 self.used[bucket] -= delta
             self._audit()
 

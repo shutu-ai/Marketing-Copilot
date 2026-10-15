@@ -309,7 +309,12 @@ def append_event(kind: str, payload: dict[str, Any], timeout: float = 10.0,
             parent = capacity.owner_for(payload) if kind != "receipt" else None
             maximum = capacity.MAX_PART_EVENT if kind == "part_result" else (
                 capacity.MAX_FINAL_EVENT if parent else capacity.MAX_EVENT)
-            _credit = capacity.ledger.event(maximum, parent)
+            aggregate = (kind == "fast_checkpoint"
+                         and isinstance(payload.get("items"), list)
+                         and len(payload["items"]) > 1)
+            _credit = capacity.ledger.event(
+                maximum, parent, owner="dispatch" if aggregate else "emergency"
+            )
             if _credit is None:
                 raise capacity.ResultCapacityError("result emergency bytes exhausted")
             capacity.validate(record)

@@ -74,6 +74,24 @@ def test_fsync_handoff_keeps_credit_until_terminal(fair):
     assert journal.load_state(path)["pending"] == []
 
 
+def test_aggregate_fast_checkpoint_uses_dispatch_budget(fair):
+    event_id, path, credit = journal.append_event(
+        "fast_checkpoint",
+        {"items": [
+            {"task_id": 7, "claim_token": "c7"},
+            {"task_id": 8, "claim_token": "c8"},
+        ]},
+        _handoff=True,
+    )
+    assert event_id and path
+    assert credit.owner == "dispatch"
+    assert capacity.ledger.status()["used_bytes"].get("emergency", 0) == 0
+    assert capacity.ledger.safe()
+    journal.append_terminal([event_id], "committed", path)
+    capacity.ledger.release(credit)
+    assert capacity.ledger.status()["live"] == 0
+
+
 def test_terminal_lane_does_not_consume_normal_dispatch_budget(fair):
     normal = capacity.ledger.acquire(capacity.charge(capacity.MAX_EVENT), "dispatch")
     assert normal is not None

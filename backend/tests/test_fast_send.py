@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import database
-from services import fast_send_service, sms_task_service, sms_write_buffer, task_worker
+from services import bounded_dispatch_service, fast_send_service, sms_task_service, sms_write_buffer, task_worker
 from services.smpp_gateway import _SmppConnection
 
 
@@ -223,6 +223,42 @@ def test_fast_successes_share_one_checkpoint_event(fast_db):
         conn.close()
     assert checkpoint_count == 1
     assert {row["status"]: row["count"] for row in statuses} == {"accepted": 3}
+
+
+def test_fair_fast_successes_share_one_checkpoint_event(fast_db, monkeypatch):
+    monkeypatch.setattr(bounded_dispatch_service, "_frozen_mode", "fair")
+    submitted = []
+
+    def capture(kind, payload, wait=False):
+        submitted.append((kind, payload, wait))
+        return f"event-{len(submitted)}"
+
+    monkeypatch.setattr(sms_write_buffer, "submit", capture)
+    tasks = []
+    for task_id in range(1, 4):
+        reservation = SimpleNamespace(
+            pool=SimpleNamespace(limits=SimpleNamespace(tasks=8)),
+            result_credit=object(),
+            state="completing",
+        )
+        tasks.append({
+            "id": task_id,
+            "_fast_mode": True,
+            "_fast_batch_id": f"batch-{task_id}",
+            "_dispatch_reservation": reservation,
+            "_delivery_receipt_mode": "disabled",
+            "_fast_planned_parts": 1,
+        })
+
+    for task in tasks:
+        assert fast_send_service.record_success(task, [])
+
+    assert submitted == []
+    assert fast_send_service.status()["checkpoint_pending"] == 3
+    assert fast_send_service._flush_once()
+    assert len(submitted) == 1
+    assert submitted[0][0] == "fast_checkpoint"
+    assert len(submitted[0][1]["items"]) == 3
 
 
 def test_fast_startup_recovery_marks_claim_unknown_and_does_not_reclaim(fast_db):

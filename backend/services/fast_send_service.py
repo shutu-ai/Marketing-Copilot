@@ -290,6 +290,7 @@ _checkpoint_error = ""
 _last_checkpoint_at = 0.0
 _last_checkpoint_event_at = 0.0
 _unresolved_count = 0
+_FAIR_CHECKPOINT_INTERVAL_SECONDS = 0.3
 
 
 def _int_env(name: str, default: int, low: int, high: int) -> int:
@@ -320,6 +321,13 @@ def _checkpoint_interval() -> float:
 
 def _pending_durable_limit() -> int:
     return _int_env("MC_FAST_SEND_MAX_DURABLE_BACKLOG", 2000, 100, 100000)
+
+
+def _checkpoint_wait_seconds() -> float:
+    from services import result_capacity_service as capacity
+    if capacity.enabled():
+        return max(_checkpoint_interval(), _FAIR_CHECKPOINT_INTERVAL_SECONDS)
+    return _checkpoint_interval()
 
 
 def start() -> None:
@@ -419,29 +427,34 @@ def record_success(task: dict, message_ids: list[str]) -> bool:
         return False
     payload = _checkpoint_payload(task, message_ids)
     from services import result_capacity_service as capacity
-    if capacity.enabled():
-        # Fair mode already owns worst-case credit. Persist one bounded task
-        # checkpoint directly; no unmetered intermediate Fast accumulator.
-        from services import sms_write_buffer
-        try:
-            sms_write_buffer.submit("fast_checkpoint", {"items": [payload]}, wait=False)
-        except Exception as exc:
-            _set_checkpoint_failure(exc)
-            return False
-        return True
     task_id = int(payload["task_id"])
-    with _checkpoint_condition:
-        if task_id not in _checkpoint_pending and len(_checkpoint_pending) >= _checkpoint_limit():
+    pending_limit = _checkpoint_limit()
+    if capacity.enabled():
+        reservation = task.get("_dispatch_reservation")
+        pool = getattr(reservation, "pool", None)
+        limits = getattr(pool, "limits", None)
+        result_credit = getattr(reservation, "result_credit", None)
+        pending_limit = int(getattr(limits, "tasks", 0) or 0)
+        if (reservation is None or result_credit is None
+                or getattr(reservation, "state", "") in {"released", "failed"}
+                or pending_limit < 1):
             _unresolved_count += 1
-            _set_checkpoint_failure(RuntimeError("Fast success checkpoint queue is full"))
+            _set_checkpoint_failure(
+                RuntimeError("Fair Fast success is missing a live dispatch result reservation")
+            )
             return False
-        _checkpoint_pending[task_id] = payload
-        # Let normal successes accumulate for one checkpoint interval so the
-        # journal and DuckDB writer see a bounded batch rather than one event
-        # per response.  A full batch wakes the worker immediately; shutdown
-        # also wakes it through _checkpoint_stop/notify_all.
-        if len(_checkpoint_pending) >= _checkpoint_batch_size():
-            _checkpoint_condition.notify_all()
+    failure = None
+    with _checkpoint_condition:
+        if task_id not in _checkpoint_pending and len(_checkpoint_pending) >= pending_limit:
+            _unresolved_count += 1
+            failure = RuntimeError("Fast success checkpoint queue is full")
+        else:
+            _checkpoint_pending[task_id] = payload
+            if len(_checkpoint_pending) >= _checkpoint_batch_size():
+                _checkpoint_condition.notify_all()
+    if failure:
+        _set_checkpoint_failure(failure)
+        return False
     metrics_service.inc("marketing_copilot_fast_success_aggregated_total")
     metrics_service.set_gauge(
         "marketing_copilot_fast_checkpoint_pending", len(_checkpoint_pending)
@@ -518,9 +531,9 @@ def _checkpoint_loop() -> None:
     while not _checkpoint_stop.is_set():
         with _checkpoint_condition:
             if not _checkpoint_pending:
-                _checkpoint_condition.wait(timeout=_checkpoint_interval())
+                _checkpoint_condition.wait(timeout=_checkpoint_wait_seconds())
             else:
-                _checkpoint_condition.wait(timeout=_checkpoint_interval())
+                _checkpoint_condition.wait(timeout=_checkpoint_wait_seconds())
             ready = bool(_checkpoint_pending)
         if ready:
             _flush_once()
@@ -551,7 +564,7 @@ def status() -> dict:
         "checkpoint_pending": pending,
         "checkpoint_queue_capacity": _checkpoint_limit(),
         "checkpoint_batch_size": _checkpoint_batch_size(),
-        "checkpoint_interval_ms": round(_checkpoint_interval() * 1000),
+        "checkpoint_interval_ms": round(_checkpoint_wait_seconds() * 1000),
         "checkpoint_lag_seconds": max(0.0, time.time() - oldest_at) if oldest_at else 0.0,
         "last_checkpoint_at": last,
         "unresolved_count": unresolved,
