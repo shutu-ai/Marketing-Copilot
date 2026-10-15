@@ -1673,6 +1673,7 @@ def init_db():
                      total_chunks INTEGER NOT NULL DEFAULT 0, worker_id TEXT NOT NULL DEFAULT '',
                      retry_count INTEGER NOT NULL DEFAULT 0, last_error_class TEXT NOT NULL DEFAULT '',
                      last_error_at TEXT, next_retry_at TEXT, max_retry_count INTEGER NOT NULL DEFAULT 4,
+                     source_state_version BIGINT NOT NULL DEFAULT -1,
              detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
             UNIQUE(campaign_type, campaign_id, filename)
         )""",
@@ -1683,6 +1684,7 @@ def init_db():
             filename TEXT NOT NULL,
             file_path TEXT NOT NULL DEFAULT '',
             file_size BIGINT NOT NULL DEFAULT 0,
+            file_hash TEXT NOT NULL DEFAULT '',
              manifest_id BIGINT DEFAULT NULL,
             total_rows BIGINT NOT NULL DEFAULT 0,
             chunk_size INTEGER NOT NULL DEFAULT 5000,
@@ -1702,6 +1704,7 @@ def init_db():
             lease_expires_at TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
             last_error_class TEXT NOT NULL DEFAULT '', last_error_at TEXT, next_retry_at TEXT,
             max_retry_count INTEGER NOT NULL DEFAULT 4,
+            state_version BIGINT NOT NULL DEFAULT 0,
             UNIQUE(campaign_type, campaign_id, filename)
         )""",
         """CREATE TABLE IF NOT EXISTS ingestion_chunks (
@@ -1884,8 +1887,10 @@ def init_db():
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS last_error_at TEXT",
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS next_retry_at TEXT",
         "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS max_retry_count INTEGER DEFAULT 4",
+        "ALTER TABLE processed_files ADD COLUMN IF NOT EXISTS source_state_version BIGINT DEFAULT -1",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS whitelist_version_id INTEGER",
          "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS manifest_id BIGINT",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS file_hash TEXT DEFAULT ''",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processing_started_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS last_progress_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS processing_phase TEXT DEFAULT 'queued'",
@@ -1900,6 +1905,7 @@ def init_db():
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS last_error_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS next_retry_at TEXT",
         "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS max_retry_count INTEGER DEFAULT 4",
+        "ALTER TABLE ingestion_files ADD COLUMN IF NOT EXISTS state_version BIGINT DEFAULT 0",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS smpp_config_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS flash_sms BOOLEAN DEFAULT FALSE",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS transport_smpp_config_id INTEGER",
@@ -1954,6 +1960,7 @@ def init_db():
                      total_chunks INTEGER NOT NULL DEFAULT 0, worker_id TEXT NOT NULL DEFAULT '',
                      retry_count INTEGER NOT NULL DEFAULT 0, last_error_class TEXT NOT NULL DEFAULT '',
                      last_error_at TEXT, next_retry_at TEXT, max_retry_count INTEGER NOT NULL DEFAULT 4,
+                    source_state_version BIGINT NOT NULL DEFAULT -1,
                     detected_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), completed_at TEXT,
                     UNIQUE(campaign_type, campaign_id, filename)
                 )"""
@@ -1963,11 +1970,11 @@ def init_db():
                    (id,campaign_type,campaign_id,filename,file_hash,file_path,file_size,status,
                      total_rows,created_tasks,error_detail,whitelist_version_id,processing_started_at,last_progress_at,
                      processing_phase,processed_rows,matched_rows,current_chunk_index,total_chunks,worker_id,retry_count,
-                     last_error_class,last_error_at,next_retry_at,max_retry_count,detected_at,completed_at)
+                     last_error_class,last_error_at,next_retry_at,max_retry_count,source_state_version,detected_at,completed_at)
                    SELECT id,campaign_type,campaign_id,filename,file_hash,file_path,file_size,status,
                            total_rows,created_tasks,error_detail,whitelist_version_id,processing_started_at,last_progress_at,
                            processing_phase,processed_rows,matched_rows,current_chunk_index,total_chunks,worker_id,retry_count,
-                           last_error_class,last_error_at,next_retry_at,max_retry_count,detected_at,completed_at
+                           last_error_class,last_error_at,next_retry_at,max_retry_count,source_state_version,detected_at,completed_at
                    FROM processed_files
                    QUALIFY row_number() OVER (
                        PARTITION BY campaign_type,campaign_id,filename

@@ -715,15 +715,8 @@ def retry_realtime_file(file_id: int) -> Optional[dict]:
     result = ingestion_job_service.requeue_file(file_id)
     if not result:
         return None
-    write_transaction(
-        lambda conn: conn.execute(
-            "UPDATE processed_files SET status='queued',processing_phase='queued',next_retry_at=NULL WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
-            (job["campaign_id"], job["filename"]),
-        ),
-        attempts=3,
-        operation="monitor.realtime_file.retry",
-        base_delay=0.1,
-    )
+    from services import realtime_ingestion_state
+    realtime_ingestion_state.project_processed_file(file_id)
     return {"success": True, "file": result}
 
 
@@ -781,12 +774,8 @@ def archive_realtime_file(file_id: int) -> Optional[dict]:
         shutil.move(source, target)
     def write(conn):
         conn.execute(
-            "UPDATE ingestion_files SET status='archived',processing_phase='archived',file_path=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE ingestion_files SET status='archived',processing_phase='archived',file_path=?,state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (target, file_id),
-        )
-        conn.execute(
-            "UPDATE processed_files SET status='archived',processing_phase='archived',file_path=?,completed_at=COALESCE(completed_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)) WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
-            (target, job["campaign_id"], job["filename"]),
         )
 
     write_transaction(
@@ -795,6 +784,8 @@ def archive_realtime_file(file_id: int) -> Optional[dict]:
         operation="monitor.realtime_file.archive",
         base_delay=0.1,
     )
+    from services import realtime_ingestion_state
+    realtime_ingestion_state.project_processed_file(file_id, path=target)
     return {"success": True, "file_id": file_id, "archive_path": target}
 
 

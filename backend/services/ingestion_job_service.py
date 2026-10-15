@@ -1,5 +1,6 @@
 """Persistent file manifests and resumable ingestion chunk leases."""
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -19,6 +20,17 @@ FILE_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_FILE_LEASE_SECONDS", 
 _RETRY_DUE_SQL = "(next_retry_at IS NULL OR TRY_CAST(next_retry_at AS TIMESTAMPTZ) <= CURRENT_TIMESTAMP)"
 
 
+def _file_hash(path: str) -> str:
+    """Hash an input before entering the short authoritative DB transaction."""
+    if not path or not os.path.isfile(path):
+        return ""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def get_file(campaign_type: str, campaign_id: int, filename: str) -> Optional[dict]:
     row = read_transaction(
         lambda conn: conn.execute(
@@ -35,11 +47,13 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
                   total_rows: int = 0, chunk_size: int = 5000,
                   chunks: Optional[Iterable[dict]] = None, reset: bool = False,
                   whitelist_version_id: Optional[int] = None,
-                  reservation_token: str = "", manifest_id: Optional[int] = None) -> tuple[int, bool]:
+                  reservation_token: str = "", manifest_id: Optional[int] = None,
+                  file_hash: Optional[str] = None) -> tuple[int, bool]:
     """Register by stable business identity; a renamed file is a new manifest."""
     safe_filename = os.path.basename(filename)
     absolute_path = os.path.abspath(file_path) if file_path else ""
     file_size = os.path.getsize(absolute_path) if absolute_path and os.path.isfile(absolute_path) else 0
+    source_hash = str(file_hash or "").strip() or _file_hash(absolute_path)
     def write(conn):
         if reservation_token:
             reservation = conn.execute(
@@ -60,14 +74,16 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
             or existing is None
             or existing.get("manifest_id") in (None, int(manifest_id))
         )
-        if existing and existing["status"] == "completed" and not reset and same_manifest:
+        existing_hash = str(existing.get("file_hash") or "") if existing else ""
+        same_content = not source_hash or not existing_hash or source_hash == existing_hash
+        if existing and existing["status"] == "completed" and not reset and same_manifest and same_content:
             if reservation_token:
                 conn.execute(
                     "DELETE FROM realtime_inbox_reservations WHERE token=?",
                     (reservation_token,),
                 )
             return existing["id"], True
-        if existing and not reset and same_manifest and existing["file_path"] == absolute_path \
+        if existing and not reset and same_manifest and same_content and existing["file_path"] == absolute_path \
                 and int(existing.get("file_size", 0) or 0) == file_size:
             if reservation_token:
                 conn.execute(
@@ -78,23 +94,25 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
         if existing:
             file_id = existing["id"]
             conn.execute(
-                """UPDATE ingestion_files SET file_path=?,file_size=?,manifest_id=?,total_rows=?,chunk_size=?,
+                """UPDATE ingestion_files SET file_path=?,file_size=?,file_hash=?,manifest_id=?,total_rows=?,chunk_size=?,
                    total_chunks=0,completed_chunks=0,created_tasks=0,status='pending',
                    error_detail='',processing_phase='queued',processed_rows=0,matched_rows=0,
                    current_chunk_index=0,worker_id='',lease_token='',lease_expires_at=NULL,
                    retry_count=0,last_error_class='',last_error_at=NULL,next_retry_at=NULL,
                    whitelist_version_id=COALESCE(?,whitelist_version_id),
+                   state_version=COALESCE(state_version,0)+1,
                    updated_at=CURRENT_TIMESTAMP,completed_at=NULL WHERE id=?""",
-                (absolute_path, file_size, manifest_id, int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id, file_id),
+                (absolute_path, file_size, source_hash, manifest_id, int(total_rows or 0),
+                 max(1, int(chunk_size)), whitelist_version_id, file_id),
             )
-            if reset:
+            if reset or (source_hash and existing_hash and source_hash != existing_hash):
                 conn.execute("DELETE FROM ingestion_chunks WHERE file_id=?", (file_id,))
         else:
             file_id = conn.execute(
                 """INSERT INTO ingestion_files
-                   (campaign_type,campaign_id,filename,file_path,file_size,manifest_id,total_rows,chunk_size,whitelist_version_id)
-                   VALUES (?,?,?,?,?,?,?,?,?) RETURNING id""",
-                 (campaign_type, campaign_id, safe_filename, absolute_path, file_size,
+                   (campaign_type,campaign_id,filename,file_path,file_size,file_hash,manifest_id,total_rows,chunk_size,whitelist_version_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+                 (campaign_type, campaign_id, safe_filename, absolute_path, file_size, source_hash,
                   manifest_id, int(total_rows or 0), max(1, int(chunk_size)), whitelist_version_id),
             ).fetchone()["id"]
         chunk_rows = list(chunks or [])
@@ -108,7 +126,7 @@ def register_file(campaign_type: str, campaign_id: int, filename: str, file_path
             )
         if chunk_rows:
             conn.execute(
-                "UPDATE ingestion_files SET total_chunks=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                "UPDATE ingestion_files SET total_chunks=?,state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (len(chunk_rows), file_id),
             )
         if reservation_token:
@@ -257,7 +275,8 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
             """UPDATE ingestion_files SET status='processing',worker_id=?,lease_token=?,
                lease_expires_at=CAST(CURRENT_TIMESTAMP+(? * INTERVAL '1 second') AS VARCHAR),
                processing_started_at=COALESCE(processing_started_at,CAST(CURRENT_TIMESTAMP AS VARCHAR)),
-               last_progress_at=CURRENT_TIMESTAMP,processing_phase='queued',updated_at=CURRENT_TIMESTAMP
+               last_progress_at=CURRENT_TIMESTAMP,processing_phase='queued',
+               state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                WHERE id=? AND status IN ('pending','retrying')
                  AND """ + _RETRY_DUE_SQL + """
                  """ + (" AND campaign_id=?" if campaign_id is not None else "") + """
@@ -313,7 +332,8 @@ def update_progress(file_id: int, phase: str, processed_rows: Optional[int] = No
                     matched_rows: Optional[int] = None, chunk_index: Optional[int] = None,
                     total_chunks: Optional[int] = None, worker_id: Optional[str] = None,
                     whitelist_version_id: Optional[int] = None) -> None:
-    fields = ["processing_phase=?", "last_progress_at=CURRENT_TIMESTAMP", "updated_at=CURRENT_TIMESTAMP"]
+    fields = ["processing_phase=?", "state_version=COALESCE(state_version,0)+1",
+              "last_progress_at=CURRENT_TIMESTAMP", "updated_at=CURRENT_TIMESTAMP"]
     values = [phase]
     for column, value in (("processed_rows", processed_rows), ("matched_rows", matched_rows),
                           ("current_chunk_index", chunk_index), ("total_chunks", total_chunks),
@@ -341,7 +361,7 @@ def schedule_retry(file_id: int, error_class: str, error, delay_seconds: int,
             """UPDATE ingestion_files SET status='retrying',retry_count=?,last_error_class=?,
                last_error_at=CURRENT_TIMESTAMP,next_retry_at=CAST(CURRENT_TIMESTAMP + (? * INTERVAL '1 second') AS VARCHAR),
                processing_phase='queued',lease_token='',lease_expires_at=NULL,worker_id='',
-               updated_at=CURRENT_TIMESTAMP,error_detail=? WHERE id=?""",
+               state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP,error_detail=? WHERE id=?""",
             (retry_count, error_class, int(max(1, delay_seconds)), str(error)[:4000], file_id),
         )
         return {"scheduled": True, "retry_count": retry_count, "max_retry_count": max_retry_count}
@@ -361,7 +381,8 @@ def requeue_waiting_whitelist_files(campaign_id: int) -> int:
         result = conn.execute(
             """UPDATE ingestion_files SET status='pending',processing_phase='queued',retry_count=0,
                       last_error_class='',last_error_at=NULL,next_retry_at=NULL,error_detail='',
-                      lease_token='',lease_expires_at=NULL,worker_id='',updated_at=CURRENT_TIMESTAMP
+                      lease_token='',lease_expires_at=NULL,worker_id='',
+                      state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                WHERE campaign_type='realtime' AND campaign_id=?
                  AND last_error_class IN ('WAITING_DEPENDENCY','WHITELIST_INDEX')
                  AND status IN ('retrying','failed','quarantined')""",
@@ -390,7 +411,8 @@ def fail_file(file_id: int, error_class: str, error: str, status: str = "failed"
         conn.execute(
             """UPDATE ingestion_files SET status=?,processing_phase=?,last_error_class=?,
                last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,lease_token='',lease_expires_at=NULL,
-               worker_id='',error_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+               worker_id='',error_detail=?,state_version=COALESCE(state_version,0)+1,
+               updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (status, "quarantined" if status == "quarantined" else "failed", error_class, str(error)[:4000], file_id),
         )
     write_transaction(write, operation="realtime.ingestion.fail_file")
@@ -404,7 +426,8 @@ def expire_file(file_id: int, error: str, include_processing: bool = False) -> b
             """UPDATE ingestion_files SET status='failed',processing_phase='failed',
                last_error_class='EXPIRED_FILE',last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,
                lease_token='',lease_expires_at=NULL,worker_id='',error_detail=?,
-               completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               completed_at=CURRENT_TIMESTAMP,state_version=COALESCE(state_version,0)+1,
+               updated_at=CURRENT_TIMESTAMP
                WHERE id=? AND status IN """ + active_statuses,
             (str(error)[:4000], file_id),
         )
@@ -436,7 +459,8 @@ def expire_files(file_ids: Iterable[int], error: str,
             """UPDATE ingestion_files SET status='failed',processing_phase='failed',
                last_error_class='EXPIRED_FILE',last_error_at=CURRENT_TIMESTAMP,next_retry_at=NULL,
                lease_token='',lease_expires_at=NULL,worker_id='',error_detail=?,
-               completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               completed_at=CURRENT_TIMESTAMP,state_version=COALESCE(state_version,0)+1,
+               updated_at=CURRENT_TIMESTAMP
                WHERE id IN (""" + placeholders + ") AND status IN " + active_statuses,
             (str(error)[:4000], *ids),
         )
@@ -464,7 +488,8 @@ def complete_file(file_id: int) -> None:
         conn.execute(
             """UPDATE ingestion_files SET status='completed',processing_phase='completed',
                next_retry_at=NULL,lease_token='',lease_expires_at=NULL,worker_id='',
-               completed_at=CURRENT_TIMESTAMP,last_progress_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+               completed_at=CURRENT_TIMESTAMP,last_progress_at=CURRENT_TIMESTAMP,
+               state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                WHERE id=?""", (file_id,),
         )
     write_transaction(write, operation="realtime.ingestion.complete_file")
@@ -478,7 +503,8 @@ def requeue_file(file_id: int) -> Optional[dict]:
         updated = conn.execute(
             """UPDATE ingestion_files SET status='pending',processing_phase='queued',retry_count=0,
                last_error_class='',last_error_at=NULL,next_retry_at=NULL,error_detail='',
-               lease_token='',lease_expires_at=NULL,worker_id='',updated_at=CURRENT_TIMESTAMP
+               lease_token='',lease_expires_at=NULL,worker_id='',
+               state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                WHERE id=? RETURNING *""", (file_id,),
         ).fetchone()
         return dict(updated) if updated else None
@@ -496,7 +522,8 @@ def ensure_chunk(file_id: int, chunk_index: int, start_row: int, end_row: int,
         )
         conn.execute(
             """UPDATE ingestion_files SET total_chunks=GREATEST(total_chunks,?),
-               total_rows=GREATEST(total_rows,?),updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+               total_rows=GREATEST(total_rows,?),state_version=COALESCE(state_version,0)+1,
+               updated_at=CURRENT_TIMESTAMP WHERE id=?""",
             (chunk_index + 1, end_row, file_id),
         )
         row = conn.execute(
@@ -534,7 +561,7 @@ def claim_chunk(file_id: Optional[int] = None, chunk_index: Optional[int] = None
         ).fetchone()
         if claimed:
             conn.execute(
-                "UPDATE ingestion_files SET status='processing',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                "UPDATE ingestion_files SET status='processing',state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (claimed["file_id"],),
             )
             return dict(claimed)
@@ -567,7 +594,7 @@ def record_chunk_progress_in_transaction(conn, chunk_id: int, result: dict) -> N
     conn.execute(
         """UPDATE ingestion_files SET created_tasks=(
              SELECT COALESCE(SUM(created_tasks),0) FROM ingestion_chunks WHERE file_id=?
-           ), updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+           ), state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
         (row["file_id"], row["file_id"]),
     )
 
@@ -594,7 +621,7 @@ def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:
         """UPDATE ingestion_files SET
            completed_chunks=(SELECT COUNT(*) FROM ingestion_chunks WHERE file_id=? AND status='completed'),
            created_tasks=(SELECT COALESCE(SUM(created_tasks),0) FROM ingestion_chunks WHERE file_id=?),
-           updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+           state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
         (row["file_id"], row["file_id"], row["file_id"]),
     )
 
@@ -615,7 +642,7 @@ def fail_chunk_in_transaction(conn, chunk_id: int, error) -> None:
             (str(error)[:4000], chunk_id),
         )
         conn.execute(
-            "UPDATE ingestion_files SET status='failed',error_detail=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            "UPDATE ingestion_files SET status='failed',error_detail=?,state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (str(error)[:4000], row["file_id"]),
         )
 
@@ -641,7 +668,7 @@ def finish_file(file_id: int, status: str = "completed", error: str = "") -> Non
             final_status = "processing"
         conn.execute(
             """UPDATE ingestion_files SET status=?,total_chunks=?,completed_chunks=?,created_tasks=?,
-               error_detail=?,updated_at=CURRENT_TIMESTAMP,
+               error_detail=?,state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP,
                completed_at=CASE WHEN ?='completed' THEN CAST(CURRENT_TIMESTAMP AS VARCHAR) ELSE completed_at END
                WHERE id=?""",
             (final_status, counts["total"], counts["completed"] or 0, counts["created"],
@@ -675,7 +702,8 @@ def recover_expired_files() -> int:
         rows = conn.execute(
             """UPDATE ingestion_files SET status='pending',processing_phase='queued',
                lease_token='',lease_expires_at=NULL,worker_id='',
-               error_detail='file lease expired; recovered after restart',updated_at=CURRENT_TIMESTAMP
+               error_detail='file lease expired; recovered after restart',
+               state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                WHERE status='processing' AND lease_expires_at IS NOT NULL
                  AND CAST(lease_expires_at AS TIMESTAMP)<=CURRENT_TIMESTAMP RETURNING id"""
         ).fetchall()

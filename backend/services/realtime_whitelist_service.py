@@ -538,7 +538,7 @@ def repair_active_binding(limit: int = 10) -> int:
                     """UPDATE ingestion_files SET whitelist_version_id=?,status='pending',
                        processing_phase='queued',retry_count=0,last_error_class='',last_error_at=NULL,
                        next_retry_at=NULL,error_detail='',lease_token='',lease_expires_at=NULL,
-                       worker_id='',updated_at=CURRENT_TIMESTAMP
+                       worker_id='',state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                        WHERE campaign_type='realtime' AND campaign_id=? AND whitelist_version_id=?
                          AND status IN ('pending','retrying','failed','quarantined')""",
                     (candidate["id"], campaign_id, active_id),
@@ -548,7 +548,7 @@ def repair_active_binding(limit: int = 10) -> int:
                     """UPDATE ingestion_files SET whitelist_version_id=?,status='pending',
                        processing_phase='queued',retry_count=0,last_error_class='',last_error_at=NULL,
                        next_retry_at=NULL,error_detail='',lease_token='',lease_expires_at=NULL,
-                       worker_id='',updated_at=CURRENT_TIMESTAMP
+                       worker_id='',state_version=COALESCE(state_version,0)+1,updated_at=CURRENT_TIMESTAMP
                        WHERE campaign_type='realtime' AND campaign_id=?
                          AND status IN ('pending','retrying','failed','quarantined')
                          AND (whitelist_version_id IS NULL

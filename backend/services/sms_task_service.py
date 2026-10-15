@@ -832,6 +832,17 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                   "created_msisdns": []}
         phone_prefix = (campaign.get("phone_prefix") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
         template_map = _resolve_template_map(conn, campaign_type, campaign["id"], campaign)
+        task_source_identity = source_file
+        if campaign_type == "realtime" and ingestion_lease:
+            source_row = conn.execute(
+                "SELECT file_hash FROM ingestion_files WHERE id=?",
+                (ingestion_lease[0],),
+            ).fetchone()
+            source_hash = str(source_row["file_hash"] or "") if source_row else ""
+            if source_hash:
+                # Keep the public source_file filename stable, while making
+                # same-name/different-content manifests distinct task keys.
+                task_source_identity = f"{source_file}:{source_hash}"
         stage_rows = []
         for ordinal, raw in enumerate(rows):
             payload = {str(k): "" if v is None else str(v) for k, v in dict(raw).items()}
@@ -913,7 +924,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             for key, value in payload.items():
                 content = content.replace("{" + key + "}", value)
             dedupe_key = stable_task_dedupe_key(
-                campaign_type, campaign["id"], msisdn, task_date, source_file
+                campaign_type, campaign["id"], msisdn, task_date, task_source_identity
             )
             task_rows.append((
                 campaign_type, campaign["id"], batch_id, campaign.get("name", ""), msisdn,
@@ -975,6 +986,12 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             operation=f"sms_tasks.enqueue.{campaign_type}",
             lock_timeout=1.0,
         )
+        if campaign_type == "realtime" and ingestion_lease:
+            # Task/chunk authority is committed first.  The processed-file
+            # row is only a repairable display projection and must not be
+            # inside this OCC transaction.
+            from services import realtime_ingestion_state
+            realtime_ingestion_state.project_processed_file(ingestion_lease[0])
         result["duplicate"] += len(task_rows) - len(created)
         result["created"] += len(created)
         created_keys = {dedupe for _task_id, dedupe in created}

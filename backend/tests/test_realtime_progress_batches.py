@@ -69,7 +69,7 @@ def test_claim_file_does_not_write_advisory_fairness_row(job, monkeypatch):
     assert claimed and int(claimed["id"]) == int(job["id"])
 
 
-def test_progress_is_one_atomic_transaction_and_releases_gate(job):
+def test_progress_commits_authority_even_when_projection_row_is_missing(job):
     report = state.Progress(job["id"], job["processed_id"], job["lease_token"])
     assert report("matching", 10, 3, 1, 2)
     file, processed = rows(job)
@@ -78,11 +78,10 @@ def test_progress_is_one_atomic_transaction_and_releases_gate(job):
     conn.execute("DROP TABLE processed_files")
     conn.commit()
     conn.close()
-    with pytest.raises(duckdb.CatalogException):
-        report("matching", 99, force=True)
+    assert report("matching", 99, force=True)
     conn = database.get_connection()
     try:
-        assert conn.execute("SELECT processed_rows FROM ingestion_files WHERE id=?", (job["id"],)).fetchone()["processed_rows"] == 10
+        assert conn.execute("SELECT processed_rows FROM ingestion_files WHERE id=?", (job["id"],)).fetchone()["processed_rows"] == 99
     finally:
         conn.close()
     acquired = []
@@ -419,7 +418,7 @@ def test_realtime_recovery_budget_splits_large_chunk_and_preserves_checkpoint(jo
         conn.close()
 
 
-def test_duplicate_worker_completion_preserves_original_file_totals(job, monkeypatch):
+def test_duplicate_worker_completion_does_not_treat_mirror_totals_as_authority(job, monkeypatch):
     conn = database.get_connection()
     conn.execute("UPDATE processed_files SET status='completed',total_rows=100,created_tasks=9 WHERE id=?", (job["processed_id"],))
     conn.commit()
@@ -429,4 +428,5 @@ def test_duplicate_worker_completion_preserves_original_file_totals(job, monkeyp
     assert worker.process_once("test-worker") is True
     file, processed = rows(job)
     assert file["status"] == processed["status"] == "completed"
-    assert processed["total_rows"] == 100 and processed["created_tasks"] == 9
+    assert processed["total_rows"] == file["total_rows"] == 0
+    assert processed["created_tasks"] == file["created_tasks"] == 0

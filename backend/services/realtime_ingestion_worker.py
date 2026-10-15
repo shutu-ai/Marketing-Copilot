@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from database import read_transaction, write_transaction
+from database import read_transaction
 from services import backpressure_service
 from services import ingestion_job_service, operations_service, realtime_campaign_service, realtime_whitelist_service
 from services import realtime_ingestion_state
@@ -35,14 +35,23 @@ def _configured_worker_count() -> int:
 
 
 def _processed_id(campaign_id: int, filename: str):
-    row = read_transaction(
-        lambda conn: conn.execute(
-            "SELECT id FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
-            (campaign_id, filename),
-        ).fetchone(),
-        operation="realtime.ingestion.processed_file_lookup",
-    )
-    return row["id"] if row else None
+    try:
+        row = read_transaction(
+            lambda conn: conn.execute(
+                "SELECT id FROM processed_files WHERE campaign_type='realtime' AND campaign_id=? AND filename=?",
+                (campaign_id, filename),
+            ).fetchone(),
+            operation="realtime.ingestion.processed_file_lookup",
+        )
+        return row["id"] if row else None
+    except Exception as exc:
+        # This is a display-projection lookup only.  A missing/corrupt mirror
+        # must never turn a valid ingestion lease into a retry or quarantine.
+        logger.warning(
+            "Realtime processed-file lookup deferred campaign=%s file=%s error=%s",
+            campaign_id, filename, exc,
+        )
+        return None
 
 
 def _discard_expired_queued_files(include_processing: bool = False):
@@ -80,16 +89,10 @@ def _discard_expired_queued_files(include_processing: bool = False):
     if not expired_ids:
         return
     discarded_jobs = [job for job in expired_jobs if job["id"] in expired_ids]
-    write_transaction(
-        lambda conn: conn.executemany(
-            """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
-               processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
-               completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
-               WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
-            ((reason, job["campaign_id"], job["filename"]) for job in discarded_jobs),
-        ),
-        operation="realtime.ingestion.expired_processed_files",
-    )
+    for job in discarded_jobs:
+        realtime_ingestion_state.project_processed_file(
+            job["id"], path="", error=reason,
+        )
 
     for job in discarded_jobs:
         try:
@@ -136,17 +139,12 @@ def _discard_inactive_campaign_files() -> None:
     if not discarded_jobs:
         return
 
-    write_transaction(
-        lambda conn: conn.executemany(
-            """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
-               processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
-               completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
-               WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
-            (("campaign not found" if job.get("matched_campaign_id") is None else "campaign is not enabled",
-              job["campaign_id"], job["filename"]) for job in discarded_jobs),
-        ),
-        operation="realtime.ingestion.inactive_processed_files",
-    )
+    for job in discarded_jobs:
+        realtime_ingestion_state.project_processed_file(
+            job["id"], path="",
+            error=("campaign not found" if job.get("matched_campaign_id") is None
+                   else "campaign is not enabled"),
+        )
 
     for job in discarded_jobs:
         try:
@@ -173,7 +171,9 @@ def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str, worker
     else:
         ingestion_job_service.expire_file(job["id"], reason, include_processing=True)
         if processed_id:
-            operations_service.finish_file(processed_id, "failed", "", error=reason)
+            realtime_ingestion_state.project_processed_file(
+                job["id"], path="", error=reason,
+            )
     file_path = job.get("file_path", "")
     try:
         if file_path and os.path.isfile(file_path):
@@ -437,6 +437,20 @@ def _run_maintenance():
         now_monotonic = time.monotonic()
         if now_monotonic - _last_lease_recovery_at >= 30:
             recovered = realtime_ingestion_state.recover_expired_files()
+            try:
+                projection = realtime_ingestion_state.reconcile_processed_files(
+                    repair=True, limit=50,
+                )
+                if projection.get("issues"):
+                    logger.warning(
+                        "Realtime processed-file projection repaired drift=%s",
+                        len(projection["issues"]),
+                    )
+            except Exception:
+                logger.warning(
+                    "Realtime processed-file projection repair deferred",
+                    exc_info=True,
+                )
             _last_lease_recovery_at = now_monotonic
             if recovered:
                 logger.warning("Realtime expired file leases recovered count=%s", recovered)

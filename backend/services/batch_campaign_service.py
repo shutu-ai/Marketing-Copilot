@@ -729,7 +729,7 @@ def reset_batches_for_today(campaign_id: int) -> bool:
         )
         conn.execute(
             """UPDATE ingestion_files SET status='pending',completed_chunks=0,created_tasks=0,
-               error_detail='',completed_at=NULL,updated_at=CURRENT_TIMESTAMP
+               error_detail='',state_version=COALESCE(state_version,0)+1,completed_at=NULL,updated_at=CURRENT_TIMESTAMP
                WHERE campaign_type='batch' AND campaign_id=?""",
             (campaign_id,),
         )

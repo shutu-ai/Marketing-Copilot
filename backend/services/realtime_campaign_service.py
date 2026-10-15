@@ -1303,14 +1303,26 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         if os.path.isfile(archived):
             file_path = archived
             recovered_archive = True
-    try:
-        if lease_token:
-            file_record_id, duplicate_file = realtime_ingestion_state.register_processed(
-                campaign_id, file_path, original_filename, ingestion_file_id, lease_token,
+    # Direct callers without a worker lease still register the authoritative
+    # manifest first.  The processed-file row is never used for duplicate
+    # decisions; it is only projected after the authority commit.
+    if ingestion_file_id is None:
+        ingestion_file_id, duplicate_file = ingestion_job_service.register_file(
+            "realtime", campaign_id, original_filename, file_path,
+            chunk_size=_realtime_chunk_size(), reset=False,
+            whitelist_version_id=whitelist_version_id,
+        )
+        if duplicate_file:
+            duplicate_path = "" if recovered_archive else operations_service.archive_duplicate(
+                file_path, campaign.get("campaign_dir", ""), original_filename
             )
-        else:
-            file_record_id, duplicate_file = operations_service.register_file(
-                "realtime", campaign_id, file_path, original_filename)
+            return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
+                    "message": "file already processed"}
+    chunk_size = _realtime_chunk_size()
+    try:
+        file_record_id, duplicate_file = realtime_ingestion_state.register_processed(
+            campaign_id, file_path, original_filename, ingestion_file_id, lease_token,
+        )
     except realtime_ingestion_state.LeaseLost:
         raise
     except Exception as exc:
@@ -1322,12 +1334,6 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             file_path, campaign.get("campaign_dir", ""), original_filename)
         return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
                 "message": "file already processed"}
-    chunk_size = _realtime_chunk_size()
-    if ingestion_file_id is None:
-        ingestion_file_id, _ = ingestion_job_service.register_file(
-            "realtime", campaign_id, original_filename, file_path,
-            chunk_size=chunk_size, reset=False, whitelist_version_id=whitelist_version_id,
-        )
     if whitelist_version_id is None:
         whitelist_version_id = (realtime_whitelist_service.active_version(campaign_id) or {}).get("id")
     progress = realtime_ingestion_state.Progress(
@@ -2534,20 +2540,10 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
             )
             expired_jobs = [job for job in jobs if job["id"] in expired_ids]
             if expired_jobs:
-                def mark_processed_failed(conn):
-                    conn.executemany(
-                        """UPDATE processed_files SET status='failed',file_path='',error_detail=?,
-                           processing_phase='failed',last_progress_at=CURRENT_TIMESTAMP,
-                           completed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR)
-                           WHERE campaign_type='realtime' AND campaign_id=? AND filename=? AND status<>'completed'""",
-                        ((reason, job["campaign_id"], job["filename"]) for job in expired_jobs),
+                for job in expired_jobs:
+                    realtime_ingestion_state.project_processed_file(
+                        job["id"], path="", error=reason,
                     )
-                write_transaction(
-                    mark_processed_failed,
-                    attempts=3,
-                    operation="realtime.ingestion.closed_window_processed_files",
-                    lock_timeout=1.0,
-                )
         for job in expired_jobs:
             try:
                 path = job.get("file_path", "")
