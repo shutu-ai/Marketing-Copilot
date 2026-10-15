@@ -899,11 +899,11 @@ def duckdb_connection_config() -> dict:
     if os.path.isdir(extension_directory):
         config["extension_directory"] = extension_directory
     # DuckDB 1.2.0's OCC path is exercised by several application connections
-    # at once.  Keep connection-local vectorized execution single-threaded in
-    # OCC mode so a replay cannot corrupt variable-width authority columns;
-    # transaction concurrency remains OCC across connections.  Operators can
-    # override this for a newer DuckDB build after re-running the acceptance
-    # matrix.
+    # at once. Keep connection-local vectorized execution single-threaded by
+    # default; the process-level owner/cursor lifecycle above is the integrity
+    # boundary, while transaction concurrency remains OCC across cursors.
+    # Operators can override this for a newer DuckDB build after re-running
+    # the acceptance matrix.
     if _WRITE_CONCURRENCY == "occ":
         config["threads"] = str(os.environ.get("MC_DUCKDB_THREADS", "1"))
     return config
@@ -1263,10 +1263,44 @@ class WrappedConnection:
             pass
 
 
+# DuckDB 1.2.0's Python module keeps a shared database cache keyed by path.
+# Opening and closing that cache while several service threads create their own
+# short-lived connections is not a safe ownership lifecycle.  Keep one process
+# owner open for the lifetime of this coordinator and hand out independent
+# cursors; a cursor has its own transaction context while sharing the already
+# initialized native database.
+_ROOT_CONNECTION = None
+_ROOT_CONNECTION_PATH = None
+_ROOT_CONNECTION_LOCK = threading.Lock()
+
+
+def _root_connection():
+    global _ROOT_CONNECTION, _ROOT_CONNECTION_PATH
+    with _ROOT_CONNECTION_LOCK:
+        if _ROOT_CONNECTION is not None and _ROOT_CONNECTION_PATH != DATABASE_FILE:
+            _ROOT_CONNECTION.close()
+            _ROOT_CONNECTION = None
+            _ROOT_CONNECTION_PATH = None
+        if _ROOT_CONNECTION is None:
+            _ROOT_CONNECTION = duckdb.connect(
+                DATABASE_FILE, config=duckdb_connection_config()
+            )
+            _ROOT_CONNECTION_PATH = DATABASE_FILE
+        return _ROOT_CONNECTION
+
+
+def _close_root_connection() -> None:
+    global _ROOT_CONNECTION, _ROOT_CONNECTION_PATH
+    with _ROOT_CONNECTION_LOCK:
+        connection = _ROOT_CONNECTION
+        _ROOT_CONNECTION = None
+        _ROOT_CONNECTION_PATH = None
+    if connection is not None:
+        connection.close()
+
+
 def get_connection():
-    return WrappedConnection(
-        duckdb.connect(DATABASE_FILE, config=duckdb_connection_config())
-    )
+    return WrappedConnection(_root_connection().cursor())
 
 
 def reconnect(path: str = None):
@@ -1277,6 +1311,8 @@ def reconnect(path: str = None):
 
 def set_database_file(path: str):
     global DATABASE_FILE
+    if path != DATABASE_FILE:
+        _close_root_connection()
     DATABASE_FILE = path
 
 

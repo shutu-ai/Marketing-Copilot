@@ -127,6 +127,113 @@ def test_occ_conflict_retries_the_complete_transaction(tmp_path):
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
 
 
+def test_occ_conflict_preserves_variable_width_state_exactly(tmp_path):
+    result = _run_occ(
+        tmp_path,
+        """
+        import datetime, sys, threading
+        import database
+
+        database.set_database_file(sys.argv[1])
+        setup = database.get_connection()
+        setup.execute("CREATE TABLE authority(id INTEGER PRIMARY KEY, status VARCHAR NOT NULL, changed_at VARCHAR)")
+        setup.execute("INSERT INTO authority VALUES (1, 'processing', '')")
+        setup.close()
+
+        barrier = threading.Barrier(4, timeout=4)
+        attempts = 0
+        attempts_lock = threading.Lock()
+        errors = []
+
+        def worker(worker_id):
+            def tx(conn):
+                global attempts
+                with attempts_lock:
+                    attempts += 1
+                    first_attempt = attempts <= 4
+                if first_attempt:
+                    barrier.wait()
+                conn.execute(
+                    "UPDATE authority SET status='completed', changed_at=CAST(CURRENT_TIMESTAMP AS VARCHAR) WHERE id=1"
+                )
+            try:
+                database.write_transaction(
+                    tx, attempts=8, operation="test.varchar-conflict",
+                    base_delay=0.01, retry_jitter=0,
+                )
+            except BaseException as exc:
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        assert all(not thread.is_alive() for thread in threads), threads
+        assert not errors, errors
+        assert attempts >= 5, attempts
+        verify = database.get_connection()
+        try:
+            row = verify.execute(
+                "SELECT status, changed_at FROM authority WHERE id=1"
+            ).fetchone()
+            assert row["status"] == "completed", dict(row)
+            datetime.datetime.fromisoformat(row["changed_at"].replace("Z", "+00:00"))
+        finally:
+            verify.close()
+        """,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
+def test_concurrent_cursors_reuse_the_initialized_database_owner(tmp_path):
+    result = _run_occ(
+        tmp_path,
+        """
+        import sys, threading
+        import database
+
+        database.set_database_file(sys.argv[1])
+        setup = database.get_connection()
+        setup.execute("CREATE TABLE cursor_rows(id INTEGER PRIMARY KEY, value INTEGER)")
+        setup.executemany("INSERT INTO cursor_rows VALUES (?, 0)", [(1,), (2,)])
+        setup.close()
+
+        # Concurrent service threads must not race native database open/close for
+        # every short transaction after the process owner has been initialized.
+        database.duckdb.connect = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected native database open")
+        )
+        errors = []
+
+        def worker(row_id):
+            try:
+                conn = database.get_connection()
+                try:
+                    conn.execute("UPDATE cursor_rows SET value=value+1 WHERE id=?", (row_id,))
+                finally:
+                    conn.close()
+            except BaseException as exc:
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=worker, args=(row_id,)) for row_id in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        assert all(not thread.is_alive() for thread in threads), threads
+        assert not errors, errors
+        verify = database.get_connection()
+        try:
+            rows = verify.execute("SELECT value FROM cursor_rows ORDER BY id").fetchall()
+            assert [row["value"] for row in rows] == [1, 1]
+        finally:
+            verify.close()
+        """,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
 def test_maintenance_exclusive_drains_and_blocks_new_admission(tmp_path):
     result = _run_occ(
         tmp_path,
