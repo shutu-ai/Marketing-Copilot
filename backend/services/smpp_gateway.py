@@ -236,12 +236,104 @@ class _SmppConnection:
         # for submit_sm_resp so the configured window can stay in flight.
         self._send_lock = threading.Lock()
         self._window = threading.BoundedSemaphore(self.window_size)
+        # S2 Fair mode accounts one credit per submit_sm actually handed to the
+        # transport.  Legacy keeps the historical task-wide semaphore.  The two
+        # units are deliberately visible separately in status().
+        self._pdu_window_lock = threading.Condition(threading.RLock())
+        self._pdu_sequence_credits = {}
+        self._pdu_unbound_reservations = {}
+        self._pdu_retired_generations = set()
+        self._pdu_credit_stats = {"acquired": 0, "released": 0, "retired": 0}
         self._connection_generation = uuid.uuid4().hex
+        self._fair_handoff_permits = threading.BoundedSemaphore(1)
+        self._fair_handoff_lock = threading.Lock()
+        self._fair_active_handoffs = 0
         # A control action records the newest durable activity generation here
         # as a best-effort queue accelerator. The database generation/attempt
         # fence remains authoritative if this process is restarted.
         self._campaign_invalidations = {}
         self._campaign_invalidation_lock = threading.Lock()
+
+    def _fair_mode(self) -> bool:
+        from services import bounded_dispatch_service
+        return bounded_dispatch_service.mode() == "fair"
+
+    def _pdu_used_locked(self) -> int:
+        return len(self._pdu_sequence_credits) + len(self._pdu_unbound_reservations)
+
+    def _pdu_retire_locked(self):
+        """Clear a disconnected generation; late responses can never pay it."""
+        retired = (len(self._pdu_sequence_credits)
+                   + len(self._pdu_unbound_reservations))
+        self._pdu_sequence_credits.clear()
+        self._pdu_unbound_reservations.clear()
+        self._pdu_retired_generations.add(self._connection_generation)
+        self._pdu_credit_stats["retired"] += retired
+        if retired:
+            self._pdu_window_lock.notify_all()
+
+    def _pdu_retire(self):
+        with self._pdu_window_lock:
+            self._pdu_retire_locked()
+
+    def _pdu_reserve(self, generation: str, timeout: float):
+        """Reserve one not-yet-written PDU slot without blocking task workers."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        key = (generation, uuid.uuid4().hex)
+        with self._pdu_window_lock:
+            while generation not in self._pdu_retired_generations:
+                if self._pdu_used_locked() < self.window_size:
+                    self._pdu_unbound_reservations[key] = generation
+                    self._pdu_credit_stats["acquired"] += 1
+                    self._pdu_window_lock.notify_all()
+                    return key
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._pdu_window_lock.wait(min(remaining, 0.1))
+            return None
+
+    def _pdu_bind(self, reservation, sequence, generation: str) -> bool:
+        with self._pdu_window_lock:
+            if self._pdu_unbound_reservations.get(reservation) != generation:
+                return False
+            del self._pdu_unbound_reservations[reservation]
+            self._pdu_sequence_credits[(generation, int(sequence))] = reservation
+            return True
+
+    def _pdu_release_sequence_locked(self, sequence) -> bool:
+        # Called while holding _condition; acquire the independent PDU lock
+        # here so a response can safely settle its exact credit.
+        with self._pdu_window_lock:
+            key = next((item for item in self._pdu_sequence_credits
+                        if item[1] == int(sequence)), None)
+            if key is None:
+                return False
+            del self._pdu_sequence_credits[key]
+            self._pdu_credit_stats["released"] += 1
+            self._pdu_window_lock.notify_all()
+            return True
+
+    def _pdu_release_reservation(self, reservation) -> bool:
+        with self._pdu_window_lock:
+            if reservation not in self._pdu_unbound_reservations:
+                return False
+            del self._pdu_unbound_reservations[reservation]
+            self._pdu_credit_stats["released"] += 1
+            self._pdu_window_lock.notify_all()
+            return True
+
+    def _pdu_window_status(self) -> dict:
+        with self._pdu_window_lock:
+            return {
+                "unit": "submit_sm_pdu",
+                "limit": self.window_size,
+                "used": self._pdu_used_locked(),
+                "bound_sequences": len(self._pdu_sequence_credits),
+                "unbound_write_reservations": len(self._pdu_unbound_reservations),
+                "credits": dict(self._pdu_credit_stats),
+                "hard_limit": "IMPLEMENTED",
+            }
 
     @staticmethod
     def _text(value) -> str:
@@ -321,6 +413,10 @@ class _SmppConnection:
                 task, callback = self._send_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            fair_handoff = self._fair_mode()
+            if fair_handoff:
+                with self._fair_handoff_lock:
+                    self._fair_active_handoffs += 1
             try:
                 if self._is_invalidated_campaign_task(task):
                     metrics_service.inc(
@@ -349,6 +445,10 @@ class _SmppConnection:
                 )
             finally:
                 self._send_queue.task_done()
+                if fair_handoff:
+                    with self._fair_handoff_lock:
+                        self._fair_active_handoffs -= 1
+                    self._fair_handoff_permits.release()
 
     def _fail_queued_submissions(self, error: Exception):
         queued = []
@@ -435,12 +535,14 @@ class _SmppConnection:
             response_latency = self._response_latency_locked(sequence, outcome)
             outcomes.append(outcome)
         for sequence in submission.sequences:
+            self._pdu_release_sequence_locked(sequence)
             self._sequence_tasks.pop(sequence, None)
             self._sequence_persist_message_ids.pop(sequence, None)
             self._sequence_sent_at.pop(sequence, None)
             self._sequence_context.pop(sequence, None)
         self._async_submissions.pop(task_id, None)
-        self._window.release()
+        if not self._fair_mode():
+            self._window.release()
         failed = next((item for item in outcomes if not item["ok"]), None)
         accepted_parts = sum(1 for item in outcomes if item["ok"])
         if fast_send_service.is_fast_task(submission.task):
@@ -502,12 +604,14 @@ class _SmppConnection:
                         if current is None:
                             continue
                         for sequence in submission.sequences:
+                            self._pdu_release_sequence_locked(sequence)
                             self._sequence_tasks.pop(sequence, None)
                             self._sequence_persist_message_ids.pop(sequence, None)
                             self._sequence_sent_at.pop(sequence, None)
                             self._sequence_context.pop(sequence, None)
                             self._outcomes.pop(sequence, None)
-                        self._window.release()
+                        if not self._fair_mode():
+                            self._window.release()
                         metrics_service.inc(
                             "marketing_copilot_smpp_submit_sm_resp_timeout_total",
                             amount=len(submission.sequences),
@@ -546,12 +650,14 @@ class _SmppConnection:
             self._async_submissions.clear()
             for submission in submissions:
                 for sequence in submission.sequences:
+                    self._pdu_release_sequence_locked(sequence)
                     self._sequence_tasks.pop(sequence, None)
                     self._sequence_persist_message_ids.pop(sequence, None)
                     self._sequence_sent_at.pop(sequence, None)
                     self._sequence_context.pop(sequence, None)
                     self._outcomes.pop(sequence, None)
-                self._window.release()
+                if not self._fair_mode():
+                    self._window.release()
                 completions.append((submission.task, [], error, submission.callback))
             if submissions:
                 self._condition.notify_all()
@@ -599,7 +705,7 @@ class _SmppConnection:
         except Exception as exc:
             if self.connected:
                 self.last_error = str(exc)
-                logger.warning("SMPP listener stopped config=%s slot=%s: %s", self.config["id"], self.slot, exc)
+                logger.exception("SMPP listener stopped config=%s slot=%s", self.config["id"], self.slot)
         finally:
             self.connected = False
             self.state = "disconnected"
@@ -666,6 +772,10 @@ class _SmppConnection:
         self._fail_async_submissions(
             SmppDeliveryUnknownError("SMPP connection closed with pending submissions")
         )
+        # A failed write has no sequence.  Its unbound credit is proved dead at
+        # this generation boundary; late responses are ignored by the cleared
+        # sequence maps and can never release a newer generation.
+        self._pdu_retire()
         if stop_sender:
             self._fail_queued_submissions(
                 SmppDeliveryUnknownError("SMPP connection closed with queued submissions")
@@ -803,16 +913,38 @@ class _SmppConnection:
             )
 
     def try_send_async(self, task: dict, callback: Callable) -> bool:
-        """S1 handoff: never wait for Slot FIFO capacity on a shared worker."""
+        """S1 handoff: never wait for Slot FIFO capacity on a shared worker.
+
+        Fair mode additionally bounds each physical Slot to one not-yet-started
+        descriptor.  The permit transfers to the dedicated sender thread and is
+        released only after the send loop has taken ownership of the task (or
+        failed it before a socket write).  This is a shallow handoff fence, not
+        a substitute for the PDU credit ledger below.
+        """
         self._start_async_sender()
         self._start_async_reaper()
+        fair = self._fair_mode()
+        acquired = self._fair_handoff_permits.acquire(blocking=False) if fair else True
+        if fair and not acquired:
+            return False
         try:
             self._send_queue.put_nowait((task, callback))
+            if fair:
+                metrics_service.set_gauge(
+                    "marketing_copilot_smpp_fair_active_handoffs",
+                    self._fair_active_handoffs + 1,
+                    labels=self._metric_labels(),
+                )
             return True
         except queue.Full:
+            if fair:
+                self._fair_handoff_permits.release()
             return False
 
     def _send_windowed(self, task: dict) -> list[str]:
+        # Synchronous direct send is rejected in Fair mode and retains the
+        # historical task-wide window unit.
+        fair_window = False
         self.connect()
         import smpplib.consts
         parts, coding, esm_class = _make_task_parts(task)
@@ -900,6 +1032,7 @@ class _SmppConnection:
                     self._sequence_sent_at[sequence] = sent_at
                     self._sequence_context[sequence] = {
                         "task": task, "part_no": part_no,
+                        "window_generation": generation if fair_window else None,
                     }
                     if sequence in self._early_outcomes:
                         outcome = self._early_outcomes.pop(sequence)
@@ -965,23 +1098,26 @@ class _SmppConnection:
                     self._sequence_context.pop(seq, None)
 
     def _send_windowed_async(self, task: dict, callback: Callable):
-        wait_timeout = max(1.0, min(60.0, float(self.config.get("timeout") or 10) + 2.0))
-        window_wait_started = time.monotonic()
-        window_acquired = self._window.acquire(timeout=wait_timeout)
-        metrics_service.observe_histogram(
-            "marketing_copilot_smpp_window_wait_seconds",
-            time.monotonic() - window_wait_started,
-            labels=self._metric_labels(),
-        )
-        if not window_acquired:
-            metrics_service.inc(
-                "marketing_copilot_smpp_window_exhausted_total",
-                labels={"config_id": self.config["id"], "slot": self.slot},
+        fair_window = self._fair_mode()
+        if not fair_window:
+            wait_timeout = max(1.0, min(60.0, float(self.config.get("timeout") or 10) + 2.0))
+            window_wait_started = time.monotonic()
+            window_acquired = self._window.acquire(timeout=wait_timeout)
+            metrics_service.observe_histogram(
+                "marketing_copilot_smpp_window_wait_seconds",
+                time.monotonic() - window_wait_started,
+                labels=self._metric_labels(),
             )
-            self._dispatch_async_completion(
-                task, [], SmppWindowExhaustedError(), callback,
-            )
-            return
+            if not window_acquired:
+                metrics_service.inc(
+                    "marketing_copilot_smpp_window_exhausted_total",
+                    labels={"config_id": self.config["id"], "slot": self.slot},
+                )
+                self._dispatch_async_completion(
+                    task, [], SmppWindowExhaustedError(), callback,
+                )
+                return
+        reservation = None
         try:
             connect_started = time.monotonic()
             self.connect()
@@ -1002,7 +1138,12 @@ class _SmppConnection:
             task_id = task.get("id")
             if task_id is None:
                 raise ValueError("SMPP async submission requires a task id")
+            dispatch_reservation = task.get("_dispatch_reservation")
+            if dispatch_reservation is not None and len(parts) != int(
+                    dispatch_reservation.cost["parts"]):
+                raise SmppSubmissionNotAllowedError("encoded parts differ from reserved cost")
             persist_message_ids = self._persist_message_ids(task)
+            generation = self._connection_generation
             if fast_send_service.is_fast_task(task):
                 attempt_token = fast_send_service.prepare_task(
                     task, len(parts),
@@ -1011,7 +1152,7 @@ class _SmppConnection:
             else:
                 attempt_token = sms_task_service.record_send_intent(
                     task, self.config["id"], self.slot, len(parts),
-                    self._connection_generation,
+                    generation,
                 )
             if not attempt_token:
                 raise SmppSubmissionNotAllowedError(
@@ -1020,11 +1161,13 @@ class _SmppConnection:
                 )
             source_addr = task.get("source_addr") or self.config.get("source_addr") or "Marketing"
             detail_logger.info(
-                "[SMPP ASYNC SEND] task=%s msisdn=%s config=%s slot=%s parts=%s",
+                "[SMPP ASYNC SEND] task=%s msisdn=%s config=%s slot=%s parts=%s window_unit=%s",
                 task_id, task.get("msisdn"), self.config.get("id"), self.slot, len(parts),
+                "pdu" if fair_window else "task",
             )
         except Exception as exc:
-            self._window.release()
+            if not fair_window:
+                self._window.release()
             error = exc if isinstance(exc, SmppSubmitError) else SmppDeliveryUnknownError(str(exc))
             self._dispatch_async_completion(task, [], error, callback)
             return
@@ -1033,12 +1176,24 @@ class _SmppConnection:
         parts_loop_started = time.monotonic()
         try:
             for part_no, part in enumerate(parts, 1):
+                if self._is_invalidated_campaign_task(task):
+                    raise SmppSubmissionNotAllowedError(
+                        "campaign dispatch generation was invalidated before socket write"
+                    )
                 if not self._throttle():
                     raise SmppSubmissionNotAllowedError(
                         "SMPP submission stopped before socket write"
                     )
                 from services.bounded_dispatch_service import assert_delivery_safe
                 assert_delivery_safe(task)
+                if fair_window:
+                    reservation = self._pdu_reserve(
+                        generation, max(0.0, float(self.config.get("timeout") or 10))
+                    )
+                    if reservation is None:
+                        raise SmppWindowExhaustedError(
+                            "Fair PDU window remained exhausted before submit_sm"
+                        )
                 send_started = time.monotonic()
                 send_lock_started = time.monotonic()
                 with self._send_lock:
@@ -1058,6 +1213,8 @@ class _SmppConnection:
                         )
                 if fast_send_service.is_fast_task(task):
                     task["_fast_socket_submitted"] = True
+                if fair_window:
+                    self._pdu_bind(reservation, pdu.sequence, generation)
                 sent_at = time.monotonic()
                 metrics_service.inc(
                     "marketing_copilot_smpp_submit_sm_sent_total",
@@ -1096,6 +1253,7 @@ class _SmppConnection:
                     self._sequence_sent_at[sequence] = sent_at
                     self._sequence_context[sequence] = {
                         "task": task, "part_no": part_no,
+                        "window_generation": generation if fair_window else None,
                     }
                     if sequence in self._early_outcomes:
                         early_outcome = self._early_outcomes.pop(sequence)
@@ -1145,13 +1303,22 @@ class _SmppConnection:
                 error = SmppDeliveryUnknownError(f"connection lost after submit: {exc}")
             with self._condition:
                 for sequence in sequences:
+                    self._pdu_release_sequence_locked(sequence)
                     self._sequence_tasks.pop(sequence, None)
                     self._sequence_persist_message_ids.pop(sequence, None)
                     self._sequence_sent_at.pop(sequence, None)
                     self._sequence_context.pop(sequence, None)
                     self._outcomes.pop(sequence, None)
                 if self._async_submissions.pop(task_id, None) is None:
-                    self._window.release()
+                    if fair_window:
+                        if task.get("_socket_write_started"):
+                            # A failed/ambiguous write keeps its unbound credit
+                            # until this generation is isolated and closed.
+                            self._pdu_release_reservation(reservation)
+                    else:
+                        self._window.release()
+                elif fair_window:
+                    self._pdu_release_reservation(reservation)
             self._dispatch_async_completion(task, [], error, callback)
         finally:
             metrics_service.set_gauge(
@@ -1161,9 +1328,13 @@ class _SmppConnection:
 
     def status(self):
         configured_route_tps = max(0.0, float(self.config.get("tps") or 0))
+        fair = self._fair_mode()
         return {"slot": self.slot, "state": self.state, "connected": self.connected,
                 "last_error": self.last_error, "last_connected_at": self.last_connected_at,
                 "window_size": self.window_size, "inflight": len(self._sequence_tasks),
+                "window_unit": "submit_sm_pdu" if fair else "task",
+                "pdu_window": self._pdu_window_status() if fair else None,
+                "fair_active_handoffs": self._fair_active_handoffs,
                 "send_queue_size": self._send_queue.qsize(),
                 "send_queue_capacity": self._send_queue_capacity,
                 "configured_route_tps": configured_route_tps,
@@ -1179,6 +1350,7 @@ class SmppGateway:
         self._lock = threading.RLock()
         self._pools = {}
         self._round_robin = {}
+        self._fair_served = {}
         self._down_until = {}
         self._last_error = ""
         self._active_config_id = None
@@ -1340,6 +1512,22 @@ class SmppGateway:
         return next((c for c in candidates
                      if time.monotonic() >= self._down_until.get(c["id"], 0)), None)
 
+    def _fair_pool(self, config: dict):
+        """Return the revision-isolated physical pool without RR side effects."""
+        config_id = int(config["id"])
+        desired = max(1, min(20, int(config.get("pool_size") or 1)))
+        with self._lock:
+            pool = self._pools.setdefault(config_id, [])
+            retained = [item for item in pool
+                        if item.config.get("updated_at") == config.get("updated_at")]
+            # Removing a stale object must not join its listener on a task
+            # worker. Its disconnected generation fails closed; process shutdown
+            # and recover() remain the lifecycle cleanup paths.
+            pool[:] = retained
+            while len(pool) < desired:
+                pool.append(self._connection_factory(config, len(pool) + 1))
+            return list(pool)
+
     def try_send_async(self, task: dict, callback: Callable) -> bool:
         reservation = task.get("_dispatch_reservation")
         if reservation is None or reservation.state != "prepare":
@@ -1350,10 +1538,27 @@ class SmppGateway:
             raise SmppSubmissionNotAllowedError("resolved route changed before handoff")
         # Connection establishment belongs to the existing Slot sender. No
         # connect(), throttle, window wait or FIFO wait on the SMS worker.
-        connection = self._connection_for(config, connect=False)
-        task["_delivery_receipt_mode"] = config.get("delivery_receipt_mode") or "optional"
-        task["_transport_smpp_config_id"] = config["id"]
-        return connection.try_send_async(task, callback)
+        connections = self._fair_pool(config)
+        candidates = sorted(
+            connections,
+            key=lambda item: (
+                1 if item._fair_active_handoffs else 0,
+                self._fair_served.get(reservation.group, 0),
+                self._round_robin.get(config["id"], 0),
+                item.slot,
+            ),
+        )
+        for connection in candidates:
+            task["_delivery_receipt_mode"] = config.get("delivery_receipt_mode") or "optional"
+            task["_transport_smpp_config_id"] = config["id"]
+            if connection.try_send_async(task, callback):
+                self._fair_served[reservation.group] = self._fair_served.get(reservation.group, 0) + 1
+                with self._lock:
+                    self._round_robin[config["id"]] = (
+                        self._round_robin.get(config["id"], 0) + 1
+                    )
+                return True
+        return False
 
     def disconnect(self, config_id=None):
         with self._lock:
@@ -1401,7 +1606,10 @@ class SmppGateway:
                           "cooldown_seconds": max(0, round(self._down_until.get(config["id"], 0) - time.monotonic(), 1))})
         return {"state": "bound" if self.connected else "disconnected", "connected": self.connected,
                 "config_id": self._active_config_id, "active_config_id": self._active_config_id,
-                "enabled_configs": len(configs), "pools": pools, "last_error": self._last_error}
+                "enabled_configs": len(configs), "pools": pools, "last_error": self._last_error,
+                "dispatch_fairness": "IMPLEMENTED_NOT_VERIFIED",
+                "socket_fairness": "NOT_VERIFIED",
+                "pdu_window_hard_limit": "NOT_VERIFIED"}
 
 
 gateway = SmppGateway()

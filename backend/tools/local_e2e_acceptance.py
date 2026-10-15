@@ -232,6 +232,18 @@ class AcceptanceRunner:
         ).strip().lower()
         if self.send_mode not in {"reliable", "fast"}:
             raise ValueError("send mode must be reliable or fast")
+        self.dispatch_mode = str(
+            getattr(args, "dispatch_mode", None)
+            or os.environ.get("MC_CAMPAIGN_DISPATCH_MODE", "legacy")
+        ).strip().lower()
+        if self.dispatch_mode not in {"legacy", "fair"}:
+            raise ValueError("dispatch mode must be legacy or fair")
+        self.db_concurrency = str(
+            getattr(args, "db_concurrency", None)
+            or os.environ.get("MC_DUCKDB_WRITE_CONCURRENCY", "serialized")
+        ).strip().lower()
+        if self.db_concurrency not in {"serialized", "occ"}:
+            raise ValueError("database concurrency must be serialized or occ")
         self.pool_size = max(1, int(getattr(args, "pool_size", 1) or 1))
         self.flash_sms = bool(getattr(args, "flash_sms", False))
         self.no_live_observer = bool(getattr(args, "no_live_observer", False))
@@ -315,6 +327,8 @@ class AcceptanceRunner:
             "MC_SMPP_SEND_QUEUE_CAPACITY": str(max(1, self.args.smpp_send_queue_capacity)),
             "MC_TASK_ARCHIVE_ENABLED": "false",
             "MC_SMS_SEND_MODE": self.send_mode,
+            "MC_CAMPAIGN_DISPATCH_MODE": self.dispatch_mode,
+            "MC_DUCKDB_WRITE_CONCURRENCY": self.db_concurrency,
         })
         return env
 
@@ -1247,6 +1261,9 @@ class AcceptanceRunner:
                     "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
                     "delivery_receipt_mode": self.delivery_receipt_mode,
                     "send_mode": self.send_mode,
+                    "dispatch_mode": self.dispatch_mode,
+                    "dispatch_mode_effective": self.dispatch_mode,
+                    "db_concurrency": self.db_concurrency,
                     "live_env_status": "LIVE_ENV_UNVERIFIED",
                 },
                 "diagnostics": {
@@ -1433,6 +1450,9 @@ class AcceptanceRunner:
                 "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
                 "delivery_receipt_mode": self.delivery_receipt_mode,
                 "send_mode": self.send_mode,
+                "dispatch_mode": self.dispatch_mode,
+                "dispatch_mode_effective": self.dispatch_mode,
+                "db_concurrency": self.db_concurrency,
                 "flash_sms": self.flash_sms,
                 "live_env_status": "LIVE_ENV_UNVERIFIED",
             },
@@ -1598,6 +1618,14 @@ def main() -> int:
     parser.add_argument(
         "--send-mode", choices=("reliable", "fast"), default=None,
         help="send pipeline for the isolated run; default is reliable",
+    )
+    parser.add_argument(
+        "--dispatch-mode", choices=("legacy", "fair"), default=None,
+        help="campaign dispatch mode for the isolated API; explicit fair is required for S2",
+    )
+    parser.add_argument(
+        "--db-concurrency", choices=("serialized", "occ"), default=None,
+        help="DuckDB write concurrency for the isolated API",
     )
     parser.add_argument("--flash-sms", action="store_true", help="create the loopback campaign with Flash SMS enabled")
     parser.add_argument("--task-workers", type=int, default=2)
