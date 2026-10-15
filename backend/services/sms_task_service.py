@@ -982,7 +982,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
 
         created, chunk_committed, chunk_progress_committed = write_transaction(
             persist,
-            attempts=3,
+            attempts=5,
             operation=f"sms_tasks.enqueue.{campaign_type}",
             lock_timeout=1.0,
         )

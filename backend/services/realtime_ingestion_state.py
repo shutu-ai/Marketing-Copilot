@@ -432,7 +432,7 @@ class Progress:
         self.last_attempt = now
         try:
             transaction(
-                self._write, attempts=3 if force else 1,
+                self._write, attempts=5 if force else 1,
                 lock_timeout=None if force else 0.1,
             )
         except Exception as exc:
