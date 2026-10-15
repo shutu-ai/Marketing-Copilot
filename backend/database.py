@@ -895,9 +895,18 @@ def duckdb_connection_config() -> dict:
         extension_directory = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "offline", "extensions"
         )
+    config = {}
     if os.path.isdir(extension_directory):
-        return {"extension_directory": extension_directory}
-    return {}
+        config["extension_directory"] = extension_directory
+    # DuckDB 1.2.0's OCC path is exercised by several application connections
+    # at once.  Keep connection-local vectorized execution single-threaded in
+    # OCC mode so a replay cannot corrupt variable-width authority columns;
+    # transaction concurrency remains OCC across connections.  Operators can
+    # override this for a newer DuckDB build after re-running the acceptance
+    # matrix.
+    if _WRITE_CONCURRENCY == "occ":
+        config["threads"] = str(os.environ.get("MC_DUCKDB_THREADS", "1"))
+    return config
 
 DATABASE_FILE = os.environ.get(
     "DUCKDB_PATH",
