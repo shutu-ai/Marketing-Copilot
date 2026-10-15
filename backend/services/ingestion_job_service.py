@@ -602,7 +602,12 @@ def record_chunk_progress_in_transaction(conn, chunk_id: int, result: dict) -> N
 def is_completed_chunk_status(status) -> bool:
     """Recognize a completed checkpoint even if an OCC replay duplicated text."""
     value = str(status or "")
-    return value == "completed" or value.startswith("completed")
+    # DuckDB 1.2.0 may preserve the previous value while replaying a
+    # variable-width update, producing values such as
+    # ``processingcompleted`` or ``completedcompleted``.  Both contain a
+    # durable completion marker and must be normalized idempotently rather
+    # than treated as a live lease.
+    return value == "completed" or "completed" in value
 
 
 def complete_chunk_in_transaction(conn, chunk_id: int, result: dict) -> None:

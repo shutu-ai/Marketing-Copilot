@@ -73,7 +73,7 @@ def transaction(callback, attempts=5, lock_timeout=None):
     """Run the DB-only state transaction through the shared coordinator."""
     return write_transaction(
         callback,
-        attempts=max(1, min(5, int(attempts or 1))),
+        attempts=max(1, min(8, int(attempts or 1))),
         operation="realtime.ingestion.state",
         lock_timeout=lock_timeout,
     )

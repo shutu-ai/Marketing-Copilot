@@ -603,7 +603,7 @@ def write_transaction(callback, attempts: int = 5, operation: str = "write",
     only the failed statement can leave earlier statements from the logical
     operation missing or partially committed.
     """
-    attempts = max(1, min(5, int(attempts or 1)))
+    attempts = max(1, min(8, int(attempts or 1)))
     if deadline is not None:
         try:
             deadline = float(deadline)
