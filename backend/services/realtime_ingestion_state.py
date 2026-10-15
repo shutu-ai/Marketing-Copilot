@@ -69,7 +69,7 @@ def transient(error):
     return isinstance(error, TimeoutError) or is_transient_write_error(error)
 
 
-def transaction(callback, attempts=3, lock_timeout=None):
+def transaction(callback, attempts=5, lock_timeout=None):
     """Run the DB-only state transaction through the shared coordinator."""
     return write_transaction(
         callback,
@@ -79,7 +79,7 @@ def transaction(callback, attempts=3, lock_timeout=None):
     )
 
 
-def processed_transaction(callback, attempts=3, lock_timeout=None):
+def processed_transaction(callback, attempts=5, lock_timeout=None):
     """Run a short projection transaction under the mirror-only guard.
 
     Authoritative ingestion writes must use :func:`transaction` directly.
@@ -188,7 +188,7 @@ def _project_processed_snapshot(snapshot: dict) -> int | None:
         ).fetchone()
         return int(row["id"]) if row else None
 
-    return processed_transaction(write, attempts=3, lock_timeout=1.0)
+    return processed_transaction(write, attempts=5, lock_timeout=1.0)
 
 
 def project_processed_file(file_id: int, *, status=None, path=None, error=None) -> int | None:
@@ -338,7 +338,7 @@ def register_processed(campaign_id, path, filename, file_id, token):
 
     # The file hash is calculated before this short authority transaction.  A
     # mirror insert/update is intentionally a separate best-effort projection.
-    authoritative = transaction(write, attempts=3)
+    authoritative = transaction(write, attempts=5)
     processed_id = None
     try:
         processed_id = _project_processed_snapshot(

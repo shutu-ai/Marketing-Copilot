@@ -593,7 +593,7 @@ def write_busy_message(error: BaseException) -> str:
     return "数据库写入失败，请联系管理员"
 
 
-def write_transaction(callback, attempts: int = 3, operation: str = "write",
+def write_transaction(callback, attempts: int = 5, operation: str = "write",
                       lock_timeout=None, base_delay: float = 0.05,
                       deadline=None, retry_jitter: float = None):
     """Run a complete short write transaction with bounded retry.

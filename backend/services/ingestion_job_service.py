@@ -295,7 +295,7 @@ def claim_file(campaign_type: str = "realtime", worker_id: str = "",
         return None
     return write_transaction(
         claim,
-        attempts=3,
+        attempts=5,
         operation="realtime.ingestion.file_claim",
         lock_timeout=1.0,
     )
