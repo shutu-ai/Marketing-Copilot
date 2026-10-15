@@ -57,10 +57,13 @@ except (TypeError, ValueError):
 try:
     _OCC_RETRY_JITTER_SECONDS = max(
         0.0,
-        float(os.environ.get("MC_DUCKDB_OCC_RETRY_JITTER_MS", "25")) / 1000.0,
+        # A wider default spreads complete-transaction replays across the
+        # worker pool.  OCC remains fully enabled; operators can still tune
+        # this with MC_DUCKDB_OCC_RETRY_JITTER_MS for a constrained runtime.
+        float(os.environ.get("MC_DUCKDB_OCC_RETRY_JITTER_MS", "100")) / 1000.0,
     )
 except (TypeError, ValueError):
-    _OCC_RETRY_JITTER_SECONDS = 0.025
+    _OCC_RETRY_JITTER_SECONDS = 0.1
 
 
 class _AdmissionToken:
