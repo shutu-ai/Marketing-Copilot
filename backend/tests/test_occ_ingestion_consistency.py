@@ -188,3 +188,33 @@ def test_same_name_different_hash_starts_a_new_manifest(authority_file):
     assert row["status"] == "pending"
     assert row["file_hash"]
     assert row["state_version"] > 0
+
+
+def test_invalid_replayed_chunk_status_is_replayable(authority_file):
+    item = authority_file
+    conn = database.get_connection()
+    try:
+        chunk_id = conn.execute(
+            """INSERT INTO ingestion_chunks(file_id,chunk_index,start_row,end_row,
+               status) VALUES (?,?,?,?,?) RETURNING id""",
+            (item["file_id"], 0, 0, 1, "completedcompleted"),
+        ).fetchone()["id"]
+        conn.commit()
+    finally:
+        conn.close()
+
+    claimed = state.prepare_chunk(
+        item["file_id"], 0, 0, 1, item["job"]["lease_token"],
+    )
+    assert claimed["id"] == chunk_id
+    assert claimed["status"] == "processing"
+    state.complete_chunk(
+        item["file_id"], claimed, {}, item["job"]["lease_token"],
+    )
+    conn = database.get_connection()
+    try:
+        assert conn.execute(
+            "SELECT status FROM ingestion_chunks WHERE id=?", (chunk_id,)
+        ).fetchone()["status"] == "completed"
+    finally:
+        conn.close()

@@ -481,6 +481,20 @@ def prepare_chunk(file_id, index, start, end, token=""):
         row = conn.execute("SELECT * FROM ingestion_chunks WHERE file_id=? AND chunk_index=?", (file_id, index)).fetchone()
         if row["status"] == "completed":
             return dict(row)
+        # DuckDB 1.2.0 can leave a repeated text value after an OCC commit
+        # conflict (for example, ``completedcompleted``).  It is not a valid
+        # checkpoint state; make it replayable so task dedupe can safely finish
+        # the logical chunk instead of treating it as a held lease forever.
+        if str(row["status"] or "") not in {"pending", "processing", "failed"}:
+            conn.execute(
+                """UPDATE ingestion_chunks SET status='failed',lease_token='',
+                   lease_expires_at=NULL,error_detail='invalid checkpoint state recovered',
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (row["id"],),
+            )
+            row = conn.execute(
+                "SELECT * FROM ingestion_chunks WHERE id=?", (row["id"],)
+            ).fetchone()
         claimed = conn.execute(
             """UPDATE ingestion_chunks SET status='processing',attempts=attempts+1,lease_token=?,
                lease_expires_at=CAST(CURRENT_TIMESTAMP+(? * INTERVAL '1 second') AS VARCHAR),
@@ -499,7 +513,12 @@ def prepare_chunk(file_id, index, start, end, token=""):
 def complete_chunk_in_transaction(conn, file_id, chunk, result, token=""):
     assert_owned(conn, file_id, token)
     row = conn.execute("SELECT status,lease_token FROM ingestion_chunks WHERE id=?", (chunk["id"],)).fetchone()
-    if not row or row["status"] != "processing" or row["lease_token"] != chunk["lease_token"]:
+    if not row:
+        raise LeaseLost(f"realtime chunk lease lost: {chunk['id']}")
+    if ingestion_job_service.is_completed_chunk_status(row["status"]):
+        ingestion_job_service.complete_chunk_in_transaction(conn, chunk["id"], result)
+        return
+    if row["status"] != "processing" or row["lease_token"] != chunk["lease_token"]:
         raise LeaseLost(f"realtime chunk lease lost: {chunk['id']}")
     ingestion_job_service.complete_chunk_in_transaction(conn, chunk["id"], result)
 
@@ -539,6 +558,14 @@ def transition(file_id, processed_id, token, status, error_class="", error="", d
     def write(conn):
         assert_owned(conn, file_id, token)
         if status == "completed":
+            # Normalize a checkpoint duplicated by an OCC replay before
+            # checking completeness. Task dedupe makes replay safe.
+            conn.execute(
+                """UPDATE ingestion_chunks SET status='completed',lease_token='',
+                   lease_expires_at=NULL,updated_at=CURRENT_TIMESTAMP
+                   WHERE file_id=? AND status LIKE 'completed%' AND status<>'completed'""",
+                (file_id,),
+            )
             incomplete = conn.execute("SELECT COUNT(*) n FROM ingestion_chunks WHERE file_id=? AND status<>'completed'", (file_id,)).fetchone()["n"]
             if incomplete:
                 raise RuntimeError("Cannot complete realtime file with incomplete chunks")
