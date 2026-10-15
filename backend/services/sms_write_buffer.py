@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from database import is_transient_write_error, write_transaction
 from services import result_journal_service
+from services import result_capacity_service as capacity
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class WriteItem:
     metrics_recorded: bool = False
     terminal_state: str = ""
     terminal_error: str = ""
+    credit: object = None
+    retry_scheduled: bool = False
 
 
 _KIND_QUEUE = {
@@ -74,6 +77,12 @@ _quarantined: dict[str, str] = {}
 _retry_heap: list[tuple[float, int, WriteItem]] = []
 _pending_condition = threading.Condition(_guard)
 _loaded_paths: set[str] = set()
+_start_lock = threading.Lock()
+_replay_iterator = None
+_replay_next = None
+_replay_remaining = False
+_replay_path = ""
+_quarantine_count = 0
 MAX_RETRIES = max(3, min(100, int(os.environ.get("MC_SMS_WRITE_MAX_RETRIES", "10"))))
 try:
     TRANSIENT_LOG_INTERVAL = max(
@@ -116,19 +125,31 @@ class _PartialCommitError(RuntimeError):
 
 
 def start() -> None:
-    global _thread
-    with _guard:
+    global _thread, _replay_iterator, _replay_remaining, _replay_path, _quarantine_count
+    with _start_lock:
         if _thread and _thread.is_alive():
             return
         result_journal_service.start()
         state = result_journal_service.load_state()
         journal_path = state["path"]
         if journal_path not in _loaded_paths:
-            for record in state["pending"]:
-                _restore_event(record, journal_path)
+            if capacity.enabled():
+                capacity.ledger.recovering = True
+                if os.path.exists(journal_path + ".rejected.jsonl"):
+                    capacity.ledger.fail("rejected result evidence requires reconciliation")
+                _replay_iterator = iter(state["pending"])
+                _replay_path = journal_path
+                _replay_remaining = bool(state["pending"])
+                if not _replay_remaining:
+                    capacity.ledger.recovering = False
+            else:
+                for record in state["pending"]:
+                    _restore_event(record, journal_path)
             for item in state["quarantined"]:
                 event_id = str(item["event"].get("event_id") or "")
-                _quarantined[event_id] = str(item["terminal"].get("error") or "quarantined")
+                _quarantine_count += 1
+                if not capacity.enabled() or len(_quarantined) < 16:
+                    _quarantined[event_id] = str(item["terminal"].get("error") or "quarantined")
             _loaded_paths.add(journal_path)
         _stop.clear()
         _thread = threading.Thread(target=_run, name="sms-db-write-buffer", daemon=True)
@@ -144,8 +165,25 @@ def _next_sequence() -> int:
 def _restore_event(record: dict[str, Any], journal_path: str) -> None:
     event_id = str(record.get("event_id") or "")
     kind = str(record.get("kind") or "")
-    if not event_id or kind not in _KIND_QUEUE or event_id in _pending:
+    if not event_id or kind not in _KIND_QUEUE:
+        if capacity.enabled():
+            capacity.ledger.fail("unknown or malformed durable result event; replay blocked")
+            raise capacity.ResultCapacityError(
+                "unknown or malformed durable result event; replay blocked"
+            )
         return
+    if event_id in _pending:
+        return True
+    credit = None
+    if capacity.enabled():
+        capacity.validate(record)
+        size = len(result_journal_service._encoded_line(record))
+        if size > capacity.MAX_EVENT:
+            capacity.ledger.fail("historical pending event exceeds fair envelope; retained")
+            raise capacity.ResultCapacityError("historical pending event exceeds fair envelope")
+        credit = capacity.ledger.event(size)
+        if credit is None:
+            return False
     item = WriteItem(
         kind=kind,
         payload=dict(record.get("payload") or {}),
@@ -153,6 +191,7 @@ def _restore_event(record: dict[str, Any], journal_path: str) -> None:
         journal_path=journal_path,
         sequence=_next_sequence(),
         created_at=float(record.get("created_at") or time.time()),
+        credit=credit,
     )
     _pending[event_id] = item
     try:
@@ -161,6 +200,27 @@ def _restore_event(record: dict[str, Any], journal_path: str) -> None:
     except queue.Full:
         item.next_attempt_at = time.monotonic() + FLUSH_INTERVAL
         heapq.heappush(_retry_heap, (item.next_attempt_at, item.sequence, item))
+        item.retry_scheduled = True
+    capacity.ledger.transfer(credit, "replay")
+    return True
+
+
+def _pump_replay():
+    global _replay_next, _replay_remaining, _replay_iterator, _replay_path
+    if not capacity.enabled() or not _replay_remaining:
+        return
+    for _ in range(64):
+        if _replay_next is None:
+            try:
+                _replay_next = next(_replay_iterator)
+            except StopIteration:
+                _replay_remaining = False
+                _replay_iterator = None
+                _replay_path = ""
+                return
+        if _restore_event(_replay_next, _replay_path) is False:
+            return
+        _replay_next = None
 
 
 def submit(kind: str, payload: dict[str, Any], wait: bool = False,
@@ -169,24 +229,30 @@ def submit(kind: str, payload: dict[str, Any], wait: bool = False,
     queue_name = _KIND_QUEUE.get(kind)
     if queue_name is None:
         raise ValueError(f"unknown SMS buffered write kind: {kind}")
-    event_id, journal_path = result_journal_service.append_event(
-        kind, payload, timeout=timeout
-    )
+    if capacity.enabled():
+        event_id, journal_path, credit = result_journal_service.append_event(
+            kind, payload, timeout=timeout, _handoff=True)
+    else:
+        event_id, journal_path = result_journal_service.append_event(kind, payload, timeout=timeout)
+        credit = None
     with _pending_condition:
         item = WriteItem(
             kind=kind, payload=payload, event_id=event_id,
             journal_path=journal_path, sequence=_next_sequence(),
+            credit=credit,
         )
         _pending[event_id] = item
         try:
-            _queues[queue_name].put(item, timeout=timeout)
+            _queues[queue_name].put_nowait(item)
             _available.release()
         except queue.Full:
             # The event is already durable. Keep it in the retry heap so a
             # temporary in-memory capacity shortage cannot lose the outcome.
             item.next_attempt_at = time.monotonic() + FLUSH_INTERVAL
             heapq.heappush(_retry_heap, (item.next_attempt_at, item.sequence, item))
+            item.retry_scheduled = True
             _pending_condition.notify_all()
+    capacity.ledger.transfer(credit, "write_pending")
     try:
         from services import metrics_service
         metrics_service.inc("marketing_copilot_sms_write_enqueued_total", labels={"kind": kind})
@@ -205,7 +271,8 @@ def flush(timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     with _pending_condition:
         target_sequence = _sequence
-        while any(item.sequence <= target_sequence for item in _pending.values()):
+        while (_replay_remaining or any(item.sequence <= target_sequence for item in _pending.values())
+               or (capacity.enabled() and capacity.ledger.recovering)):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("SMS write buffer flush timed out")
@@ -214,10 +281,10 @@ def flush(timeout: float = 10.0) -> None:
             f"{event_id}:{error}" for event_id, error in _quarantined.items()
             if event_id
         ]
-        if failed:
+        if failed or (capacity.enabled() and capacity.ledger.failure):
             raise RuntimeError(
                 "SMS write buffer contains quarantined durable events: "
-                + "; ".join(failed[:5])
+                + "; ".join(failed[:5]) + " " + capacity.ledger.failure
             )
 
 
@@ -254,7 +321,7 @@ def status() -> dict[str, Any]:
         oldest = min((item.created_at for item in pending_items), default=0.0)
         pending_durable = len(pending_items)
         retry_depth = len(_retry_heap)
-        quarantined = len(_quarantined)
+        quarantined = max(len(_quarantined), _quarantine_count) if capacity.enabled() else len(_quarantined)
     return {
         "running": bool(thread and thread.is_alive()),
         # Durable pending includes queued, currently committing, and delayed
@@ -272,6 +339,7 @@ def status() -> dict[str, Any]:
         "retry_depth": retry_depth,
         "quarantined": quarantined,
         "journal": result_journal_service.status(),
+        "replay_remaining": _replay_remaining,
     }
 
 
@@ -344,6 +412,9 @@ def _mark_committed(items: list[WriteItem], timeout: float = 10.0) -> None:
     with _pending_condition:
         for item in items:
             _pending.pop(item.event_id, None)
+            if capacity.enabled():
+                item.payload = {}
+            capacity.ledger.release(item.credit)
             item.error = None
             item.done.set()
         _pending_condition.notify_all()
@@ -351,6 +422,7 @@ def _mark_committed(items: list[WriteItem], timeout: float = 10.0) -> None:
 
 def _quarantine(items: list[WriteItem], error: BaseException,
                 timeout: float = 10.0) -> None:
+    global _quarantine_count
     message = str(error)[:2000]
     by_path: dict[str, list[str]] = {}
     for item in items:
@@ -362,7 +434,12 @@ def _quarantine(items: list[WriteItem], error: BaseException,
     with _pending_condition:
         for item in items:
             _pending.pop(item.event_id, None)
-            _quarantined[item.event_id] = message
+            _quarantine_count += 1
+            if not capacity.enabled() or len(_quarantined) < 16:
+                _quarantined[item.event_id] = message
+            if capacity.enabled():
+                item.payload = {}
+            capacity.ledger.release(item.credit)
             item.error = error
             item.done.set()
         _pending_condition.notify_all()
@@ -371,10 +448,14 @@ def _quarantine(items: list[WriteItem], error: BaseException,
 def _schedule_retry(items: list[WriteItem]) -> None:
     with _pending_condition:
         for item in items:
+            if item.retry_scheduled or item.event_id not in _pending:
+                continue
             item.attempts += 1
             delay = min(30.0, 0.05 * (2 ** min(item.attempts - 1, 9)))
             item.next_attempt_at = time.monotonic() + delay
             heapq.heappush(_retry_heap, (item.next_attempt_at, item.sequence, item))
+            item.retry_scheduled = True
+            capacity.ledger.transfer(item.credit, "retry")
         _pending_condition.notify_all()
 
 
@@ -383,6 +464,7 @@ def _release_due_retries() -> None:
     with _pending_condition:
         while _retry_heap and _retry_heap[0][0] <= now:
             _when, _seq, item = heapq.heappop(_retry_heap)
+            item.retry_scheduled = False
             if item.event_id not in _pending:
                 continue
             try:
@@ -393,6 +475,7 @@ def _release_due_retries() -> None:
                 heapq.heappush(
                     _retry_heap, (item.next_attempt_at, item.sequence, item)
                 )
+                item.retry_scheduled = True
                 break
 
 
@@ -516,6 +599,16 @@ def _run() -> None:
     # not keep the daemon thread alive forever after a prolonged DB outage.
     # They will be replayed on the next start.
     while not _stop.is_set():
+        if capacity.enabled():
+            try:
+                _pump_replay()
+            except Exception as exc:
+                capacity.ledger.fail(exc)
+                logger.exception("Result replay blocked; source Journal retained")
+                _stop.set()
+                break
+            if not _replay_remaining and not _pending:
+                capacity.ledger.recovering = False
         _release_due_retries()
         if not _available.acquire(timeout=FLUSH_INTERVAL):
             continue
@@ -534,6 +627,7 @@ def _run() -> None:
                     continue
             if item is not None:
                 items.append(item)
+                capacity.ledger.transfer(item.credit, "db_batch")
             remaining = deadline - time.monotonic()
             if len(items) >= MAX_BATCH_SIZE or remaining <= 0:
                 break

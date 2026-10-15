@@ -136,7 +136,7 @@ def _fair_claim_once(pool):
     completed = pool.result_candidates()
     fast_pending = fast_send_service.status()["checkpoint_pending"]
     results = sms_write_buffer.status()
-    if (not fast_pending and not results["pending_durable"]
+    if (not fast_pending and not results["pending_durable"] and not results.get("replay_remaining")
             and not results["quarantined"] and results["journal"].get("healthy", False)):
         pool.retire_results(completed)
     if pool.status()["failure"]:

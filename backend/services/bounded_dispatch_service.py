@@ -62,6 +62,12 @@ def assert_delivery_safe(task):
     if reservation is None:
         return
     from services import backpressure_service, fast_send_service
+    from services import result_capacity_service as capacity
+    if not capacity.ledger.safe():
+        raise fast_send_service.FastSendAdmissionDenied("result byte/replay safety gate is closed")
+    credit = getattr(reservation, "result_credit", None)
+    if credit is None or credit.closed:
+        raise fast_send_service.FastSendAdmissionDenied("missing live result reservation")
     active, _state = backpressure_service.reasons(refresh_database=False)
     reasons = [r for r in active if r in {"writes", "disk", "results", "database_maintenance"}]
     state = reservation.pool.status()
@@ -127,6 +133,7 @@ class Reservation:
     created: float = field(default_factory=time.monotonic)
     eligible_at: float = 0.0
     preparing: bool = False
+    result_credit: object = None
 
 
 class ReadyPool:
@@ -188,7 +195,13 @@ class ReadyPool:
             self._campaign_used[group[:2]] += 1
             self._route_used[group[2]] += 1
             self._stats["acquired"] += 1
-            return item
+        from services import result_capacity_service as capacity
+        if capacity.enabled():
+            item.result_credit = capacity.reserve(task, int(parts))
+            if item.result_credit is None:
+                self.release(item)
+                return None
+        return item
 
     def publish(self, item, task):
         actual = cached_bytes(task)
@@ -201,6 +214,8 @@ class ReadyPool:
                 self._stats["overflow"] += 1
                 raise RuntimeError("claimed descriptor exceeded its reservation/identity")
             item.claim = str(task["claim_token"])
+            if item.result_credit:
+                item.result_credit.claim = item.claim
             item.task = task
             task["_dispatch_reservation"] = item
             item.state = "ready"
@@ -328,6 +343,9 @@ class ReadyPool:
         item.state = "released"
         item.task = None
         self._stats["released"] += 1
+        if item.result_credit:
+            from services import result_capacity_service as capacity
+            capacity.release_owner(item.task_id, item.result_credit)
         self._condition.notify_all()
         return True
 
@@ -352,6 +370,7 @@ class ReadyPool:
             return sum(len(items) for items in self._groups.values())
 
     def status(self):
+        from services import result_capacity_service as capacity
         with self._condition:
             states = Counter(item.state for item in self._live.values())
             return {"mode": "fair", "epoch": self.epoch, "limits": vars(self.limits),
@@ -366,5 +385,7 @@ class ReadyPool:
                     "oldest_live_seconds": max((time.monotonic() - item.created
                                                 for item in self._live.values()), default=0),
                     "result_budget": "conservative_admission_until_buffer_drain",
-                    "result_pipeline_hard_bytes": "NOT_VERIFIED",
+                    "result_pipeline_hard_bytes": (
+                        "VERIFIED" if capacity.enabled() else "NOT_VERIFIED"
+                    ),
                     "socket_fairness": "NOT_VERIFIED"}

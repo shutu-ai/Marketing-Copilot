@@ -418,6 +418,17 @@ def record_success(task: dict, message_ids: list[str]) -> bool:
     if not is_fast_task(task):
         return False
     payload = _checkpoint_payload(task, message_ids)
+    from services import result_capacity_service as capacity
+    if capacity.enabled():
+        # Fair mode already owns worst-case credit. Persist one bounded task
+        # checkpoint directly; no unmetered intermediate Fast accumulator.
+        from services import sms_write_buffer
+        try:
+            sms_write_buffer.submit("fast_checkpoint", {"items": [payload]}, wait=False)
+        except Exception as exc:
+            _set_checkpoint_failure(exc)
+            return False
+        return True
     task_id = int(payload["task_id"])
     with _checkpoint_condition:
         if task_id not in _checkpoint_pending and len(_checkpoint_pending) >= _checkpoint_limit():

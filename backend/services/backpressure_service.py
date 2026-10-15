@@ -375,6 +375,11 @@ def reasons(producing_chunks: bool = False, refresh_database: bool = True) -> tu
         _paused["results"] = (
             not journal.get("healthy", True)
             or int(state.get("write_quarantined", 0)) > 0
+            or bool(journal.get("rejected_evidence"))
+            or bool(journal.get("capacity", {}).get("failure"))
+            or bool(journal.get("capacity", {}).get("recovering"))
+            or bool(journal.get("capacity", {}).get("used_bytes", {}).get("emergency"))
+            or (int(journal.get("file_bytes", 0)) >= int(journal.get("disk_limit_bytes", 2**63)))
         )
         if producing_chunks:
             _paused["chunks"] = (
