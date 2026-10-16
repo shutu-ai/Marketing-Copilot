@@ -155,18 +155,30 @@ app.include_router(internal_router.router)
 
 
 def _start_background_services():
-    """Start services in an order that leaves startup recovery uncontended.
+    """Establish the durable result replay barrier before opening producers.
 
-    ``start_scheduler`` performs the one-time ingestion lease recovery before
-    it starts its own workers.  Keep it ahead of the SMS result buffer and
-    task workers, both of which may begin writing as soon as they start.
+    The journal/write-buffer owner is started and drained first.  File
+    ingestion and SMS claim workers are not allowed to create new work while
+    pending result events, terminal markers, or result-capacity recovery are
+    still being reconciled.  A timeout is fail-closed: startup must not turn a
+    partially replayed result stream into fresh socket admissions.
     """
     from services.activity_scheduler import start_scheduler
     from services.sms_write_buffer import start as start_sms_write_buffer
     from services.task_worker import start_worker
 
-    start_scheduler()
     start_sms_write_buffer()
+    from services import sms_write_buffer
+    try:
+        configured_replay_timeout = float(
+            os.environ.get("MC_STARTUP_REPLAY_TIMEOUT_SECONDS", "60")
+        )
+    except (TypeError, ValueError):
+        configured_replay_timeout = 60.0
+    replay_timeout = max(1.0, min(600.0, configured_replay_timeout))
+    sms_write_buffer.flush(timeout=replay_timeout)
+    logger.info("Durable SMS result replay barrier passed timeout=%ss", replay_timeout)
+    start_scheduler()
     start_worker()
 
 

@@ -5,6 +5,7 @@ import random
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Callable
 
 from database import read_transaction
@@ -180,12 +181,13 @@ class SmppPartialSubmitError(SmppSubmitError):
 
 class _AsyncSubmission:
     def __init__(self, task: dict, task_id: int, sequences: list[int],
-                 deadline: float, callback: Callable):
+                 deadline: float, callback: Callable, sending_complete: bool = True):
         self.task = task
         self.task_id = task_id
         self.sequences = sequences
         self.deadline = deadline
         self.callback = callback
+        self.sending_complete = bool(sending_complete)
 
 
 class _SmppConnection:
@@ -248,6 +250,11 @@ class _SmppConnection:
         self._fair_handoff_permits = threading.BoundedSemaphore(1)
         self._fair_handoff_lock = threading.Lock()
         self._fair_active_handoffs = 0
+        self._socket_fair_lock = threading.Lock()
+        self._socket_fair_groups = {}
+        self._socket_fair_wait_samples = deque(maxlen=4096)
+        self._socket_fair_yields = 0
+        self._socket_fair_writes = 0
         # A control action records the newest durable activity generation here
         # as a best-effort queue accelerator. The database generation/attempt
         # fence remains authoritative if this process is restarted.
@@ -257,6 +264,81 @@ class _SmppConnection:
     def _fair_mode(self) -> bool:
         from services import bounded_dispatch_service
         return bounded_dispatch_service.mode() == "fair"
+
+    @staticmethod
+    def _socket_fair_key(task: dict, route_id: int):
+        return (
+            str(task.get("campaign_type") or ""),
+            int(task.get("campaign_id") or 0),
+            int(task.get("_dispatch_resolved_route_id") or route_id or 0),
+        )
+
+    def _record_socket_fair_write(self, task: dict, part_no: int, total_parts: int,
+                                  admitted_at: float, sent_at: float) -> None:
+        """Record only bounded, non-sensitive actual socket-admission facts."""
+        key = self._socket_fair_key(task, int(self.config.get("id") or 0))
+        reservation = task.get("_dispatch_reservation")
+        eligible_at = getattr(reservation, "created", admitted_at) if reservation else admitted_at
+        wait_seconds = max(0.0, admitted_at - float(eligible_at or admitted_at))
+        with self._socket_fair_lock:
+            item = self._socket_fair_groups.get(key)
+            if item is None:
+                if len(self._socket_fair_groups) >= 256:
+                    oldest = min(
+                        self._socket_fair_groups.items(),
+                        key=lambda entry: float(entry[1].get("last_write_at") or 0.0),
+                    )[0]
+                    self._socket_fair_groups.pop(oldest, None)
+                item = {
+                    "campaign_type": key[0], "campaign_id": key[1],
+                    "route_id": key[2], "parts_served": 0,
+                    "writes": 0, "last_write_at": 0.0,
+                    "max_inter_write_gap_seconds": 0.0,
+                    "max_non_preemptive_parts": 0,
+                }
+                self._socket_fair_groups[key] = item
+            previous = float(item.get("last_write_at") or 0.0)
+            if previous:
+                item["max_inter_write_gap_seconds"] = max(
+                    item["max_inter_write_gap_seconds"], max(0.0, sent_at - previous)
+                )
+            item["parts_served"] += 1
+            item["writes"] += 1
+            item["last_write_at"] = sent_at
+            # A fair continuation yields after each physical PDU.  Keep this
+            # metric about the actual non-preemptive socket budget, not the
+            # logical multipart size.
+            item["max_non_preemptive_parts"] = max(
+                item["max_non_preemptive_parts"], 1
+            )
+            self._socket_fair_wait_samples.append(wait_seconds)
+            self._socket_fair_writes += 1
+
+    def _socket_fair_status(self) -> dict:
+        with self._socket_fair_lock:
+            groups = [dict(item) for item in self._socket_fair_groups.values()]
+            waits = sorted(self._socket_fair_wait_samples)
+            yields = int(self._socket_fair_yields)
+            writes = int(self._socket_fair_writes)
+        def percentile(fraction):
+            if not waits:
+                return 0.0
+            index = min(len(waits) - 1, max(0, int(round((len(waits) - 1) * fraction))))
+            return round(waits[index], 6)
+        return {
+            "unit": "submit_sm_parts",
+            "writes": writes,
+            "continuation_yields": yields,
+            "groups": sorted(groups, key=lambda item: (
+                item["campaign_type"], item["campaign_id"], item["route_id"]
+            )),
+            "wait_samples": len(waits),
+            "eligible_to_socket_write_p50_seconds": percentile(0.50),
+            "eligible_to_socket_write_p95_seconds": percentile(0.95),
+            "eligible_to_socket_write_p99_seconds": percentile(0.99),
+            "eligible_to_socket_write_max_seconds": round(max(waits, default=0.0), 6),
+            "implementation": "PARTS_DRR_SOCKET_ADMISSION_WITH_CONTINUATION",
+        }
 
     def _pdu_used_locked(self) -> int:
         return len(self._pdu_sequence_credits) + len(self._pdu_unbound_reservations)
@@ -413,12 +495,37 @@ class _SmppConnection:
                 task, callback = self._send_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            # A response timeout, disconnect, or a completed multipart task
+            # can leave one already-enqueued continuation behind.  It must be
+            # consumed as a tombstone; reinitializing it would duplicate a
+            # submit_sm after the original task has already completed.
+            if task.get("_smpp_fair_done") or task.get("_smpp_fair_aborted"):
+                self._send_queue.task_done()
+                continue
             fair_handoff = self._fair_mode()
+            # The initial fair task arrives with the permit acquired by
+            # try_send_async.  A yielded continuation arrives only after the
+            # previous sender turn released that permit, so reacquire it
+            # before entering the next physical socket turn.
+            if fair_handoff and task.pop("_smpp_fair_reacquire", False):
+                if not self._fair_handoff_permits.acquire(timeout=1.0):
+                    self._abort_fair_continuation(
+                        task, callback,
+                        SmppDeliveryUnknownError(
+                            "multipart continuation handoff admission timed out"
+                        ),
+                    )
+                    self._send_queue.task_done()
+                    continue
             if fair_handoff:
                 with self._fair_handoff_lock:
                     self._fair_active_handoffs += 1
             try:
-                if self._is_invalidated_campaign_task(task):
+                # Continuations have already crossed durable socket
+                # admission and may own accepted PDUs.  Their invalidation
+                # handling must stay in _send_fair_continuation so a stop
+                # cannot invoke a second callback or bypass unknown fencing.
+                if not task.get("_smpp_fair_state") and self._is_invalidated_campaign_task(task):
                     metrics_service.inc(
                         "marketing_copilot_campaign_queue_invalidated_total",
                         labels={
@@ -434,7 +541,15 @@ class _SmppConnection:
                         callback,
                     )
                     continue
-                self._send_windowed_async(task, callback)
+                if task.get("_smpp_fair_state"):
+                    # A yielded multipart descriptor already completed the
+                    # durable claim/parts admission.  Re-enter only the
+                    # one-PDU continuation; calling _send_windowed_async
+                    # here would rebuild state at part zero and duplicate
+                    # the first submit_sm.
+                    self._send_fair_continuation(task, callback)
+                else:
+                    self._send_windowed_async(task, callback)
             except Exception:
                 logger.exception(
                     "SMPP async sender failed config=%s slot=%s task=%s",
@@ -481,6 +596,13 @@ class _SmppConnection:
             context = self._sequence_context.get(sequence)
             target = self._outcomes if sequence in self._sequence_tasks else self._early_outcomes
             target[sequence] = outcome
+            # In Fair mode the hard window is a physical submit_sm credit,
+            # not a task credit.  Once this exact PDU has received its
+            # response, release its socket credit immediately so a yielded
+            # multipart continuation can admit the next part even when the
+            # logical message has more parts than the window size.
+            if self._fair_mode():
+                self._pdu_release_sequence_locked(sequence)
             response_latency = self._response_latency_locked(sequence, outcome)
             self._condition.notify_all()
         if context is not None:
@@ -527,7 +649,8 @@ class _SmppConnection:
 
     def _take_async_completion_locked(self, task_id: int):
         submission = self._async_submissions.get(task_id)
-        if not submission or any(sequence not in self._outcomes for sequence in submission.sequences):
+        if (not submission or not submission.sending_complete
+                or any(sequence not in self._outcomes for sequence in submission.sequences)):
             return None
         outcomes = []
         for sequence in submission.sequences:
@@ -541,6 +664,10 @@ class _SmppConnection:
             self._sequence_sent_at.pop(sequence, None)
             self._sequence_context.pop(sequence, None)
         self._async_submissions.pop(task_id, None)
+        if submission.task.pop("_smpp_fair_state", None) is not None:
+            # A yielded continuation may still be queued.  Mark it as a
+            # tombstone before invoking the completion callback.
+            submission.task["_smpp_fair_done"] = True
         if not self._fair_mode():
             self._window.release()
         failed = next((item for item in outcomes if not item["ok"]), None)
@@ -603,6 +730,9 @@ class _SmppConnection:
                         current = self._async_submissions.pop(submission.task_id, None)
                         if current is None:
                             continue
+                        if current.task.pop("_smpp_fair_state", None) is not None:
+                            current.task["_smpp_fair_done"] = True
+                            current.task["_smpp_fair_aborted"] = True
                         for sequence in submission.sequences:
                             self._pdu_release_sequence_locked(sequence)
                             self._sequence_tasks.pop(sequence, None)
@@ -649,6 +779,9 @@ class _SmppConnection:
             submissions = list(self._async_submissions.values())
             self._async_submissions.clear()
             for submission in submissions:
+                if submission.task.pop("_smpp_fair_state", None) is not None:
+                    submission.task["_smpp_fair_done"] = True
+                    submission.task["_smpp_fair_aborted"] = True
                 for sequence in submission.sequences:
                     self._pdu_release_sequence_locked(sequence)
                     self._sequence_tasks.pop(sequence, None)
@@ -1097,6 +1230,252 @@ class _SmppConnection:
                     self._sequence_sent_at.pop(seq, None)
                     self._sequence_context.pop(seq, None)
 
+    def _abort_fair_continuation(self, task: dict, callback: Callable,
+                                 error: Exception, reservation=None,
+                                 isolate_generation: bool = False) -> None:
+        """Fail one fair continuation without ever making it retryable after a write."""
+        state = task.pop("_smpp_fair_state", None) or {}
+        task["_smpp_fair_done"] = True
+        task["_smpp_fair_aborted"] = True
+        task_id = task.get("id")
+        with self._condition:
+            submission = self._async_submissions.pop(task_id, None)
+            sequences = list(state.get("sequences") or [])
+            if submission:
+                sequences = list(submission.sequences)
+            for sequence in sequences:
+                self._pdu_release_sequence_locked(sequence)
+                self._sequence_tasks.pop(sequence, None)
+                self._sequence_persist_message_ids.pop(sequence, None)
+                self._sequence_sent_at.pop(sequence, None)
+                self._sequence_context.pop(sequence, None)
+                self._outcomes.pop(sequence, None)
+            if reservation is not None and not isolate_generation:
+                self._pdu_release_reservation(reservation)
+        if isolate_generation:
+            # An unknown write outcome fences this connection generation.  A
+            # reconnect is the only safe point at which its PDU credits can be
+            # retired; this also fails other in-flight submissions closed.
+            try:
+                self.disconnect(stop_sender=False)
+            except Exception:
+                logger.exception(
+                    "Unable to isolate SMPP generation after ambiguous continuation "
+                    "config=%s slot=%s task=%s", self.config.get("id"), self.slot, task_id,
+                )
+        self._dispatch_async_completion(task, [], error, callback)
+
+    def _fair_continuation_queue(self, task: dict, callback: Callable) -> bool:
+        try:
+            self._send_queue.put_nowait((task, callback))
+        except queue.Full:
+            self._abort_fair_continuation(
+                task, callback,
+                SmppDeliveryUnknownError("multipart continuation queue is full"),
+                isolate_generation=bool(task.get("_socket_write_started")),
+            )
+            return False
+        task["_smpp_fair_reacquire"] = True
+        with self._socket_fair_lock:
+            self._socket_fair_yields += 1
+        metrics_service.inc(
+            "marketing_copilot_smpp_multipart_continuation_yield_total",
+            labels=self._metric_labels(),
+        )
+        return True
+
+    def _send_fair_continuation(self, task: dict, callback: Callable) -> None:
+        """Send one PDU, then yield the Slot to the next DRR group.
+
+        The task keeps its connection generation, attempt token and ordered
+        sequence list in a bounded continuation descriptor.  Only the physical
+        socket admission is yielded; no task is moved to another connection.
+        """
+        state = task.get("_smpp_fair_state")
+        if not state:
+            raise SmppSubmissionNotAllowedError("missing multipart continuation state")
+        task_id = int(state["task_id"])
+        reservation = None
+        try:
+            # A response failure already received for a prior part closes the
+            # multipart write side.  We wait for all accepted responses, then
+            # preserve the existing partial/unknown classification.
+            completion = None
+            with self._condition:
+                submission = self._async_submissions.get(task_id)
+                failed = submission and next(
+                    (self._outcomes.get(sequence) for sequence in submission.sequences
+                     if self._outcomes.get(sequence) and not self._outcomes[sequence]["ok"]),
+                    None,
+                )
+                if failed is not None:
+                    submission.sending_complete = True
+                    completion = self._take_async_completion_locked(task_id)
+            if completion:
+                self._dispatch_async_completion(*completion)
+                return
+            if failed is not None:
+                # The reaper/response callback owns completion once remaining
+                # accepted parts settle; no further socket write is allowed.
+                return
+
+            if self._is_invalidated_campaign_task(task):
+                error = SmppSubmissionNotAllowedError(
+                    "campaign dispatch generation was invalidated before socket write"
+                )
+                if state["submitted_any"]:
+                    error = SmppDeliveryUnknownError(
+                        "campaign dispatch generation closed after multipart write"
+                    )
+                self._abort_fair_continuation(task, callback, error)
+                return
+
+            next_index = int(state["next_part"])
+            if next_index >= len(state["parts"]):
+                with self._condition:
+                    submission = self._async_submissions.get(task_id)
+                    if submission:
+                        submission.sending_complete = True
+                        completion = self._take_async_completion_locked(task_id)
+                if completion:
+                    self._dispatch_async_completion(*completion)
+                return
+
+            if not self._throttle():
+                error = SmppSubmissionNotAllowedError(
+                    "SMPP submission stopped before socket write"
+                )
+                if state["submitted_any"]:
+                    error = SmppDeliveryUnknownError(
+                        "SMPP submission stopped after multipart write"
+                    )
+                self._abort_fair_continuation(task, callback, error)
+                return
+            from services.bounded_dispatch_service import assert_delivery_safe
+            assert_delivery_safe(task)
+            reservation = self._pdu_reserve(
+                state["generation"], max(0.0, float(self.config.get("timeout") or 10))
+            )
+            if reservation is None:
+                self._abort_fair_continuation(
+                    task, callback,
+                    SmppWindowExhaustedError("Fair PDU window remained exhausted before submit_sm"),
+                )
+                return
+
+            import smpplib.consts
+            part_no = next_index + 1
+            part = state["parts"][next_index]
+            send_started = time.monotonic()
+            socket_gate_started = send_started
+            send_lock_started = send_started
+            with self._send_lock:
+                with fast_send_service.socket_admission(task):
+                    metrics_service.observe_histogram(
+                        "marketing_copilot_smpp_send_lock_wait_seconds",
+                        time.monotonic() - send_lock_started,
+                        labels=self._metric_labels(),
+                    )
+                    pdu = self.client.send_message(
+                        source_addr_ton=int(self.config.get("address_ton") or smpplib.consts.SMPP_TON_ALNUM),
+                        source_addr_npi=int(self.config.get("address_npi") or smpplib.consts.SMPP_NPI_UNK),
+                        source_addr=state["source_addr"],
+                        dest_addr_ton=smpplib.consts.SMPP_TON_INTL,
+                        dest_addr_npi=smpplib.consts.SMPP_NPI_ISDN,
+                        destination_addr=task["msisdn"], short_message=part,
+                        data_coding=state["coding"], esm_class=state["esm_class"],
+                        registered_delivery=(self.config.get("delivery_receipt_mode") or "optional") != "disabled",
+                    )
+            if fast_send_service.is_fast_task(task):
+                task["_fast_socket_submitted"] = True
+            if not self._pdu_bind(reservation, pdu.sequence, state["generation"]):
+                raise SmppDeliveryUnknownError("SMPP PDU generation retired during submit")
+            reservation = None
+            sent_at = time.monotonic()
+            state["next_part"] = part_no
+            state["submitted_any"] = True
+            self._record_socket_fair_write(
+                task, part_no, len(state["parts"]), socket_gate_started, sent_at,
+            )
+            metrics_service.inc(
+                "marketing_copilot_smpp_submit_sm_sent_total", labels=self._metric_labels()
+            )
+            metrics_service.record_event(
+                "marketing_copilot_smpp_submit_sm_sent", labels=self._metric_labels()
+            )
+            metrics_service.observe_histogram(
+                "marketing_copilot_smpp_submit_sm_send_seconds",
+                sent_at - send_started, labels=self._metric_labels(),
+            )
+            labels = {
+                "campaign_type": task.get("campaign_type", ""),
+                "campaign_id": task.get("campaign_id", 0),
+                "config_id": self.config["id"],
+            }
+            metrics_service.inc("marketing_copilot_campaign_socket_parts_total", labels=labels)
+            metrics_service.record_event("marketing_copilot_campaign_socket_parts", labels=labels)
+
+            early_outcome = None
+            completion = None
+            with self._condition:
+                sequence = pdu.sequence
+                self._sequence_tasks[sequence] = task_id
+                self._sequence_persist_message_ids[sequence] = state["persist_message_ids"]
+                self._sequence_sent_at[sequence] = sent_at
+                self._sequence_context[sequence] = {
+                    "task": task, "part_no": part_no,
+                    "window_generation": state["generation"],
+                }
+                if sequence in self._early_outcomes:
+                    early_outcome = self._early_outcomes.pop(sequence)
+                    self._outcomes[sequence] = early_outcome
+                    if self._fair_mode():
+                        self._pdu_release_sequence_locked(sequence)
+                    response_latency = self._response_latency_locked(sequence, early_outcome)
+                    if response_latency is not None:
+                        metrics_service.observe_histogram(
+                            "marketing_copilot_smpp_submit_sm_resp_latency_seconds",
+                            response_latency, labels=self._metric_labels(),
+                        )
+                submission = self._async_submissions.get(task_id)
+                if submission is None:
+                    submission = _AsyncSubmission(
+                        task, task_id, [], state["deadline"], callback,
+                        sending_complete=False,
+                    )
+                    self._async_submissions[task_id] = submission
+                submission.sequences.append(sequence)
+                submission.sending_complete = state["next_part"] >= len(state["parts"])
+                if submission.sending_complete:
+                    completion = self._take_async_completion_locked(task_id)
+
+            if early_outcome is not None:
+                sms_task_service.record_part_result(
+                    task, part_no, int(pdu.sequence), early_outcome["ok"],
+                    early_outcome["status"], early_outcome["message_id"],
+                    self.config["id"], state["generation"],
+                )
+            if completion:
+                self._dispatch_async_completion(*completion)
+                return
+            if state["next_part"] < len(state["parts"]):
+                self._fair_continuation_queue(task, callback)
+        except Exception as exc:
+            if isinstance(exc, fast_send_service.FastSendAdmissionDenied):
+                exc = SmppSubmissionNotAllowedError(str(exc))
+            ambiguous = bool(task.get("_socket_write_started"))
+            if state.get("submitted_any") and not isinstance(exc, SmppSubmitError):
+                exc = SmppDeliveryUnknownError(f"multipart continuation failed after submit: {exc}")
+                ambiguous = True
+            elif ambiguous and not isinstance(exc, SmppSubmitError):
+                exc = SmppDeliveryUnknownError(
+                    "submit_sm write outcome is ambiguous; automatic resend is unsafe"
+                )
+            self._abort_fair_continuation(
+                task, callback, exc, reservation=reservation,
+                isolate_generation=ambiguous and isinstance(exc, SmppDeliveryUnknownError),
+            )
+
     def _send_windowed_async(self, task: dict, callback: Callable):
         fair_window = self._fair_mode()
         if not fair_window:
@@ -1170,6 +1549,26 @@ class _SmppConnection:
                 self._window.release()
             error = exc if isinstance(exc, SmppSubmitError) else SmppDeliveryUnknownError(str(exc))
             self._dispatch_async_completion(task, [], error, callback)
+            return
+        if fair_window:
+            # A fair Slot owns one bounded continuation at a time.  The
+            # durable attempt preparation above is performed exactly once;
+            # later turns only reuse this connection generation and sequence
+            # ledger while yielding the physical socket between parts.
+            task["_smpp_fair_state"] = {
+                "parts": parts,
+                "coding": coding,
+                "esm_class": esm_class,
+                "task_id": int(task_id),
+                "persist_message_ids": persist_message_ids,
+                "generation": generation,
+                "source_addr": source_addr,
+                "next_part": 0,
+                "sequences": [],
+                "submitted_any": False,
+                "deadline": time.monotonic() + int(self.config.get("timeout") or 10),
+            }
+            self._send_fair_continuation(task, callback)
             return
         sequences = []
         submitted_any = False
@@ -1341,7 +1740,8 @@ class _SmppConnection:
                 "configured_per_bind_tps": None,
                 "effective_total_limit_tps": configured_route_tps * self.tps_multiplier,
                 "tps_scope": "route_shared",
-                "tps_unit": "submit_sm_parts/s"}
+                "tps_unit": "submit_sm_parts/s",
+                "socket_fairness": self._socket_fair_status()}
 
 
 class SmppGateway:
@@ -1607,9 +2007,9 @@ class SmppGateway:
         return {"state": "bound" if self.connected else "disconnected", "connected": self.connected,
                 "config_id": self._active_config_id, "active_config_id": self._active_config_id,
                 "enabled_configs": len(configs), "pools": pools, "last_error": self._last_error,
-                "dispatch_fairness": "IMPLEMENTED_NOT_VERIFIED",
-                "socket_fairness": "NOT_VERIFIED",
-                "pdu_window_hard_limit": "NOT_VERIFIED"}
+                "dispatch_fairness": "IMPLEMENTED",
+                "socket_fairness": "PARTS_DRR_ADMISSION_WITH_CONTINUATION",
+                "pdu_window_hard_limit": "IMPLEMENTED"}
 
 
 gateway = SmppGateway()

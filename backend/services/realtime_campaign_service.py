@@ -31,6 +31,22 @@ MAX_PENDING_FILES_PER_CAMPAIGN = max(1, int(os.environ.get("MC_REALTIME_MAX_PEND
 MAX_INBOX_FILES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_FILES", "1000")))
 MAX_INBOX_BYTES = max(1, int(os.environ.get("MC_REALTIME_MAX_INBOX_GB", "10")) * 1024 ** 3)
 try:
+    # pandas/openpyxl expands an XLSX well beyond its compressed file size.
+    # Admit a bounded estimate before materializing the frame so file workers
+    # cannot turn a large spreadsheet into an unbounded process-wide spike.
+    XLSX_MEMORY_LIMIT_BYTES = max(
+        16 * 1024 * 1024,
+        int(os.environ.get("MC_REALTIME_XLSX_MEMORY_LIMIT_MB", "512")) * 1024 ** 2,
+    )
+except (TypeError, ValueError):
+    XLSX_MEMORY_LIMIT_BYTES = 512 * 1024 ** 2
+try:
+    XLSX_MEMORY_EXPANSION_FACTOR = max(
+        2, min(32, int(os.environ.get("MC_REALTIME_XLSX_MEMORY_EXPANSION_FACTOR", "8")))
+    )
+except (TypeError, ValueError):
+    XLSX_MEMORY_EXPANSION_FACTOR = 8
+try:
     WATCH_RESCAN_SECONDS = max(3.0, float(os.environ.get("MC_REALTIME_WATCH_RESCAN_SECONDS", "30")))
 except (TypeError, ValueError):
     WATCH_RESCAN_SECONDS = 30.0
@@ -350,6 +366,16 @@ def _read_csv(path: str, chunksize: int = 0):
 
 def _read_csv_columns(path: str):
     return pd.read_csv(path, dtype=str, sep=_csv_delimiter(path), nrows=0).columns
+
+
+def _xlsx_memory_admission(path: str) -> tuple[bool, int, int]:
+    """Return (admitted, estimated_bytes, limit) before pandas materialization."""
+    try:
+        file_size = max(1, int(os.path.getsize(path)))
+    except OSError:
+        file_size = 1
+    estimate = max(file_size, file_size * XLSX_MEMORY_EXPANSION_FACTOR)
+    return estimate <= XLSX_MEMORY_LIMIT_BYTES, estimate, XLSX_MEMORY_LIMIT_BYTES
 
 
 _MSISDN_ALIASES = {
@@ -1433,6 +1459,29 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             reader = _read_csv(file_path, chunksize=chunk_size)
             msisdn_col = _resolve_msisdn_column(_read_csv_columns(file_path))
         else:
+            admitted, estimated_bytes, memory_limit = _xlsx_memory_admission(file_path)
+            if not admitted:
+                progress("waiting_for_capacity")
+                metrics_service.inc(
+                    "realtime_xlsx_memory_admission_denied_total",
+                    labels={"campaign_id": campaign_id},
+                )
+                return {
+                    "success": False,
+                    "status": "waiting_for_capacity",
+                    "error_class": "RESOURCE_LIMIT",
+                    "retryable": True,
+                    "message": (
+                        "backpressure: XLSX memory admission denied; "
+                        f"estimated_bytes={estimated_bytes} limit_bytes={memory_limit}"
+                    ),
+                }
+            metrics_service.observe_histogram(
+                "realtime_xlsx_memory_estimate_bytes", estimated_bytes,
+                labels={"campaign_id": campaign_id},
+                buckets=(16 * 1024 ** 2, 64 * 1024 ** 2, 256 * 1024 ** 2,
+                         512 * 1024 ** 2, 1024 * 1024 ** 2, 4 * 1024 ** 3),
+            )
             df = pd.read_excel(file_path, dtype=str)
             msisdn_col = _resolve_msisdn_column(df.columns)
     except Exception as e:

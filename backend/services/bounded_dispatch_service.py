@@ -3,7 +3,9 @@
 No database, gateway, logging or blocking queue calls occur under the ledger
 condition. Reservations remain charged through Slot handoff and completion;
 result debt is retired only at an observed empty result-buffer boundary.
-This is deliberately not a socket/PDU scheduler (S2).
+The fair ReadyPool is the bounded socket-admission scheduler: it charges the
+resolved campaign/route group by encoded submit_sm parts before handing work to
+the physical Slot.  Socket continuation/yield remains owned by the gateway.
 """
 
 from __future__ import annotations
@@ -20,6 +22,15 @@ import uuid
 
 _mode_lock = threading.Lock()
 _frozen_mode = None
+
+
+def _percentile(values, fraction: float) -> float:
+    """Return a bounded percentile for the low-cardinality fairness ring."""
+    values = sorted(float(value) for value in values)
+    if not values:
+        return 0.0
+    index = min(len(values) - 1, max(0, int(round((len(values) - 1) * fraction))))
+    return round(values[index], 6)
 
 
 def mode():
@@ -140,11 +151,21 @@ class ReadyPool:
     def __init__(self, limits=None):
         self.limits = limits or Limits.from_env()
         self.maxsize = self.limits.tasks
+        try:
+            configured_quantum = int(os.environ.get("MC_SOCKET_DRR_QUANTUM_PARTS", "20"))
+        except (TypeError, ValueError):
+            configured_quantum = 20
+        self._drr_quantum_parts = max(1, min(4096, configured_quantum))
+        self._drr_max_deficit = self._drr_quantum_parts * 20 + self.limits.max_task_parts
         self.epoch = uuid.uuid4().hex
         self._condition = threading.Condition(threading.RLock())
         self._live = {}
         self._groups = {}
         self._ring = deque()
+        self._drr_deficit = {}
+        self._drr_served = Counter()
+        self._drr_wait_seconds = deque(maxlen=4096)
+        self._drr_oldest_eligible_at = 0.0
         self._used = Counter()
         self._group_used = {}
         self._campaign_used = Counter()
@@ -225,6 +246,9 @@ class ReadyPool:
         if item.group not in self._groups:
             self._groups[item.group] = deque()
             self._ring.append(item.group)
+            self._drr_deficit.setdefault(item.group, 0)
+        if not item.eligible_at:
+            item.eligible_at = time.monotonic()
         self._groups[item.group].append(item)
         self._condition.notify_all()
 
@@ -239,6 +263,22 @@ class ReadyPool:
                     item = items[0]
                     self._ring.append(group)
                     if item.eligible_at > now:
+                        self._drr_oldest_eligible_at = min(
+                            (value.eligible_at for value in items if value.eligible_at > now),
+                            default=0.0,
+                        )
+                        continue
+                    # This is the actual socket-admission credit unit.  The
+                    # claim scheduler has a separate DRR, but it must not be
+                    # treated as proof of transport fairness: a long SMS is
+                    # charged by its encoded submit_sm parts here as well.
+                    self._drr_deficit[group] = min(
+                        self._drr_max_deficit,
+                        self._drr_deficit.get(group, 0) + self._drr_quantum_parts,
+                    )
+                    cost_parts = int(item.cost["parts"])
+                    if cost_parts > self._drr_deficit[group]:
+                        self._blocked["socket_drr_credit"] += 1
                         continue
                     if (self._used["prepare_tasks"] >= self.limits.prepare_tasks
                             or self._used["prepare_bytes"] + item.cost["bytes"] > self.limits.prepare_bytes):
@@ -250,6 +290,10 @@ class ReadyPool:
                         del self._groups[group]
                     item.state = "prepare"
                     item.preparing = True
+                    self._drr_deficit[group] -= cost_parts
+                    self._drr_served[group] += cost_parts
+                    self._drr_wait_seconds.append(max(0.0, now - item.created))
+                    self._drr_oldest_eligible_at = 0.0
                     self._used["prepare_tasks"] += 1
                     self._used["prepare_bytes"] += item.cost["bytes"]
                     self._stats["prepared"] += 1
@@ -336,6 +380,9 @@ class ReadyPool:
         group.subtract(item.cost)
         if not group["tasks"]:
             del self._group_used[item.group]
+        if item.group not in self._groups:
+            self._drr_deficit.pop(item.group, None)
+            self._drr_served.pop(item.group, None)
         for counter, key in ((self._campaign_used, item.group[:2]), (self._route_used, item.group[2])):
             counter[key] -= 1
             if not counter[key]:
@@ -388,4 +435,21 @@ class ReadyPool:
                     "result_pipeline_hard_bytes": (
                         "VERIFIED" if capacity.enabled() else "NOT_VERIFIED"
                     ),
-                    "socket_fairness": "NOT_VERIFIED"}
+                    "socket_fairness": "PARTS_DRR_ADMISSION",
+                    "socket_drr": {
+                        "unit": "submit_sm_parts",
+                        "quantum_parts": self._drr_quantum_parts,
+                        "max_deficit_parts": self._drr_max_deficit,
+                        "served_parts": [
+                            {"campaign_type": key[0], "campaign_id": key[1],
+                             "route_id": key[2], "parts": int(value)}
+                            for key, value in sorted(self._drr_served.items())
+                        ],
+                        "oldest_eligible_wait_seconds": max(
+                            0.0, time.monotonic() - self._drr_oldest_eligible_at
+                        ) if self._drr_oldest_eligible_at else 0.0,
+                        "wait_samples": len(self._drr_wait_seconds),
+                        "wait_p50_seconds": _percentile(self._drr_wait_seconds, 0.50),
+                        "wait_p95_seconds": _percentile(self._drr_wait_seconds, 0.95),
+                        "wait_max_seconds": max(self._drr_wait_seconds, default=0.0),
+                    }}

@@ -44,7 +44,7 @@ def test_startup_recovery_still_raises_non_transient_errors(monkeypatch):
         activity_scheduler._recover_expired_chunks_on_startup()
 
 
-def test_main_starts_scheduler_before_writers(monkeypatch):
+def test_main_replays_results_before_starting_producers(monkeypatch):
     import main
     from services import sms_write_buffer, task_worker
 
@@ -60,6 +60,11 @@ def test_main_starts_scheduler_before_writers(monkeypatch):
         lambda: calls.append("sms_write_buffer"),
     )
     monkeypatch.setattr(
+        sms_write_buffer,
+        "flush",
+        lambda timeout: calls.append("replay_barrier"),
+    )
+    monkeypatch.setattr(
         task_worker,
         "start_worker",
         lambda: calls.append("task_worker"),
@@ -67,4 +72,6 @@ def test_main_starts_scheduler_before_writers(monkeypatch):
 
     main._start_background_services()
 
-    assert calls == ["scheduler", "sms_write_buffer", "task_worker"]
+    # Durable result replay must finish before either scheduler or sender
+    # producers can create new work after a restart.
+    assert calls == ["sms_write_buffer", "replay_barrier", "scheduler", "task_worker"]

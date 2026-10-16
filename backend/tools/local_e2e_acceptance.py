@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import faulthandler
+import hashlib
 import json
 import os
 import platform
@@ -185,6 +186,7 @@ class AcceptanceRunner:
         self.campaign_dir = self.root / "campaign"
         self.whitelist_path = self.root / "whitelist.csv"
         self.smsc_event_log = self.root / "smsc.events.jsonl"
+        self.smsc_metrics = self.root / "smsc.metrics.json"
         self.api_log = self.root / "api.log"
         self.smsc_log = self.root / "smsc.log"
         self.app_log = self.root / "marketing-copilot.log"
@@ -270,8 +272,32 @@ class AcceptanceRunner:
             args.timeout_seconds or self.spec.get("timeout_seconds", 120)
         )
         self.faults = dict(self.spec.get("faults") or {})
+        self.legacy_smsc_tps = args.smsc_tps is not None
+        injected_fault_keys = (
+            "response_delay", "reject_ratio", "drop_response_ratio",
+            "drop_receipt_ratio", "disconnect_after", "disconnect_before_response",
+            "partial_submit_after",
+            "drop_receipts",
+        )
+        inferred_fault_mode = any(
+            bool(self.faults.get(key)) for key in injected_fault_keys
+        ) or self.spec.get("delivery_receipt_mode") in {"optional", "required"}
+        self.simulator_mode = str(
+            getattr(args, "simulator_mode", None)
+            or self.spec.get("simulator_mode")
+            or ("fault" if inferred_fault_mode else "fast")
+        ).strip().lower()
+        if self.simulator_mode not in {"fast", "fault"}:
+            raise ValueError("simulator mode must be fast or fault")
+        self.simulator_audit = str(
+            getattr(args, "simulator_audit", None)
+            or self.spec.get("simulator_audit")
+            or ("fast" if self.simulator_mode == "fast" else "full")
+        ).strip().lower()
+        if self.simulator_audit not in {"fast", "full", "off"}:
+            raise ValueError("simulator audit must be fast, full, or off")
         if args.smsc_tps is not None:
-            self.faults["tps"] = float(args.smsc_tps)
+            self.legacy_smsc_tps = True
         if args.smsc_response_delay is not None:
             self.faults["response_delay"] = float(args.smsc_response_delay)
         if args.smsc_reject_ratio is not None:
@@ -284,6 +310,52 @@ class AcceptanceRunner:
             self.faults["dlr_delay"] = float(args.smsc_receipt_delay)
         if args.smsc_disconnect_after is not None:
             self.faults["disconnect_after"] = int(args.smsc_disconnect_after)
+        if args.smsc_disconnect_before_response is not None:
+            self.faults["disconnect_before_response"] = int(
+                args.smsc_disconnect_before_response
+            )
+        if self.simulator_mode == "fast" and any(
+            bool(self.faults.get(key)) for key in injected_fault_keys
+        ):
+            raise ValueError(
+                "fast simulator mode cannot combine with fault injection; "
+                "use --simulator-mode fault"
+            )
+        if self.simulator_mode == "fast" and self.delivery_receipt_mode != "disabled":
+            raise ValueError("fast simulator mode requires delivery_receipt_mode=disabled")
+        if self.legacy_smsc_tps:
+            legacy_tps = float(args.smsc_tps)
+            self.simulator_tps = max(0.0, legacy_tps)
+            self.route_tps = max(1.0, legacy_tps)
+            self.tps_scope = "legacy_both"
+        else:
+            simulator_tps = (
+                getattr(args, "simulator_tps", None)
+                if getattr(args, "simulator_tps", None) is not None
+                else self.spec.get(
+                    "simulator_tps",
+                    self.faults.get("tps", 0.0) if self.simulator_mode == "fault" else 0.0,
+                )
+            )
+            route_tps = (
+                getattr(args, "route_tps", None)
+                if getattr(args, "route_tps", None) is not None
+                else self.spec.get("route_tps", self.faults.get("tps", 200))
+            )
+            self.simulator_tps = max(0.0, float(simulator_tps if simulator_tps is not None else 0.0))
+            self.route_tps = max(1.0, float(route_tps if route_tps is not None else 200.0))
+            self.tps_scope = "separate"
+        self.simulator_response_delay = max(
+            0.0,
+            float(
+                getattr(args, "simulator_response_delay", None)
+                if getattr(args, "simulator_response_delay", None) is not None
+                else self.faults.get("response_delay", 0.0)
+            ),
+        )
+        self.simulator_max_inflight = max(
+            1, int(getattr(args, "simulator_max_inflight", 256) or 256)
+        )
         self.duration_seconds = int(
             args.duration_seconds or self.spec.get("duration_seconds", 0) or 0
         )
@@ -351,16 +423,25 @@ class AcceptanceRunner:
             "--host", "127.0.0.1", "--port", str(self.smsc_port),
             "--system-id", "test", "--password", "test",
             "--receipt-delay", str(float(self.faults.get("dlr_delay", 0.1))),
-            "--submit-response-delay", str(float(self.faults.get("response_delay", 0.0))),
-            "--tps", str(float(self.faults.get("tps", 0.0))),
+            "--simulator-mode", self.simulator_mode,
+            "--simulator-response-delay", str(self.simulator_response_delay),
+            "--simulator-tps", str(self.simulator_tps),
             "--reject-ratio", str(float(self.faults.get("reject_ratio", 0.0))),
             "--drop-response-ratio", str(float(self.faults.get("drop_response_ratio", 0.0))),
             "--drop-receipt-ratio", str(float(self.faults.get("drop_receipt_ratio", 0.0))),
             "--disconnect-after", str(int(self.faults.get("disconnect_after", 0))),
+            "--disconnect-before-response",
+            str(int(self.faults.get("disconnect_before_response", 0))),
             "--partial-submit-after", str(int(self.faults.get("partial_submit_after", 0))),
             "--partial-submit-status", str(self.faults.get("partial_submit_status", "0xb")),
             "--seed", str(int(self.faults.get("seed", 1))),
+            "--simulator-audit", self.simulator_audit,
+            "--audit-queue-size", str(int(getattr(self.args, "simulator_audit_queue_size", 8192) or 8192)),
+            "--audit-batch-size", str(int(getattr(self.args, "simulator_audit_batch_size", 128) or 128)),
+            "--audit-flush-interval", str(float(getattr(self.args, "simulator_audit_flush_interval", 0.05) or 0.05)),
+            "--max-inflight-per-connection", str(self.simulator_max_inflight),
             "--event-log", str(self.smsc_event_log),
+            "--metrics-output", str(self.smsc_metrics),
         ]
         if self.faults.get("drop_receipts"):
             args.append("--drop-receipts")
@@ -373,6 +454,32 @@ class AcceptanceRunner:
             raise BlockedEnv(f"Python executable does not exist: {self.python_executable}")
         self.watch_dir.mkdir(parents=True, exist_ok=True)
         self.campaign_dir.mkdir(parents=True, exist_ok=True)
+        (self.root / "run-manifest.json").write_text(
+            json.dumps(
+                {
+                    "scenario": self.scenario,
+                    "gate": self.gate,
+                    "simulator_mode": self.simulator_mode,
+                    "simulator_tps": self.simulator_tps,
+                    "simulator_response_delay": self.simulator_response_delay,
+                    "simulator_audit": self.simulator_audit,
+                    "route_tps": self.route_tps,
+                    "tps_scope": self.tps_scope,
+                    "delivery_receipt_mode": self.delivery_receipt_mode,
+                    "send_mode": self.send_mode,
+                    "dispatch_mode": self.dispatch_mode,
+                    "db_concurrency": self.db_concurrency,
+                    "faults": self.faults,
+                    "pool_size": self.pool_size,
+                    "window_size": max(1, self.args.smpp_window),
+                    "legacy_smsc_tps": self.legacy_smsc_tps,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         self._spawn(
             "smsc",
             [str(self.python_executable), str(TOOLS_DIR / "smsc_simulator.py"), *self._fault_args()],
@@ -831,7 +938,10 @@ class AcceptanceRunner:
             "window_size": max(1, self.args.smpp_window),
             "enquire_interval": 5,
             "timeout": 2 if self.faults.get("drop_response_ratio") else 10,
-            "tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
+            # This is the Marketing Copilot route-shared pacing contract.
+            # The simulator's artificial pacing is passed to its own process
+            # and is intentionally not reused here.
+            "tps": self.route_tps,
             "priority": 1,
             "reconnect_max_seconds": 2,
             "delivery_receipt_mode": self.delivery_receipt_mode,
@@ -927,7 +1037,21 @@ class AcceptanceRunner:
         process = self.processes.get("api")
         if not process or process.poll() is not None:
             return
-        process.terminate()
+        # The sender-only gate opens DuckDB itself immediately after stopping
+        # the API. A hard Windows TerminateProcess can leave the native owner
+        # in the middle of a WAL checkpoint and surface as a misleading
+        # UnicodeDecodeError/lock failure in the next connector. The API is
+        # spawned as a process group, so request the same graceful signal used
+        # for the simulator first; only the bounded timeout path is forced.
+        graceful_sent = False
+        if platform.system().lower() == "windows" and hasattr(signal, "CTRL_BREAK_EVENT"):
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                graceful_sent = True
+            except Exception:
+                graceful_sent = False
+        if not graceful_sent:
+            process.terminate()
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -958,6 +1082,13 @@ class AcceptanceRunner:
             )
             if campaign is None:
                 raise RuntimeError("sender-only campaign was not found")
+            # The application expires prior-day tasks using DuckDB's
+            # CURRENT_DATE. Seed with that same database-owner clock instead
+            # of the runner's UTC date; otherwise a near-midnight timezone
+            # boundary turns a valid sender-only workload into a safe but
+            # misleading "previous day task cancelled" result after restart.
+            task_date = conn.execute("SELECT CURRENT_DATE").fetchone()[0]
+            task_date = getattr(task_date, "isoformat", lambda: str(task_date))()
             campaign_name = str(campaign["name"] or "")
             dispatch_generation = int(campaign["dispatch_generation"] or 0)
             task_rows = []
@@ -972,7 +1103,7 @@ class AcceptanceRunner:
                     int(campaign["smpp_config_id"] or self.smpp_config_id or 0),
                     bool(campaign["flash_sms"]), content, "E2E",
                     json.dumps(row, ensure_ascii=False), "sender-only-preloaded",
-                    datetime.now(timezone.utc).date().isoformat(),
+                    task_date,
                     f"sender-only:{self.realtime_campaign_id}:{row['msisdn']}",
                     dispatch_generation,
                 ))
@@ -1118,10 +1249,42 @@ class AcceptanceRunner:
         except OSError:
             return ""
 
+    def _simulator_observation(self, submit_events: list[dict]) -> dict:
+        metrics = {}
+        try:
+            if self.smsc_metrics.is_file():
+                metrics = json.loads(self.smsc_metrics.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            metrics = {}
+        timestamps = [_parse_time(item.get("time")) for item in submit_events]
+        timestamps = [item for item in timestamps if item]
+        elapsed = (
+            max(timestamps) - min(timestamps)
+        ).total_seconds() if len(timestamps) > 1 else 0.0
+        stats = dict(metrics.get("stats") or {})
+        received = int(stats.get("received") or len(submit_events))
+        response_sent = int(stats.get("response_sent") or 0)
+        return {
+            "mode": self.simulator_mode,
+            "simulator_tps": self.simulator_tps,
+            "response_delay": self.simulator_response_delay,
+            "dlr_enabled": bool(metrics.get("dlr_enabled", self.simulator_mode == "fault")),
+            "tps_scope": "simulator",
+            "received": received,
+            "response_sent": response_sent,
+            "submit_sm_per_second": round(received / max(0.001, elapsed), 3) if received else 0.0,
+            "response_per_second": round(response_sent / max(0.001, elapsed), 3) if response_sent else 0.0,
+            "metrics": metrics,
+            "audit_status": metrics.get("audit_status", "NOT_RECORDED"),
+            "metrics_path": str(self.smsc_metrics),
+            "event_log_path": str(self.smsc_event_log),
+        }
+
     def _reconcile(self) -> dict:
         expected_status = self._expected_terminal_status()
         submit_events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"]
         dlr_events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "dlr"]
+        simulator_observation = self._simulator_observation(submit_events)
         tasks = self._db_query(
             """SELECT t.id,t.msisdn,t.status,t.attempts,t.source_file,t.created_at,t.submitted_at,t.delivered_at,
                       t.smsc_message_ids,COUNT(m.smsc_message_id) AS mapping_count
@@ -1145,25 +1308,51 @@ class AcceptanceRunner:
         has_unknown_expected = expected_status == "unknown" or self.expected_status_counts.get("unknown", 0) > 0
         unknown_submit_ids = unbound_accepts if has_unknown_expected else []
         task_by_msisdn = {str(item.get("msisdn")): item for item in tasks}
-        misdelivered = [
-            {
-                "message_id": item.get("message_id"),
-                "destination_addr": item.get("destination_addr"),
-                "task_msisdn": mapping_by_mid.get(
-                    str(item.get("message_id")), task_by_msisdn.get(str(item.get("destination_addr")), {})
-                ).get("msisdn"),
-            }
-            for item in accepted_events
-            if (
-                str(item.get("destination_addr")) not in task_by_msisdn
-                or (
-                    str(item.get("message_id")) in mapping_by_mid
-                    and str(item.get("destination_addr")) != str(
-                        mapping_by_mid[str(item.get("message_id"))].get("msisdn")
-                    )
-                )
+        # Fast audit intentionally omits raw destination addresses.  When
+        # delivery receipts are disabled there may also be no durable
+        # message-id binding, so reconcile the redacted destination digest
+        # against authoritative task MSISDNs instead of treating a redacted
+        # address as an empty string.  A multipart task legitimately emits
+        # several submit_sm records with the same destination, so this is a
+        # membership check rather than a one-record-per-task decrement.
+        expected_digests = {
+            hashlib.sha256(str(item.get("msisdn", "")).encode("utf-8")).hexdigest()[:16]
+            for item in tasks
+        }
+        misdelivered = []
+        for item in accepted_events:
+            message_id = str(item.get("message_id") or "")
+            mapping = mapping_by_mid.get(message_id)
+            raw_destination = item.get("destination_addr")
+            expected_msisdn = (
+                mapping.get("msisdn") if mapping else
+                task_by_msisdn.get(str(raw_destination), {}).get("msisdn")
             )
-        ]
+            digest = str(item.get("destination_digest") or "")
+            valid = True
+            if digest:
+                if expected_msisdn is not None:
+                    valid = digest == hashlib.sha256(
+                        str(expected_msisdn).encode("utf-8")
+                    ).hexdigest()[:16]
+                elif digest in expected_digests:
+                    # No raw address/message binding is present, but every
+                    # accepted PDU is still proven to target an authoritative
+                    # task recipient; multipart parts may repeat it.
+                    valid = True
+                else:
+                    valid = False
+            elif mapping:
+                valid = str(raw_destination) == str(mapping.get("msisdn"))
+            else:
+                valid = str(raw_destination) in task_by_msisdn
+            if not valid:
+                misdelivered.append({
+                    "message_id": item.get("message_id"),
+                    "destination_addr": raw_destination,
+                    "destination_digest": digest or None,
+                    "task_msisdn": expected_msisdn,
+                })
         attempts = self._db_query(
             """SELECT task_id,COUNT(*) AS count FROM sms_send_attempts
                 WHERE task_id IN (SELECT id FROM sms_tasks WHERE campaign_type='realtime' AND campaign_id=?)
@@ -1213,7 +1402,7 @@ class AcceptanceRunner:
                 and not attempts
             )
             return {
-                "status": "PASS" if ingest_ok else "FAIL",
+                "status": "PASS" if ingest_ok and simulator_observation["audit_status"] == "VERIFIED" else "FAIL",
                 "gate": self.gate,
                 "expected_terminal_status": "queued",
                 "delivery_receipt_mode": self.delivery_receipt_mode,
@@ -1225,6 +1414,7 @@ class AcceptanceRunner:
                 "smsc_submit_sm": len(submit_events),
                 "smsc_submit_sm_success": len(accepted_events),
                 "smsc_submit_sm_rejected": len(submit_events) - len(accepted_events),
+                "simulator": simulator_observation,
                 "duplicate_send_tasks": [int(item["task_id"]) for item in attempts],
                 "lost_submit_mappings": [],
                 "misdelivered": [],
@@ -1248,6 +1438,8 @@ class AcceptanceRunner:
                 "throughput": {
                     "events_per_second": None,
                     "submit_sm_per_second": None,
+                    "simulator_submit_sm_per_second": simulator_observation["submit_sm_per_second"],
+                    "simulator_response_per_second": simulator_observation["response_per_second"],
                     "queue_backlog_max": max(self.backlog_samples or [0]),
                     "queue_backlog_final": queued,
                 },
@@ -1258,7 +1450,11 @@ class AcceptanceRunner:
                     "smpp_loopback_only": loopback,
                     "pool_size": self.pool_size,
                     "window_size": max(1, self.args.smpp_window),
-                    "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
+                    "route_tps": self.route_tps,
+                    "simulator_tps": self.simulator_tps,
+                    "tps_scope": self.tps_scope,
+                    "simulator_mode": self.simulator_mode,
+                    "simulator_audit": self.simulator_audit,
                     "delivery_receipt_mode": self.delivery_receipt_mode,
                     "send_mode": self.send_mode,
                     "dispatch_mode": self.dispatch_mode,
@@ -1274,6 +1470,8 @@ class AcceptanceRunner:
                     "app_log": str(self.app_log),
                     "smsc_log": str(self.smsc_log),
                     "smsc_event_log": str(self.smsc_event_log),
+                    "smsc_metrics": str(self.smsc_metrics),
+                    "run_manifest": str(self.root / "run-manifest.json"),
                 },
             }
         event_rows = self._db_query(
@@ -1329,6 +1527,7 @@ class AcceptanceRunner:
             and (any(int(item.get("attempts") or 0) != 1 for item in tasks) or len(submit_events) != self.expected_submit_events)
         )
         dlr_violation = bool(dlr_events) and self.delivery_receipt_mode == "disabled"
+        simulator_audit_ok = simulator_observation["audit_status"] == "VERIFIED"
         expected_ok = (
             len(tasks) == self.expected_tasks
             and (
@@ -1346,6 +1545,7 @@ class AcceptanceRunner:
             and not duplicate_tasks
             and not unknown_retry_violation
             and not dlr_violation
+            and simulator_audit_ok
         )
         if self.expected_status_counts:
             expected_ok = expected_ok and all(
@@ -1386,6 +1586,7 @@ class AcceptanceRunner:
             "smsc_submit_sm": len(submit_events),
             "smsc_submit_sm_success": len(accepted_events),
             "smsc_submit_sm_rejected": len(submit_events) - len(accepted_events),
+            "simulator": simulator_observation,
             "data_coding_counts": dict(data_coding_counts),
             "esm_class_counts": dict(esm_class_counts),
             "multipart_total_counts": dict(multipart_counts),
@@ -1426,6 +1627,8 @@ class AcceptanceRunner:
             "throughput": {
                 "events_per_second": round(self.expected_tasks / max(0.001, elapsed), 3),
                 "submit_sm_per_second": round(len(submit_events) / max(0.001, elapsed), 3),
+                "simulator_submit_sm_per_second": simulator_observation["submit_sm_per_second"],
+                "simulator_response_per_second": simulator_observation["response_per_second"],
                 "queue_backlog_max": max(self.backlog_samples or [0]),
                 "queue_backlog_final": final_backlog,
             },
@@ -1439,6 +1642,7 @@ class AcceptanceRunner:
                 "api_log_scheduler_started": "Activity scheduler started" in self._read_log(self.app_log),
                 "api_log_ingestion_started": "Realtime ingestion worker started" in self._read_log(self.app_log),
                 "smsc_bind_seen": any(item.get("event_type") == "bind" and item.get("success") for item in _read_jsonl(self.smsc_event_log)),
+                "simulator_audit": simulator_audit_ok,
             },
             "environment": {
                 "system_mode": system_mode,
@@ -1447,7 +1651,11 @@ class AcceptanceRunner:
                 "smpp_loopback_only": loopback,
                 "pool_size": self.pool_size,
                 "window_size": max(1, self.args.smpp_window),
-                "route_tps": max(1, int(float(self.faults.get("tps", 200) or 200))),
+                "route_tps": self.route_tps,
+                "simulator_tps": self.simulator_tps,
+                "tps_scope": self.tps_scope,
+                "simulator_mode": self.simulator_mode,
+                "simulator_audit": self.simulator_audit,
                 "delivery_receipt_mode": self.delivery_receipt_mode,
                 "send_mode": self.send_mode,
                 "dispatch_mode": self.dispatch_mode,
@@ -1464,6 +1672,8 @@ class AcceptanceRunner:
                 "app_log": str(self.app_log),
                 "smsc_log": str(self.smsc_log),
                 "smsc_event_log": str(self.smsc_event_log),
+                "smsc_metrics": str(self.smsc_metrics),
+                "run_manifest": str(self.root / "run-manifest.json"),
             },
         }
 
@@ -1511,6 +1721,13 @@ class AcceptanceRunner:
             # Stop the real writers before opening a second read-only DuckDB
             # connection for the final ledger.  This keeps the audit query
             # independent from the worker's last buffered result flush.
+            # Capture one final in-process gateway snapshot while the API is
+            # still alive; a short quick run can finish before the periodic
+            # watchdog tick and otherwise lose actual socket-fairness data.
+            try:
+                self._watchdog_snapshot(full=False)
+            except Exception as exc:
+                self.failures.append(f"final live metrics snapshot failed: {type(exc).__name__}: {exc}")
             self._stop_watchdog()
             self.shutdown()
             report["reconciliation"] = self._reconcile()
@@ -1565,7 +1782,10 @@ class AcceptanceRunner:
             if not process or process.poll() is not None:
                 continue
             try:
-                process.send_signal(signal.SIGTERM)
+                if role == "smsc" and platform.system().lower() == "windows" and hasattr(signal, "CTRL_BREAK_EVENT"):
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    process.send_signal(signal.SIGTERM)
                 process.wait(timeout=10)
             except Exception:
                 try:
@@ -1609,11 +1829,21 @@ def main() -> int:
     parser.add_argument("--duration-seconds", type=int)
     parser.add_argument("--smsc-tps", type=float)
     parser.add_argument("--smsc-response-delay", type=float)
+    parser.add_argument("--simulator-mode", choices=("fast", "fault"), default=None)
+    parser.add_argument("--simulator-tps", type=float)
+    parser.add_argument("--simulator-response-delay", type=float)
+    parser.add_argument("--simulator-audit", choices=("fast", "full", "off"), default=None)
+    parser.add_argument("--simulator-max-inflight", type=int, default=256)
+    parser.add_argument("--simulator-audit-queue-size", type=int, default=8192)
+    parser.add_argument("--simulator-audit-batch-size", type=int, default=128)
+    parser.add_argument("--simulator-audit-flush-interval", type=float, default=0.05)
+    parser.add_argument("--route-tps", type=float)
     parser.add_argument("--smsc-reject-ratio", type=float)
     parser.add_argument("--smsc-drop-response-ratio", type=float)
     parser.add_argument("--smsc-drop-receipt-ratio", type=float)
     parser.add_argument("--smsc-receipt-delay", type=float)
     parser.add_argument("--smsc-disconnect-after", type=int)
+    parser.add_argument("--smsc-disconnect-before-response", type=int)
     parser.add_argument("--delivery-receipt-mode", choices=("disabled", "optional", "required"))
     parser.add_argument(
         "--send-mode", choices=("reliable", "fast"), default=None,
@@ -1653,6 +1883,18 @@ def main() -> int:
     parser.add_argument("--output", default=str(REPO_ROOT / "Docs" / "local-e2e-acceptance-results.json"))
     args = parser.parse_args()
     try:
+        if args.smsc_tps is not None and (
+            args.simulator_tps is not None or args.route_tps is not None
+        ):
+            parser.error(
+                "--smsc-tps is legacy and cannot be combined with "
+                "--simulator-tps/--route-tps; pass both new scopes explicitly"
+            )
+        if args.smsc_response_delay is not None and args.simulator_response_delay is not None:
+            parser.error(
+                "--smsc-response-delay is legacy and cannot be combined with "
+                "--simulator-response-delay"
+            )
         spec = _scenario_spec(Path(args.scenario_file), args.scenario)
         report = AcceptanceRunner(args, spec).run()
     except Exception as exc:

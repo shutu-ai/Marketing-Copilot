@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -42,10 +43,17 @@ class MultiCampaignFairRunner(AcceptanceRunner):
     def __init__(self, args: argparse.Namespace):
         spec = {
             "timeout_seconds": int(args.timeout_seconds),
-            "faults": {"tps": 1000},
+            "simulator_mode": str(getattr(args, "simulator_mode", None) or "fast"),
+            "simulator_tps": float(getattr(args, "simulator_tps", 0.0) or 0.0),
+            "route_tps": float(getattr(args, "route_tps", 200.0) or 200.0),
+            "simulator_audit": str(getattr(args, "simulator_audit", None) or "fast"),
+            "delivery_receipt_mode": "disabled",
+            "faults": {},
             "message": "Marketing Copilot fairness acceptance {event_id} {msisdn}",
         }
         super().__init__(args, spec)
+        self.large_rows = max(1, int(getattr(args, "large_rows", self.LARGE_ROWS)))
+        self.small_rows = max(1, int(getattr(args, "small_rows", self.SMALL_ROWS)))
         self.watch_dir = self.root / "watch-unused"
         self.campaign_dir = self.root / "campaign-unused"
         self.realtime_campaign_ids: dict[str, int] = {}
@@ -215,10 +223,14 @@ class MultiCampaignFairRunner(AcceptanceRunner):
             "enabled": 1,
         })
         self.smpp_config_id = int(smpp["id"])
-        self._provision_realtime("A", 1, self.LARGE_ROWS)
-        self._provision_realtime("B", 1001, self.SMALL_ROWS)
-        self._provision_batch("A", 2001, self.LARGE_ROWS)
-        self._provision_batch("B", 3001, self.SMALL_ROWS)
+        self._provision_realtime("A", 1, self.large_rows)
+        self._provision_realtime("B", self.large_rows + 1, self.small_rows)
+        self._provision_batch("A", self.large_rows + self.small_rows + 1, self.large_rows)
+        self._provision_batch(
+            "B",
+            (2 * self.large_rows) + self.small_rows + 1,
+            self.small_rows,
+        )
         self.expected_total = sum(item["expected_rows"] for item in self.activity_meta.values())
         self.realtime_campaign_id = self.realtime_campaign_ids["A"]
         self._wait_until(
@@ -310,7 +322,6 @@ class MultiCampaignFairRunner(AcceptanceRunner):
         tasks_by_activity: dict[tuple[str, int], list[dict]] = {}
         for task in all_tasks:
             tasks_by_activity.setdefault((str(task["campaign_type"]), int(task["campaign_id"])), []).append(task)
-        event_by_msisdn = {str(item.get("destination_addr")): item for item in accepted}
         activities = []
         duplicate_tasks = []
         missing_msisdns = []
@@ -321,7 +332,20 @@ class MultiCampaignFairRunner(AcceptanceRunner):
             attempts = [task for task in tasks if int(task.get("attempts") or 0) > 1]
             duplicate_tasks.extend(int(task["id"]) for task in attempts)
             missing_msisdns.extend(sorted(expected_msisdns - actual_msisdns))
-            submits = [event_by_msisdn[msisdn] for msisdn in actual_msisdns if msisdn in event_by_msisdn]
+            # Fast simulator audit intentionally redacts raw destinations.
+            # Reconcile each activity by the same bounded digest contract as
+            # local_e2e_acceptance rather than treating an empty address as a
+            # missing submit.  A multipart event may repeat a digest, so this
+            # is a membership filter, not a one-event-per-task map.
+            expected_digests = {
+                hashlib.sha256(str(msisdn).encode("utf-8")).hexdigest()[:16]
+                for msisdn in expected_msisdns
+            }
+            submits = [
+                event for event in accepted
+                if str(event.get("destination_digest") or "") in expected_digests
+                or str(event.get("destination_addr") or "") in expected_msisdns
+            ]
             first_submit = min((event.get("time") for event in submits), default=None)
             first_wait_ms = _duration_ms(meta.get("activated_at"), first_submit)
             statuses = Counter(str(task["status"]) for task in tasks)
@@ -424,6 +448,17 @@ def main() -> int:
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--timeout-seconds", type=int, default=180)
     parser.add_argument("--max-memory-mb", type=int, default=0)
+    parser.add_argument("--large-rows", type=int, default=MultiCampaignFairRunner.LARGE_ROWS)
+    parser.add_argument("--small-rows", type=int, default=MultiCampaignFairRunner.SMALL_ROWS)
+    parser.add_argument("--dispatch-mode", choices=("legacy", "fair"), default="fair")
+    parser.add_argument("--send-mode", choices=("reliable", "fast"), default="reliable")
+    parser.add_argument("--db-concurrency", choices=("serialized", "occ"), default="serialized")
+    parser.add_argument("--pool-size", type=int, default=1)
+    parser.add_argument("--smpp-window", type=int, default=10)
+    parser.add_argument("--route-tps", type=float, default=200.0)
+    parser.add_argument("--simulator-tps", type=float, default=0.0)
+    parser.add_argument("--simulator-mode", choices=("fast", "fault"), default="fast")
+    parser.add_argument("--simulator-audit", choices=("fast", "full", "off"), default="fast")
     parser.add_argument("--keep-artifacts", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -444,17 +479,29 @@ def main() -> int:
         "smsc_drop_receipt_ratio": None,
         "smsc_receipt_delay": None,
         "smsc_disconnect_after": None,
+        "smsc_disconnect_before_response": None,
         "delivery_receipt_mode": "disabled",
+        "dispatch_mode": args.dispatch_mode,
+        "send_mode": args.send_mode,
+        "db_concurrency": args.db_concurrency,
+        "simulator_mode": args.simulator_mode,
+        "simulator_tps": args.simulator_tps,
+        "simulator_response_delay": 0.0,
+        "simulator_audit": args.simulator_audit,
+        "route_tps": args.route_tps,
         "task_workers": 2,
         "ingest_workers": 2,
         "workers": 2,
         "claim_batch": 8,
-        "smpp_window": 10,
+        "smpp_window": args.smpp_window,
+        "pool_size": args.pool_size,
         "smpp_send_queue_capacity": 32,
         "producer_chunk_size": 0,
         "producer_chunk_delay": 0.0,
         "max_memory_mb": args.max_memory_mb,
         "keep_artifacts": args.keep_artifacts,
+        "large_rows": args.large_rows,
+        "small_rows": args.small_rows,
     }
     run_args = argparse.Namespace(**common)
     report = {
