@@ -1,0 +1,6 @@
+[extension]
+/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305/src/offline/extensions/1.2.0/linux_amd64_gcc4/core_functions.duckdb_extension
+61b0fc7741f6fda664025c8fc3b330d821c64c6c77407ed24a31316226cf4640  /home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305/src/offline/extensions/1.2.0/linux_amd64_gcc4/core_functions.duckdb_extension
+[extension-after]
+/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305/src/offline/extensions/v1.2.0/linux_amd64_gcc4/core_functions.duckdb_extension.info
+9273a9c47cf4bf02829050962ff09619fd8cba9fd61ea8be8f43e2803c35c6c7  /home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305/src/offline/extensions/v1.2.0/linux_amd64_gcc4/core_functions.duckdb_extension.info

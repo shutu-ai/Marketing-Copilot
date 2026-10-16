@@ -1,0 +1,1 @@
+pid 10576's current affinity list: 0-21

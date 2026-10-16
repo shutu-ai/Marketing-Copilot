@@ -1,0 +1,10 @@
+timestamp_utc=2026-10-16T12:52:17Z
+run=/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305
+run_owned_child_pids=none
+
+[run-size]
+1.8G	/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305
+
+[df]
+Filesystem     Type 1K-blocks     Used Available Use% Mounted on
+/dev/sda2      ext4  20466256 11049240   8352056  57% /

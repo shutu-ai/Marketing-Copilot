@@ -1,0 +1,19 @@
+{
+  "target_label": "SLES_PROXY_PERFORMANCE_TARGET",
+  "actual_os": "EulerOS 2.0 (SP15x86_64)",
+  "server": "10.202.245.70",
+  "username": "paas",
+  "run_root": "/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305",
+  "uid": 1000,
+  "filesystem": "ext4",
+  "python": "CPython 3.11.5",
+  "glibc": "2.38",
+  "cpu_list": "0,1,2,3",
+  "max_logical_cpus": 4,
+  "aggregate_rss_warning_mb": 2048,
+  "run_disk_warning_gb": 5,
+  "offline_only": true,
+  "no_index": true,
+  "host_window": "T0 observed 80-86 percent idle, no swap in/out, no other Run-owned child process at gate start",
+  "post_shutdown": "run_owned_child_pids=none"
+}

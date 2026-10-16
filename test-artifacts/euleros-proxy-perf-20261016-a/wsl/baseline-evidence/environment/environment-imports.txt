@@ -1,0 +1,4 @@
+/tmp/mc-euleros-proxy-perf-20261016-a/venv/bin/python
+3.11.5 (main, Aug 26 2023, 07:22:50) [Clang 16.0.3 ]
+duckdb 1.2.0
+ssl OpenSSL 1.1.1v  1 Aug 2023

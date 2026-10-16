@@ -1,0 +1,43 @@
+{
+  "target_label": "SLES_PROXY_PERFORMANCE_TARGET",
+  "actual_os": "EulerOS 2.0 SP15x86_64",
+  "server": "10.202.245.70",
+  "username": "paas",
+  "run_root": "/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305",
+  "frozen_git_sha": "d6b482f2a330570cf25d5d54802b8ba1bcee2b08",
+  "closure_sha256": "237d68dcdbeca0cc81606105a2cc71f3d767d097db4ae5a0b9a26c79a78de3ef",
+  "gates": {
+    "e0": {
+      "guard": "PASS",
+      "runner": "PASS"
+    },
+    "e1": {
+      "guard": "PASS",
+      "runner": "PASS"
+    },
+    "e2": {
+      "guard": "PASS",
+      "runner": "PASS"
+    },
+    "e3-occ": {
+      "guard": "PASS",
+      "runner": "PASS"
+    },
+    "e4-serialized": {
+      "guard": "FAIL",
+      "runner": "FAIL"
+    }
+  },
+  "EULEROS_PROXY_P100_STATUS": "PASS",
+  "EULEROS_PROXY_P1K_STATUS": "PASS",
+  "EULEROS_PROXY_OCC_STATUS": "PASS",
+  "P5500_STATUS": "FAIL_E4_TIMEOUT_OR_RECONCILIATION",
+  "OFFLINE_WAL_STATUS": "OFFLINE_EXTENSION_AND_GATED_RUNS_VERIFIED; DEDICATED_WAL_GATE_NOT_RUN",
+  "HOST_SAFETY_STATUS": "PASS_RESOURCE_LIMITS_AND_POST_SHUTDOWN",
+  "INTEGRATED_STATUS": "FAIL_E4",
+  "notes": [
+    "E2b not required because E2 passed.",
+    "E4 was run once only and was not retried after the runner timeout.",
+    "E4 runner generated 3500/5500 tasks and timed out waiting for all four activities accepted; guard RSS/disk limits were not breached."
+  ]
+}

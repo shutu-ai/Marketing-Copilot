@@ -1,0 +1,63 @@
+{
+  "gate": "e0",
+  "guard": {
+    "status": "PASS",
+    "exit_code": 0,
+    "reason": "completed",
+    "duration_seconds": 19.889,
+    "sample_count": 9,
+    "max_aggregate_rss_mb": 290.652,
+    "max_disk_delta_gb": 0.0
+  },
+  "runner": {
+    "status": "PASS",
+    "local_e2e_status": "LOCAL_E2E_PASS",
+    "live_env_status": "LIVE_ENV_UNVERIFIED",
+    "config_audit_status": "PASS",
+    "reconciliation_status": "PASS",
+    "acceptance_states": {},
+    "task_statuses": {
+      "accepted": 10
+    },
+    "stage_counts": {
+      "input_rows": 10,
+      "filtered_excluded": 0,
+      "filtered_invalid": 0,
+      "filtered_no_template": 0,
+      "tasks_created": 10,
+      "tasks_queued": 0,
+      "tasks_sending": 0,
+      "tasks_accepted": 10,
+      "tasks_unknown": 0,
+      "tasks_partial": 0,
+      "socket_submit_sm": 10,
+      "submit_sm_resp_observed": 10,
+      "submit_sm_resp_success": 10
+    },
+    "expected_tasks": null,
+    "generated_tasks": 10,
+    "smsc_submit_sm": 10,
+    "smsc_submit_sm_success": 10,
+    "missing_count": 0,
+    "duplicate_send_count": 0,
+    "duplicate_message_id_count": 0,
+    "simulator_stats": {
+      "received": 10,
+      "response_sent": 10,
+      "response_success": 10,
+      "response_failed": 0,
+      "response_dropped": 0,
+      "bind_attempts": 2,
+      "bind_count": 2,
+      "inflight": 0,
+      "max_inflight": 1,
+      "connected": 3,
+      "disconnected": 3,
+      "dlr_generated": 0,
+      "error_count": 0,
+      "latency_sample_count": 10
+    },
+    "simulator_audit_status": "VERIFIED",
+    "failure_reason": null
+  }
+}

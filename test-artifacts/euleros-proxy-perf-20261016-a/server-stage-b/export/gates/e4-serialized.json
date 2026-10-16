@@ -1,0 +1,39 @@
+{
+  "gate": "e4-serialized",
+  "guard": {
+    "status": "FAIL",
+    "exit_code": 2,
+    "reason": "guarded command exited with 2",
+    "duration_seconds": 338.511,
+    "sample_count": 140,
+    "max_aggregate_rss_mb": 457.25,
+    "max_disk_delta_gb": 0.0
+  },
+  "runner": {
+    "status": "FAIL",
+    "local_e2e_status": "LOCAL_E2E_FAIL",
+    "live_env_status": "LIVE_ENV_UNVERIFIED",
+    "config_audit_status": "PASS",
+    "reconciliation_status": "FAIL",
+    "acceptance_states": {
+      "BATCH_INGEST_FAIRNESS": "PASS",
+      "REALTIME_INTAKE_FAIRNESS": "PASS",
+      "SMS_DISPATCH_FAIRNESS": "FAIL",
+      "CROSS_TYPE_E2E": "FAIL",
+      "FAIRNESS_TELEMETRY": "PASS",
+      "SFTP": "BLOCKED_ENV"
+    },
+    "task_statuses": {},
+    "stage_counts": {},
+    "expected_tasks": 5500,
+    "generated_tasks": 3500,
+    "smsc_submit_sm": 2787,
+    "smsc_submit_sm_success": 2787,
+    "missing_count": 2000,
+    "duplicate_send_count": 0,
+    "duplicate_message_id_count": 0,
+    "simulator_stats": {},
+    "simulator_audit_status": null,
+    "failure_reason": "TimeoutError: Timed out waiting for all four activities accepted; last_error="
+  }
+}
