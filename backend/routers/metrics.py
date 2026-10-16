@@ -100,6 +100,38 @@ def capacity_status():
             'calculated_at': time.time()}
 
 
+@router.get('/api/metrics/live')
+def live_status():
+    """Return bounded in-process counters for acceptance observers.
+
+    This endpoint deliberately does not refresh task aggregates, inspect the
+    task table, or read an event log.  The acceptance harness uses it while a
+    load is running; the stopped-service reconciliation remains the
+    authoritative correctness audit.
+    """
+    try:
+        fast_send = fast_send_service.status()
+    except Exception as exc:
+        fast_send = {'error': f'{type(exc).__name__}: {exc}'}
+    transport_snapshot = metrics_service.campaign_transport_snapshot()
+    transport = [
+        {
+            'campaign_type': key[0],
+            'campaign_id': key[1],
+            'config_id': key[2],
+            **value,
+        }
+        for key, value in transport_snapshot.items()
+    ]
+    return {
+        'captured_at': time.time(),
+        'observer_contract': 'in_process_counters_only',
+        'campaign_transport': transport,
+        'fast_send': fast_send,
+        'workers': worker_status(),
+    }
+
+
 @router.get('/api/metrics/stall-diagnostics')
 def stall_diagnostics():
     """Return bounded in-process state and all Python thread stacks.

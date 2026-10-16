@@ -64,6 +64,12 @@ class MultiCampaignFairRunner(AcceptanceRunner):
         self.realtime_campaign_id = None
         self.expected_total = 0
         self.sftp_status = "BLOCKED_ENV"
+        self.observer_audit: dict[str, object] = {
+            "sampling_policy": "bounded_in_process_live_counters; final task/event audit after shutdown",
+            "samples": 0,
+            "errors": [],
+            "full_event_audit": None,
+        }
 
     def _environment(self) -> dict[str, str]:
         env = super()._environment()
@@ -204,7 +210,7 @@ class MultiCampaignFairRunner(AcceptanceRunner):
         )
 
     def _provision(self) -> None:
-        smpp = self._api_json("POST", "/api/smpp/configs", {
+        declared_smpp = {
             "name": "fairness-loopback",
             "host": "127.0.0.1",
             "port": self.smsc_port,
@@ -212,17 +218,20 @@ class MultiCampaignFairRunner(AcceptanceRunner):
             "password": "test",
             "source_addr": "FAIR",
             "bind_type": "transceiver",
-            "pool_size": 1,
-            "window_size": 10,
+            "pool_size": self.pool_size,
+            "window_size": max(1, self.args.smpp_window),
             "enquire_interval": 5,
             "timeout": 10,
-            "tps": 1000,
+            "tps": self.route_tps,
             "priority": 1,
             "reconnect_max_seconds": 2,
             "delivery_receipt_mode": "disabled",
             "enabled": 1,
-        })
+        }
+        smpp = self._api_json("POST", "/api/smpp/configs", declared_smpp)
         self.smpp_config_id = int(smpp["id"])
+        declared_smpp["config_id"] = self.smpp_config_id
+        self._declared_smpp_config = declared_smpp
         self._provision_realtime("A", 1, self.large_rows)
         self._provision_realtime("B", self.large_rows + 1, self.small_rows)
         self._provision_batch("A", self.large_rows + self.small_rows + 1, self.large_rows)
@@ -237,6 +246,7 @@ class MultiCampaignFairRunner(AcceptanceRunner):
             lambda: bool((self._api_json("GET", "/api/health").get("smpp") or {}).get("connected")),
             self.timeout_seconds, "SMPP bind connected",
         )
+        self._assert_smpp_effective_config(declared_smpp, require_bind=True)
 
     def _publish_inputs(self) -> None:
         # Start the two large activities first.  The small activities are
@@ -274,22 +284,50 @@ class MultiCampaignFairRunner(AcceptanceRunner):
             if not cursor:
                 return rows
 
+    def _live_transport_snapshot(self) -> dict:
+        payload = self._api_json("GET", "/api/metrics/live") or {}
+        rows = payload.get("campaign_transport") or []
+        totals = {
+            "scheduled_parts": 0,
+            "socket_parts": 0,
+            "response_success": 0,
+            "response_failure": 0,
+        }
+        for row in rows:
+            totals["scheduled_parts"] += int(float(row.get("scheduled_parts_total") or 0))
+            totals["socket_parts"] += int(float(row.get("socket_parts_total") or 0))
+            totals["response_success"] += int(float(row.get("submit_sm_resp_success_total") or 0))
+            totals["response_failure"] += int(float(row.get("submit_sm_resp_failure_total") or 0))
+        totals["backlog_parts"] = max(0, totals["scheduled_parts"] - totals["socket_parts"])
+        return {
+            "observer_contract": payload.get("observer_contract"),
+            "transport": rows,
+            **totals,
+        }
+
     def _sample_runtime(self) -> None:
         for role, process in self.processes.items():
             if process.poll() is None:
                 self.resource_samples.append(_safe_process_snapshot(process.pid, role))
         try:
-            tasks = self._environment_task_rows()
-            counts = Counter(str(item.get("status")) for item in tasks)
+            transport = self._live_transport_snapshot()
             snapshot = {
-                "task_total": len(tasks),
-                "tasks": dict(counts),
-                "backlog": sum(counts.get(status, 0) for status in ("queued", "sending", "retrying")),
+                "task_total": transport["scheduled_parts"],
+                "tasks": {},
+                "scheduled_parts": transport["scheduled_parts"],
+                "socket_parts": transport["socket_parts"],
+                "response_success": transport["response_success"],
+                "response_failure": transport["response_failure"],
+                "backlog": transport["backlog_parts"],
+                "observer_contract": transport.get("observer_contract"),
             }
             self.last_snapshot = snapshot
             self.backlog_samples.append(int(snapshot["backlog"]))
-        except Exception:
-            pass
+            self.observer_audit["samples"] = int(self.observer_audit["samples"]) + 1
+        except Exception as exc:
+            errors = self.observer_audit.setdefault("errors", [])
+            if len(errors) < 20:
+                errors.append(f"{type(exc).__name__}: {exc}")
         if self.args.max_memory_mb:
             limit = int(self.args.max_memory_mb) * 1024 * 1024
             if any(int(item.get("rss_bytes", 0) or 0) > limit for item in self.resource_samples[-4:]):
@@ -297,20 +335,34 @@ class MultiCampaignFairRunner(AcceptanceRunner):
 
     def _wait_for_business(self) -> None:
         def done():
-            rows = self._environment_task_rows()
-            events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"]
-            accepted = [item for item in events if int(item.get("response_status", 1)) == 0]
-            status_counts = Counter(str(item.get("status")) for item in rows)
+            transport = self._live_transport_snapshot()
             return (
-                len(rows) >= self.expected_total
-                and status_counts.get("accepted", 0) >= self.expected_total
-                and len(accepted) >= self.expected_total
+                transport["scheduled_parts"] >= self.expected_total
+                and transport["socket_parts"] >= self.expected_total
             )
 
         self._wait_until(done, self.timeout_seconds, "all four activities accepted")
 
+    def _read_final_events(self) -> list[dict]:
+        started = time.perf_counter()
+        try:
+            events = _read_jsonl(self.smsc_event_log)
+        finally:
+            try:
+                size = self.smsc_event_log.stat().st_size
+            except OSError:
+                size = 0
+            self.observer_audit["full_event_audit"] = {
+                "path": str(self.smsc_event_log),
+                "event_count": len(events) if "events" in locals() else None,
+                "bytes": int(size),
+                "seconds": round(max(0.0, time.perf_counter() - started), 6),
+                "when": "post_shutdown_reconciliation",
+            }
+        return events
+
     def _reconcile(self) -> dict:
-        events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"]
+        events = [item for item in self._read_final_events() if item.get("event_type") == "submit_sm"]
         accepted = [item for item in events if int(item.get("response_status", 1)) == 0]
         all_tasks = self._db_query(
             "SELECT id,campaign_type,campaign_id,msisdn,status,attempts,created_at,submitted_at,smsc_message_ids FROM sms_tasks ORDER BY id"
@@ -433,7 +485,13 @@ class MultiCampaignFairRunner(AcceptanceRunner):
                 "live_env_status": "LIVE_ENV_UNVERIFIED",
                 "sftp_status": self.sftp_status,
                 "smpp_loopback_only": True,
+                "pool_size": self.pool_size,
+                "window_size": max(1, self.args.smpp_window),
+                "route_tps": self.route_tps,
+                "tps_scope": self.tps_scope,
             },
+            "config_audit": self.config_audit,
+            "observer": self.observer_audit,
             "diagnostics": {
                 "artifacts_dir": str(self.root),
                 "api_log": str(self.api_log),
@@ -460,6 +518,7 @@ def main() -> int:
     parser.add_argument("--simulator-mode", choices=("fast", "fault"), default="fast")
     parser.add_argument("--simulator-audit", choices=("fast", "full", "off"), default="fast")
     parser.add_argument("--keep-artifacts", action="store_true")
+    parser.add_argument("--run-root", default="")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     common = {
@@ -500,6 +559,7 @@ def main() -> int:
         "producer_chunk_delay": 0.0,
         "max_memory_mb": args.max_memory_mb,
         "keep_artifacts": args.keep_artifacts,
+        "run_root": args.run_root,
         "large_rows": args.large_rows,
         "small_rows": args.small_rows,
     }

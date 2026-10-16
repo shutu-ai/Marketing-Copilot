@@ -290,7 +290,6 @@ _checkpoint_error = ""
 _last_checkpoint_at = 0.0
 _last_checkpoint_event_at = 0.0
 _unresolved_count = 0
-_FAIR_CHECKPOINT_INTERVAL_SECONDS = 0.3
 
 
 def _int_env(name: str, default: int, low: int, high: int) -> int:
@@ -315,6 +314,19 @@ def _checkpoint_batch_size() -> int:
     return _int_env("MC_FAST_SEND_CHECKPOINT_BATCH", 250, 1, 2000)
 
 
+def _fair_checkpoint_interval() -> float:
+    """Return the bounded fair-mode coalescing interval.
+
+    Fair Result capacity deliberately keeps Fast success checkpoints durable
+    and bounded.  The default remains the historical 300 ms interval; the
+    operator may increase only the coalescing delay, never remove the queue or
+    capacity limits.
+    """
+    return _float_env(
+        "MC_FAST_SEND_FAIR_CHECKPOINT_MS", 300.0, 300.0, 5000.0
+    ) / 1000.0
+
+
 def _checkpoint_interval() -> float:
     return _float_env("MC_FAST_SEND_CHECKPOINT_MS", 100.0, 10.0, 5000.0) / 1000.0
 
@@ -326,7 +338,7 @@ def _pending_durable_limit() -> int:
 def _checkpoint_wait_seconds() -> float:
     from services import result_capacity_service as capacity
     if capacity.enabled():
-        return max(_checkpoint_interval(), _FAIR_CHECKPOINT_INTERVAL_SECONDS)
+        return max(_checkpoint_interval(), _fair_checkpoint_interval())
     return _checkpoint_interval()
 
 
@@ -363,7 +375,7 @@ def start() -> None:
     thread.start()
     logger.warning(
         "Fast Send checkpoint pipeline started batch=%s interval_ms=%s queue=%s",
-        _checkpoint_batch_size(), round(_checkpoint_interval() * 1000),
+        _checkpoint_batch_size(), round(_checkpoint_wait_seconds() * 1000),
         _checkpoint_limit(),
     )
 

@@ -1,0 +1,87 @@
+{
+  "task_id": "MC-INTEGRATED-NATIVE-THROUGHPUT-FINAL-CLOSURE-20261016",
+  "baseline": {
+    "git_head": "95efa42491af5bb0aa0b08560bf293fd26a92553",
+    "origin_main": "95efa42491af5bb0aa0b08560bf293fd26a92553",
+    "source_sha_policy": "record_final_frozen_source_manifest_before_each_gate"
+  },
+  "correctness_contract": {
+    "preserve": [
+      "journal fsync",
+      "result hard bytes and credit",
+      "attempt/part identity",
+      "unknown and partial terminal states",
+      "stop/cancel fences",
+      "duplicate and unmapped result rejection"
+    ],
+    "relaxation_allowed": false
+  },
+  "g4_named_contract": {
+    "large_rows": 50000,
+    "small_rows": 1000,
+    "named_activity_mapping": {
+      "A": 50000,
+      "B": 1000,
+      "C": 1000
+    },
+    "named_activity_total": 52000,
+    "four_activity_runner_mapping": {
+      "realtime-A": "large_rows",
+      "batch-A": "large_rows",
+      "realtime-B": "small_rows",
+      "batch-B": "small_rows"
+    },
+    "four_activity_runner_total_formula": "2 * large_rows + 2 * small_rows",
+    "four_activity_runner_total_with_named_values": 102000,
+    "mapping_status": "EXPLICIT_CONTRACT_AMBIGUITY_RETAINED",
+    "route_tps": 200,
+    "default_deadline_seconds": 180,
+    "single_route_minimum_seconds": {
+      "named_52000_single_pdu": 260,
+      "four_activity_102000_single_pdu": 510
+    },
+    "strict_completion_result_if_unchanged": "SPEC_INFEASIBLE_NEEDS_DECISION"
+  },
+  "g4_matrix": {
+    "route_structures": ["same_route", "two_route"],
+    "pool_sizes": [1, 4],
+    "window_sizes": [1, 2, 50],
+    "route_tps_scope": "shared_per_physical_route_submit_sm_parts_per_second",
+    "simulator_tps_scope": "separate_process_pacing",
+    "required_effective_config_evidence": [
+      "declared CLI values",
+      "API persisted configuration",
+      "gateway desired pool and per-slot window/TPS",
+      "physical bind success events",
+      "socket submit and response counters"
+    ]
+  },
+  "observer_contract": {
+    "in_run": "bounded in-process live counters; no task-table pagination or full event-log scans",
+    "sample_interval_seconds": 1,
+    "final_audit": "post-shutdown complete task, attempt, part, journal, DB and simulator event audit",
+    "observer_effect_ab": "retain API call counts, response bytes, elapsed time, CPU/RSS and final audit byte counts"
+  },
+  "native_contract": {
+    "os": "AlmaLinux-8 WSL",
+    "filesystem": "native ext4",
+    "python": "CPython 3.11.13",
+    "duckdb": "1.2.0",
+    "faulthandler": true,
+    "core_or_native_frame": "record if available; never invent a frame",
+    "sigsegv_result": "any SIGSEGV/SIGABRT/OOM/unknown task loss is FAIL and retains artifacts"
+  },
+  "gate_outputs": [
+    "G0",
+    "G1",
+    "G3",
+    "G4_FAIRNESS",
+    "G4_CAPACITY",
+    "G4_CONTROL",
+    "G4_NATIVE",
+    "G5",
+    "G6",
+    "G-SIM"
+  ],
+  "status": "FROZEN_CONTRACT_NOT_A_PASS"
+}

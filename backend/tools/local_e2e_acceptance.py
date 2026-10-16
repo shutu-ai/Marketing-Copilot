@@ -49,6 +49,10 @@ class BlockedEnv(RuntimeError):
     pass
 
 
+class HarnessConfigFail(RuntimeError):
+    """The declared acceptance configuration did not become effective."""
+
+
 def _load_duckdb():
     try:
         import duckdb
@@ -208,7 +212,11 @@ class AcceptanceRunner:
         self.last_snapshot: dict = {}
         self.last_snapshot_at = 0.0
         self.last_watchdog_metrics: dict = {}
+        self.final_metrics: dict = {}
+        self.final_metrics_path: Path | None = None
         self.last_runtime_snapshot_at = 0.0
+        self.api_call_stats: dict[str, dict[str, float | int]] = {}
+        self.config_audit: dict[str, Any] = {"status": "NOT_RUN"}
         self.diagnostics_dir = self.root / "diagnostics"
         self.watchdog_stop = threading.Event()
         self.watchdog_thread: threading.Thread | None = None
@@ -540,10 +548,149 @@ class AcceptanceRunner:
             return exc.code, body_value
 
     def _api_json(self, method: str, path: str, payload: Any = None) -> Any:
-        status, body = self._http(method, path, payload)
-        if status < 200 or status >= 300:
-            raise RuntimeError(f"API {method} {path} -> HTTP {status}: {body}")
-        return body
+        endpoint = path.split("?", 1)[0]
+        key = f"{method.upper()} {endpoint}"
+        started = time.perf_counter()
+        status = 0
+        body = None
+        try:
+            status, body = self._http(method, path, payload)
+            if status < 200 or status >= 300:
+                raise RuntimeError(f"API {method} {path} -> HTTP {status}: {body}")
+            return body
+        finally:
+            elapsed = max(0.0, time.perf_counter() - started)
+            item = self.api_call_stats.setdefault(key, {
+                "calls": 0, "total_seconds": 0.0, "max_seconds": 0.0,
+                "response_bytes_estimate": 0,
+            })
+            item["calls"] = int(item["calls"]) + 1
+            item["total_seconds"] = float(item["total_seconds"]) + elapsed
+            item["max_seconds"] = max(float(item["max_seconds"]), elapsed)
+            if body is not None:
+                try:
+                    item["response_bytes_estimate"] = int(item["response_bytes_estimate"]) + len(
+                        json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+    def _assert_smpp_effective_config(
+        self,
+        declared: dict[str, Any],
+        *,
+        require_bind: bool = True,
+        event_log: Path | None = None,
+    ) -> dict:
+        """Prove CLI values reached DB, gateway status and physical binds."""
+        config_id = int(declared["config_id"])
+        db_config = self._api_json("GET", f"/api/smpp/configs/{config_id}") or {}
+        status = self._api_json("GET", "/api/smpp/status") or {}
+        pool = next(
+            (item for item in (status.get("pools") or [])
+             if int(item.get("config_id") or 0) == config_id),
+            None,
+        ) or {}
+        connections = list(pool.get("connections") or [])
+        bind_count = sum(1 for item in connections if item.get("connected"))
+        expected_pool = max(1, int(declared["pool_size"]))
+        expected_window = max(1, int(declared["window_size"]))
+        expected_route_tps = float(declared.get("route_tps", declared["tps"]))
+        db_effective = {
+            "id": int(db_config.get("id") or 0),
+            "pool_size": int(db_config.get("pool_size") or 0),
+            "window_size": int(db_config.get("window_size") or 0),
+            "tps": float(db_config.get("tps") or 0),
+            "updated_at": db_config.get("updated_at"),
+            "host": db_config.get("host"),
+            "port": int(db_config.get("port") or 0),
+        }
+        gateway_effective = {
+            "desired_pool_size": int(pool.get("desired_pool_size") or 0),
+            "connection_count": len(connections),
+            "connected_count": bind_count,
+            "connections": [
+                {
+                    "slot": item.get("slot"),
+                    "connected": bool(item.get("connected")),
+                    "window_size": int(item.get("window_size") or 0),
+                    "configured_route_tps": float(item.get("configured_route_tps") or 0),
+                    "effective_total_limit_tps": float(item.get("effective_total_limit_tps") or 0),
+                    "tps_scope": item.get("tps_scope"),
+                    "window_unit": item.get("window_unit"),
+                }
+                for item in connections
+            ],
+            "active_config_id": status.get("active_config_id"),
+        }
+        bind_event_path = event_log or self.smsc_event_log
+        bind_events = [
+            item for item in _read_jsonl(bind_event_path)
+            if item.get("event_type") == "bind" and item.get("success")
+        ]
+        mismatches = []
+        if db_effective["id"] != config_id:
+            mismatches.append(f"db.id={db_effective['id']} expected={config_id}")
+        if db_effective["pool_size"] != expected_pool:
+            mismatches.append(f"db.pool_size={db_effective['pool_size']} expected={expected_pool}")
+        if db_effective["window_size"] != expected_window:
+            mismatches.append(f"db.window_size={db_effective['window_size']} expected={expected_window}")
+        if db_effective["tps"] != expected_route_tps:
+            mismatches.append(f"db.tps={db_effective['tps']} expected={expected_route_tps}")
+        if gateway_effective["desired_pool_size"] != expected_pool:
+            mismatches.append(
+                f"gateway.desired_pool_size={gateway_effective['desired_pool_size']} expected={expected_pool}"
+            )
+        if require_bind and gateway_effective["connected_count"] != expected_pool:
+            mismatches.append(
+                f"gateway.connected_count={gateway_effective['connected_count']} expected={expected_pool}"
+            )
+        if require_bind and len(bind_events) < expected_pool:
+            mismatches.append(f"simulator.bind_success={len(bind_events)} expected_at_least={expected_pool}")
+        for item in gateway_effective["connections"]:
+            if item["window_size"] != expected_window:
+                mismatches.append(
+                    f"gateway.slot{item['slot']}.window_size={item['window_size']} expected={expected_window}"
+                )
+            if item["configured_route_tps"] != expected_route_tps:
+                mismatches.append(
+                    f"gateway.slot{item['slot']}.configured_route_tps={item['configured_route_tps']} expected={expected_route_tps}"
+                )
+            if item["effective_total_limit_tps"] > expected_route_tps + 1e-9:
+                mismatches.append(
+                    f"gateway.slot{item['slot']}.effective_total_limit_tps={item['effective_total_limit_tps']} exceeds shared route={expected_route_tps}"
+                )
+        self.config_audit = {
+            "status": "PASS" if not mismatches else "HARNESS_CONFIG_FAIL",
+            "declared": dict(declared),
+            "db_effective": db_effective,
+            "gateway_effective": gateway_effective,
+            "simulator_effective": {
+                "bind_success_events": len(bind_events),
+                "event_log": str(bind_event_path),
+            },
+            "route_tps_scope": "route_shared_submit_sm_parts_per_second",
+            "mismatches": mismatches,
+        }
+        if mismatches:
+            raise HarnessConfigFail("; ".join(mismatches))
+        return self.config_audit
+
+    def _live_transport_totals(self, timeout: float = 2) -> dict[str, int]:
+        payload = self._api_json("GET", "/api/metrics/live") or {}
+        totals = {
+            "scheduled_parts": 0,
+            "socket_parts": 0,
+            "response_success": 0,
+            "response_failure": 0,
+        }
+        for row in payload.get("campaign_transport") or []:
+            totals["scheduled_parts"] += int(float(row.get("scheduled_parts_total") or 0))
+            totals["socket_parts"] += int(float(row.get("socket_parts_total") or 0))
+            totals["response_success"] += int(float(row.get("submit_sm_resp_success_total") or 0))
+            totals["response_failure"] += int(float(row.get("submit_sm_resp_failure_total") or 0))
+        totals["backlog_parts"] = max(0, totals["scheduled_parts"] - totals["socket_parts"])
+        return totals
 
     def _wait_http(self, path: str, timeout: float, label: str) -> Any:
         deadline = time.monotonic() + timeout
@@ -690,12 +837,40 @@ class AcceptanceRunner:
         if self.no_live_observer:
             return {"disabled": True}
         try:
-            status, body = self._http("GET", "/api/metrics/status", timeout=2)
+            status, body = self._http("GET", "/api/metrics/live", timeout=2)
             if status < 200 or status >= 300:
                 return {"error": f"HTTP {status}", "body": body}
             return body if isinstance(body, dict) else {"body": body}
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _capture_final_metrics(self) -> None:
+        """Capture one full metrics snapshot after business completion.
+
+        Live polling uses only bounded in-process counters.  This single
+        post-completion snapshot preserves DB/result/claim timing evidence
+        without turning the observer into a repeated workload participant.
+        """
+        try:
+            body = self._api_json("GET", "/api/metrics/status")
+            if not isinstance(body, dict):
+                return
+            self.final_metrics = body
+            path = self.root / "final-metrics.json"
+            path.write_text(
+                json.dumps(body, ensure_ascii=False, indent=2, default=str) + "\n",
+                encoding="utf-8",
+            )
+            self.final_metrics_path = path
+        except Exception as exc:
+            self.failures.append(f"final metrics snapshot failed: {type(exc).__name__}: {exc}")
+
+    def _observability_report(self) -> dict:
+        return {
+            "live": self.last_watchdog_metrics,
+            "final_metrics_path": str(self.final_metrics_path) if self.final_metrics_path else None,
+            "final_metrics_captured": bool(self.final_metrics),
+        }
 
     def _watchdog_db_snapshot(self) -> dict:
         """Describe the deferred database part of a live watchdog snapshot.
@@ -723,18 +898,23 @@ class AcceptanceRunner:
         metrics = self._watchdog_metrics()
         if metrics and not metrics.get("error"):
             self.last_watchdog_metrics = metrics
-        submit_events = [
-            item for item in _read_jsonl(self.smsc_event_log)
-            if item.get("event_type") == "submit_sm"
-        ]
-        response_observed = sum(
-            1 for item in submit_events if not item.get("response_dropped", False)
-        )
+        transport = {
+            "scheduled_parts": 0,
+            "socket_parts": 0,
+            "response_success": 0,
+            "response_failure": 0,
+        }
+        for row in metrics.get("campaign_transport") or []:
+            transport["scheduled_parts"] += int(float(row.get("scheduled_parts_total") or 0))
+            transport["socket_parts"] += int(float(row.get("socket_parts_total") or 0))
+            transport["response_success"] += int(float(row.get("submit_sm_resp_success_total") or 0))
+            transport["response_failure"] += int(float(row.get("submit_sm_resp_failure_total") or 0))
         task_counts = live.get("tasks") or {}
         progress = {
             "generated": int(live.get("task_total", 0) or 0),
-            "socket_submit": len(submit_events),
-            "response_observed": response_observed,
+            "scheduled_parts": transport["scheduled_parts"],
+            "socket_submit": transport["socket_parts"],
+            "response_observed": transport["response_success"] + transport["response_failure"],
             "task_accepted": int(task_counts.get("accepted", 0) or 0),
         }
         process_states = {
@@ -926,7 +1106,7 @@ class AcceptanceRunner:
         )
 
     def _provision(self) -> None:
-        smpp = self._api_json("POST", "/api/smpp/configs", {
+        declared_smpp = {
             "name": "local-e2e-loopback",
             "host": "127.0.0.1",
             "port": self.smsc_port,
@@ -946,8 +1126,11 @@ class AcceptanceRunner:
             "reconnect_max_seconds": 2,
             "delivery_receipt_mode": self.delivery_receipt_mode,
             "enabled": 1,
-        })
+        }
+        smpp = self._api_json("POST", "/api/smpp/configs", declared_smpp)
         self.smpp_config_id = int(smpp["id"])
+        declared_smpp["config_id"] = self.smpp_config_id
+        self._declared_smpp_config = declared_smpp
 
         self._api_json("POST", "/api/realtime-campaigns", {
             "name": f"local-e2e-{self.scenario}",
@@ -1004,6 +1187,9 @@ class AcceptanceRunner:
         )
         if not self.task_worker_disabled:
             self._wait_for_smpp()
+        self._assert_smpp_effective_config(
+            declared_smpp, require_bind=not self.task_worker_disabled,
+        )
 
     def _build_input_rows(self) -> None:
         if self.scenario == "quick":
@@ -1161,14 +1347,11 @@ class AcceptanceRunner:
             if snapshot:
                 self.last_snapshot = snapshot
                 self.last_snapshot_at = time.monotonic()
-            events = [
-                item for item in _read_jsonl(self.smsc_event_log)
-                if item.get("event_type") == "submit_sm"
-            ]
+            transport = self._live_transport_totals()
             return bool(
                 snapshot.get("files", {}).get("completed", 0) >= len(self.file_manifests)
                 and snapshot.get("task_total", 0) >= self.expected_tasks
-                and not events
+                and transport["socket_parts"] == 0
             )
 
         self._wait_until(
@@ -1183,9 +1366,10 @@ class AcceptanceRunner:
         expected_status = self._expected_terminal_status()
 
         def done():
-            events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"]
             if self.no_live_observer:
+                events = [item for item in _read_jsonl(self.smsc_event_log) if item.get("event_type") == "submit_sm"]
                 return len(events) >= self.expected_submit_events
+            transport = self._live_transport_totals()
             now = time.monotonic()
             if self.last_snapshot and now - self.last_snapshot_at < 0.8:
                 snapshot = self.last_snapshot
@@ -1212,9 +1396,9 @@ class AcceptanceRunner:
                     and snapshot.get("backlog", 0) == 0
                 )
             if expected_status == "partial":
-                sms_complete = len(events) >= 2
+                sms_complete = transport["socket_parts"] >= 1
             else:
-                sms_complete = len(events) >= self.expected_submit_events
+                sms_complete = transport["socket_parts"] >= self.expected_submit_events
             if files_complete and tasks_ready and terminal and sms_complete:
                 return True
             return False
@@ -1434,7 +1618,7 @@ class AcceptanceRunner:
                 "files": file_breakdown,
                 "file_statuses": dict(file_statuses),
                 "pre_generated_tasks": {},
-                "observability": self.last_watchdog_metrics,
+                "observability": self._observability_report(),
                 "throughput": {
                     "events_per_second": None,
                     "submit_sm_per_second": None,
@@ -1618,7 +1802,7 @@ class AcceptanceRunner:
                 "submit_sm_resp_success": len(accepted_events),
             },
             "pre_generated_tasks": dict(self.sender_seed),
-            "observability": self.last_watchdog_metrics,
+            "observability": self._observability_report(),
             "latency_ms": {
                 "file_discovery_to_ingestion_start": _percentiles(file_to_db),
                 "ingestion_to_task_creation": _percentiles(ingest_to_task),
@@ -1673,6 +1857,7 @@ class AcceptanceRunner:
                 "smsc_log": str(self.smsc_log),
                 "smsc_event_log": str(self.smsc_event_log),
                 "smsc_metrics": str(self.smsc_metrics),
+                "final_metrics": str(self.final_metrics_path) if self.final_metrics_path else None,
                 "run_manifest": str(self.root / "run-manifest.json"),
             },
         }
@@ -1687,6 +1872,11 @@ class AcceptanceRunner:
             "status": "BLOCKED_ENV",
             "local_e2e_status": "BLOCKED_ENV",
             "live_env_status": "LIVE_ENV_UNVERIFIED",
+            "config_audit": self.config_audit,
+            "observer": {
+                "api_calls": self.api_call_stats,
+                "sampling_policy": "bounded_in_process_live_snapshot; final task/event audit after shutdown",
+            },
         }
         try:
             _load_duckdb()
@@ -1702,6 +1892,9 @@ class AcceptanceRunner:
                 self.task_worker_disabled = False
                 self._restart_api()
                 self._wait_for_smpp()
+                self._assert_smpp_effective_config(
+                    self._declared_smpp_config, require_bind=True,
+                )
                 self._wait_for_business()
             else:
                 self._publish_inputs()
@@ -1728,6 +1921,7 @@ class AcceptanceRunner:
                 self._watchdog_snapshot(full=False)
             except Exception as exc:
                 self.failures.append(f"final live metrics snapshot failed: {type(exc).__name__}: {exc}")
+            self._capture_final_metrics()
             self._stop_watchdog()
             self.shutdown()
             report["reconciliation"] = self._reconcile()
@@ -1735,6 +1929,16 @@ class AcceptanceRunner:
             report["local_e2e_status"] = "LOCAL_E2E_PASS" if report["status"] == "PASS" and not self.failures else "LOCAL_E2E_FAIL"
             if self.failures:
                 report["reconciliation"]["runner_failures"] = list(self.failures)
+        except HarnessConfigFail as exc:
+            report["status"] = "HARNESS_CONFIG_FAIL"
+            report["local_e2e_status"] = "HARNESS_CONFIG_FAIL"
+            report["failure_details"] = [str(exc)]
+            try:
+                self._stop_watchdog()
+                self.shutdown()
+                report["reconciliation"] = self._reconcile()
+            except Exception as reconcile_exc:
+                report["failure_details"].append(f"reconcile failed: {reconcile_exc}")
         except BlockedEnv as exc:
             report["status"] = "BLOCKED_ENV"
             report["local_e2e_status"] = "BLOCKED_ENV"
@@ -1754,6 +1958,11 @@ class AcceptanceRunner:
             except Exception as reconcile_exc:
                 report["failure_details"].append(f"reconcile failed: {reconcile_exc}")
         finally:
+            report["config_audit"] = self.config_audit
+            report["observer"] = {
+                "api_calls": self.api_call_stats,
+                "sampling_policy": "bounded_in_process_live_snapshot; final task/event audit after shutdown",
+            }
             report["finished_at"] = _utc_now()
             report["ports"] = {"api": self.api_port, "smsc": self.smsc_port}
             self._stop_watchdog()

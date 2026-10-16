@@ -261,6 +261,15 @@ def test_fair_fast_successes_share_one_checkpoint_event(fast_db, monkeypatch):
     assert len(submitted[0][1]["items"]) == 3
 
 
+def test_fair_checkpoint_interval_is_bounded(monkeypatch):
+    monkeypatch.setenv("MC_FAST_SEND_FAIR_CHECKPOINT_MS", "1000")
+    assert fast_send_service._fair_checkpoint_interval() == 1.0
+    monkeypatch.setenv("MC_FAST_SEND_FAIR_CHECKPOINT_MS", "1")
+    assert fast_send_service._fair_checkpoint_interval() == 0.3
+    monkeypatch.setenv("MC_FAST_SEND_FAIR_CHECKPOINT_MS", "not-a-number")
+    assert fast_send_service._fair_checkpoint_interval() == 0.3
+
+
 def test_fast_startup_recovery_marks_claim_unknown_and_does_not_reclaim(fast_db):
     _campaign_and_tasks(1)
     task = sms_task_service.claim_next_fast_batch(1)[0]

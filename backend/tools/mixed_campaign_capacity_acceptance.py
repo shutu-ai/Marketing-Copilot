@@ -188,6 +188,8 @@ class MixedCampaignRunner(AcceptanceRunner):
         self.pre_stop_snapshot: dict = {}
         self.stop_transition: dict = {}
         self.timing: dict[str, float] = {}
+        self.route_config_audits: list[dict] = []
+        self.observer_stats: dict[str, int] = {"bounded_samples": 0, "errors": 0}
         self._check_ext4_and_resources()
 
     def _check_ext4_and_resources(self) -> None:
@@ -472,7 +474,7 @@ class MixedCampaignRunner(AcceptanceRunner):
     def _provision(self) -> None:
         self.lock_regression = self._run_lock_regression()
         for route in range(max(1, int(self.spec.get("smsc_routes", 1)))):
-            smpp = self._api_json("POST", "/api/smpp/configs", {
+            declared_smpp = {
                 "name": f"mixed-loopback-route-{route + 1}",
                 "host": "127.0.0.1",
                 "port": self.smsc_ports[route],
@@ -480,8 +482,8 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "password": "test",
                 "source_addr": f"MIX{route + 1}",
                 "bind_type": "transceiver",
-                "pool_size": 1,
-                "window_size": 10,
+                "pool_size": max(1, int(getattr(self.args, "pool_size", 1) or 1)),
+                "window_size": max(1, int(self.args.smpp_window)),
                 "enquire_interval": 5,
                 "timeout": 10,
                 "tps": max(1, int(float(self.spec.get("smsc_tps", 1000) or 1000))),
@@ -489,8 +491,50 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "reconnect_max_seconds": 2,
                 "delivery_receipt_mode": "disabled",
                 "enabled": 1,
-            })
+            }
+            smpp = self._api_json("POST", "/api/smpp/configs", declared_smpp)
+            declared_smpp["config_id"] = int(smpp["id"])
             self.smpp_config_ids.append(int(smpp["id"]))
+            try:
+                self._wait_until(
+                    lambda: all(
+                        sum(1 for connection in (item.get("connections") or []) if connection.get("connected"))
+                        >= declared_smpp["pool_size"]
+                        for item in (self._api_json("GET", "/api/smpp/status").get("pools") or [])
+                        if int(item.get("config_id") or 0) == declared_smpp["config_id"]
+                    ),
+                    self.timeout_seconds,
+                    f"SMPP route {route + 1} pool connected",
+                )
+            except TimeoutError:
+                try:
+                    failed_audit = self._assert_smpp_effective_config(
+                        declared_smpp,
+                        require_bind=True,
+                        event_log=self.smsc_event_logs[route],
+                    )
+                except Exception:
+                    failed_audit = dict(self.config_audit)
+                self.route_config_audits.append(failed_audit)
+                self.config_audit = {
+                    "status": "HARNESS_CONFIG_FAIL",
+                    "route_count": len(self.route_config_audits),
+                    "routes": self.route_config_audits,
+                    "route_tps_scope": "independent_shared_tps_per_physical_route",
+                }
+                raise
+            audit = self._assert_smpp_effective_config(
+                declared_smpp,
+                require_bind=True,
+                event_log=self.smsc_event_logs[route],
+            )
+            self.route_config_audits.append(audit)
+        self.config_audit = {
+            "status": "PASS" if all(item.get("status") == "PASS" for item in self.route_config_audits) else "HARNESS_CONFIG_FAIL",
+            "route_count": len(self.route_config_audits),
+            "routes": self.route_config_audits,
+            "route_tps_scope": "independent_shared_tps_per_physical_route",
+        }
         plan = build_activity_plan(self.spec, self.seed)
         self.creation_order = [int(item["logical_index"]) for item in plan]
         for item in plan:
@@ -579,34 +623,48 @@ class MixedCampaignRunner(AcceptanceRunner):
             if process.poll() is None:
                 self.resource_samples.append(_safe_process_snapshot(process.pid, role))
         try:
-            rows = self._environment_task_rows()
-            self.last_task_rows = rows
-            events = self._event_records()
-            submits = [item for item in events if item.get("event_type") == "submit_sm"]
-            counts = self._activity_counts(rows)
+            payload = self._api_json("GET", "/api/metrics/live") or {}
+            transport = {
+                (str(item.get("campaign_type") or ""), int(item.get("campaign_id") or 0)): item
+                for item in (payload.get("campaign_transport") or [])
+            }
+            scheduled_total = 0
+            socket_total = 0
+            response_success_total = 0
+            response_failure_total = 0
             now = time.monotonic()
             for key in self.activity_meta:
-                activity_rows = counts.get(key, {})
+                item = transport.get(key) or {}
+                scheduled = int(float(item.get("scheduled_parts_total") or 0))
+                socket_parts = int(float(item.get("socket_parts_total") or 0))
+                response_success = int(float(item.get("submit_sm_resp_success_total") or 0))
+                response_failure = int(float(item.get("submit_sm_resp_failure_total") or 0))
+                scheduled_total += scheduled
+                socket_total += socket_parts
+                response_success_total += response_success
+                response_failure_total += response_failure
                 self.activity_history[key].append({
                     "monotonic": now,
                     "sampled_at": _utc_now(),
-                    "task_total": sum(activity_rows.values()),
-                    "accepted": activity_rows.get("accepted", 0),
-                    "terminal": sum(activity_rows.get(status, 0) for status in TERMINAL_STATUSES),
-                    "submit_sm": sum(1 for event in submits if self._event_key(event) == key),
+                    "task_total": scheduled,
+                    "accepted": response_success,
+                    "terminal": response_success,
+                    "submit_sm": socket_parts,
                 })
             self.last_snapshot = {
-                "task_total": len(rows),
-                "tasks": dict(Counter(str(row.get("status")) for row in rows)),
-                "submit_sm": len(submits),
-                "backlog": sum(1 for row in rows if row.get("status") in {"queued", "sending", "retrying"}),
+                "task_total": scheduled_total,
+                "tasks": {},
+                "scheduled_parts": scheduled_total,
+                "submit_sm": socket_total,
+                "response_success": response_success_total,
+                "response_failure": response_failure_total,
+                "backlog": max(0, scheduled_total - socket_total),
+                "observer_contract": payload.get("observer_contract"),
             }
             self.backlog_samples.append(int(self.last_snapshot["backlog"]))
-            if len(self.metrics_samples) == 0 or now - self.metrics_samples[-1]["monotonic"] >= 1.0:
-                status = self._api_json("GET", "/api/metrics/status")
-                self.metrics_samples.append({"monotonic": now, "sampled_at": _utc_now(), "status": status})
+            self.observer_stats["bounded_samples"] += 1
         except Exception:
-            pass
+            self.observer_stats["errors"] += 1
         if self.args.max_memory_mb:
             limit = int(self.args.max_memory_mb) * 1024 * 1024
             recent = self.resource_samples[-max(1, len(self.processes)):]
@@ -652,19 +710,16 @@ class MixedCampaignRunner(AcceptanceRunner):
             if not self.injected and time.monotonic() >= injected_at:
                 self._inject_extra_inputs()
             self._sample_runtime()
-            events = self._event_records()
-            submits = [item for item in events if item.get("event_type") == "submit_sm"]
-            counts = self._activity_counts(self.last_task_rows)
             complete = all(
-                counts.get(key, {}).get("accepted", 0) >= int(meta["expected_rows"])
-                and sum(1 for event in submits if self._event_key(event) == key) >= int(meta["expected_rows"])
+                (self.activity_history.get(key) or [{}])[-1].get("submit_sm", 0)
+                >= int(meta["expected_rows"])
                 for key, meta in self.activity_meta.items()
             )
             if complete:
                 self.stop_reason = "completed"
                 self._capture_pre_stop_snapshot()
                 return
-            if int(self.spec.get("max_events", 0) or 0) and len(submits) >= int(self.spec["max_events"]):
+            if int(self.spec.get("max_events", 0) or 0) and self.last_snapshot.get("submit_sm", 0) >= int(self.spec["max_events"]):
                 self.stop_reason = "max_events"
                 return
             time.sleep(0.25)
@@ -677,6 +732,12 @@ class MixedCampaignRunner(AcceptanceRunner):
             self._sample_runtime()
         except Exception:
             pass
+        try:
+            now = time.monotonic()
+            status = self._api_json("GET", "/api/metrics/status")
+            self.metrics_samples.append({"monotonic": now, "sampled_at": _utc_now(), "status": status})
+        except Exception:
+            self.observer_stats["errors"] += 1
         latest_metrics = self.metrics_samples[-1].get("status", {}).get("metrics", {}) if self.metrics_samples else {}
         self.pre_stop_snapshot = {
             "captured_at": _utc_now(),
@@ -1122,6 +1183,7 @@ class MixedCampaignRunner(AcceptanceRunner):
                 "smsc_logs": [str(path) for path in self.smsc_log_paths],
                 "smsc_event_logs": [str(path) for path in self.smsc_event_logs],
                 "metrics_samples": len(self.metrics_samples),
+                "observer": dict(self.observer_stats),
                 "creation_order": self.creation_order,
                 "last_snapshot": self.last_snapshot,
                 "lifecycle": {
@@ -1155,6 +1217,7 @@ def _args_for_runner(args: argparse.Namespace, spec: dict) -> argparse.Namespace
         duration_seconds=0, smsc_tps=None, smsc_response_delay=None,
         smsc_reject_ratio=None, smsc_drop_response_ratio=None,
         smsc_drop_receipt_ratio=None, smsc_receipt_delay=None, smsc_disconnect_after=None,
+        smsc_disconnect_before_response=None,
         delivery_receipt_mode="disabled", task_workers=int(spec.get("task_workers", 2)),
         ingest_workers=int(spec.get("ingest_workers", 2)), workers=int(spec.get("copy_workers", 1)),
         claim_batch=int(spec.get("claim_batch", 8)),
@@ -1162,6 +1225,8 @@ def _args_for_runner(args: argparse.Namespace, spec: dict) -> argparse.Namespace
         smpp_send_queue_capacity=int(spec.get("smpp_send_queue_capacity", 32)),
         producer_chunk_size=0, producer_chunk_delay=0.0,
         max_memory_mb=int(args.max_memory_mb or 0), keep_artifacts=bool(args.keep_artifacts),
+        pool_size=int(getattr(args, "pool_size", 1) or 1),
+        run_root=str(getattr(args, "run_root", "") or ""),
         profile=args.profile, flash_sms=bool(args.flash_sms),
     )
 
@@ -1195,11 +1260,13 @@ def main() -> int:
     parser.add_argument("--smsc-response-delay", type=float, default=None)
     parser.add_argument("--task-workers", type=int, default=0)
     parser.add_argument("--claim-batch", type=int, default=0)
+    parser.add_argument("--pool-size", type=int, default=1)
     parser.add_argument("--smpp-window", type=int, default=0)
     parser.add_argument("--smpp-send-queue-capacity", type=int, default=0)
     parser.add_argument("--flash-sms", action="store_true", help="enable Flash SMS on alternating activities")
     parser.add_argument("--max-memory-mb", type=int, default=0)
     parser.add_argument("--keep-artifacts", action="store_true")
+    parser.add_argument("--run-root", default="")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     try:
