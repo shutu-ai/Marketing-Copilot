@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .ingress import IngressRouter
-from .diagnostics import read_process_metadata, write_process_metadata
+from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
 from .projection_writer import ProjectionWriterProcess, ProgressJournal
 from .route_credits import RouteCreditBroker
 from .spool import TaskSpool
@@ -25,6 +25,9 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     diagnostic_root = str(context.get("diagnostics_root") or "")
     run_id = str(context.get("run_id") or "")
     start_method = str(context.get("start_method") or "spawn")
+    native_fault_path = enable_native_fault_capture(
+        diagnostic_root, f"worker-{int(worker_id)}"
+    )
 
     def diagnostic(**kwargs) -> None:
         try:
@@ -38,7 +41,12 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         except Exception:
             pass
 
-    diagnostic(phase="starting", status="starting", progress={"worker_id": int(worker_id)})
+    diagnostic(
+        phase="starting",
+        status="starting",
+        progress={"worker_id": int(worker_id)},
+        extra={"native_fault_log": str(native_fault_path) if native_fault_path else ""},
+    )
     spool = TaskSpool(
         context["spool_root"], virtual_partition_count=int(context["virtual_partition_count"]),
         max_bytes=int(context["max_spool_bytes"]),
@@ -371,10 +379,10 @@ class VNextRuntime:
     def status(self) -> dict:
         with self._control_lock:
             self._load_control_state()
-        spool = TaskSpool(
-            self.spool_root, virtual_partition_count=self.virtual_partition_count,
-            max_bytes=self.max_spool_bytes,
-        )
+        # The detailed status API remains a full reconciliation boundary, but
+        # it reuses the long-lived ingress owner instead of reconstructing a
+        # complete TaskSpool index on every request.
+        spool = self.spool.status()
         journal_bytes = 0
         journal_paths = []
         for path in sorted(self.progress_root.glob("worker-*.jsonl")):
@@ -393,7 +401,7 @@ class VNextRuntime:
             "started": self._started,
             "run_id": self.run_id,
             "start_method": self.start_method,
-            "spool": spool.status(),
+            "spool": spool,
             "supervisor": self.supervisor.status() if self.supervisor else None,
             "projection": self.projection.snapshot(),
             "worker_progress": self._worker_progress(),
@@ -411,10 +419,20 @@ class VNextRuntime:
             ),
         }
 
+    def _idle_snapshot(self) -> dict:
+        """Return only bounded cross-process signals for the hot idle loop."""
+
+        return {
+            "spool": self.spool.lightweight_snapshot(),
+            "supervisor": self.supervisor.status() if self.supervisor else None,
+            "projection": self.projection.snapshot(),
+            "worker_progress": self._worker_progress(),
+        }
+
     async def wait_for_idle(self, timeout: float = 30.0) -> dict:
         deadline = time.monotonic() + max(0.1, float(timeout))
         while time.monotonic() < deadline:
-            status = self.status()
+            status = self._idle_snapshot()
             workers = status.get("worker_progress") or []
             workers_idle = bool(workers) and all(
                 not bool(item.get("active"))
@@ -433,6 +451,6 @@ class VNextRuntime:
                 except OSError:
                     journals_caught_up = False
             if status["spool"]["pending_records"] == 0 and workers_idle and journals_caught_up:
-                return status
+                return self.status()
             await asyncio.sleep(0.05)
         return self.status()

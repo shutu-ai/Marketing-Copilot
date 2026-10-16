@@ -1,5 +1,6 @@
 import os
 import faulthandler
+import json
 import logging
 import random
 import threading
@@ -31,6 +32,7 @@ _stall_watchdog_threshold = 30.0
 _stall_watchdog_emitted = False
 _stall_watchdog_started_at = 0.0
 _stall_watchdog_stack_handle = None
+_stall_watchdog_dump_lock = threading.Lock()
 
 _WRITE_CONCURRENCY_MODES = {"serialized", "occ"}
 _WRITE_CONCURRENCY = str(
@@ -332,7 +334,33 @@ except (TypeError, ValueError):
 _READ_ONLY_STATEMENTS = {"SELECT", "EXPLAIN", "DESCRIBE", "SHOW"}
 
 
-def start_stall_watchdog(directory=None, threshold_seconds=30.0):
+def _env_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "disabled"}
+
+
+def _stall_watchdog_reason(status: dict, *, now=None):
+    """Return a no-progress reason without treating run age as a stall.
+
+    A healthy long-running process has no reason to be classified as stalled.
+    The only currently supported no-progress signal is a write admission held
+    beyond the diagnostic threshold; wall-clock age is recorded separately as
+    a scheduled snapshot and is never a failure classification.
+    """
+
+    if not status.get("held"):
+        return None
+    try:
+        age_seconds = float(status.get("age_seconds") or 0.0)
+    except (TypeError, ValueError):
+        age_seconds = 0.0
+    if age_seconds >= float(_stall_watchdog_threshold):
+        return "no_progress_stall"
+    return None
+
+
+def start_stall_watchdog(directory=None, threshold_seconds=30.0, enabled=None):
     """Start opt-in thread-stack capture for a local acceptance run.
 
     The watchdog is deliberately disabled unless the caller supplies a
@@ -343,10 +371,12 @@ def start_stall_watchdog(directory=None, threshold_seconds=30.0):
     global _stall_watchdog_threshold, _stall_watchdog_emitted
     global _stall_watchdog_started_at
     global _stall_watchdog_stack_handle
-    if not directory:
-        return
+    if enabled is None:
+        enabled = os.environ.get("MC_STALL_WATCHDOG_ENABLED", "1" if directory else "0")
+    if not directory or not _env_bool(enabled):
+        return False
     if _stall_watchdog_thread and _stall_watchdog_thread.is_alive():
-        return
+        return True
     _stall_watchdog_dir = os.fspath(directory)
     _stall_watchdog_threshold = max(1.0, float(threshold_seconds or 30.0))
     os.makedirs(_stall_watchdog_dir, exist_ok=True)
@@ -365,7 +395,25 @@ def start_stall_watchdog(directory=None, threshold_seconds=30.0):
             repeat=False,
             file=_stall_watchdog_stack_handle,
         )
+        with open(os.path.join(_stall_watchdog_dir, "watchdog-config.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "enabled": True,
+                "threshold_seconds": _stall_watchdog_threshold,
+                "started_at": time.time(),
+                "scheduled_snapshot": "application-threads-timeout.txt",
+                "no_progress_signal": "no_progress_stall",
+                "run_age_is_not_stall": True,
+            }, handle, ensure_ascii=False, sort_keys=True, indent=2)
     except Exception:
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        if _stall_watchdog_stack_handle is not None:
+            try:
+                _stall_watchdog_stack_handle.close()
+            except Exception:
+                pass
         _stall_watchdog_stack_handle = None
         logger.exception("Database stall watchdog faulthandler setup failed")
     logger.info(
@@ -378,6 +426,7 @@ def start_stall_watchdog(directory=None, threshold_seconds=30.0):
         daemon=True,
     )
     _stall_watchdog_thread.start()
+    return True
 
 
 def stop_stall_watchdog(timeout=2.0):
@@ -397,21 +446,15 @@ def stop_stall_watchdog(timeout=2.0):
         except Exception:
             pass
         _stall_watchdog_stack_handle = None
+    return True
 
 
 def _stall_watchdog_loop():
     global _stall_watchdog_emitted
     while not _stall_watchdog_stop.wait(5.0):
         status = write_lock_status()
-        lock_stalled = (
-            status.get("held")
-            and float(status.get("age_seconds") or 0.0) >= _stall_watchdog_threshold
-        )
-        run_stalled = (
-            _stall_watchdog_started_at
-            and time.monotonic() - _stall_watchdog_started_at >= _stall_watchdog_threshold
-        )
-        if not lock_stalled and not run_stalled:
+        reason = _stall_watchdog_reason(status)
+        if not reason:
             continue
         if _stall_watchdog_emitted:
             continue
@@ -420,19 +463,19 @@ def _stall_watchdog_loop():
         stack_path = os.path.join(_stall_watchdog_dir, f"application-threads-{stamp}.txt")
         state_path = os.path.join(_stall_watchdog_dir, f"application-write-lock-{stamp}.json")
         try:
-            with open(stack_path, "w", encoding="utf-8") as handle:
-                faulthandler.dump_traceback(file=handle, all_threads=True)
+            with _stall_watchdog_dump_lock:
+                with open(stack_path, "w", encoding="utf-8") as handle:
+                    faulthandler.dump_traceback(file=handle, all_threads=True)
             with open(state_path, "w", encoding="utf-8") as handle:
-                import json
                 json.dump({
                     "captured_at": time.time(),
                     "threshold_seconds": _stall_watchdog_threshold,
                     "write_lock": status,
-                    "reason": "write_lock_age" if lock_stalled else "local_run_age",
+                    "reason": reason,
                     "thread_dump": stack_path,
                 }, handle, ensure_ascii=False, indent=2)
             logger.warning(
-                "Database stall watchdog captured write_lock operation=%s age=%.3fs state=%s",
+                "Database stall watchdog captured no-progress operation=%s age=%.3fs state=%s",
                 status.get("operation"), status.get("age_seconds"), state_path,
             )
         except Exception:

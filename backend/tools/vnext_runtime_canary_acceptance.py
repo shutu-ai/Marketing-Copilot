@@ -14,7 +14,9 @@ import argparse
 import hashlib
 import importlib
 import json
+import multiprocessing
 import os
+from collections import Counter
 from pathlib import Path
 import socket
 import subprocess
@@ -32,9 +34,17 @@ except ImportError:  # standalone application runtime intentionally excludes tes
 TOOLS_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = Path(os.environ.get("MC_APP_BACKEND_DIR", str(TOOLS_DIR.parent))).resolve()
 REPO_ROOT = BACKEND_DIR.parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from vnext.diagnostics import (
+    disable_native_fault_capture,
+    enable_native_fault_capture,
+    read_process_metadata,
+    write_process_metadata,
+)
 from vnext.ingress import IngressRouter
 from vnext.projection_writer import ProgressJournal
 from vnext_loopback_acceptance import LoopbackSMSC
@@ -300,6 +310,72 @@ class CanaryRunner:
         self.expected_destinations: dict[int, set[str]] = {}
         self.events: list[dict] = []
         self.started_at = time.time()
+        self._progress_offsets: dict[str, int] = {}
+        self._progress_events_by_id: dict[str, dict] = {}
+        self._received_counts: Counter[str] = Counter()
+        self._received_observer_index = 0
+        self._phase_marker_path = self.run_root / "diagnostics" / "phase-markers.jsonl"
+        self._phase_sequence = 0
+        self.native_fault_path: Path | None = None
+        # The runner is loopback-only; do not let an inherited corporate proxy
+        # intercept its local API or SMPP observations.
+        self._url_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _mark_phase(self, phase: str, *, progress: dict | None = None, role: str = "canary-root") -> None:
+        """Persist bounded stage markers without message or MSISDN content."""
+
+        self._phase_sequence += 1
+        item = {
+            "sequence": int(self._phase_sequence),
+            "phase": str(phase),
+            "pid": os.getpid(),
+            "monotonic_seconds": time.monotonic(),
+            "captured_at": time.time(),
+            "progress": dict(progress or {}),
+        }
+        try:
+            self._phase_marker_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._phase_marker_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+            write_process_metadata(
+                self.run_root / "diagnostics",
+                role,
+                run_id=self.run_root.name,
+                phase=str(phase),
+                status="running",
+                progress=dict(progress or {}),
+                extra={
+                    "last_phase_marker": str(phase),
+                    "phase_marker_path": str(self._phase_marker_path),
+                },
+            )
+        except OSError:
+            pass
+
+    def _record_resource_tracker(self) -> None:
+        try:
+            tracker = getattr(multiprocessing, "resource_tracker", None)
+            tracker_pid = getattr(getattr(tracker, "_resource_tracker", None), "_pid", None)
+            if not tracker_pid:
+                return
+            write_process_metadata(
+                self.run_root / "diagnostics",
+                "resource-tracker",
+                run_id=self.run_root.name,
+                start_method="spawn",
+                phase="observed",
+                status="running",
+                process_pid=int(tracker_pid),
+                process_ppid=os.getpid(),
+                extra={
+                    "observed_only": True,
+                    "native_fault_capture": "UNAVAILABLE",
+                    "observed_by_pid": os.getpid(),
+                },
+            )
+        except (AttributeError, TypeError, ValueError, OSError):
+            pass
 
     def setup_environment(self) -> None:
         env = {
@@ -319,10 +395,14 @@ class CanaryRunner:
             "MC_ADMIN_PASSWORD": "not-a-production-secret",
             "MC_FRONTEND_DIR": str(self.run_root / "empty-frontend"),
             "MC_STALL_DIAGNOSTICS_DIR": str(self.run_root / "stall-diagnostics"),
+            "MC_STALL_WATCHDOG_ENABLED": "1" if getattr(self.args, "watchdog", "enabled") == "enabled" else "0",
+            "PYTHONFAULTHANDLER": "1",
         }
         os.environ.update(env)
+        self._mark_phase("environment_ready", progress={"watchdog": self.args.watchdog})
 
     def seed_database(self) -> None:
+        self._mark_phase("seed_start")
         self.route_port = self.smsc.start()
         from database import close_root_connection, get_connection, init_db, set_database_file
 
@@ -344,8 +424,10 @@ class CanaryRunner:
         self.route_id = int(conn.execute("SELECT id FROM smpp_configs ORDER BY id DESC LIMIT 1").fetchone()[0])
         conn.close()
         close_root_connection()
+        self._mark_phase("seed_complete", progress={"route_id": int(self.route_id)})
 
     def start_api(self) -> None:
+        self._mark_phase("api_starting", role="api-main")
         if self.main is None:
             self.main = importlib.import_module("main")
         from services import vnext_service
@@ -353,11 +435,14 @@ class CanaryRunner:
         self.api_server = _UvicornThread(self.main.app, self.api_port)
         self.api_server.start()
         self.wait_for(lambda value: value.get("started") is True, "/api/vnext/status", timeout=30)
+        self._record_resource_tracker()
+        self._mark_phase("api_started", role="api-main", progress={"port": int(self.api_port)})
 
     def stop_api(self) -> None:
         if self.api_server is not None:
             self.api_server.stop()
             self.api_server = None
+            self._mark_phase("api_stopped", role="api-main")
 
     def api(self, method: str, path: str, payload: dict | None = None) -> dict:
         url = f"http://127.0.0.1:{self.api_port}{path}"
@@ -368,7 +453,7 @@ class CanaryRunner:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with self._url_opener.open(request, timeout=30) as response:
                 value = json.loads(response.read().decode("utf-8"))
                 return value if isinstance(value, dict) else {"value": value}
         except urllib.error.HTTPError as exc:
@@ -441,20 +526,36 @@ class CanaryRunner:
         }
 
     def wait_idle(self, timeout: float = 300.0) -> dict:
-        return self.api("GET", f"/api/vnext/idle?timeout={max(0.1, float(timeout))}")
+        self._mark_phase("wait_idle_start", progress={"timeout_seconds": float(timeout)})
+        result = self.api("GET", f"/api/vnext/idle?timeout={max(0.1, float(timeout))}")
+        self._mark_phase(
+            "wait_idle_complete",
+            progress={"pending_records": int((result.get("spool") or {}).get("pending_records", -1))},
+        )
+        return result
 
     def progress_events(self) -> list[dict]:
-        events: dict[str, dict] = {}
         progress_root = self.run_root / "vnext" / "progress"
         for path in sorted(progress_root.glob("worker-*.jsonl")):
             try:
-                for event in ProgressJournal(path).read():
-                    event_id = str(event.get("event_id") or "")
-                    if event_id:
-                        events.setdefault(event_id, event)
+                key = str(path)
+                offset = int(self._progress_offsets.get(key, 0))
+                journal = ProgressJournal(path)
+                while True:
+                    batch, next_offset = journal.read_from(offset, max_events=4096)
+                    if not batch and next_offset == offset:
+                        break
+                    for event in batch:
+                        event_id = str(event.get("event_id") or "")
+                        if event_id:
+                            self._progress_events_by_id.setdefault(event_id, event)
+                    offset = int(next_offset)
+                    if len(batch) < 4096:
+                        break
+                self._progress_offsets[key] = offset
             except (OSError, ValueError, TypeError):
                 continue
-        return list(events.values())
+        return list(self._progress_events_by_id.values())
 
     def campaign_summary(self, campaign_id: int) -> dict:
         events = [item for item in self.progress_events() if int(item.get("campaign_id", -1)) == int(campaign_id)]
@@ -470,16 +571,29 @@ class CanaryRunner:
         }
 
     def loopback_summary(self, campaign_id: int) -> dict:
+        received_values = self.smsc.smsc.received
+        if self._received_observer_index > len(received_values):
+            self._received_observer_index = 0
+            self._received_counts.clear()
+        for item in received_values[self._received_observer_index:]:
+            self._received_counts[str(item["destination"])] += 1
+        self._received_observer_index = len(received_values)
         expected = self.expected_destinations.get(int(campaign_id), set())
-        received = [str(item["destination"]) for item in self.smsc.smsc.received]
-        actual = [item for item in received if item in expected]
-        duplicates = sorted(value for value in set(actual) if actual.count(value) > 1)
+        actual_keys = expected.intersection(self._received_counts)
+        duplicates = sorted(value for value in actual_keys if self._received_counts[value] > 1)
+        missing = expected.difference(self._received_counts)
+        unexpected = sorted(
+            value for value, count in self._received_counts.items()
+            if count and value not in expected
+        )
         return {
             "expected": len(expected),
-            "received": len(actual),
+            "received": sum(self._received_counts[value] for value in actual_keys),
             "duplicates": duplicates,
-            "missing": sorted(expected.difference(actual))[:20],
-            "missing_count": len(expected.difference(actual)),
+            "missing": sorted(missing)[:20],
+            "missing_count": len(missing),
+            "unexpected": unexpected[:20],
+            "unexpected_count": len(unexpected),
         }
 
     def route_credit_state(self) -> dict:
@@ -545,6 +659,7 @@ class CanaryRunner:
     def gate_live(self, name: str, campaign_id: int, batches: list[tuple[list[dict], str, int]], *,
                   expected: int, timeout: float = 300.0, retry_check: bool = False) -> dict:
         started = time.monotonic()
+        self._mark_phase("gate_start", progress={"gate": name, "campaign_id": int(campaign_id), "expected": int(expected)})
         accepted = duplicate = 0
         responses = []
         for rows, source_id, ordinal in batches:
@@ -552,12 +667,14 @@ class CanaryRunner:
             responses.append(self.response_summary(item))
             accepted += int(item.get("accepted", 0))
             duplicate += int(item.get("duplicate", 0))
+        self._mark_phase("ingress_complete", progress={"gate": name, "campaign_id": int(campaign_id), "accepted": int(accepted)})
         if retry_check and batches:
             rows, source_id, ordinal = batches[0]
             retry = self.ingest(campaign_id, rows, source_id=source_id, row_ordinal_start=ordinal, phone_prefix="251")
             responses.append(self.response_summary(retry))
             duplicate += int(retry.get("duplicate", 0))
         status = self.wait_idle(timeout)
+        self._mark_phase("idle_boundary_reached", progress={"gate": name, "campaign_id": int(campaign_id)})
         boundary_deadline = time.monotonic() + max(1.0, min(float(timeout), 30.0))
         while time.monotonic() < boundary_deadline:
             boundary = self.loopback_summary(campaign_id)
@@ -566,12 +683,14 @@ class CanaryRunner:
             time.sleep(0.05)
         summary = self.campaign_summary(campaign_id)
         loopback = self.loopback_summary(campaign_id)
+        self._mark_phase("reconciliation_complete", progress={"gate": name, "campaign_id": int(campaign_id), "received": int(loopback["received"])})
         passed = (
             accepted == expected
             and summary["states"].get("socket_written", 0) == expected
             and loopback["received"] == expected
             and not loopback["duplicates"]
             and loopback["missing_count"] == 0
+            and loopback["unexpected_count"] == 0
             and int((status.get("spool") or {}).get("pending_records", 0)) == 0
         )
         return {
@@ -758,6 +877,7 @@ class CanaryRunner:
         return result
 
     def run(self) -> dict:
+        self._mark_phase("run_start")
         self.setup_environment()
         self.seed_database()
         self.start_api()
@@ -812,6 +932,7 @@ class CanaryRunner:
                 "projection_queue": self.args.projection_queue,
                 "max_inflight": self.args.max_inflight,
                 "prefetch": self.args.prefetch,
+                "watchdog": getattr(self.args, "watchdog", "enabled"),
                 "real_smsc": False,
                 "loopback_host": "127.0.0.1",
             },
@@ -841,6 +962,11 @@ class CanaryRunner:
             "artifacts": {
                 "sha256": hashes,
                 "disk_bytes": _disk_bytes(self.run_root),
+            },
+            "diagnostics": {
+                "native_fault_log": str(self.native_fault_path) if self.native_fault_path else "",
+                "phase_markers": str(self._phase_marker_path),
+                "processes": read_process_metadata(self.run_root / "diagnostics"),
             },
             "historical_status": "VNEXT_PIPELINE_READY_FOR_CANARY",
             "legacy_status": "INTEGRATED_NO_GO",
@@ -872,18 +998,33 @@ def main() -> int:
     parser.add_argument("--projection-queue", type=int, default=128)
     parser.add_argument("--max-inflight", type=int, default=32)
     parser.add_argument("--prefetch", type=int, default=16)
+    parser.add_argument("--watchdog", choices=("enabled", "disabled"), default="enabled")
     args = parser.parse_args()
+    run_root = Path(args.run_root).resolve()
+    os.environ["PYTHONFAULTHANDLER"] = "1"
+    native_fault_path = enable_native_fault_capture(run_root / "diagnostics", "canary-root")
     runner = CanaryRunner(args)
-    result = runner.run()
+    runner.native_fault_path = native_fault_path
+    try:
+        result = runner.run()
+    except BaseException as exc:
+        result = {
+            "tool": "vnext_runtime_canary_acceptance",
+            "status": "ERROR",
+            "captured_at": time.time(),
+            "run_root": str(run_root),
+            "exception": f"{type(exc).__name__}: {exc}",
+        }
     output = Path(args.output).resolve() if args.output else runner.run_root / "canary-result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({
         "status": result["status"],
         "run_root": result["run_root"],
-        "gates": {key: value.get("status") for key, value in result["gates"].items()},
-        "projection": result["projection_database"],
+        "gates": {key: value.get("status") for key, value in result.get("gates", {}).items()},
+        "projection": result.get("projection_database", {}),
     }, ensure_ascii=False, sort_keys=True))
+    disable_native_fault_capture("canary-root")
     return 0 if result["status"] == "PASS" else 2
 
 

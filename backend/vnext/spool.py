@@ -176,6 +176,13 @@ class TaskSpool:
         self._recovery_issues: list[str] = []
         self._manifest_signature = self._file_signature(self._manifest_path)
         self._segment_offsets: dict[Path, int] = {}
+        self._lightweight_manifest_signature = self._manifest_signature
+        self._lightweight_cursor_signatures: dict[str, tuple[int, int] | None] = {}
+        self._lightweight_taken_signatures: dict[str, tuple[int, int] | None] = {}
+        self._lightweight_cursors = dict(self._cursors)
+        self._lightweight_taken_pending = {
+            key: set(value) for key, value in self._taken_pending.items()
+        }
         self._recover_index()
 
     @staticmethod
@@ -355,6 +362,90 @@ class TaskSpool:
             except FileNotFoundError:
                 pass
         return total
+
+    def _refresh_lightweight_cursor_state(self) -> None:
+        """Refresh only changed cursor/taken JSON, never segment contents."""
+
+        for index in range(self.virtual_partition_count):
+            key = str(index)
+            cursor_path = self._cursor_dir / f"partition-{index:04d}.json"
+            taken_path = self._taken_dir / f"partition-{index:04d}.json"
+            cursor_signature = self._file_signature(cursor_path)
+            taken_signature = self._file_signature(taken_path)
+            if key not in self._lightweight_cursor_signatures or (
+                cursor_signature != self._lightweight_cursor_signatures[key]
+            ):
+                value = int(self._cursors.get(key, 0))
+                if cursor_signature is not None:
+                    try:
+                        value = int(json.loads(cursor_path.read_text(encoding="utf-8")).get("cursor", 0))
+                    except (OSError, ValueError, TypeError):
+                        value = int(self._lightweight_cursors.get(key, 0))
+                self._lightweight_cursors[key] = value
+                self._lightweight_cursor_signatures[key] = cursor_signature
+            if key not in self._lightweight_taken_signatures or (
+                taken_signature != self._lightweight_taken_signatures[key]
+            ):
+                values: set[int] = set(self._taken_pending.get(key, set()))
+                if taken_signature is not None:
+                    try:
+                        values = {
+                            int(item) for item in json.loads(
+                                taken_path.read_text(encoding="utf-8")
+                            ).get("taken", [])
+                        }
+                    except (OSError, ValueError, TypeError):
+                        values = set(self._lightweight_taken_pending.get(key, set()))
+                self._lightweight_taken_pending[key] = values
+                self._lightweight_taken_signatures[key] = taken_signature
+
+    def lightweight_snapshot(self) -> dict:
+        """Return an idle-safe snapshot without rebuilding the segment index.
+
+        The manifest's maintained record/byte counters and per-partition
+        cursor/taken files are sufficient for the pending boundary.  Segment
+        JSON and CRC records remain the responsibility of ``refresh`` and the
+        detailed ``status``/recovery APIs.
+        """
+
+        with self._lock:
+            try:
+                manifest = self._load_manifest()
+            except (OSError, ValueError, TypeError, SpoolError):
+                manifest = self._manifest
+            manifest_signature = self._file_signature(self._manifest_path)
+            self._lightweight_manifest_signature = manifest_signature
+            self._refresh_lightweight_cursor_state()
+            pending_by_partition = {}
+            for partition in range(self.virtual_partition_count):
+                key = str(partition)
+                records = sum(
+                    int(entry.get("records", 0))
+                    for entry in manifest.get("segments", {}).get(key, [])
+                )
+                pending_by_partition[key] = max(
+                    0,
+                    records
+                    - int(self._lightweight_cursors.get(key, 0))
+                    - len(self._lightweight_taken_pending.get(key, set())),
+                )
+            return {
+                "schema_version": SPOOL_SCHEMA_VERSION,
+                "virtual_partition_count": self.virtual_partition_count,
+                "total_records": int(manifest.get("total_records", 0) or 0),
+                "total_bytes": int(manifest.get("total_bytes", 0) or 0),
+                "pending_records": sum(pending_by_partition.values()),
+                "pending_by_partition": pending_by_partition,
+                "cursors": dict(self._lightweight_cursors),
+                "taken_pending": {
+                    key: sorted(value)
+                    for key, value in self._lightweight_taken_pending.items()
+                    if value
+                },
+                "recovery_issues": list(self._recovery_issues),
+                "snapshot_mode": "lightweight",
+                "full_recovery_required": manifest_signature != self._manifest_signature,
+            }
 
     def _persist_manifest(self) -> None:
         self._manifest["updated_at"] = time.time()

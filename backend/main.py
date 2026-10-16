@@ -204,6 +204,7 @@ def startup():
     start_stall_watchdog(
         os.environ.get("MC_STALL_DIAGNOSTICS_DIR"),
         os.environ.get("MC_STALL_DIAGNOSTICS_THRESHOLD_SECONDS", "30"),
+        enabled=os.environ.get("MC_STALL_WATCHDOG_ENABLED"),
     )
     from services import user_service
     user_service.bootstrap_admin()

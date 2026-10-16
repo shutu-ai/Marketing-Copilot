@@ -9,6 +9,8 @@ lock into the runtime being diagnosed.
 from __future__ import annotations
 
 import json
+import faulthandler
+from functools import lru_cache
 import multiprocessing
 import os
 import platform
@@ -20,6 +22,9 @@ from pathlib import Path
 from typing import Any
 
 
+_NATIVE_FAULTHANDLER_HANDLES: dict[str, object] = {}
+
+
 def _runtime_version() -> str:
     try:
         from importlib.metadata import version
@@ -27,6 +32,23 @@ def _runtime_version() -> str:
         return str(version("duckdb"))
     except Exception:
         return "unavailable"
+
+
+@lru_cache(maxsize=1)
+def _native_module_versions() -> dict[str, str]:
+    """Return bounded package versions without importing optional extensions."""
+
+    try:
+        from importlib.metadata import version
+    except Exception:
+        return {}
+    values = {}
+    for package in ("duckdb", "cffi", "cryptography", "numpy", "pandas", "smpplib"):
+        try:
+            values[package] = str(version(package))
+        except Exception:
+            values[package] = "unavailable"
+    return values
 
 
 def _start_method(value: str | None = None) -> str:
@@ -41,6 +63,57 @@ def _start_method(value: str | None = None) -> str:
 def _safe_role(role: str) -> str:
     value = "".join(character if character.isalnum() or character in "-_" else "_" for character in str(role))
     return value or "process"
+
+
+def enable_native_fault_capture(
+    root: str | os.PathLike[str] | None,
+    role: str,
+) -> Path | None:
+    """Enable a persistent, role-specific Python faulthandler log.
+
+    This is deliberately independent of the database stall watchdog.  The
+    file handle remains open for the process lifetime so a native crash during
+    startup or shutdown can still write the last Python-visible frames.  A
+    Python frame is evidence of the runtime boundary only; it is never treated
+    as a C/C++ faulting frame.
+    """
+
+    if not root:
+        return None
+    safe_role = _safe_role(role)
+    if safe_role in _NATIVE_FAULTHANDLER_HANDLES:
+        return Path(_NATIVE_FAULTHANDLER_HANDLES[safe_role][1])
+    directory = Path(root).resolve() / "native-crash"
+    path = directory / f"{safe_role}-faulthandler.log"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = path.open("w", encoding="utf-8")
+        faulthandler.enable(handle, all_threads=True)
+        _NATIVE_FAULTHANDLER_HANDLES[safe_role] = (handle, str(path))
+        return path
+    except (OSError, ValueError):
+        try:
+            handle.close()
+        except (NameError, AttributeError, OSError):
+            pass
+        return None
+
+
+def disable_native_fault_capture(role: str | None = None) -> None:
+    """Close a capture handle after a graceful process shutdown."""
+
+    roles = [_safe_role(role)] if role else list(_NATIVE_FAULTHANDLER_HANDLES)
+    for value in roles:
+        item = _NATIVE_FAULTHANDLER_HANDLES.pop(value, None)
+        if item is None:
+            continue
+        handle = item[0]
+        try:
+            faulthandler.disable()
+            handle.flush()
+            handle.close()
+        except (OSError, ValueError):
+            pass
 
 
 def write_process_metadata(
@@ -85,7 +158,9 @@ def write_process_metadata(
                 "platform": platform.platform(),
                 "start_method": _start_method(start_method),
                 "duckdb_version": _runtime_version(),
+                "native_module_versions": _native_module_versions(),
                 "faulthandler_enabled": bool(getattr(__import__("faulthandler"), "is_enabled", lambda: False)()),
+                "native_fault_capture": bool(_safe_role(role) in _NATIVE_FAULTHANDLER_HANDLES),
                 "thread_count": threading.active_count(),
                 "phase": str(phase or current.get("phase") or ""),
                 "status": str(status or "running"),

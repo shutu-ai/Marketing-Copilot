@@ -12,7 +12,7 @@ import contextlib
 from collections import deque
 from pathlib import Path
 
-from .diagnostics import write_process_metadata
+from .diagnostics import enable_native_fault_capture, write_process_metadata
 
 
 class ProjectionWriterBusy(RuntimeError):
@@ -326,6 +326,7 @@ def _process_main(
 ) -> None:
     status_file = Path(status_path)
     role = "projection-writer"
+    native_fault_path = enable_native_fault_capture(diagnostic_root, role)
 
     def diagnostic(**kwargs) -> None:
         try:
@@ -339,7 +340,11 @@ def _process_main(
         except Exception:
             pass
 
-    diagnostic(phase="starting", status="starting")
+    diagnostic(
+        phase="starting",
+        status="starting",
+        extra={"native_fault_log": str(native_fault_path) if native_fault_path else ""},
+    )
     writer = ProjectionWriter(
         db_path,
         batch_size=batch_size,
