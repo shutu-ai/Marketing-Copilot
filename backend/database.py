@@ -1299,6 +1299,19 @@ def _close_root_connection() -> None:
         connection.close()
 
 
+def close_root_connection() -> None:
+    """Close the cached owner connection after a maintenance drain.
+
+    Callers must hold ``maintenance_exclusive`` (or an equivalent process
+    quiescence boundary).  DuckDB keeps the process owner open deliberately
+    for normal request lifetime; Windows cannot copy the database file while
+    that owner handle remains open, even after a separate CHECKPOINT
+    connection has been closed.  The next ``get_connection`` lazily creates
+    the owner again.
+    """
+    _close_root_connection()
+
+
 def get_connection():
     return WrappedConnection(_root_connection().cursor())
 

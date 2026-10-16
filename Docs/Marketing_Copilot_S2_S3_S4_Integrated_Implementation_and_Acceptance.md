@@ -6,24 +6,24 @@
 
 ## 结论
 
-`INTEGRATED_BLOCKED_ENV`
+`INTEGRATED_NO_GO`
 
-M0 的 Fast SMSC 模拟器能力、Route TPS/Simulator TPS 解耦、真实 SMPP socket、Fair/PDU Window/multipart、故障恢复与核心数据守恒已实施并取得可复核证据。当前不能宣布 `INTEGRATED_READY_FOR_S5`，原因是：
+M0 的 Fast SMSC 模拟器能力、Route TPS/Simulator TPS 解耦、真实 SMPP socket、Fair/PDU Window/multipart、故障恢复与核心数据守恒已实施并取得可复核证据。最终收口仍不能宣布 `INTEGRATED_READY_FOR_S5`，原因是：
 
-1. 当前 Windows CPython 3.13 + DuckDB 1.2.0 native runtime 在 OCC + Fast 全链路压力下出现 `0xC0000374` heap corruption；这不是可以通过重试或放宽对账条件掩盖的结果。该环境不能作为 OCC 性能/稳定性通过环境。
-2. G0 的 Windows 全后端 pytest 受到历史 AppData 临时目录 ACL/清理错误影响；另一次外部权限重跑长时间无进展后被中断，未声称全量 PASS。
-3. G4 要求的 A=50K、B/C=1K、pool1/4、window1/2/50 完整矩阵，以及 G6 有效持续 600 秒长稳，当前 Windows 环境未完成。已完成的是 4 活动 scaled Fair smoke，不替代 50K 门禁。
-4. 精确的“旧同步 debug/JSONL”模拟器版本不在当前工作树；SIM-5 已完成同硬件 fast-audit/full-audit 对照，但没有伪造旧版本基线。
+1. G4 的高并发 50K/1K/1K ext4 运行出现真实 API `SIGSEGV (-11)`；随后完成的低并发隔离矩阵证明 B/C 可以公平完成，但每项仍因 50K 容量门禁未完成而严格 FAIL，不能用子场景替代总门禁。
+2. Windows 文件锁兼容性已通过 `close_root_connection()` 的最小修复和定向回归；Windows Set-based 次级测试仍为 33 个批次（阈值 <30），但同一源码在全新 ext4 G0 全量通过，分类为 Windows 写入/flush 时序差异而非真实 Set-based 正确性回归，失败证据保留。
+3. G6 已在全新 ext4 中执行有效 600 秒多 Campaign 长稳；最终结果及写锁/OCC 诊断以本报告末尾收口记录为准，不能用持续有进程替代长稳 PASS。
+4. 精确的“旧同步 debug/JSONL”模拟器版本不在当前工作树；当前 ext4 fast/full audit 对照已完成，但不伪造旧实现基线，因此 G-SIM 的历史替代 A/B 仍单独标记环境限制。
 
-生产安全结论：继续保持 `reliable` 为默认，`dispatch_mode=legacy` 为默认回滚路径；不要在当前 Windows 环境启用 OCC 或据此宣称生产吞吐。完成 WSL AlmaLinux-8/ext4 隔离环境中的 G0/G3/G4/G6 后，才能重新判定 S5 前置条件。
+生产安全结论：继续保持 `reliable` 为默认，`dispatch_mode=legacy` 为默认回滚路径；OCC 仍只允许显式实验。G4 native crash/容量与 G6 长稳未形成全部 PASS 前，不切换生产模式、不宣布 S5 前置条件完成。
 
 ## 1. 版本、范围与工作区保护
 
 ### 1.1 源码冻结信息
 
-- 起点 `HEAD`：`fd07c5b2c8c2b03dd71f3a3fa3754c83ec93e34f`
-- `origin/main`：`fd07c5b2c8c2b03dd71f3a3fa3754c83ec93e34f`
-- 未创建 commit，未 push。
+- 起点 `HEAD`：`404d921bb06a89f3ef87686bb450ae61f011ae38`
+- `origin/main`：`404d921bb06a89f3ef87686bb450ae61f011ae38`
+- 本报告记录收口前的起点；本轮收口变更仅纳入下述两个生产源码文件和本主报告，运行产物与无关工作区变更不纳入提交。
 - 当前为 dirty worktree；本报告使用“HEAD + 下列文件 SHA256”作为未提交工作区 manifest。G3 运行的 `git_commit` 均记录了上述 HEAD；G4 harness 兼容性修复发生在 G3 运行之后，因此 G3 不被包装成“当前完整 workspace manifest 的全矩阵 PASS”。
 
 实现/验收相关文件的最终 SHA256：
@@ -262,4 +262,106 @@ G3 OCC/reliable：r1/r3 PASS；r2 live wait 超过 300 秒，但停机后 DB 对
 4. 在目标环境确认 DuckDB/Python 版本组合后，重新评估 OCC；在此之前只允许显式实验，不切换默认 serialized。
 5. SLES12SP5 离线部署包、真实 SMSC、真实号码、生产数据库与生产切换不属于本任务授权范围，仍需独立 S5/部署验收。
 
-最终交付不包含 commit/push；本报告是本任务唯一主报告，历史任务书和运行证据均未被删除或覆盖。
+本报告是本任务唯一主报告；历史任务书和运行证据均未被删除或覆盖，运行产物与无关工作区变更不纳入本轮提交。
+
+## 8. 最终验收收口（2026-10-16）
+
+本节是本轮最终收口结果，覆盖并 supersede 第 5 节和第 7 节中先前的 `NOT_RUN` / `ENV_BLOCKED` 临时状态；旧结果、失败日志和失败 JSON 保留不删，不把历史失败改写成 PASS。
+
+### 8.1 可重复基线与源码边界
+
+- 基线：`HEAD=origin/main=404d921bb06a89f3ef87686bb450ae61f011ae38`（短 SHA：`404d921b`）。
+- 环境：全新 `/tmp/marketing-copilot-acceptance-404d921b`，WSL `AlmaLinux-8`，根文件系统 `ext4`；CPython `3.11.13`；DuckDB `1.2.0`；FastAPI `0.115.0`；pytest `8.3.5`。
+- 冻结依赖：`.tmp/mc-venv-404d921b-freeze.txt`，SHA256=`966d47f160df6ce36765e4771291c42e345acfb997cff3236bf620b78b8a244c`。
+- 本轮唯一生产源码修复是 Windows 备份复制前释放长期 DuckDB owner connection：`backend/database.py` 和 `backend/services/runtime_service.py`；没有增加调度抽象、没有关闭一致性检查、没有放宽验收阈值。该修复不属于 `404d921b` 起点，并由本轮收口提交纳入，报告不把它伪装成基线已包含的内容。
+- C 盘清理后当前只读检查约为总计 200 GB、可用 81.13 GB。磁盘满会造成临时目录/WAL/日志/构建和测试写入失败或异常退出，通常不会直接损坏磁盘硬件；本轮仍保留磁盘满期间的失败证据，不用清理后的空间把失败静默归零。
+
+### 8.2 M0 / G-SIM：模拟器独立吞吐与审计
+
+独立 simulator benchmark 在同一 ext4/CPython 3.11 环境中验证了 simulator TPS 与 route TPS 解耦：
+
+| 场景 | 结果 | 关键证据 |
+|---|---|---|
+| Fast，30 s，pool4/window50，simulator TPS=0 | PASS | 98,814 submit/response，3,282.644/s；server response P99 0.988 ms；audit 197,637/197,637，overflow=0，`VERIFIED` |
+| Fast，限速 50 TPS | PASS | 700/700，50.031/s；audit 1,409/1,409，overflow=0，`VERIFIED` |
+| Fast，限速 200 TPS | PASS | 2,200/2,200，199.883/s；audit 4,409/4,409，overflow=0，`VERIFIED` |
+| Unicode/Flash/Multipart compatibility | PASS | 120/120；multipart 5 PDU；audit 249/249，overflow=0，`VERIFIED` |
+| Full audit，10 s | PASS | 34,415/34,415，3,417.374/s；audit 68,839/68,839，overflow=0，`VERIFIED` |
+
+保留的失败证据：`.tmp/mc-sim-ext4-30s-queue-overflow.json` 曾在 audit queue capacity=8,192 时出现 143,536/143,536 socket 业务收发，但 `error_count=187003`、audit overflow、`SIMULATOR_AUDIT_INCOMPLETE` 和 `TEST_HARNESS_FAIL`。该结果证明 audit backpressure 不能被吞掉；扩大队列后的通过结果不是对它的覆盖。
+
+因此，模拟器自身性能能力和 route/simulator TPS 解耦为 PASS；精确的旧 debug/synchronous-JSONL A/B 实现不在当前工作树，Windows 历史 A/B 也不是本次 ext4 冻结基线，故 G-SIM 的“完整历史 A/B”子门禁仍标记为未完成，不能把 capability PASS 扩展成完整 G-SIM 总 PASS。
+
+### 8.3 G0：三项失败分类与复核
+
+正式 ext4 全后端复跑命令使用独立 basetemp，结果为：`344 passed, 2 skipped, 4 warnings in 223.08s`，exit=0；frontend `npm run build` 也通过。
+
+三项原始 Windows 失败及处理如下：
+
+1. `test_backup_copy_is_readable_after_owner_checkpoint`：Windows `WinError 32`，属于长期 DuckDB owner handle 的文件锁兼容性问题。增加显式 `close_root_connection()` 并在 copy 前调用后，Windows 定向复测 `1 passed in 0.15s`。
+2. `test_no_dlr_successes_use_one_set_based_update_without_message_ids`：Windows 清洁 DB 定向复测通过；原始计数 34 的失败证据保留。
+3. `test_no_dlr_secondary_state_updates_are_set_based_and_fenced`：Windows 清洁 DB 定向复测为 33，仍高于严格阈值 `<30`；同一最终源码在正式 ext4 全套中通过。该差异归类为 Windows flush/timing batching variance，而不是可由 Linux/ext4 复现的 Set-based correctness/performance regression；阈值没有放宽，Windows 证据没有删除。
+
+结论：G0 的目标 ext4 门禁 PASS；Windows 文件锁修复已定向 PASS；Windows 单项 Set-based 计数差异作为兼容性/时序观察项保留，不能被表述为“Windows 全套 pytest 已 PASS”。原始完整日志仍在 `.tmp/pytest-full-rerun-after-disk-clean.log`。
+
+### 8.4 G1：正确性、窗口和 Sender-only 基线
+
+- ingest-only 1,000/1,000 queued，audit `VERIFIED`。
+- sender-only pool1：1,000 accepted、1,000 submit/response，audit `VERIFIED`，约 4.173/s。
+- sender-only pool4：1,000 accepted、1,000 submit/response，audit `VERIFIED`，约 4.110/s；pool4 没有带来吞吐提升。
+- multipart window 1/2/50：均 5/5 PDU submit/response，credits acquired/released=5/5，retired=0，audit `VERIFIED`。
+- 所有结果均保留 task/submit/response/audit 对账、PDU credit 和 fail-closed 指标；没有通过跳过检查来提高 TPS。
+
+### 8.5 G3：四组合 × 3 的 ext4 正式复跑
+
+固定为 Fair、1K tasks、pool4/window50、route TPS=200、simulator TPS=0、Fast simulator、DLR disabled，并在同一 ext4 clone 中顺序执行：
+
+| 组合 | 结果 |
+|---|---|
+| serialized/reliable | 3/3 PASS |
+| serialized/fast | 3/3 PASS |
+| OCC/reliable | 3/3 PASS |
+| OCC/fast | 3/3 PASS |
+
+12 次均为 1,000/1,000 task、submit、response，audit `VERIFIED`，无 duplicate、lost mapping、unknown retry violation 或 native crash。早先 NTFS `/mnt/d` 上的 timeout、API `-11` 和 Windows access violation 仍作为环境失败证据保留，但不与 ext4 正式结果混算。G3 ext4 门禁 PASS，且没有把 Windows 非确定性失败拼接成 PASS。
+
+### 8.6 G4：多 Campaign 公平性矩阵
+
+采用严格容量场景 A=50,000、B/C=1,000，控制 probe、pause/cancel、Fast audit digest 对账均启用；每行均 `control=PASS`、`retry_diagnostics.safety_status=PASS`，无 `unknown_partial_retry_violations`、无 `partial_fence_violations`，但因未在预算内完成全部 52,000 tasks，严格结果全部为 FAIL：
+
+| route 结构 | pool/window | generated | accepted / submit | large A completed |
+|---|---:|---:|---:|---:|
+| same route | 1/1 | 13,248 | 2,025 / 2,025 | 25/50,000 |
+| same route | 1/2 | 10,000 | 2,011 / 2,011 | 11/50,000 |
+| same route | 1/50 | 10,250 | 2,009 / 2,009 | 9/50,000 |
+| same route | 4/1 | 11,056 | 2,027 / 2,027 | 27/50,000 |
+| same route | 4/2 | 10,120 | 2,030 / 2,030 | 30/50,000 |
+| same route | 4/50 | 11,250 | 2,036 / 2,036 | 36/50,000 |
+| two routes | 1/50 | 10,432 | 2,005 / 2,005 | 5/50,000 |
+| two routes | 4/50 | 12,000 | 2,028 / 2,028 | 28/50,000 |
+
+每次 B/C 都各自完成 1,000/1,000；失败是严格容量/进度失败，不是把小 Campaign 饿死或绕过安全检查。高并发正式 ext4 试跑另保留 API `SIGSEGV (-11)` 及 `stall-60s` diagnostics；低 worker 矩阵不能覆盖该 native failure。G1 multipart continuation 证据支持协议正确性，但不能替代 G4 的 52K 多 Campaign 容量门禁。G4 = FAIL。
+
+### 8.7 G6：有效 600 秒长稳
+
+最终长稳结果 `.tmp/mc-g6-ext4-safe-p4-w50.json`：`status=FAIL`、`stop_reason=time_budget`，有效运行约 631.248 s；generated=11,270，accepted=5,283，SMSC submit/mapped=5,283/5,283。Campaign 进度为 `ba-02=1000/1000`、`re-01=1000/1000`、`re-00=3283/50000`；RSS max=382,042,112 bytes，最终可用空间约 962 GB。`retry_diagnostics.safety_status=PASS`，没有 partial fence 或 unknown retry violation，但未完成严格容量目标。因此 G6 是有效长稳证据但门禁 FAIL，不能用进程存活或部分进度替代 600 秒验收目标。
+
+### 8.8 Sender-only 瓶颈与最小优化结论
+
+当前 ext4 应用侧 sender-only 约 4.1–4.2 TPS（pool1 4.173/s，pool4 4.110/s），而独立 simulator 可达约 3,282.644/s，且 route TPS=200。pool4 无收益、SMPP send 约 0.0007–0.0016 s、simulator RTT 小于 1.1 ms；较大的耗时集中在应用 DB/result/checkpoint 路径：`sms_result_batch` lock/tx 约 0.10–0.12 s，`fast_checkpoint` 约 0.085–0.105 s，claim transaction 约 0.046–0.048 s，journal fsync 约 0.0026–0.0031 s。
+
+有证据的最小后续优化候选是对 result transaction/checkpoint 做有界批量合并，同时保留 Journal fence、PDU credits、claim fencing、audit 对账和 fail-closed 行为；本轮没有未经验证地实施它，也没有通过增加 worker、放宽正确性或重新引入调度层来制造 TPS。当前唯一实际源码改动仍是 Windows owner handle release。
+
+### 8.9 最终门禁结论
+
+| 门禁 | 最终状态 | 说明 |
+|---|---|---|
+| G-SIM/M0 | capability PASS / aggregate NO-GO | 独立吞吐、限速、兼容性、audit 均通过；精确旧 A/B 实现缺失，历史 overflow 失败保留 |
+| G0 | PASS（ext4 目标基线） | 344 passed；Windows lock 定向修复通过；Windows Set-based 33 的兼容性证据保留 |
+| G1 | PASS | ingest、sender-only、multipart/window 正确性与审计对账通过 |
+| G3 | PASS | 4 组合 × 3，12/12 ext4 PASS |
+| G4 | FAIL | 8 项矩阵均未完成 52K 严格容量目标；另有高并发 native SIGSEGV 证据 |
+| G5 | PASS | 既有 fault/recovery 门禁保持通过 |
+| G6 | FAIL | 有效约 600 秒运行，但严格多 Campaign 容量未完成 |
+
+最终结论：`INTEGRATED_NO_GO`。当前不能宣布 `INTEGRATED_READY_FOR_S5`；除非后续在不放宽标准、不绕过正确性检查的前提下完成 G4 严格容量矩阵、G6 严格 600 秒目标，以及 G-SIM 缺失的精确历史 A/B 门禁，否则 S5 不得开始。

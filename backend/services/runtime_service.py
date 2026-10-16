@@ -175,6 +175,11 @@ def backup_database(target_dir: str = "", *, resolve_database: bool = True) -> s
             conn.execute("CHECKPOINT")
         finally:
             conn.close()
+        # The long-lived process owner also holds the database file on
+        # Windows.  It is safe to close it only after the maintenance boundary
+        # has drained all tracked transactions; the next DB request lazily
+        # recreates it through database.get_connection().
+        database.close_root_connection()
         shutil.copy2(source, target)
     keep = int(os.environ.get("MC_BACKUP_KEEP", "14"))
     backups = sorted(destination_dir.glob(f"{source.stem}-*{source.suffix}"), reverse=True)
