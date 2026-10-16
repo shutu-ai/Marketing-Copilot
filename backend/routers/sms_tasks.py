@@ -17,6 +17,9 @@ class ExclusionRequest(BaseModel):
 def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = "",
                campaign_type: str = "", smpp_config_id: int = Query(-1),
                cursor: Optional[int] = Query(None, ge=1)):
+    from services import vnext_service
+    if vnext_service.is_active():
+        return vnext_service.list_tasks(page, page_size, status, campaign_type, smpp_config_id, cursor)
     return sms_task_service.list_tasks(
         page, page_size, status, campaign_type, smpp_config_id, cursor
     )
@@ -24,6 +27,9 @@ def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = 
 
 @router.get("/stats")
 def stats():
+    from services import vnext_service
+    if vnext_service.is_active():
+        return vnext_service.task_stats()
     return sms_task_service.task_stats()
 
 
@@ -34,6 +40,9 @@ def dlr_codes():
 
 @router.post("/{task_id}/retry")
 def retry(task_id: int):
+    from services import vnext_service
+    if vnext_service.is_active():
+        raise HTTPException(409, "VNext uses socket_written/unknown evidence; manual legacy retry is disabled")
     try:
         retried = sms_task_service.retry_task(task_id)
     except sms_task_service.TaskRetryRejected as exc:
@@ -45,6 +54,9 @@ def retry(task_id: int):
 
 @router.post("/{task_id}/deliver")
 def confirm_delivered(task_id: int):
+    from services import vnext_service
+    if vnext_service.is_active():
+        raise HTTPException(409, "VNext does not infer handset delivery from submit_sm")
     ok, message = sms_task_service.mark_delivered(task_id)
     if not ok:
         raise HTTPException(400, message)

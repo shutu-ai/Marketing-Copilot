@@ -45,6 +45,10 @@ def test_startup_recovery_still_raises_non_transient_errors(monkeypatch):
 
 
 def test_main_replays_results_before_starting_producers(monkeypatch):
+    # VNext is the production default.  This test covers the explicitly
+    # supported legacy rollback path and therefore opts into it rather than
+    # relying on the process default.
+    monkeypatch.setenv("MC_PIPELINE_MODE", "legacy")
     import main
     from services import sms_write_buffer, task_worker
 

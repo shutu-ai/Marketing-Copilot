@@ -88,6 +88,9 @@ export MC_STATE_DIR="${MC_STATE_DIR:-$APP_HOME/data}"
 export MC_UPDATE_DIR="${MC_UPDATE_DIR:-$APP_HOME/updates}"
 export MC_UPDATE_MODE="${MC_UPDATE_MODE:-manual}"
 export MC_FRONTEND_DIR="${MC_FRONTEND_DIR:-$APP_HOME/frontend/dist}"
+export MC_PIPELINE_MODE="${MC_PIPELINE_MODE:-vnext}"
+export MC_VNEXT_RUN_ROOT="${MC_VNEXT_RUN_ROOT:-$MC_STATE_DIR/vnext}"
+mkdir -p "$MC_VNEXT_RUN_ROOT"
 
 # When invoked by systemd, this script must remain the managed foreground
 # process only for legacy units that still use run.sh as ExecStart.

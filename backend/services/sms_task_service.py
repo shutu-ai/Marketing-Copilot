@@ -344,6 +344,11 @@ def reconcile_campaign_state_in_transaction(
     deliberately retained for result reconciliation and are never inferred
     to be safe to resend.
     """
+    from services import vnext_service
+    if vnext_service.is_active():
+        # Campaign control is fenced by the VNext control-state file.  There
+        # is no legacy sms_tasks claim set to reconcile in this mode.
+        return {"requeued": 0, "terminated": 0, "pipeline": "vnext"}
     target_status = str(target_status or "")
     generation = int(dispatch_generation or 0)
     if target_status == "paused":
@@ -803,7 +808,16 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
                 batch_id: Optional[int] = None, validate_schedule: bool = True,
                 ingestion_lease: Optional[tuple] = None,
                 ingestion_chunk: Optional[dict] = None,
-                ingestion_chunk_progress: bool = False) -> dict:
+                 ingestion_chunk_progress: bool = False,
+                 row_ordinal_start: int = 0) -> dict:
+    from services import vnext_service
+    if vnext_service.is_active():
+        return vnext_service.enqueue_rows(
+            campaign_type, campaign, rows, source_file, batch_id,
+            validate_schedule=validate_schedule, ingestion_lease=ingestion_lease,
+            ingestion_chunk=ingestion_chunk, ingestion_chunk_progress=ingestion_chunk_progress,
+            row_ordinal_start=row_ordinal_start,
+        )
     if ingestion_chunk and not ingestion_lease:
         raise ValueError("ingestion_chunk requires ingestion_lease")
     if validate_schedule:

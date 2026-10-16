@@ -173,6 +173,7 @@ def _enqueue_realtime_with_admission(campaign: dict, records: list[dict], source
             ingestion_lease=(ingestion_file_id, lease_token),
             ingestion_chunk=ingestion_chunk,
             ingestion_chunk_progress=not final_atomic,
+            row_ordinal_start=int(ingestion_chunk.get("start_row") or 0) + offset,
         )
         if not result.get("success"):
             return result
@@ -670,7 +671,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         ).fetchone()
         if not current:
             return None
-        if new_smpp_id is not None:
+        if new_smpp_id is not None and not vnext_active:
             smpp = conn.execute(
                 "SELECT id FROM smpp_configs WHERE id=? AND enabled=1", (new_smpp_id,)
             ).fetchone()
@@ -707,20 +708,27 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
 
     from contextlib import nullcontext
     from services import fast_send_service
+    from services import vnext_service
+    vnext_active = vnext_service.is_active()
     barrier = (
         fast_send_service.campaign_control_barrier("realtime", campaign_id)
-        if status_update else nullcontext()
+        if status_update and not vnext_active else nullcontext()
     )
     with barrier:
         updated = _run_campaign_write("update", write)
         if status_update and updated:
-            fast_send_service.publish_campaign_state(
-                "realtime", campaign_id, updated.get("status", ""),
-                int(updated.get("dispatch_generation") or 0),
-            )
+            if vnext_active:
+                vnext_service.set_campaign_state(
+                    "realtime", campaign_id, updated.get("status", ""),
+                )
+            else:
+                fast_send_service.publish_campaign_state(
+                    "realtime", campaign_id, updated.get("status", ""),
+                    int(updated.get("dispatch_generation") or 0),
+                )
     if updated is None:
         return None
-    if fields.get("status") is not None:
+    if fields.get("status") is not None and not vnext_active:
         try:
             from services.smpp_gateway import gateway
             gateway.invalidate_campaign(

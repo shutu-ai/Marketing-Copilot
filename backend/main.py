@@ -22,7 +22,7 @@ from database import (
 )
 from auth import auth_middleware
 from services import update_service
-from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router, users as users_router, internal as internal_router
+from routers import smpp, sms_content, monitor, rabbitmq as rabbitmq_router, db_config as db_config_router, batch_campaign, settings as settings_router, dashboard as dashboard_router, realtime_campaign as realtime_campaign_router, db_query as db_query_router, sms_tasks as sms_tasks_router, operations as operations_router, metrics as metrics_router, filesystem as filesystem_router, logs as logs_router, auth as auth_router, update as update_router, users as users_router, internal as internal_router, vnext as vnext_router
 
 from services.runtime_service import configure_logging, acquire_instance_lock, release_instance_lock
 configure_logging()
@@ -152,17 +152,27 @@ app.include_router(auth_router.router)
 app.include_router(update_router.router)
 app.include_router(users_router.router)
 app.include_router(internal_router.router)
+app.include_router(vnext_router.router)
 
 
 def _start_background_services():
-    """Establish the durable result replay barrier before opening producers.
+    """Start the VNext data plane and retain only the ingestion scheduler.
 
-    The journal/write-buffer owner is started and drained first.  File
-    ingestion and SMS claim workers are not allowed to create new work while
-    pending result events, terminal markers, or result-capacity recovery are
-    still being reconciled.  A timeout is fail-closed: startup must not turn a
-    partially replayed result stream into fresh socket admissions.
+    The historical claim/SMPP/result-buffer chain is available only through an
+    explicit ``MC_PIPELINE_MODE=legacy`` setting for controlled rollback or
+    old regression tests.  Normal startup owns SMPP workers and DuckDB
+    projection through VNext.
     """
+    from services import vnext_service
+    if vnext_service.pipeline_mode() not in {"legacy", "test"}:
+        vnext_service.start()
+        # This scheduler is now an input/SFTP producer only; it calls the
+        # VNext ingress adapter and never starts a legacy SMS send worker.
+        from services.activity_scheduler import start_scheduler
+        start_scheduler()
+        logger.info("VNext pipeline started; legacy send chain is disabled")
+        return
+
     from services.activity_scheduler import start_scheduler
     from services.sms_write_buffer import start as start_sms_write_buffer
     from services.task_worker import start_worker
@@ -211,6 +221,9 @@ def startup():
     _start_background_services()
 
     try:
+        from services import vnext_service
+        if vnext_service.pipeline_mode() not in {"legacy", "test"}:
+            return
         from services.rabbitmq_service import get_config, start_consumer
         config = get_config()
         if config and config.get("enabled"):
@@ -223,6 +236,27 @@ def startup():
 
 @app.on_event("shutdown")
 def shutdown():
+    from services import vnext_service
+    if vnext_service.pipeline_mode() not in {"legacy", "test"}:
+        from services.activity_scheduler import stop_scheduler
+        try:
+            stop_scheduler()
+        except Exception:
+            logger.exception("Failed to stop VNext ingestion scheduler")
+        try:
+            vnext_service.stop()
+        except Exception:
+            logger.exception("Failed to stop VNext runtime")
+        try:
+            release_instance_lock()
+        except Exception:
+            logger.exception("Failed to release instance lock during shutdown")
+        try:
+            stop_stall_watchdog()
+        except Exception:
+            logger.exception("Failed to stop database stall watchdog during shutdown")
+        return
+
     from services.task_worker import stop_worker
     from services.activity_scheduler import stop_scheduler
     from services.sms_write_buffer import stop as stop_sms_write_buffer
@@ -259,14 +293,21 @@ def health():
         db_ok = True
     except Exception:
         pass
-    from services.smpp_gateway import gateway
-    try:
-        smpp = gateway.status()
-    except Exception as exc:
-        if not is_database_read_error(exc):
-            raise
-        logger.warning("Health SMPP status unavailable: %s", exc)
-        smpp = _smpp_unavailable_status()
+    from services import vnext_service
+    if vnext_service.is_active():
+        pipeline = vnext_service.status()
+        smpp = {"state": "vnext", "connected": any(
+            item.get("alive") for item in (pipeline.get("supervisor") or {}).get("workers", [])
+        ), "routes": pipeline.get("routes", []), "projection": pipeline.get("projection", {})}
+    else:
+        from services.smpp_gateway import gateway
+        try:
+            smpp = gateway.status()
+        except Exception as exc:
+            if not is_database_read_error(exc):
+                raise
+            logger.warning("Health SMPP status unavailable: %s", exc)
+            smpp = _smpp_unavailable_status()
     return {"status": "ok" if db_ok else "degraded", "service": "Marketing Copilot",
             "database": "connected" if db_ok else "disconnected", "smpp": smpp}
 

@@ -1,0 +1,266 @@
+"""Bounded, fair shard workers that never write the application DuckDB."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Awaitable, Callable
+
+from .metrics import VNextMetrics
+from .route_credits import RouteCreditBroker
+from .smpp_transport import AsyncSmppTransport, SocketWriteResult
+from .spool import SpoolRecord, TaskSpool
+
+
+@dataclass(frozen=True)
+class WorkerProgress:
+    event_id: str
+    partition_id: int
+    ordinal: int
+    campaign_type: str
+    campaign_id: int
+    route_id: int
+    normalized_msisdn: str
+    state: str
+    parts_written: int
+    parts_total: int
+    error: str = ""
+    created_at: float = 0.0
+    message: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "event_id": self.event_id,
+            "partition_id": self.partition_id,
+            "ordinal": self.ordinal,
+            "campaign_type": self.campaign_type,
+            "campaign_id": self.campaign_id,
+            "route_id": self.route_id,
+            "normalized_msisdn": self.normalized_msisdn,
+            "state": self.state,
+            "parts_written": self.parts_written,
+            "parts_total": self.parts_total,
+            "error": self.error,
+            "created_at": self.created_at or time.time(),
+            "message": self.message,
+        }
+
+
+class ShardWorker:
+    """Consume assigned logical shards with bounded fair concurrency."""
+
+    def __init__(self, worker_id: int, partitions: tuple[int, ...], spool: TaskSpool,
+                 route_configs: dict[int | str, dict], *, credits: RouteCreditBroker | None = None,
+                 transport_factory: Callable | None = None,
+                 progress_sink: Callable[[dict], Awaitable[None] | None] | None = None,
+                 max_inflight: int = 64, prefetch_per_partition: int = 32,
+                 metrics: VNextMetrics | None = None):
+        self.worker_id = int(worker_id)
+        self.partitions = tuple(int(item) for item in partitions)
+        self.spool = spool
+        self.route_configs = {str(key): dict(value) for key, value in route_configs.items()}
+        self.credits = credits or RouteCreditBroker()
+        self.transport_factory = transport_factory or (lambda config, broker: AsyncSmppTransport(config, credits=broker))
+        self.progress_sink = progress_sink
+        self.max_inflight = max(1, int(max_inflight))
+        self.prefetch_per_partition = max(1, int(prefetch_per_partition))
+        self.metrics = metrics or VNextMetrics()
+        self._stop = asyncio.Event()
+        self._paused_campaigns: set[tuple[str, int]] = set()
+        self._cancelled_campaigns: set[tuple[str, int]] = set()
+        self._transports: dict[str, object] = {}
+        self._number_locks: dict[str, asyncio.Lock] = {}
+        self._progress_events: deque[dict] = deque(maxlen=10_000)
+        self._group_cursor = 0
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str) -> None:
+        key = (str(campaign_type), int(campaign_id))
+        normalized = str(state).lower()
+        if normalized in {"pause", "paused"}:
+            self._paused_campaigns.add(key)
+        elif normalized in {"running", "resume", "resumed"}:
+            self._paused_campaigns.discard(key)
+        if normalized in {"cancel", "cancelled", "stopped"}:
+            self._paused_campaigns.add(key)
+            self._cancelled_campaigns.add(key)
+
+    def _eligible(self, record: SpoolRecord) -> bool:
+        key = (record.campaign_type, record.campaign_id)
+        return key in self._cancelled_campaigns or key not in self._paused_campaigns
+
+    async def _transport(self, route_id: int):
+        key = str(int(route_id))
+        if key not in self._transports:
+            config = self.route_configs.get(key)
+            if not config:
+                return None
+            config = dict(config)
+            config.setdefault("route_id", key)
+            value = self.transport_factory(config, self.credits)
+            if inspect.isawaitable(value):
+                value = await value
+            self._transports[key] = value
+        return self._transports[key]
+
+    async def _emit(self, progress: WorkerProgress) -> None:
+        event = progress.as_dict()
+        event.update({
+            "taken": int(not progress.error.startswith("dispatch checkpoint failed")),
+            "socket_written": int(progress.state == "socket_written"),
+            "write_failed": int(progress.state == "write_failed"),
+            "unknown": int(progress.state == "unknown"),
+            "response_success": 0,
+            "response_error": 0,
+        })
+        self._progress_events.append(event)
+        self.metrics.record(event)
+        if not self.progress_sink:
+            return
+        result = self.progress_sink(event)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _process(self, record: SpoolRecord) -> None:
+        # Persist dispatch_taken before any socket call.  A crash after this
+        # point is intentionally at-most-once-after-dispatch.
+        try:
+            self.spool.checkpoint(record.partition_id, record.ordinal)
+        except Exception as exc:
+            await self._emit(WorkerProgress(
+                record.event_id, record.partition_id, record.ordinal,
+                record.campaign_type, record.campaign_id, record.route_id,
+                record.normalized_msisdn, "write_failed", 0, record.part_count_hint,
+                f"dispatch checkpoint failed: {type(exc).__name__}: {exc}",
+                message=record.message,
+            ))
+            return
+        if (record.campaign_type, record.campaign_id) in self._cancelled_campaigns:
+            await self._emit(WorkerProgress(
+                record.event_id, record.partition_id, record.ordinal,
+                record.campaign_type, record.campaign_id, record.route_id,
+                record.normalized_msisdn, "cancelled", 0, record.part_count_hint,
+                "campaign cancelled", message=record.message,
+            ))
+            return
+        lock = self._number_locks.setdefault(record.normalized_msisdn, asyncio.Lock())
+        async with lock:
+            transport = await self._transport(record.route_id)
+            if transport is None:
+                await self._emit(WorkerProgress(
+                    record.event_id, record.partition_id, record.ordinal,
+                    record.campaign_type, record.campaign_id, record.route_id,
+                    record.normalized_msisdn, "write_failed", 0, record.part_count_hint,
+                    "route configuration unavailable",
+                    message=record.message,
+                ))
+                return
+            try:
+                result: SocketWriteResult = await transport.send_task(
+                    destination_addr=record.normalized_msisdn,
+                    message=record.message,
+                    flash_sms=record.flash_sms,
+                    reference=(record.ordinal % 255) or 1,
+                    source_addr=record.source_addr or None,
+                )
+            except Exception as exc:
+                result = SocketWriteResult(
+                    "unknown", 0, max(1, record.part_count_hint),
+                    f"{type(exc).__name__}: {exc}",
+                )
+            await self._emit(WorkerProgress(
+                record.event_id, record.partition_id, record.ordinal,
+                record.campaign_type, record.campaign_id, record.route_id,
+                record.normalized_msisdn, result.state, result.parts_written,
+                result.parts_total, result.error, message=record.message,
+            ))
+
+    def _seed_buffers(self):
+        iterators = {partition: iter(self.spool.iter_from(partition, self.spool.cursor(partition))) for partition in self.partitions}
+        buffers: dict[tuple[int, str, int, int], deque[SpoolRecord]] = defaultdict(deque)
+        counts: dict[int, int] = defaultdict(int)
+        exhausted: set[int] = set()
+        group_order: list[tuple[int, str, int, int]] = []
+
+        def fill() -> None:
+            for partition in self.partitions:
+                if partition in exhausted:
+                    continue
+                while counts[partition] < self.prefetch_per_partition:
+                    try:
+                        record = next(iterators[partition])
+                    except StopIteration:
+                        exhausted.add(partition)
+                        break
+                    group = (partition, record.campaign_type, record.campaign_id, record.route_id)
+                    if group not in buffers:
+                        group_order.append(group)
+                    buffers[group].append(record)
+                    counts[partition] += 1
+
+        return iterators, buffers, counts, exhausted, group_order, fill
+
+    async def run_until_idle(self, *, max_tasks: int | None = None) -> dict:
+        iterators, buffers, counts, exhausted, group_order, fill = self._seed_buffers()
+        pending: set[asyncio.Task] = set()
+        processed = 0
+        fill()
+        try:
+            while not self._stop.is_set() and (group_order or pending) and (max_tasks is None or processed < int(max_tasks)):
+                fill()
+                eligible_group = None
+                for offset in range(len(group_order)):
+                    index = (self._group_cursor + offset) % len(group_order)
+                    group = group_order[index]
+                    queue = buffers[group]
+                    if queue and self._eligible(queue[0]):
+                        eligible_group = group
+                        self._group_cursor = (index + 1) % len(group_order)
+                        break
+                if eligible_group is not None and len(pending) < self.max_inflight:
+                    record = buffers[eligible_group].popleft()
+                    counts[record.partition_id] -= 1
+                    pending.add(asyncio.create_task(self._process(record)))
+                    processed += 1
+                    continue
+                if pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        task.result()
+                    continue
+                if all(not buffers[group] for group in group_order):
+                    fill()
+                    if not any(buffers[group] for group in group_order):
+                        break
+                else:
+                    # Every buffered group is paused/cancelled.  Do not busy
+                    # loop or advance its cursor; control can resume it later.
+                    break
+            if pending:
+                await asyncio.gather(*pending)
+        finally:
+            for transport in self._transports.values():
+                close = getattr(transport, "close", None)
+                if close:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+        return self.snapshot()
+
+    def snapshot(self) -> dict:
+        counters = self.metrics.snapshot()["counters"]
+        return {
+            "worker_id": self.worker_id,
+            "partitions": list(self.partitions),
+            "counters": counters,
+            "progress_events": len(self._progress_events),
+            "transports": [
+                transport.snapshot() for transport in self._transports.values()
+                if hasattr(transport, "snapshot")
+            ],
+        }

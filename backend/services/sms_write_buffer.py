@@ -25,7 +25,11 @@ MAX_BATCH_SIZE = max(100, min(1000, int(os.environ.get("MC_SMS_WRITE_BATCH_SIZE"
 TRANSACTION_BATCH_SIZE = max(
     50, min(500, int(os.environ.get("MC_SMS_WRITE_TRANSACTION_SIZE", "250")))
 )
-FLUSH_INTERVAL = max(0.05, min(0.2, float(os.environ.get("MC_SMS_WRITE_FLUSH_MS", "100")) / 1000.0))
+# Legacy rollback mode still receives one durable journal fsync per callback.
+# A 200 ms collection window lets that producer form useful set-based batches
+# without changing the bounded 250-row transaction limit.  VNext does not use
+# this writer on its normal send path.
+FLUSH_INTERVAL = max(0.05, min(0.2, float(os.environ.get("MC_SMS_WRITE_FLUSH_MS", "200")) / 1000.0))
 QUEUE_CAPACITY = max(MAX_BATCH_SIZE * 2, int(os.environ.get("MC_SMS_WRITE_QUEUE_CAPACITY", "100000")))
 
 

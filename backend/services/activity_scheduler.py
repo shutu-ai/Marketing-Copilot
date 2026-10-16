@@ -34,6 +34,14 @@ _last_batch_reset = 0.0
 _last_batch_cancel = 0.0
 
 
+def _vnext_active() -> bool:
+    try:
+        from services import vnext_service
+        return vnext_service.is_active()
+    except Exception:
+        return False
+
+
 def _batch_quantum_seconds() -> float:
     try:
         return max(0.05, float(os.environ.get("MC_BATCH_QUANTUM_SECONDS", "1.5")))
@@ -153,10 +161,11 @@ def _process_batches():
         _run_stage("batch_daily_reset", batch_campaign_service.reset_daily_batches)
     if now - _last_batch_cancel >= _BATCH_CANCEL_INTERVAL:
         _last_batch_cancel = now
-        _run_stage(
-            "batch_overdue_cancel",
-            batch_campaign_service.cancel_overdue_daily_tasks,
-        )
+        if not _vnext_active():
+            _run_stage(
+                "batch_overdue_cancel",
+                batch_campaign_service.cancel_overdue_daily_tasks,
+            )
 
 
 def _run():
@@ -167,7 +176,8 @@ def _run():
             from services import metrics_service
             metrics_service.set_gauge("realtime_scheduler_last_tick_timestamp", time.time())
             _run_stage("batch_scheduler", _process_batches)
-            _run_stage("realtime_daily_finalize", realtime_campaign_service.finalize_daily_tasks)
+            if not _vnext_active():
+                _run_stage("realtime_daily_finalize", realtime_campaign_service.finalize_daily_tasks)
             active = _run_stage(
                 "realtime_active_check",
                 realtime_campaign_service.has_active_realtime_campaigns,
@@ -188,16 +198,18 @@ def _run():
                 _run_stage("realtime_retention", realtime_campaign_service.cleanup_realtime_retention)
                 from services import realtime_whitelist_service
                 _run_stage("whitelist_cleanup", realtime_whitelist_service.cleanup_versions)
-                _run_stage("task_retention", sms_task_service.cleanup_task_retention)
+                if not _vnext_active():
+                    _run_stage("task_retention", sms_task_service.cleanup_task_retention)
                 _run_stage("campaign_auto_complete", p1_service.auto_complete_campaigns)
-                from services import metrics_service, task_worker
-                from services.smpp_gateway import gateway
-                _run_stage(
-                    "alert_evaluation",
-                    lambda: metrics_service.evaluate_alerts(
-                        task_worker.worker_status()['running'], gateway.status()
-                    ),
-                )
+                if not _vnext_active():
+                    from services import metrics_service, task_worker
+                    from services.smpp_gateway import gateway
+                    _run_stage(
+                        "alert_evaluation",
+                        lambda: metrics_service.evaluate_alerts(
+                            task_worker.worker_status()['running'], gateway.status()
+                        ),
+                    )
         except Exception:
             # Keep the scheduler thread alive even if a future stage is added
             # without the per-stage guard above.

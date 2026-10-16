@@ -1,0 +1,333 @@
+"""Loopback-only VNext socket-write acceptance runner.
+
+The runner starts a tiny SMPP 3.4 server on 127.0.0.1, feeds the real VNext
+ingress/spool/worker code from multiple processes, then reconciles worker
+``socket_written`` events with bytes observed at the simulator protocol
+boundary. It never opens the application DuckDB in a worker.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import multiprocessing
+import os
+from pathlib import Path
+import sys
+import time
+from collections import Counter
+
+TOOLS_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = TOOLS_DIR.parent
+REPO_ROOT = BACKEND_DIR.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from vnext.ingress import IngressRouter
+from vnext.partition import PartitionMap
+from vnext.projection_writer import ProjectionWriterProcess, ProgressJournal
+from vnext.route_credits import RouteCreditBroker
+from vnext.smpp_transport import (
+    BIND_TRANSCEIVER,
+    ENQUIRE_LINK,
+    HEADER,
+    RESPONSE_MASK,
+    SUBMIT_SM,
+    UNBIND,
+    cstring,
+    read_pdu,
+)
+from vnext.spool import TaskSpool
+from vnext.worker import ShardWorker
+
+
+def _read_cstring(body: bytes, offset: int) -> tuple[str, int]:
+    end = body.find(b"\x00", offset)
+    if end < 0:
+        raise ValueError("unterminated SMPP C string")
+    return body[offset:end].decode("ascii", errors="replace"), end + 1
+
+
+def _parse_destination(body: bytes) -> str:
+    offset = 0
+    _service_type, offset = _read_cstring(body, offset)
+    offset += 2
+    _source, offset = _read_cstring(body, offset + 0)
+    offset += 2
+    destination, _offset = _read_cstring(body, offset)
+    return destination
+
+
+class LoopbackSMSC:
+    def __init__(self):
+        self.server = None
+        self.received: list[dict] = []
+        self.responses = 0
+        self.response_success = 0
+        self.binds = 0
+        self.errors: list[str] = []
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            while True:
+                command, _status, sequence, body = await read_pdu(reader)
+                if command == BIND_TRANSCEIVER:
+                    self.binds += 1
+                    response = cstring("VNEXT-SMSC")
+                    writer.write(HEADER.pack(16 + len(response), command | RESPONSE_MASK, 0, sequence) + response)
+                    await writer.drain()
+                elif command == SUBMIT_SM:
+                    destination = _parse_destination(body)
+                    item = {
+                        "sequence": int(sequence),
+                        "destination": destination,
+                        "destination_digest": hashlib.sha256(destination.encode("utf-8")).hexdigest()[:16],
+                        "received_at": time.time(),
+                    }
+                    self.received.append(item)
+                    response = cstring(f"VNEXT-{len(self.received):010d}")
+                    writer.write(HEADER.pack(16 + len(response), command | RESPONSE_MASK, 0, sequence) + response)
+                    await writer.drain()
+                    self.responses += 1
+                    self.response_success += 1
+                elif command == ENQUIRE_LINK:
+                    writer.write(HEADER.pack(16, command | RESPONSE_MASK, 0, sequence))
+                    await writer.drain()
+                elif command == UNBIND:
+                    writer.write(HEADER.pack(16, command | RESPONSE_MASK, 0, sequence))
+                    await writer.drain()
+                    break
+                else:
+                    self.errors.append(f"unsupported command=0x{command:08x}")
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        except Exception as exc:
+            self.errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    async def start(self) -> int:
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        return int(self.server.sockets[0].getsockname()[1])
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+
+def _worker_process(worker_id: int, partitions: tuple[int, ...], spool_root: str,
+                    credits_root: str, route_config: dict, journal_path: str,
+                    result_path: str, max_inflight: int, prefetch: int) -> None:
+    spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
+    credits = RouteCreditBroker(credits_root)
+    journal = ProgressJournal(journal_path)
+    worker = ShardWorker(
+        worker_id, tuple(partitions), spool, {str(route_config["route_id"]): route_config},
+        credits=credits, progress_sink=journal.append,
+        max_inflight=max_inflight, prefetch_per_partition=prefetch,
+    )
+    result = asyncio.run(worker.run_until_idle())
+    Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+
+
+def _campaign_plan(count: int) -> list[tuple[int, int]]:
+    total = max(1, int(count))
+    if total == 5500:
+        return [(1, 2500), (2, 2500), (3, 250), (4, 250)]
+    return [(1, total)]
+
+
+async def run_gate(*, count: int, run_root: Path, workers: int = 4,
+                   route_tps: float = 0.0, timeout: float = 300.0) -> dict:
+    run_root = Path(run_root).resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+    spool_root = run_root / "spool"
+    credits_root = run_root / "route-credits"
+    spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
+    ingress = IngressRouter(spool)
+    planned = _campaign_plan(count)
+    expected: dict[str, dict] = {}
+    generated = 0
+    for campaign_id, campaign_count in planned:
+        rows = []
+        for index in range(campaign_count):
+            msisdn = f"090{campaign_id:02d}{index:07d}"
+            rows.append({"msisdn": msisdn, "message": f"VNext campaign={campaign_id} event={index}"})
+            normalized = f"251{msisdn[1:]}"
+            expected[normalized] = {"campaign_id": campaign_id, "index": index}
+        result = ingress.enqueue_chunk(
+            rows, campaign_type="batch", campaign_id=campaign_id,
+            phone_prefix="251", source_id=f"synthetic-campaign-{campaign_id}",
+            payload_ref=f"synthetic:{campaign_id}", route_id=1,
+        )
+        generated += campaign_count
+        if result.accepted != campaign_count:
+            raise RuntimeError(f"ingress did not durably accept campaign {campaign_id}: {result.as_dict()}")
+
+    smsc = LoopbackSMSC()
+    port = await smsc.start()
+    partition_map = PartitionMap.create(run_root / "partition-map.json", 256, workers)
+    route_config = {
+        "route_id": 1, "host": "127.0.0.1", "port": port,
+        "system_id": "test", "password": "test", "source_addr": "VNEXT",
+        "window_size": 50, "tps": max(0.0, float(route_tps)), "timeout": 10,
+    }
+    context = multiprocessing.get_context("spawn")
+    processes = []
+    for worker_id in range(workers):
+        journal_path = run_root / "progress" / f"worker-{worker_id}.jsonl"
+        result_path = run_root / "workers" / f"worker-{worker_id}.json"
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        process = context.Process(
+            target=_worker_process,
+            args=(worker_id, partition_map.partitions_for_worker(worker_id), str(spool_root),
+                  str(credits_root), route_config, str(journal_path), str(result_path), 128, 64),
+            name=f"mc-vnext-acceptance-worker-{worker_id}", daemon=True,
+        )
+        process.start()
+        processes.append(process)
+    started = time.monotonic()
+    timed_out = False
+    try:
+        while any(process.is_alive() for process in processes):
+            if time.monotonic() - started > max(1.0, float(timeout)):
+                timed_out = True
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        if timed_out:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+        for process in processes:
+            process.join(timeout=5)
+        await smsc.stop()
+
+    progress = []
+    worker_results = []
+    for worker_id in range(workers):
+        journal = ProgressJournal(run_root / "progress" / f"worker-{worker_id}.jsonl")
+        progress.extend(journal.read())
+        path = run_root / "workers" / f"worker-{worker_id}.json"
+        if path.exists():
+            worker_results.append(json.loads(path.read_text(encoding="utf-8")))
+    progress.sort(key=lambda item: (float(item.get("created_at", 0)), int(item.get("ordinal", 0))))
+    projection = ProjectionWriterProcess(run_root / "projection")
+    projection.start()
+    try:
+        for item in progress:
+            projection.submit(item, timeout=2)
+    finally:
+        projection.stop(timeout=60)
+    projection_status = projection.snapshot()
+
+    states = Counter(str(item.get("state", "")) for item in progress)
+    reconciled_spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
+    per_campaign = Counter()
+    per_campaign_received = Counter()
+    for item in progress:
+        if item.get("state") == "socket_written":
+            per_campaign[int(item["campaign_id"])] += 1
+    for item in smsc.received:
+        campaign = expected.get(str(item["destination"]), {}).get("campaign_id")
+        if campaign is not None:
+            per_campaign_received[int(campaign)] += 1
+    received_destinations = [str(item["destination"]) for item in smsc.received]
+    duplicate_destinations = sorted(
+        destination for destination, value in Counter(received_destinations).items() if value > 1
+    )
+    missing_destinations = sorted(set(expected).difference(received_destinations))
+    unexpected_destinations = sorted(set(received_destinations).difference(expected))
+    fairness = {
+        str(campaign_id): {
+            "expected": campaign_count,
+            "socket_written": per_campaign[campaign_id],
+            "smpp_received": per_campaign_received[campaign_id],
+        }
+        for campaign_id, campaign_count in planned
+    }
+    passed = (
+        not timed_out and not smsc.errors and generated == len(expected)
+        and states["socket_written"] == generated
+        and len(smsc.received) == generated
+        and smsc.response_success == generated
+        and reconciled_spool.status()["pending_records"] == 0
+        and int(projection_status.get("applied", 0)) == generated
+        and not duplicate_destinations and not missing_destinations and not unexpected_destinations
+        and all(item["socket_written"] == item["expected"] for item in fairness.values())
+    )
+    gate_name = {10: "P10", 100: "P100", 1000: "P1K", 5500: "P5500"}.get(count, f"P{count}")
+    return {
+        "gate": gate_name,
+        "status": "PASS" if passed else "FAIL",
+        "run_root": str(run_root),
+        "workers": workers,
+        "route_tps": route_tps,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "generated": generated,
+        "spool": reconciled_spool.status(),
+        "states": dict(states),
+        "socket_written": states["socket_written"],
+        "smpp": {
+            "binds": smsc.binds, "submit_sm_received": len(smsc.received),
+            "submit_sm_resp_success": smsc.response_success,
+            "errors": smsc.errors,
+        },
+        "fairness": fairness,
+        "duplicate_destinations": duplicate_destinations,
+        "missing_destinations": missing_destinations[:20],
+        "missing_count": len(missing_destinations),
+        "unexpected_destinations": unexpected_destinations[:20],
+        "worker_results": worker_results,
+        "projection": projection_status,
+        "timeout": timed_out,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gate", choices=("p10", "p100", "p1k", "p5500"), default="p100")
+    parser.add_argument("--count", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--route-tps", type=float, default=0.0)
+    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--run-root", default="")
+    parser.add_argument("--output", default="")
+    parser.add_argument("--quiet", action="store_true", help="print only the bounded result summary")
+    args = parser.parse_args()
+    count = args.count or {"p10": 10, "p100": 100, "p1k": 1000, "p5500": 5500}[args.gate]
+    root = Path(args.run_root).resolve() if args.run_root else Path(__import__("tempfile").mkdtemp(prefix="mc-vnext-loopback-"))
+    result = asyncio.run(run_gate(
+        count=count, run_root=root, workers=max(1, min(8, args.workers)),
+        route_tps=max(0.0, args.route_tps), timeout=args.timeout,
+    ))
+    output = Path(args.output).resolve() if args.output else root / "result.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    if args.quiet:
+        print(json.dumps({
+            "gate": result["gate"], "status": result["status"],
+            "duration_seconds": result["duration_seconds"],
+            "generated": result["generated"], "socket_written": result["socket_written"],
+            "submit_sm_received": result["smpp"]["submit_sm_received"],
+            "submit_sm_resp_success": result["smpp"]["submit_sm_resp_success"],
+            "projection_applied": result["projection"].get("applied"),
+            "pending": result["spool"].get("pending_records"),
+            "missing": result["missing_count"],
+        }, ensure_ascii=False, sort_keys=True))
+    else:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["status"] == "PASS" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

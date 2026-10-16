@@ -514,7 +514,7 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
             sms_task_service.reconcile_campaign_state_in_transaction(
                 conn, "batch", campaign_id, fields["status"], next_generation,
             )
-        if new_smpp_id is not None:
+        if new_smpp_id is not None and not vnext_active:
             conn.execute(
                 """UPDATE sms_tasks SET smpp_config_id=?, updated_at=CURRENT_TIMESTAMP
                    WHERE campaign_type='batch' AND campaign_id=? AND status IN ('queued','retrying','sending')""",
@@ -527,20 +527,27 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
 
     from contextlib import nullcontext
     from services import fast_send_service
+    from services import vnext_service
+    vnext_active = vnext_service.is_active()
     barrier = (
         fast_send_service.campaign_control_barrier("batch", campaign_id)
-        if status_update else nullcontext()
+        if status_update and not vnext_active else nullcontext()
     )
     with barrier:
         updated_campaign = _run_campaign_write("update", write)
         if status_update and updated_campaign:
-            fast_send_service.publish_campaign_state(
-                "batch", campaign_id, updated_campaign.get("status", ""),
-                int(updated_campaign.get("dispatch_generation") or 0),
-            )
+            if vnext_active:
+                vnext_service.set_campaign_state(
+                    "batch", campaign_id, updated_campaign.get("status", ""),
+                )
+            else:
+                fast_send_service.publish_campaign_state(
+                    "batch", campaign_id, updated_campaign.get("status", ""),
+                    int(updated_campaign.get("dispatch_generation") or 0),
+                )
     if updated_campaign is None:
         return None
-    if fields.get("status") is not None:
+    if fields.get("status") is not None and not vnext_active:
         try:
             from services.smpp_gateway import gateway
             gateway.invalidate_campaign(
