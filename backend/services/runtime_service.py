@@ -168,8 +168,9 @@ def backup_database(target_dir: str = "", *, resolve_database: bool = True) -> s
     # The raw DuckDB connection is closed before copying because Windows
     # otherwise keeps an exclusive file handle open after CHECKPOINT.
     with database.maintenance_exclusive("backup.database"):
+        config = database.prepare_duckdb_connection()
         conn = database.duckdb.connect(
-            str(source), config=database.duckdb_connection_config()
+            str(source), config=config
         )
         try:
             conn.execute("CHECKPOINT")

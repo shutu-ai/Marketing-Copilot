@@ -8,6 +8,8 @@ from contextlib import contextmanager
 
 import duckdb
 
+from duckdb_config import duckdb_extension_config, prepare_offline_extensions
+
 logger = logging.getLogger(__name__)
 
 # ``_write_lock`` is the compatibility/fallback gate for the default
@@ -890,14 +892,7 @@ def write_lock_status() -> dict:
 
 def duckdb_connection_config() -> dict:
     """Return offline-safe DuckDB settings for the application database."""
-    extension_directory = os.environ.get("MC_DUCKDB_EXTENSION_DIR", "").strip()
-    if not extension_directory:
-        extension_directory = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "offline", "extensions"
-        )
-    config = {}
-    if os.path.isdir(extension_directory):
-        config["extension_directory"] = extension_directory
+    config = duckdb_extension_config()
     # DuckDB 1.2.0's OCC path is exercised by several application connections
     # at once. Keep connection-local vectorized execution single-threaded by
     # default; the process-level owner/cursor lifecycle above is the integrity
@@ -906,6 +901,14 @@ def duckdb_connection_config() -> dict:
     # the acceptance matrix.
     if _WRITE_CONCURRENCY == "occ":
         config["threads"] = str(os.environ.get("MC_DUCKDB_THREADS", "1"))
+    return config
+
+
+def prepare_duckdb_connection() -> dict:
+    """Prepare offline extension metadata, then return connection settings."""
+
+    config = duckdb_connection_config()
+    prepare_offline_extensions(duckdb, config)
     return config
 
 DATABASE_FILE = os.environ.get(
@@ -1282,8 +1285,9 @@ def _root_connection():
             _ROOT_CONNECTION = None
             _ROOT_CONNECTION_PATH = None
         if _ROOT_CONNECTION is None:
+            config = prepare_duckdb_connection()
             _ROOT_CONNECTION = duckdb.connect(
-                DATABASE_FILE, config=duckdb_connection_config()
+                DATABASE_FILE, config=config
             )
             _ROOT_CONNECTION_PATH = DATABASE_FILE
         return _ROOT_CONNECTION

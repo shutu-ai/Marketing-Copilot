@@ -5,7 +5,7 @@ from typing import Optional
 
 import duckdb
 
-from database import duckdb_connection_config
+from database import prepare_duckdb_connection
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,9 @@ def is_db_empty(path: str) -> Optional[bool]:
     if not path or not os.path.exists(path) or os.path.isdir(path):
         return None
     try:
-        conn = duckdb.connect(path, read_only=True, config=duckdb_connection_config())
+        conn = duckdb.connect(
+            path, read_only=True, config=prepare_duckdb_connection()
+        )
     except Exception as exc:
         logger.warning("Cannot open database for emptiness check %s: %s", path, exc)
         return None
@@ -143,8 +145,9 @@ def test_connection(data: dict) -> tuple[bool, str]:
         return False, "Database path points to a directory"
     try:
         # read-only + no auto-create: a typo must never silently create an empty DB
+        config = prepare_duckdb_connection()
         conn = duckdb.connect(
-            db_path, read_only=True, config=duckdb_connection_config()
+            db_path, read_only=True, config=config
         )
         conn.execute("SELECT 1")
         conn.close()

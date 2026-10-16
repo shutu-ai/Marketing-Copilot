@@ -41,8 +41,10 @@ from typing import Any
 TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parents[1]
 DEFAULT_SCENARIOS = TOOLS_DIR / "local_e2e_scenarios.json"
+sys.path.insert(0, str(TOOLS_DIR.parent))
 sys.path.insert(0, str(TOOLS_DIR))
 from local_e2e_data import make_msisdns, partition_rows, write_event_file, write_whitelist
+from duckdb_config import duckdb_extension_config, prepare_offline_extensions
 
 
 class BlockedEnv(RuntimeError):
@@ -59,6 +61,79 @@ def _load_duckdb():
     except ModuleNotFoundError as exc:
         raise BlockedEnv("duckdb is unavailable in the selected Python environment") from exc
     return duckdb
+
+
+def _stage_offline_extensions(source: Path, target: Path) -> dict[str, Any]:
+    """Copy and attest the packaged DuckDB extensions into the Run root.
+
+    The source may be the application package or a caller-provided offline
+    archive directory.  Child processes and the controller only use *target*,
+    which keeps every effective extension path inside the isolated Run.
+    """
+
+    source = source.expanduser().resolve()
+    target = target.expanduser().resolve()
+    if not source.is_dir():
+        raise BlockedEnv(f"OFFLINE_EXTENSION_MISSING: source directory is absent: {source}")
+    if source == target:
+        raise BlockedEnv("BLOCKED_ENV: extension source must not be the Run target")
+
+    target.mkdir(parents=True, exist_ok=False)
+    copied: list[dict[str, Any]] = []
+    for item in sorted(source.rglob("*")):
+        relative = item.relative_to(source)
+        destination = target / relative
+        if item.is_symlink():
+            raise BlockedEnv(f"BLOCKED_ENV: symlink in offline extension source: {item}")
+        if item.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        if not item.is_file():
+            raise BlockedEnv(f"BLOCKED_ENV: non-regular offline extension entry: {item}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, destination)
+        copied.append({
+            "relative_path": str(relative),
+            "sha256": _sha256_file(destination),
+            "size": destination.stat().st_size,
+        })
+
+    core_files = [
+        item for item in copied
+        if Path(str(item["relative_path"])).name == "core_functions.duckdb_extension"
+    ]
+    if not core_files:
+        raise BlockedEnv(
+            "OFFLINE_EXTENSION_MISSING: core_functions.duckdb_extension is absent"
+        )
+
+    duckdb = _load_duckdb()
+    version = str(getattr(duckdb, "__version__", ""))
+    versioned = [
+        item for item in core_files
+        if version in Path(str(item["relative_path"])).parts
+    ]
+    if not versioned:
+        raise BlockedEnv(
+            "OFFLINE_EXTENSION_MISMATCH: no core_functions extension matches "
+            f"DuckDB {version}"
+        )
+
+    return {
+        "source_dir": str(source),
+        "run_dir": str(target),
+        "duckdb_version": version,
+        "core_functions": versioned[0],
+        "files": copied,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _utc_now() -> str:
@@ -185,6 +260,41 @@ class AcceptanceRunner:
         run_parent.mkdir(parents=True, exist_ok=True)
         self.root = run_parent / f"marketing-copilot-{self.scenario}-{self.gate}-{uuid.uuid4().hex[:8]}"
         self.root.mkdir(parents=True, exist_ok=False)
+        self.tmp_dir = self.root / "tmp"
+        self.cache_dir = self.root / "cache"
+        self.home_dir = self.root / "home"
+        self.pycache_dir = self.root / "pycache"
+        self.duckdb_home = self.root / "duckdb-home"
+        for directory in (
+            self.tmp_dir, self.cache_dir, self.home_dir, self.pycache_dir,
+            self.duckdb_home,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        configured_extension_source = str(
+            os.environ.get("MC_DUCKDB_EXTENSION_DIR", "")
+        ).strip()
+        extension_source = (
+            Path(configured_extension_source).expanduser()
+            if configured_extension_source
+            else REPO_ROOT / "offline" / "extensions"
+        )
+        self.extension_dir = self.root / "extensions"
+        self.extension_manifest = _stage_offline_extensions(
+            extension_source, self.extension_dir
+        )
+        prepared = prepare_offline_extensions(
+            _load_duckdb(),
+            duckdb_extension_config(self.extension_dir, offline_only=True),
+        )
+        if prepared:
+            info_path = Path(prepared["info"])
+            generated_info = {
+                "relative_path": str(info_path.relative_to(self.extension_dir)),
+                "sha256": _sha256_file(info_path),
+                "size": info_path.stat().st_size,
+            }
+            self.extension_manifest["generated_install_metadata"] = generated_info
+            self.extension_manifest["files"].append(generated_info)
         self.db_path = self.root / "marketing_copilot.duckdb"
         self.watch_dir = self.root / "watch"
         self.campaign_dir = self.root / "campaign"
@@ -392,6 +502,16 @@ class AcceptanceRunner:
             "MC_SYSTEM_MODE": "production",
             "MC_AUTH_DISABLED": "1",
             "MC_LOG_LEVEL": "INFO",
+            "MC_DUCKDB_EXTENSION_DIR": str(self.extension_dir),
+            "MC_DUCKDB_OFFLINE_ONLY": "1",
+            "TMPDIR": str(self.tmp_dir),
+            "TMP": str(self.tmp_dir),
+            "TEMP": str(self.tmp_dir),
+            "XDG_CACHE_HOME": str(self.cache_dir),
+            "PYTHONPYCACHEPREFIX": str(self.pycache_dir),
+            "DUCKDB_HOME": str(self.duckdb_home),
+            "HOME": str(self.home_dir),
+            "USERPROFILE": str(self.home_dir),
             "MC_DETAIL_LOGGING": "0",
             "MC_REALTIME_REQUIRE_READY": "1",
             "MC_REALTIME_WATCH_STABILITY_SECONDS": "0.5",
@@ -477,6 +597,8 @@ class AcceptanceRunner:
                     "send_mode": self.send_mode,
                     "dispatch_mode": self.dispatch_mode,
                     "db_concurrency": self.db_concurrency,
+                    "extension_directory": str(self.extension_dir),
+                    "offline_extension": self.extension_manifest,
                     "faults": self.faults,
                     "pool_size": self.pool_size,
                     "window_size": max(1, self.args.smpp_window),
@@ -758,7 +880,13 @@ class AcceptanceRunner:
         if not self.db_path.exists():
             return []
         duckdb = _load_duckdb()
-        conn = duckdb.connect(str(self.db_path), read_only=True)
+        config = duckdb_extension_config(self.extension_dir, offline_only=True)
+        prepare_offline_extensions(duckdb, config)
+        conn = duckdb.connect(
+            str(self.db_path),
+            read_only=True,
+            config=config,
+        )
         try:
             cursor = conn.execute(sql, params)
             columns = [item[0] for item in cursor.description or []]
@@ -1254,7 +1382,12 @@ class AcceptanceRunner:
             or "Marketing Copilot sender-only event={event_id} msisdn={msisdn}"
         )
         message *= max(1, int(self.spec.get("repeat_message", 1)))
-        conn = duckdb.connect(str(self.db_path))
+        config = duckdb_extension_config(self.extension_dir, offline_only=True)
+        prepare_offline_extensions(duckdb, config)
+        conn = duckdb.connect(
+            str(self.db_path),
+            config=config,
+        )
         try:
             campaign_cursor = conn.execute(
                 """SELECT name,dispatch_generation,flash_sms,smpp_config_id,sms_template_id
@@ -1872,6 +2005,7 @@ class AcceptanceRunner:
             "status": "BLOCKED_ENV",
             "local_e2e_status": "BLOCKED_ENV",
             "live_env_status": "LIVE_ENV_UNVERIFIED",
+            "offline_extension": self.extension_manifest,
             "config_audit": self.config_audit,
             "observer": {
                 "api_calls": self.api_call_stats,
