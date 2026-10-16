@@ -1800,10 +1800,53 @@ class SmppGateway:
             connection.connect()
         return connection
 
-    def connect(self):
+    @staticmethod
+    def _parallel_bind_required() -> bool:
+        value = str(os.environ.get("MC_SMPP_PARALLEL_BIND_REQUIRED", "0")).strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def connect(self, *, parallel=None):
+        """Establish the configured connection pools.
+
+        The default remains primary/backup: stop after the first usable
+        configuration so a standby route is not treated as an active route.
+        Explicit parallel mode is reserved for a caller that has declared that
+        every enabled route is required (for example, a two-route acceptance
+        run).  It binds every enabled route and fails closed if any required
+        route cannot bind; TCP connectivity is never treated as bind success.
+        """
         configs = self._enabled_configs()
         if not configs:
             raise RuntimeError("No enabled SMPP configuration")
+
+        if parallel is None:
+            parallel = self._parallel_bind_required()
+        if parallel:
+            errors = []
+            bound_config_ids = []
+            for config in configs:
+                if time.monotonic() < self._down_until.get(config["id"], 0):
+                    errors.append(
+                        f"{config['name']}: reconnect cooldown active"
+                    )
+                    continue
+                try:
+                    desired = max(1, min(20, int(config.get("pool_size") or 1)))
+                    for _ in range(desired):
+                        self._connection_for(config)
+                    bound_config_ids.append(config["id"])
+                except Exception as exc:
+                    errors.append(f"{config['name']}: {exc}")
+                    self._mark_down(config, exc)
+            if errors or len(bound_config_ids) != len(configs):
+                raise RuntimeError(
+                    "Required parallel SMSC configurations unavailable: "
+                    + "; ".join(errors or ["one or more routes did not bind"])
+                )
+            if bound_config_ids:
+                self._active_config_id = bound_config_ids[0]
+            return
+
         errors = []
         for config in configs:
             if time.monotonic() < self._down_until.get(config["id"], 0):

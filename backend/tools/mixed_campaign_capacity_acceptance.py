@@ -212,6 +212,7 @@ class MixedCampaignRunner(AcceptanceRunner):
 
     def _environment(self) -> dict[str, str]:
         env = super()._environment()
+        route_count = max(1, int(self.spec.get("smsc_routes", 1)))
         env.update({
             "MC_REALTIME_DISCOVERY_QUANTUM": str(self.spec.get("discovery_quantum", 1)),
             "MC_REALTIME_COPY_QUEUE_SIZE": str(self.spec.get("copy_queue_size", 2)),
@@ -228,6 +229,10 @@ class MixedCampaignRunner(AcceptanceRunner):
             "MC_REALTIME_INGEST_WORKERS": str(self.spec.get("ingest_workers", 2)),
             "MC_CLAIM_BATCH": str(self.spec.get("claim_batch", 8)),
             "MC_TASK_ARCHIVE_ENABLED": "false",
+            # A multi-route acceptance run explicitly requires every declared
+            # physical route to reach SMPP bind before provisioning activities.
+            # The application default remains primary/backup failover.
+            "MC_SMPP_PARALLEL_BIND_REQUIRED": "1" if route_count > 1 else "0",
         })
         return env
 
