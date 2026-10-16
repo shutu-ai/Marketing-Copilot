@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import tempfile
 import threading
@@ -14,6 +15,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Callable
 
+from .diagnostics import write_process_metadata
 from .partition import PartitionMap
 
 
@@ -138,7 +140,9 @@ class WorkerSupervisor:
     def __init__(self, root: str | os.PathLike[str], *, worker_count: int = 4,
                  virtual_partition_count: int = 256, worker_target: Callable | None = None,
                  worker_args: tuple = (), lease_seconds: float = 30.0,
-                 start_method: str | None = None):
+                 start_method: str | None = "spawn", mp_context=None,
+                 diagnostics_root: str | os.PathLike[str] | None = None,
+                 run_id: str = ""):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.map = PartitionMap.load_or_create(
@@ -149,17 +153,22 @@ class WorkerSupervisor:
         self.leases = OwnerLeaseStore(self.root / "leases", lease_seconds=lease_seconds)
         self.worker_target = worker_target or _idle_worker
         self.worker_args = tuple(worker_args)
-        self._start_method = start_method
+        self._mp_context = mp_context or multiprocessing.get_context(start_method or "spawn")
+        self._start_method = self._mp_context.get_start_method()
+        self._diagnostics_root = str(Path(diagnostics_root).resolve()) if diagnostics_root else ""
+        self._run_id = str(run_id or self.root.name)
         self._handles: dict[int, WorkerHandle] = {}
         self._handles_lock = threading.RLock()
         self._owner_prefix = f"supervisor-{os.getpid()}-{uuid.uuid4().hex[:10]}"
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
         self._restart_count = 0
+        self._restart_failures: dict[int, int] = {}
+        self._restart_not_before: dict[int, float] = {}
+        self._last_exitcodes: dict[int, int | None] = {}
 
     def _context(self):
-        import multiprocessing
-        return multiprocessing.get_context(self._start_method) if self._start_method else multiprocessing.get_context()
+        return self._mp_context
 
     def _launch(self, worker_id: int) -> WorkerHandle:
         partitions = self.map.partitions_for_worker(worker_id)
@@ -187,6 +196,15 @@ class WorkerSupervisor:
         )
         process.start()
         child.close()
+        write_process_metadata(
+            self._diagnostics_root,
+            f"worker-supervisor-{worker_id}",
+            run_id=self._run_id,
+            start_method=self._start_method,
+            phase="child_started",
+            status="running",
+            progress={"worker_id": int(worker_id), "child_pid": getattr(process, "pid", None)},
+        )
         return WorkerHandle(worker_id, partitions, process, parent, tuple(acquired))
 
     def start(self) -> None:
@@ -212,18 +230,27 @@ class WorkerSupervisor:
                 if self._monitor_stop.is_set():
                     return
                 dead = [
-                    worker_id for worker_id, handle in self._handles.items()
-                    if not getattr(handle.process, "is_alive", lambda: False)()
+                    worker_id for worker_id in range(self.map.worker_count)
+                    if worker_id not in self._handles
+                    or not getattr(self._handles[worker_id].process, "is_alive", lambda: False)()
                 ]
             for worker_id in dead:
                 if self._monitor_stop.is_set():
                     return
+                if time.monotonic() < self._restart_not_before.get(worker_id, 0.0):
+                    continue
                 try:
                     self.restart_worker(worker_id)
                     self._restart_count += 1
+                    self._restart_failures[worker_id] = 0
+                    self._restart_not_before.pop(worker_id, None)
                 except Exception:
-                    # A lease or process failure is retried on the next
-                    # watchdog tick; no second owner is launched on failure.
+                    # A lease or process failure is retried with a bounded
+                    # backoff; no second owner is launched on failure.
+                    failures = self._restart_failures.get(worker_id, 0) + 1
+                    self._restart_failures[worker_id] = failures
+                    delay = min(5.0, 0.25 * (2 ** min(failures - 1, 5)))
+                    self._restart_not_before[worker_id] = time.monotonic() + delay
                     continue
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -251,6 +278,17 @@ class WorkerSupervisor:
                     handle.process.join(timeout=2.0)
                 except Exception:
                     pass
+            self._last_exitcodes[handle.worker_id] = getattr(handle.process, "exitcode", None)
+            write_process_metadata(
+                self._diagnostics_root,
+                f"worker-{handle.worker_id}",
+                run_id=self._run_id,
+                start_method=self._start_method,
+                phase="parent_observed_stop",
+                status="stopped",
+                exitcode=getattr(handle.process, "exitcode", None),
+                process_pid=getattr(handle.process, "pid", None),
+            )
             for lease in handle.leases:
                 self.leases.release(lease)
             try:
@@ -270,9 +308,21 @@ class WorkerSupervisor:
             except (EOFError, OSError):
                 pass
             old.process.join(timeout=max(0.0, float(timeout)))
+            self._last_exitcodes[worker] = getattr(old.process, "exitcode", None)
             if getattr(old.process, "is_alive", lambda: False)():
                 old.process.terminate()
                 old.process.join(timeout=2.0)
+            self._last_exitcodes[worker] = getattr(old.process, "exitcode", None)
+            write_process_metadata(
+                self._diagnostics_root,
+                f"worker-{worker}",
+                run_id=self._run_id,
+                start_method=self._start_method,
+                phase="parent_observed_restart",
+                status="stopped",
+                exitcode=getattr(old.process, "exitcode", None),
+                process_pid=getattr(old.process, "pid", None),
+            )
             for lease in old.leases:
                 self.leases.release(lease)
             old.control.close()
@@ -300,12 +350,21 @@ class WorkerSupervisor:
         return {
             "map_revision": self.map.map_revision,
             "worker_count": self.map.worker_count,
+            "start_method": self._start_method,
             "automatic_restarts": restart_count,
+            "restart_failures": {str(key): int(value) for key, value in self._restart_failures.items() if value},
+            "restart_not_before": {
+                str(key): round(max(0.0, value - time.monotonic()), 3)
+                for key, value in self._restart_not_before.items()
+                if value > time.monotonic()
+            },
+            "last_exitcodes": {str(key): value for key, value in self._last_exitcodes.items()},
             "workers": [
                 {
                     "worker_id": handle.worker_id,
                     "partitions": list(handle.partitions),
                     "pid": getattr(handle.process, "pid", None),
+                    "exitcode": getattr(handle.process, "exitcode", None),
                     "alive": bool(getattr(handle.process, "is_alive", lambda: False)()),
                     "owner_epochs": {str(item["partition_id"]): int(item["owner_epoch"]) for item in handle.leases},
                 }

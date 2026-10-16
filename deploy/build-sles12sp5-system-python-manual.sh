@@ -39,7 +39,10 @@ SOURCE_WHEEL_DIR=$(find "$WORK" -path '*/wheels/app' -type d -print -quit)
 
 tar -C "$ROOT/backend" \
   --exclude='__pycache__' --exclude='*.pyc' \
+  --exclude='tests' \
+  --exclude='tools' \
   --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
+  --exclude='backups' --exclude='*.log' --exclude='*.bak*' --exclude='*.backup*' \
   --exclude='*.db*' --exclude='*.duckdb*' \
   --exclude='uploads' --exclude='monitor_dir' --exclude='data' \
   --exclude='.rt-smoke-*' --exclude='.tmp-*' \

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from services import vnext_service
@@ -15,6 +16,18 @@ router = APIRouter(prefix="/api/vnext", tags=["VNext Pipeline"])
 
 class CampaignStateRequest(BaseModel):
     state: str
+
+
+class CanaryIngestRequest(BaseModel):
+    rows: list[dict]
+    route_id: int = 1
+    source_id: str = "canary"
+    payload_ref: str = ""
+    phone_prefix: str = ""
+    campaign_generation: int = 1
+    row_ordinal_start: int = 0
+    flash_sms: bool = False
+    source_addr: str = ""
 
 
 @router.get("/status")
@@ -69,3 +82,29 @@ async def wait_for_idle(timeout: float = Query(30.0, ge=0.1, le=300.0)):
     if not vnext_service.is_active():
         raise HTTPException(status_code=503, detail="VNext runtime is not active")
     return await vnext_service.wait_for_idle(timeout)
+
+
+@router.post("/canary/{campaign_type}/{campaign_id}/ingest")
+def canary_ingest(request: Request, campaign_type: str, campaign_id: int, body: CanaryIngestRequest):
+    """Loopback-only synthetic ingress for runtime acceptance tooling."""
+
+    if os.environ.get("MC_VNEXT_CANARY_MODE", "0") != "1":
+        raise HTTPException(status_code=404, detail="canary ingress is disabled")
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="canary ingress is loopback-only")
+    if not vnext_service.is_active():
+        raise HTTPException(status_code=503, detail="VNext runtime is not active")
+    return vnext_service.enqueue_canary_rows(
+        campaign_type,
+        int(campaign_id),
+        body.rows,
+        route_id=body.route_id,
+        source_id=body.source_id,
+        phone_prefix=body.phone_prefix,
+        payload_ref=body.payload_ref,
+        campaign_generation=body.campaign_generation,
+        row_ordinal_start=body.row_ordinal_start,
+        flash_sms=body.flash_sms,
+        source_addr=body.source_addr,
+    )

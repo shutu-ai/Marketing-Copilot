@@ -174,7 +174,21 @@ class TaskSpool:
         self._taken_pending = self._load_taken()
         self._event_index: dict[str, SpoolRecord] = {}
         self._recovery_issues: list[str] = []
+        self._manifest_signature = self._file_signature(self._manifest_path)
+        self._segment_offsets: dict[Path, int] = {}
         self._recover_index()
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return int(stat.st_mtime_ns), int(stat.st_size)
+
+    def _add_recovery_issue(self, value: str) -> None:
+        if value not in self._recovery_issues:
+            self._recovery_issues.append(value)
 
     def _load_manifest(self) -> dict:
         if self._manifest_path.exists():
@@ -237,29 +251,101 @@ class TaskSpool:
 
     def _recover_index(self) -> None:
         with self._lock:
+            self._segment_offsets = {}
             for partition_id in range(self.virtual_partition_count):
                 entries = self._manifest["segments"].get(str(partition_id), [])
                 for entry in entries:
                     path = self._segment_path(partition_id, str(entry["filename"]))
                     if not path.exists():
-                        self._recovery_issues.append(f"missing segment: {path.name}")
+                        self._add_recovery_issue(f"missing segment: {path.name}")
                         continue
-                    try:
-                        with path.open("rb") as handle:
-                            for raw in handle:
-                                if not raw.endswith(b"\n"):
-                                    self._recovery_issues.append(f"ignored partial final line: {path.name}")
-                                    continue
-                                try:
-                                    record = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
-                                except (ValueError, UnicodeError, SpoolError) as exc:
-                                    self._recovery_issues.append(f"invalid spool record {path.name}: {exc}")
-                                    continue
-                                self._event_index.setdefault(record.event_id, record)
-                    except OSError as exc:
-                        self._recovery_issues.append(f"cannot read segment {path.name}: {exc}")
+                    self._scan_segment(path, start=0)
             self._manifest["total_records"] = len(self._event_index)
             self._manifest["total_bytes"] = self._disk_bytes()
+            self._manifest_signature = self._file_signature(self._manifest_path)
+
+    def _scan_segment(self, path: Path, *, start: int = 0) -> None:
+        """Index complete records from *start*, retaining a safe tail offset."""
+
+        scan_start = max(0, int(start))
+        try:
+            size = int(path.stat().st_size)
+            if scan_start > size:
+                scan_start = 0
+            with path.open("rb") as handle:
+                handle.seek(scan_start)
+                while True:
+                    line_start = handle.tell()
+                    raw = handle.readline()
+                    if not raw:
+                        self._segment_offsets[path] = handle.tell()
+                        return
+                    if not raw.endswith(b"\n"):
+                        self._add_recovery_issue(f"ignored partial final line: {path.name}")
+                        self._segment_offsets[path] = line_start
+                        return
+                    try:
+                        record = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
+                    except (ValueError, UnicodeError, SpoolError) as exc:
+                        self._add_recovery_issue(f"invalid spool record {path.name}: {exc}")
+                        self._segment_offsets[path] = handle.tell()
+                        continue
+                    self._event_index.setdefault(record.event_id, record)
+        except OSError as exc:
+            self._add_recovery_issue(f"cannot read segment {path.name}: {exc}")
+
+    def refresh(self, partition_id: int | None = None) -> None:
+        """Refresh append-only state written by another process.
+
+        Long-lived workers keep a ``TaskSpool`` instance, while ingress owns
+        the manifest writer.  Atomic manifest replacement gives readers a
+        cheap generation signal; only new bytes in changed segments are
+        scanned.  Cursor/taken files are refreshed for the requested shard so
+        restart and live polling never depend on constructor-time snapshots.
+        """
+
+        with self._lock:
+            signature = self._file_signature(self._manifest_path)
+            if signature != self._manifest_signature and signature is not None:
+                try:
+                    loaded = self._load_manifest()
+                except (OSError, ValueError, TypeError, SpoolError):
+                    loaded = None
+                if loaded is not None:
+                    self._manifest = loaded
+                    for value in range(self.virtual_partition_count):
+                        entries = self._manifest["segments"].get(str(value), [])
+                        for entry in entries:
+                            path = self._segment_path(value, str(entry["filename"]))
+                            if not path.exists():
+                                self._add_recovery_issue(f"missing segment: {path.name}")
+                                continue
+                            previous = self._segment_offsets.get(path, 0)
+                            size = int(path.stat().st_size)
+                            self._scan_segment(path, start=previous if previous <= size else 0)
+                    self._manifest["total_records"] = len(self._event_index)
+                    self._manifest["total_bytes"] = self._disk_bytes()
+                    self._manifest_signature = signature
+
+            if partition_id is None:
+                self._cursors = self._load_cursors()
+                self._taken_pending = self._load_taken()
+            else:
+                partition = int(partition_id)
+                cursor_path = self._cursor_dir / f"partition-{partition:04d}.json"
+                taken_path = self._taken_dir / f"partition-{partition:04d}.json"
+                if cursor_path.exists():
+                    try:
+                        self._cursors[str(partition)] = int(json.loads(cursor_path.read_text(encoding="utf-8")).get("cursor", 0))
+                    except (OSError, ValueError, TypeError):
+                        pass
+                if taken_path.exists():
+                    try:
+                        self._taken_pending[str(partition)] = {
+                            int(item) for item in json.loads(taken_path.read_text(encoding="utf-8")).get("taken", [])
+                        }
+                    except (OSError, ValueError, TypeError):
+                        pass
 
     def _disk_bytes(self) -> int:
         total = 0
@@ -396,6 +482,7 @@ class TaskSpool:
         partition = int(partition_id)
         if not 0 <= partition < self.virtual_partition_count:
             raise ValueError("partition_id out of range")
+        self.refresh(partition)
         entries = list(self._manifest["segments"].get(str(partition), []))
         for entry in entries:
             path = self._segment_path(partition, str(entry["filename"]))
@@ -440,11 +527,14 @@ class TaskSpool:
 
     def status(self) -> dict:
         with self._lock:
+            self.refresh()
             pending_by_partition = {}
             for partition in range(self.virtual_partition_count):
                 cursor = self.cursor(partition)
-                pending_by_partition[str(partition)] = sum(
-                    1 for _ in self.iter_from(partition, cursor)
+                entries = self._manifest["segments"].get(str(partition), [])
+                records = sum(int(entry.get("records", 0)) for entry in entries)
+                pending_by_partition[str(partition)] = max(
+                    0, records - cursor - len(self._taken_pending.get(str(partition), set()))
                 )
             return {
                 "schema_version": SPOOL_SCHEMA_VERSION,

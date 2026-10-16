@@ -279,6 +279,35 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
     return result
 
 
+def enqueue_canary_rows(campaign_type: str, campaign_id: int, rows: Iterable[dict], *,
+                        route_id: int, source_id: str, phone_prefix: str = "",
+                        payload_ref: str = "", campaign_generation: int = 1,
+                        row_ordinal_start: int = 0, flash_sms: bool = False,
+                        source_addr: str = "") -> dict:
+    """Ingest synthetic canary rows through the real VNext ingress boundary.
+
+    The HTTP route is disabled unless ``MC_VNEXT_CANARY_MODE=1`` and is only
+    intended for loopback acceptance runs; it deliberately bypasses campaign
+    template/database business reads while retaining the production spool,
+    worker, SMPP and journal path.
+    """
+
+    result = runtime().enqueue_chunk(
+        rows,
+        campaign_type=str(campaign_type),
+        campaign_id=int(campaign_id),
+        campaign_generation=int(campaign_generation),
+        route_id=int(route_id),
+        phone_prefix=str(phone_prefix or ""),
+        source_id=str(source_id),
+        payload_ref=str(payload_ref or source_id),
+        row_ordinal_start=int(row_ordinal_start),
+        flash_sms=bool(flash_sms),
+        source_addr=str(source_addr or ""),
+    )
+    return {"success": True, "pipeline": "vnext", **result.as_dict()}
+
+
 def _select_template_content(template_map: dict, payload: dict, sms_task_service) -> tuple[str, str] | None:
     template = sms_task_service._select_template(template_map, payload.get("language", ""))
     if not template:
@@ -372,7 +401,7 @@ def set_campaign_state(campaign_type: str, campaign_id: int, state: str) -> dict
         raise ValueError(f"unsupported VNext campaign state: {state}")
     if normalized in {"resume", "running", "in_progress"}:
         normalized = "running"
-    elif normalized in {"pause", "not_started"}:
+    elif normalized in {"pause", "paused", "not_started"}:
         normalized = "paused"
     else:
         normalized = "cancelled"

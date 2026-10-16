@@ -101,3 +101,16 @@ async def _test_file_route_credit_schedule_is_shared_by_two_brokers(tmp_path):
     state = (tmp_path / "credits" / "route-route-a.json").read_text(encoding="utf-8")
     value = __import__("json").loads(state)
     assert value["next_at"] - value["updated_at"] >= 0.15
+
+
+def test_file_route_credit_broker_handles_four_process_like_bursts(tmp_path):
+    return asyncio.run(_test_file_route_credit_broker_handles_four_process_like_bursts(tmp_path))
+
+
+async def _test_file_route_credit_broker_handles_four_process_like_bursts(tmp_path):
+    brokers = [RouteCreditBroker(tmp_path / "credits", lock_timeout=10) for _ in range(4)]
+    await asyncio.gather(*[
+        broker.acquire("route-burst", 80)
+        for broker in brokers
+        for _ in range(32)
+    ])

@@ -56,6 +56,7 @@ class ShardWorker:
                  route_configs: dict[int | str, dict], *, credits: RouteCreditBroker | None = None,
                  transport_factory: Callable | None = None,
                  progress_sink: Callable[[dict], Awaitable[None] | None] | None = None,
+                 control_loader: Callable[[], list[dict] | None] | None = None,
                  max_inflight: int = 64, prefetch_per_partition: int = 32,
                  metrics: VNextMetrics | None = None):
         self.worker_id = int(worker_id)
@@ -65,6 +66,7 @@ class ShardWorker:
         self.credits = credits or RouteCreditBroker()
         self.transport_factory = transport_factory or (lambda config, broker: AsyncSmppTransport(config, credits=broker))
         self.progress_sink = progress_sink
+        self.control_loader = control_loader
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
         self.metrics = metrics or VNextMetrics()
@@ -75,6 +77,8 @@ class ShardWorker:
         self._number_locks: dict[str, asyncio.Lock] = {}
         self._progress_events: deque[dict] = deque(maxlen=10_000)
         self._group_cursor = 0
+        self._last_control_refresh = 0.0
+        self._inflight = 0
 
     def stop(self) -> None:
         self._stop.set()
@@ -86,11 +90,31 @@ class ShardWorker:
             self._paused_campaigns.add(key)
         elif normalized in {"running", "resume", "resumed"}:
             self._paused_campaigns.discard(key)
+            self._cancelled_campaigns.discard(key)
         if normalized in {"cancel", "cancelled", "stopped"}:
             self._paused_campaigns.add(key)
             self._cancelled_campaigns.add(key)
 
+    def refresh_campaign_states(self, *, force: bool = False) -> None:
+        if not self.control_loader:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_control_refresh < 0.05:
+            return
+        self._last_control_refresh = now
+        values = self.control_loader()
+        if values is None:
+            return
+        self._paused_campaigns.clear()
+        self._cancelled_campaigns.clear()
+        for item in values:
+            try:
+                self.set_campaign_state(item["campaign_type"], int(item["campaign_id"]), item["state"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
     def _eligible(self, record: SpoolRecord) -> bool:
+        self.refresh_campaign_states()
         key = (record.campaign_type, record.campaign_id)
         return key in self._cancelled_campaigns or key not in self._paused_campaigns
 
@@ -127,6 +151,13 @@ class ShardWorker:
             await result
 
     async def _process(self, record: SpoolRecord) -> None:
+        self.refresh_campaign_states(force=True)
+        key = (record.campaign_type, record.campaign_id)
+        if key in self._paused_campaigns and key not in self._cancelled_campaigns:
+            # Do not checkpoint a record that became paused while it was in a
+            # bounded prefetch buffer.  The next polling cycle will discover
+            # it again from the durable spool.
+            return
         # Persist dispatch_taken before any socket call.  A crash after this
         # point is intentionally at-most-once-after-dispatch.
         try:
@@ -140,7 +171,10 @@ class ShardWorker:
                 message=record.message,
             ))
             return
-        if (record.campaign_type, record.campaign_id) in self._cancelled_campaigns:
+        self.refresh_campaign_states(force=True)
+        if key in self._paused_campaigns and key not in self._cancelled_campaigns:
+            return
+        if key in self._cancelled_campaigns:
             await self._emit(WorkerProgress(
                 record.event_id, record.partition_id, record.ordinal,
                 record.campaign_type, record.campaign_id, record.route_id,
@@ -205,7 +239,17 @@ class ShardWorker:
 
         return iterators, buffers, counts, exhausted, group_order, fill
 
-    async def run_until_idle(self, *, max_tasks: int | None = None) -> dict:
+    async def close_transports(self) -> None:
+        for transport in self._transports.values():
+            close = getattr(transport, "close", None)
+            if close:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        self._transports.clear()
+
+    async def run_until_idle(self, *, max_tasks: int | None = None,
+                             close_transports: bool = True) -> dict:
         iterators, buffers, counts, exhausted, group_order, fill = self._seed_buffers()
         pending: set[asyncio.Task] = set()
         processed = 0
@@ -226,10 +270,12 @@ class ShardWorker:
                     record = buffers[eligible_group].popleft()
                     counts[record.partition_id] -= 1
                     pending.add(asyncio.create_task(self._process(record)))
+                    self._inflight = len(pending)
                     processed += 1
                     continue
                 if pending:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    self._inflight = len(pending)
                     for task in done:
                         task.result()
                     continue
@@ -244,12 +290,9 @@ class ShardWorker:
             if pending:
                 await asyncio.gather(*pending)
         finally:
-            for transport in self._transports.values():
-                close = getattr(transport, "close", None)
-                if close:
-                    result = close()
-                    if inspect.isawaitable(result):
-                        await result
+            self._inflight = 0
+            if close_transports:
+                await self.close_transports()
         return self.snapshot()
 
     def snapshot(self) -> dict:
@@ -259,6 +302,7 @@ class ShardWorker:
             "partitions": list(self.partitions),
             "counters": counters,
             "progress_events": len(self._progress_events),
+            "inflight": int(self._inflight),
             "transports": [
                 transport.snapshot() for transport in self._transports.values()
                 if hasattr(transport, "snapshot")

@@ -74,3 +74,19 @@ def test_projection_process_drains_all_events_before_sentinel(tmp_path):
     assert snapshot["alive"] is False
     assert snapshot["applied"] == 300
     assert snapshot["queue_depth"] == 0
+
+
+def test_projection_process_flushes_low_rate_event_before_batch_size(tmp_path):
+    process = ProjectionWriterProcess(
+        tmp_path / "low-rate", batch_size=128, flush_interval_seconds=0.05,
+    )
+    process.start()
+    try:
+        process.submit(event("low-rate"), timeout=2)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and process.snapshot().get("applied", 0) < 1:
+            time.sleep(0.02)
+        assert process.snapshot()["applied"] == 1
+        assert process.snapshot()["flush_interval_seconds"] == 0.05
+    finally:
+        process.stop(timeout=10)

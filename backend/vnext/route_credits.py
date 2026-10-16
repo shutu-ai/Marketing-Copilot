@@ -36,6 +36,11 @@ class RouteCreditBroker:
             self.root.mkdir(parents=True, exist_ok=True)
         self.lock_timeout = max(1.0, float(lock_timeout))
         self._lock = asyncio.Lock()
+        # File-backed reservations are still shared across processes, but
+        # serializing this process's own reservations prevents a burst of
+        # asyncio.to_thread calls from occupying every executor thread while
+        # they wait on the same short-lived lock file.
+        self._file_lock = asyncio.Lock()
         self._thread_lock = threading.Lock()
         self._next_at: dict[str, float] = {}
         self._rates: dict[str, float] = {}
@@ -111,7 +116,8 @@ class RouteCreditBroker:
                 self._reservations += 1
             return 0.0
         if self.root:
-            delay = await asyncio.to_thread(self._reserve_file, route, rate)
+            async with self._file_lock:
+                delay = await asyncio.to_thread(self._reserve_file, route, rate)
         else:
             async with self._lock:
                 now = time.monotonic()

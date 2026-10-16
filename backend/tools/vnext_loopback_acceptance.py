@@ -61,13 +61,14 @@ def _parse_destination(body: bytes) -> str:
 
 
 class LoopbackSMSC:
-    def __init__(self):
+    def __init__(self, *, response_delay: float = 0.0):
         self.server = None
         self.received: list[dict] = []
         self.responses = 0
         self.response_success = 0
         self.binds = 0
         self.errors: list[str] = []
+        self.response_delay = max(0.0, float(response_delay))
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -87,6 +88,8 @@ class LoopbackSMSC:
                         "received_at": time.time(),
                     }
                     self.received.append(item)
+                    if self.response_delay:
+                        await asyncio.sleep(self.response_delay)
                     response = cstring(f"VNEXT-{len(self.received):010d}")
                     writer.write(HEADER.pack(16 + len(response), command | RESPONSE_MASK, 0, sequence) + response)
                     await writer.drain()
