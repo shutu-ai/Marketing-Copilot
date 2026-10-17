@@ -1,0 +1,52 @@
+{
+  "schema": "mc-vnext-production-sizing-environment-v1",
+  "captured_at": "2026-10-17T21:22:32+03:00",
+  "repository": "D:/dev-projects/MarketingCopilot",
+  "head": "f4ab33735e657f1734db13d90e223c38047a0f22",
+  "head_tree": "82284ae4c1f6c7f8fec911594019582735b78b24",
+  "local_formal_source": "/tmp/mc-production-sizing-20261017-final/src",
+  "local_formal_run_roots": [
+    "/tmp/mc-production-sizing-20261017-f4ab-baseline",
+    "/tmp/mc-production-sizing-20261017-candidate",
+    "/tmp/mc-production-sizing-20261017-final"
+  ],
+  "platform": {
+    "distribution": "AlmaLinux-8 WSL2",
+    "uname": "Linux SWX1536744-sQkT 6.18.33.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "python": "3.11.13",
+    "duckdb": "1.2.0",
+    "pytest": "8.3.5",
+    "psutil": "6.1.1",
+    "filesystem": "/dev/sdd ext4",
+    "df": "1055762868 1K-blocks; 109650936 used; 892408460 available; 11%",
+    "affinity": "0-3",
+    "nice": 0,
+    "ionice": "default"
+  },
+  "dependency_freeze": {
+    "duckdb": "1.2.0",
+    "pytest": "8.3.5",
+    "psutil": "6.1.1",
+    "fastapi": "0.115.0",
+    "smpplib": "2.2.4",
+    "numpy": "2.2.6",
+    "pandas": "2.3.2"
+  },
+  "source_sha256": {
+    "backend/vnext/projection_writer.py": "21448FAA0DD5F0C33C3556D2F8734EF106AD19377F47F21295F6252EF5A87BC2",
+    "backend/vnext/runtime.py": "0DECFD464DE8B86160F36D6490CD246F1A7187BF277EAB63A1105D9FBDED0001",
+    "backend/vnext/worker.py": "1F10A899EA4B7E22DFA9254FA70D97C9A7EFBF8F21A9EF7A53E36C68B11C976C",
+    "backend/vnext/spool.py": "08A8EA54B1308B426686CEC245CF28753F75B8C7AFE7BF8BFFDBB1FC37D95168",
+    "backend/vnext/smpp_transport.py": "38CAB5A0868EC1B0343AD1F7B60BA2BF5C5ED824FCE177478078FDD478FDF17B",
+    "backend/tools/vnext_single_writer_benchmark.py": "9D679EC5043E61F2B71CADBDE3DDC1B5D4AF01850BF8ADA2E970AF7427D65DA6",
+    "backend/tools/vnext_streaming_acceptance.py": "F1F8211450FBD7A70675B1096F630A95718C6E3C4CA446861F39BA4051209577"
+  },
+  "validation": {
+    "native_targeted": "14 passed in 6.17s on candidate source before final measurement-only harness edits",
+    "native_full_backend": "418 passed, 2 skipped, 6 warnings in 238.50s",
+    "windows_targeted": "13 passed in 10.26s using an isolated writable pytest temp root",
+    "frontend_build": "not rerun; this task changed no frontend source"
+  },
+  "release_decision": "NO_GO",
+  "release_deployment_authorized": false
+}

@@ -9,6 +9,7 @@ no runtime database, journal or spool is read or modified.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import os
@@ -35,36 +36,51 @@ def _percentile(values: list[int], percentile: float) -> int:
     return int(round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction))
 
 
-def _event(index: int, *, duplicate_period: int | None = None, campaign_id: int = 10) -> dict:
-    event_index = index
-    if duplicate_period and index > 0 and index % duplicate_period == 0:
-        event_index = index - 1
-    state = "socket_written" if index % 17 else "submit_sm_resp_success"
+def _event(
+    index: int,
+    *,
+    duplicate_period: int | None = None,
+    campaign_count: int = 4,
+    events_per_sms: int = 2,
+    business_day_count: int = 2,
+    campaign_id_override: int | None = None,
+) -> dict:
+    events_per_sms = max(1, int(events_per_sms))
+    sms_index = index // events_per_sms
+    event_slot = index % events_per_sms
+    event_index = sms_index
+    if duplicate_period and sms_index > 0 and sms_index % duplicate_period == 0:
+        event_index = sms_index - 1
+    campaign_id = int(campaign_id_override or (10 + (event_index % max(1, campaign_count))))
+    business_day = f"2026-10-{17 + (event_index % max(1, business_day_count)):02d}"
+    is_response = event_slot > 0
+    state = "submit_sm_resp_success" if is_response else "socket_written"
+    suffix = f":resp:{event_slot}" if is_response else ""
     return {
-        "event_id": f"bench-{campaign_id}-{event_index:08d}",
-        "partition_id": index % 8,
-        "ordinal": index + 1,
+        "event_id": f"bench-{campaign_id}-{event_index:08d}{suffix}",
+        "partition_id": event_index % 8,
+        "ordinal": event_index * events_per_sms + event_slot + 1,
         "campaign_type": "batch",
         "campaign_id": campaign_id,
         "route_id": 1,
-        "normalized_msisdn": f"251900{index:07d}",
+        "normalized_msisdn": f"251900{event_index:07d}",
         "state": state,
-        "parts_written": 1,
+        "parts_written": 0 if is_response else 1,
         "parts_total": 1,
-        "message": "benchmark payload with nullable-compatible text",
-        "error": None if index % 23 else "",
-        "created_at": 1_760_000_000.0 + index,
-        "business_day": "2026-10-17",
+        "message": "benchmark payload with task and durable response event",
+        "error": "",
+        "created_at": 1_760_000_000.0 + event_index,
+        "business_day": business_day,
         "expires_at": 1_760_086_400.0,
-        "queued": 1,
-        "taken": 1,
-        "accepted": 1,
-        "socket_written": int(state == "socket_written"),
+        "queued": int(not is_response),
+        "taken": int(not is_response),
+        "accepted": int(not is_response),
+        "socket_written": int(not is_response),
         "write_failed": 0,
         "unknown": 0,
         "cancelled": 0,
         "expired": 0,
-        "response_success": int(state == "submit_sm_resp_success"),
+        "response_success": int(is_response),
         "response_error": 0,
     }
 
@@ -75,34 +91,54 @@ def _jsonable(value):
     return str(value)
 
 
-def _projection_digest(db_path: Path) -> tuple[str, int, int, list[dict]]:
+def _projection_digest(db_path: Path) -> tuple[str, int, int, list[dict], dict, list[dict]]:
     import duckdb
 
     connection = duckdb.connect(str(db_path), read_only=True)
     try:
         event_rows = connection.execute(
-            "SELECT * FROM vnext_progress_events WHERE campaign_id=10 ORDER BY event_id"
+            "SELECT * FROM vnext_progress_events WHERE campaign_id<>99 ORDER BY event_id"
         ).fetchall()
         event_columns = [str(item[0]) for item in connection.description]
         projection_rows = connection.execute(
-            "SELECT * FROM vnext_projection WHERE campaign_id=10 ORDER BY business_day,campaign_type,campaign_id,partition_id,route_id"
+            "SELECT * FROM vnext_projection WHERE campaign_id<>99 ORDER BY business_day,campaign_type,campaign_id,partition_id,route_id"
         ).fetchall()
         projection_columns = [str(item[0]) for item in connection.description]
     finally:
         connection.close()
-    payload = {
-        "events": [
+    event_payload = [
             {key: _jsonable(value) for key, value in zip(event_columns, row)}
             for row in event_rows
-        ],
-        "projection": [
+        ]
+    projection_payload = [
             {key: _jsonable(value) for key, value in zip(projection_columns, row)}
             for row in projection_rows
-        ],
+        ]
+    state_counts = Counter(str(item.get("state") or "") for item in event_payload)
+    daily_summary: dict[str, dict[str, int]] = {}
+    for item in projection_payload:
+        day = str(item.get("business_day") or "")
+        summary = daily_summary.setdefault(day, {"rows": 0, "queued": 0, "socket_written": 0, "response_success": 0})
+        summary["rows"] += 1
+        summary["queued"] += int(item.get("queued") or 0)
+        summary["socket_written"] += int(item.get("socket_written") or 0)
+        summary["response_success"] += int(item.get("response_success") or 0)
+    payload = {
+        "events": event_payload,
+        "projection": projection_payload,
+        "state_counts": dict(sorted(state_counts.items())),
+        "daily_summary": {key: daily_summary[key] for key in sorted(daily_summary)},
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return digest, len(event_rows), len(projection_rows), payload["projection"]
+    return (
+        digest,
+        len(event_rows),
+        len(projection_rows),
+        payload["projection"],
+        payload["state_counts"],
+        [dict(day=key, **daily_summary[key]) for key in sorted(daily_summary)],
+    )
 
 
 def _metrics_delta(before: dict, after: dict) -> dict:
@@ -116,7 +152,17 @@ def _metrics_delta(before: dict, after: dict) -> dict:
     return {key: int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0) for key in sorted(keys)}
 
 
-def _run_case(case_root: Path, *, label: str, batch_size: int, events: int, duplicate_fraction: float) -> dict:
+def _run_case(
+    case_root: Path,
+    *,
+    label: str,
+    batch_size: int,
+    events: int,
+    duplicate_fraction: float,
+    campaign_count: int,
+    events_per_sms: int,
+    business_day_count: int,
+) -> dict:
     case_root.mkdir(parents=True, exist_ok=True)
     db_path = case_root / "projection.duckdb"
     if label in {"A0", "A1"}:
@@ -135,7 +181,16 @@ def _run_case(case_root: Path, *, label: str, batch_size: int, events: int, dupl
     )
     writer.start()
     try:
-        warmup = [_event(index, campaign_id=99) for index in range(min(64, batch_size))]
+        warmup = [
+            _event(
+                index,
+                campaign_id_override=99,
+                campaign_count=campaign_count,
+                events_per_sms=events_per_sms,
+                business_day_count=business_day_count,
+            )
+            for index in range(min(64, batch_size))
+        ]
         for item in warmup:
             writer.submit(item)
         writer.flush()
@@ -143,7 +198,16 @@ def _run_case(case_root: Path, *, label: str, batch_size: int, events: int, dupl
         started_ns = time.perf_counter_ns()
         flush_sizes: list[int] = []
         for start in range(0, events, batch_size):
-            current = [_event(index, duplicate_period=duplicate_period) for index in range(start, min(events, start + batch_size))]
+            current = [
+                _event(
+                    index,
+                    duplicate_period=duplicate_period,
+                    campaign_count=campaign_count,
+                    events_per_sms=events_per_sms,
+                    business_day_count=business_day_count,
+                )
+                for index in range(start, min(events, start + batch_size))
+            ]
             for item in current:
                 writer.submit(item)
             flush_sizes.append(writer.flush())
@@ -152,7 +216,14 @@ def _run_case(case_root: Path, *, label: str, batch_size: int, events: int, dupl
         snapshot = writer.snapshot()
     finally:
         writer.stop()
-    digest, unique_events, aggregate_rows, projection = _projection_digest(db_path)
+    (
+        digest,
+        unique_events,
+        aggregate_rows,
+        projection,
+        state_counts,
+        daily_summary,
+    ) = _projection_digest(db_path)
     delta = _metrics_delta(metrics_before, metrics_after)
     elapsed_seconds = elapsed_ns / 1_000_000_000
     return {
@@ -163,6 +234,9 @@ def _run_case(case_root: Path, *, label: str, batch_size: int, events: int, dupl
         "events": events,
         "duplicate_period": duplicate_period,
         "duplicate_fraction_requested": duplicate_fraction,
+        "campaign_count": campaign_count,
+        "events_per_sms": events_per_sms,
+        "business_day_count": business_day_count,
         "wall_seconds": round(elapsed_seconds, 6),
         "events_per_second": round(events / elapsed_seconds, 3) if elapsed_seconds else 0.0,
         "batch_size_p50": _percentile(flush_sizes, 0.50),
@@ -171,6 +245,10 @@ def _run_case(case_root: Path, *, label: str, batch_size: int, events: int, dupl
         "writer_snapshot": snapshot,
         "unique_event_rows": unique_events,
         "aggregate_rows": aggregate_rows,
+        "task_event_count": int(state_counts.get("socket_written", 0)),
+        "response_event_count": int(state_counts.get("submit_sm_resp_success", 0)),
+        "state_counts": state_counts,
+        "daily_summary": daily_summary,
         "result_sha256": digest,
         "projection_rows": projection,
         "db_path": str(db_path),
@@ -187,11 +265,22 @@ def _parse_batch_sizes(raw: str) -> list[int]:
     return sorted(set(values))
 
 
+def _parse_labels(raw: str) -> list[str]:
+    allowed = {"A0", "A1", "A2", "A3"}
+    labels = [item.strip().upper() for item in str(raw).split(",") if item.strip()]
+    if not labels or any(item not in allowed for item in labels):
+        raise ValueError("labels must be a non-empty subset of A0,A1,A2,A3")
+    return list(dict.fromkeys(labels))
+
+
 def run(args: argparse.Namespace) -> dict:
     run_root = Path(args.run_root).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     batch_sizes = _parse_batch_sizes(args.batch_sizes)
-    labels = ("A0", "A1", "A2", "A3")
+    labels = _parse_labels(args.labels)
+    campaign_count = max(1, min(64, int(args.campaigns)))
+    events_per_sms = max(1, min(8, int(args.events_per_sms)))
+    business_day_count = max(1, min(31, int(args.business_days)))
     cases = []
     for batch_size in batch_sizes:
         for label in labels:
@@ -201,18 +290,25 @@ def run(args: argparse.Namespace) -> dict:
                 batch_size=batch_size,
                 events=max(1, int(args.events)),
                 duplicate_fraction=max(0.0, min(0.49, float(args.duplicate_fraction))),
+                campaign_count=campaign_count,
+                events_per_sms=events_per_sms,
+                business_day_count=business_day_count,
             ))
     references = {
         str(batch_size): next(
-            item["result_sha256"] for item in cases
-            if item["batch_size"] == batch_size and item["label"] == "A0"
+            (item["result_sha256"] for item in cases
+             if item["batch_size"] == batch_size and item["label"] == "A0"),
+            "",
         )
         for batch_size in batch_sizes
     }
     for item in cases:
-        item["matches_a0_result"] = item["result_sha256"] == references[str(item["batch_size"])]
+        reference = references[str(item["batch_size"])]
+        item["matches_a0_result"] = (
+            item["result_sha256"] == reference if reference else None
+        )
     return {
-        "schema": "vnext-single-writer-benchmark-v1",
+        "schema": "vnext-single-writer-benchmark-v2",
         "python": sys.version,
         "platform": platform.platform(),
         "pid": os.getpid(),
@@ -221,9 +317,17 @@ def run(args: argparse.Namespace) -> dict:
         "duckdb_version": __import__("duckdb").__version__,
         "events": max(1, int(args.events)),
         "duplicate_fraction": max(0.0, min(0.49, float(args.duplicate_fraction))),
+        "labels": labels,
+        "campaign_count": campaign_count,
+        "events_per_sms": events_per_sms,
+        "business_day_count": business_day_count,
         "batch_sizes": batch_sizes,
         "cases": cases,
-        "all_correct": all(item["matches_a0_result"] for item in cases),
+        "all_correct": (
+            all(item["matches_a0_result"] for item in cases)
+            if any(references.values())
+            else all(bool(item.get("result_sha256")) for item in cases)
+        ),
     }
 
 
@@ -234,6 +338,10 @@ def main() -> int:
     parser.add_argument("--events", type=int, default=4096)
     parser.add_argument("--batch-sizes", default="256,512,1024,2048")
     parser.add_argument("--duplicate-fraction", type=float, default=0.10)
+    parser.add_argument("--labels", default="A0,A1,A2,A3")
+    parser.add_argument("--campaigns", type=int, default=4)
+    parser.add_argument("--events-per-sms", type=int, default=2)
+    parser.add_argument("--business-days", type=int, default=2)
     args = parser.parse_args()
     result = run(args)
     output = Path(args.output).resolve()

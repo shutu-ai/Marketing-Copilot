@@ -1,0 +1,48 @@
+{
+  "schema": "mc-vnext-production-sizing-r0-v1",
+  "task_id": "MC-VNEXT-PRODUCTION-SIZING-SINGLE-WRITER-THROUGHPUT-CLOSURE-20261017",
+  "baseline_head": "f4ab33735e657f1734db13d90e223c38047a0f22",
+  "baseline_tree": "82284ae4c1f6c7f8fec911594019582735b78b24",
+  "candidate_scope": "working-tree measurement-only changes; production Writer/runtime unchanged after rollback of the non-beneficial experiment",
+  "resource_profile": "UNCONFIRMED",
+  "real_deployment_ram_total_gib": null,
+  "real_deployment_vnext_budget_gib": null,
+  "target_hardware_confirmed": false,
+  "profile_models": {
+    "PROD_8G": {
+      "machine_ram_gib": 8,
+      "initial_application_rss_budget_gib": 6,
+      "reserve_gib": 2,
+      "performance_gate": "NOT_VERIFIED"
+    },
+    "PROD_16G": {
+      "machine_ram_gib": 16,
+      "initial_application_rss_budget_gib": 12,
+      "reserve_gib": 4,
+      "performance_gate": "NOT_VERIFIED"
+    },
+    "LOW_MEM_2G": {
+      "machine_ram_gib": 2,
+      "application_rss_budget_gib": 2,
+      "performance_gate": "stress-only-not-production"
+    }
+  },
+  "local_ext4_reference": {
+    "distribution": "AlmaLinux-8 WSL2",
+    "ram_total_gib": 15,
+    "cpu_visible": 22,
+    "filesystem": "ext4",
+    "device": "/dev/sdd",
+    "mount_options": "rw,relatime,discard,errors=remount-ro,data=ordered",
+    "swap_total_gib": 4,
+    "formal_affinity": "0-3",
+    "nice": 0,
+    "ionice": "default"
+  },
+  "unverified_reasons": [
+    "The task did not receive a separate explicit authorization to connect to the EulerOS test server.",
+    "The actual 8 GiB/16 GiB deployment RAM, cgroup/container limit, CPU quota, shared services, and disk I/O plan were not provided.",
+    "Local WSL memory and CPU are a reproducible ext4 reference, not a production deployment profile."
+  ],
+  "decision": "BLOCKED_ENV/NOT_VERIFIED"
+}

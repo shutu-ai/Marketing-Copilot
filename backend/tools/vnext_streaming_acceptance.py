@@ -20,6 +20,16 @@ import subprocess
 import time
 
 
+RESOURCE_PROFILE_RSS_KIB = {
+    # LOW_MEM_2G retains the historical harness-inclusive guard for fault
+    # injection.  Production profiles guard application-only RSS so the
+    # synthetic feeder's bounded bookkeeping is reported separately.
+    "LOW_MEM_2G": 2 * 1024 * 1024,
+    "PROD_8G": 6 * 1024 * 1024,
+    "PROD_16G": 12 * 1024 * 1024,
+}
+
+
 def _install_source(source_root: str) -> None:
     root = Path(source_root).resolve()
     backend = root / "backend"
@@ -346,13 +356,20 @@ def _worker_process(
         return worker.snapshot()
 
     result = asyncio.run(loop())
+    result["process_pid"] = os.getpid()
+    result["process_role"] = "stream-worker"
     Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
 
 
 def _sample(
-    *, run_root: Path, process_roots: list[int], spool, projection, smsc, started: float
+    *, run_root: Path, process_roots: list[int], application_roots: list[int] | None = None,
+    process_roles: dict | None = None, spool, projection, smsc, started: float
 ) -> dict:
-    cpu, rss_kib, process_count = _process_tree_metrics(process_roots)
+    application_roots = list(application_roots or process_roots)
+    harness_cpu, harness_rss_kib, harness_process_count = _process_tree_metrics(process_roots)
+    application_cpu, application_rss_kib, application_process_count = _process_tree_metrics(
+        application_roots
+    )
     try:
         projection_status = projection.snapshot()
     except Exception as exc:  # pragma: no cover - diagnostic path
@@ -360,9 +377,18 @@ def _sample(
     spool_status = spool.lightweight_snapshot()
     return {
         "at_seconds": round(time.monotonic() - started, 3),
-        "cpu_percent_sum": cpu,
-        "rss_kib_sum": rss_kib,
-        "process_count": process_count,
+        # Backward-compatible aliases retain the historical harness-inclusive
+        # values; the explicit fields are used for production profile gates.
+        "cpu_percent_sum": harness_cpu,
+        "rss_kib_sum": harness_rss_kib,
+        "process_count": harness_process_count,
+        "harness_cpu_percent": harness_cpu,
+        "harness_rss_kib": harness_rss_kib,
+        "harness_process_count": harness_process_count,
+        "application_cpu_percent": application_cpu,
+        "application_rss_kib": application_rss_kib,
+        "application_process_count": application_process_count,
+        "process_roles": process_roles or {},
         "run_bytes": _directory_bytes(run_root),
         "disk_free_bytes": shutil.disk_usage(run_root).free,
         "spool_bytes": int(spool_status.get("bytes", 0) or 0),
@@ -461,10 +487,24 @@ async def run(args: argparse.Namespace) -> dict:
     feeder_done = context.Event()
     stop_event = context.Event()
     journal_paths = [run_root / "progress" / f"worker-{worker_id}.jsonl" for worker_id in range(args.workers)]
-    projection = ProjectionWriterProcess(
-        run_root / "projection", batch_size=args.projection_batch_size,
-        journal_paths=journal_paths, staging_mode=args.projection_staging_mode,
-    )
+    projection_kwargs = {
+        "batch_size": args.projection_batch_size,
+        "journal_paths": journal_paths,
+        "staging_mode": args.projection_staging_mode,
+    }
+    try:
+        projection = ProjectionWriterProcess(
+            run_root / "projection",
+            **projection_kwargs,
+            status_interval_seconds=args.projection_status_interval,
+        )
+    except TypeError as exc:
+        # The frozen f4ab3373 baseline predates the bounded status interval.
+        # Keep the harness identical while allowing that source tree to run
+        # with its historical per-loop status behavior.
+        if "status_interval_seconds" not in str(exc):
+            raise
+        projection = ProjectionWriterProcess(run_root / "projection", **projection_kwargs)
     projection.start()
     processes = []
     for worker_id in range(args.workers):
@@ -503,6 +543,7 @@ async def run(args: argparse.Namespace) -> dict:
         if args.steady_seconds > 0 else None
     )
     feed_stopped_at = None
+    smpp_drained_at = None
     projection_caught_up_at = None
     projection_drain_deadline = None
 
@@ -575,6 +616,13 @@ async def run(args: argparse.Namespace) -> dict:
                     process_roots=[os.getpid()]
                     + [process.pid for process in processes if process.pid]
                     + [int(getattr(projection, "pid", 0) or 0)],
+                    application_roots=[process.pid for process in processes if process.pid]
+                    + [int(getattr(projection, "pid", 0) or 0)],
+                    process_roles={
+                        "harness": [os.getpid()],
+                        "workers": [process.pid for process in processes if process.pid],
+                        "projection_writer": [int(getattr(projection, "pid", 0) or 0)],
+                    },
                     spool=spool,
                     projection=projection,
                     smsc=smsc,
@@ -585,7 +633,12 @@ async def run(args: argparse.Namespace) -> dict:
                 if sample["run_bytes"] > args.max_run_bytes:
                     guard_reason = "run_disk_guard_exceeded"
                     break
-                if sample["rss_kib_sum"] > args.max_rss_kib:
+                guard_rss_kib = (
+                    sample["application_rss_kib"]
+                    if args.rss_guard_scope == "application"
+                    else sample["harness_rss_kib"]
+                )
+                if guard_rss_kib > args.max_rss_kib:
                     guard_reason = "rss_guard_exceeded"
                     break
             if feed_task.done():
@@ -597,6 +650,12 @@ async def run(args: argparse.Namespace) -> dict:
                     )
                 status = spool.lightweight_snapshot()
                 if int(status.get("pending_records", 0) or 0) == 0:
+                    if (
+                        smpp_drained_at is None
+                        and smsc.total_received > 0
+                        and smsc.response_success == smsc.total_received
+                    ):
+                        smpp_drained_at = time.monotonic()
                     if _projection_caught_up(projection, journal_paths):
                         if projection_caught_up_at is None:
                             projection_caught_up_at = time.monotonic()
@@ -635,6 +694,7 @@ async def run(args: argparse.Namespace) -> dict:
         progress.extend(ProgressJournal(journal_path).read())
     task_events = [item for item in progress if not str(item.get("state", "")).startswith("submit_sm_resp_")]
     socket_events = [item for item in task_events if item.get("state") == "socket_written"]
+    write_failed_events = [item for item in task_events if item.get("state") == "write_failed"]
     response_events = [item for item in progress if ":resp:" in str(item.get("event_id", ""))]
     response_success_events = [
         item for item in response_events if item.get("state") == "submit_sm_resp_success"
@@ -642,6 +702,7 @@ async def run(args: argparse.Namespace) -> dict:
     response_unknown_events = [item for item in response_events if item.get("state") == "unknown"]
     campaign_tasks = Counter(int(item.get("campaign_id") or 0) for item in task_events)
     campaign_socket_tasks = Counter(int(item.get("campaign_id") or 0) for item in socket_events)
+    campaign_write_failed = Counter(int(item.get("campaign_id") or 0) for item in write_failed_events)
     campaign_pdus = Counter()
     for item in socket_events:
         campaign_pdus[int(item.get("campaign_id") or 0)] += int(
@@ -667,6 +728,7 @@ async def run(args: argparse.Namespace) -> dict:
         str(campaign_id): {
             "tasks": int(feed_stats[f"campaign_{campaign_id}_accepted"]),
             "socket_written_tasks": int(campaign_socket_tasks[campaign_id]),
+            "write_failed_tasks": int(campaign_write_failed[campaign_id]),
             "pdu_written": int(campaign_pdus[campaign_id]),
             "smpp_pdu_received": int(received_campaign_pdus[campaign_id]),
         }
@@ -682,6 +744,11 @@ async def run(args: argparse.Namespace) -> dict:
         and (time.monotonic() - started) >= float(args.steady_seconds)
         and generated_tasks > 0
     )
+    failure_reason = guard_reason or (smsc.errors[0] if smsc.errors else "")
+    if not failure_reason and write_failed_events:
+        failure_reason = "task_write_failed"
+    if not failure_reason and len(response_events) != smpp_total:
+        failure_reason = "response_event_count_mismatch"
     passed = (
         not guard_reason
         and not smsc.errors
@@ -693,14 +760,45 @@ async def run(args: argparse.Namespace) -> dict:
         and len(response_events) == smpp_total
         and len(response_success_events) == smsc.response_success
         and not response_unknown_events
+        and not write_failed_events
         and smsc.max_active_binds <= args.pool_size
         and not spool_status.get("pending_records")
         and int(projection_status.get("applied", 0) or 0) == len(progress)
         and all(item["socket_written_tasks"] == item["tasks"] for item in expected_campaigns.values())
     )
+    samples_sorted = sorted(samples, key=lambda item: float(item.get("at_seconds", 0.0)))
+
+    def _peak(key: str) -> int:
+        return max((int(item.get(key, 0) or 0) for item in samples_sorted), default=0)
+
+    def _slope_last_180(key: str) -> float:
+        if not samples_sorted:
+            return 0.0
+        end = samples_sorted[-1]
+        start = next(
+            (item for item in reversed(samples_sorted)
+             if float(end.get("at_seconds", 0.0)) - float(item.get("at_seconds", 0.0)) >= 180.0),
+            samples_sorted[0],
+        )
+        seconds = float(end.get("at_seconds", 0.0)) - float(start.get("at_seconds", 0.0))
+        if seconds <= 0:
+            return 0.0
+        return round((float(end.get(key, 0) or 0) - float(start.get(key, 0) or 0)) / seconds, 3)
+
+    producer_active_seconds = (
+        max(0.0, feed_stopped_at - started) if feed_stopped_at is not None else 0.0
+    )
+    smpp_drain_seconds = (
+        max(0.0, smpp_drained_at - feed_stopped_at)
+        if feed_stopped_at is not None and smpp_drained_at is not None else 0.0
+    )
+    projection_drain_seconds = (
+        max(0.0, projection_caught_up_at - feed_stopped_at)
+        if feed_stopped_at is not None and projection_caught_up_at is not None else 0.0
+    )
     return {
         "status": "PASS" if passed else "FAIL",
-        "failure_reason": guard_reason or (smsc.errors[0] if smsc.errors else ""),
+        "failure_reason": failure_reason,
         "source_root": str(Path(args.source_root).resolve()),
         "run_root": str(run_root),
         "started_epoch": time.time() - (time.monotonic() - started),
@@ -713,28 +811,37 @@ async def run(args: argparse.Namespace) -> dict:
         "window_size": args.window_size,
         "projection_batch_size": args.projection_batch_size,
         "projection_staging_mode": args.projection_staging_mode,
+        "projection_status_interval_seconds": args.projection_status_interval,
+        "resource_profile": args.resource_profile,
+        "rss_guard_scope": args.rss_guard_scope,
         "response_delay_ms": float(args.response_delay_ms),
         "counts": counts,
         "total_tasks": generated_tasks,
         "accepted_message_count": generated_tasks,
         "socket_written_task_count": len(socket_events),
+        "write_failed_task_count": len(write_failed_events),
         "socket_written_pdu_count": sum(campaign_pdus.values()),
         "journal_event_count": len(progress),
+        "journal_expected_event_count": len(progress),
         "response_event_count": len(response_events),
+        "durable_response_event_count": len(response_events),
         "response_success_event_count": len(response_success_events),
         "response_unknown_event_count": len(response_unknown_events),
         "events_per_task": round(len(progress) / generated_tasks, 6) if generated_tasks else 0.0,
         "events_per_pdu": round(len(progress) / sum(campaign_pdus.values()), 6) if sum(campaign_pdus.values()) else 0.0,
         "submit_sm_resp_success": smsc.response_success,
         "projection_events_applied": int(projection_status.get("applied", 0) or 0),
+        "duckdb_unique_event_rows": int(
+            (projection_status.get("metrics") or {}).get("events_new", 0) or 0
+        ),
         "projection_lag_seconds": float(projection_status.get("projection_lag_seconds", 0.0) or 0.0),
         "projection_caught_up_before_stop": projection_caught_up_at is not None,
         "projection_drain_timeout_seconds": float(args.projection_drain_timeout),
         "journal_bytes": journal_bytes,
-        "drain_seconds": round(
-            max(0.0, (time.monotonic() - feed_stopped_at))
-            if feed_stopped_at is not None else 0.0, 3
-        ),
+        "producer_active_seconds": round(producer_active_seconds, 3),
+        "smpp_drain_seconds": round(smpp_drain_seconds, 3),
+        "projection_drain_seconds": round(projection_drain_seconds, 3),
+        "drain_seconds": round(projection_drain_seconds, 3),
         "steady_seconds_requested": float(args.steady_seconds),
         "producer": {
             "batches": int(feed_stats["batches"]),
@@ -751,6 +858,9 @@ async def run(args: argparse.Namespace) -> dict:
             "max_active_binds": smsc.max_active_binds,
             "submit_sm_pdu_received": smpp_total,
             "submit_sm_resp_success": smsc.response_success,
+            "submit_sm_resp_error": int(
+                len([item for item in response_events if item.get("state") == "submit_sm_resp_error"])
+            ),
             "duplicate_destination_pdu_count": duplicate_destination_pdu_count,
             "destination_tracking_truncated": bool(smsc.destination_tracking_truncated),
             "errors": smsc.errors,
@@ -759,11 +869,27 @@ async def run(args: argparse.Namespace) -> dict:
         "projection": projection_status,
         "worker_results": worker_results,
         "resource_samples": samples,
+        "resource_peaks": {
+            "application_rss_kib": _peak("application_rss_kib"),
+            "harness_rss_kib": _peak("harness_rss_kib"),
+            "application_rss_slope_last_180_kib_per_second": _slope_last_180(
+                "application_rss_kib"
+            ),
+            "harness_rss_slope_last_180_kib_per_second": _slope_last_180(
+                "harness_rss_kib"
+            ),
+        },
         "guard": {
             "max_run_bytes": args.max_run_bytes,
             "max_rss_kib": args.max_rss_kib,
             "max_pending_records": args.max_pending_records,
             "sample_interval_seconds": args.sample_interval,
+            "resource_profile": args.resource_profile,
+            "rss_guard_scope": args.rss_guard_scope,
+            "application_rss_limit_kib": args.max_rss_kib
+                if args.rss_guard_scope == "application" else None,
+            "harness_rss_limit_kib": args.max_rss_kib
+                if args.rss_guard_scope == "harness" else None,
             "cpu_affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
             "nice": os.getpriority(os.PRIO_PROCESS, 0) if hasattr(os, "getpriority") else None,
         },
@@ -803,6 +929,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=250)
     parser.add_argument("--projection-batch-size", type=int, default=512)
     parser.add_argument("--projection-staging-mode", choices=("vectorized", "executemany"), default="vectorized")
+    parser.add_argument("--projection-status-interval", type=float, default=1.0,
+                        help="status/diagnostic write interval in seconds")
     parser.add_argument("--response-delay-ms", type=float, default=0.0,
                         help="delay each loopback submit_sm_resp to exercise response draining")
     parser.add_argument("--feed-interval", type=float, default=0.05)
@@ -813,7 +941,10 @@ def main() -> int:
     parser.add_argument("--projection-drain-timeout", type=float, default=600.0,
                         help="maximum seconds to wait for journal EOF catch-up after feed stop")
     parser.add_argument("--max-run-bytes", type=int, default=5 * 1024 * 1024 * 1024)
-    parser.add_argument("--max-rss-kib", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--resource-profile", choices=tuple(RESOURCE_PROFILE_RSS_KIB),
+                        default="LOW_MEM_2G")
+    parser.add_argument("--rss-guard-scope", choices=("application", "harness"), default="")
+    parser.add_argument("--max-rss-kib", type=int, default=None)
     parser.add_argument("--spool-max-bytes", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -821,7 +952,13 @@ def main() -> int:
     args.pool_size = max(1, min(20, args.pool_size))
     args.window_size = max(1, min(1000, args.window_size))
     args.projection_batch_size = max(1, min(4096, args.projection_batch_size))
+    args.projection_status_interval = min(60.0, max(0.1, float(args.projection_status_interval)))
     args.projection_drain_timeout = max(1.0, min(3600.0, args.projection_drain_timeout))
+    args.resource_profile = str(args.resource_profile).upper()
+    if args.max_rss_kib is None:
+        args.max_rss_kib = RESOURCE_PROFILE_RSS_KIB[args.resource_profile]
+    if not args.rss_guard_scope:
+        args.rss_guard_scope = "harness" if args.resource_profile == "LOW_MEM_2G" else "application"
     result = asyncio.run(run(args))
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

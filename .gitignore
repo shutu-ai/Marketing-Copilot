@@ -59,6 +59,10 @@ Docs/*.json
 *.duckdb
 *.duckdb.*
 
+# Intentional R0 production-sizing report artifacts
+!Docs/Marketing_Copilot_VNext_Production_Sizing_R0_Sizing.json
+!Docs/Marketing_Copilot_VNext_Production_Sizing_R0_Environment.json
+
 # OS and tooling
 .DS_Store
 Thumbs.db
