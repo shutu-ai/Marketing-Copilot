@@ -64,6 +64,24 @@ cp "$CORE_FUNCTIONS_EXTENSION" "$STAGE/offline/extensions/$DUCKDB_VERSION/linux_
 # Deployment text files must use Unix line endings. The repository may be
 # checked out on Windows before the package is built in WSL/Linux.
 normalize_text() { tr -d '\r' < "$1" > "$2"; }
+# The deployment package intentionally omits the local acceptance and
+# benchmark harnesses under backend/tools.  These production tools are part
+# of the runtime architecture, however: run.sh uses the systemd installer,
+# the online-update service starts apply_update.py, and the documented
+# maintenance workflow uses the backup, deployment-check, and reconciliation
+# commands.  Keep the set explicit so test/simulator tooling is not shipped.
+PRODUCTION_TOOLS=(
+  __init__.py
+  apply_update.py
+  backup_database.py
+  deployment_check.py
+  install_systemd_service.py
+  reconcile_processed_files.py
+)
+mkdir -p "$STAGE/backend/tools"
+for tool in "${PRODUCTION_TOOLS[@]}"; do
+  normalize_text "$ROOT/backend/tools/$tool" "$STAGE/backend/tools/$tool"
+done
 normalize_text "$ROOT/deploy/marketing-copilot.single-dir.env.example" "$STAGE/marketing-copilot.env.example"
 normalize_text "$ROOT/deploy/run-system-python-manual.sh" "$STAGE/run.sh"
 normalize_text "$ROOT/deploy/README-system-python-manual.md" "$STAGE/README.md"

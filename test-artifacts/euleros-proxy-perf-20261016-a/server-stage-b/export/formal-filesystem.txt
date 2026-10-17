@@ -1,6 +1,0 @@
-[df-T-dot]
-Filesystem     Type 1K-blocks     Used Available Use% Mounted on
-/dev/sda2      ext4  20466256 10331052   9070244  54% /
-
-[pwd]
-/home/paas/marketing-copilot-test/runs/euleros-proxy-perf-20261016T122709Z-6305

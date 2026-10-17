@@ -1,5 +1,0 @@
-cpu_list=0-3
-rss_limit_mb=2048
-disk_limit_gb=5
- nice_increment=10
-ionice_class=3

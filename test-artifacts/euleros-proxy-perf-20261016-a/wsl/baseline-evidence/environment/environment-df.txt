@@ -1,2 +1,0 @@
-Filesystem     Type  1K-blocks     Used Available Use% Mounted on
-/dev/sdd       ext4 1055762868 79803244 922256152   8% /

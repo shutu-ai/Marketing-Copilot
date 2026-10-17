@@ -41,7 +41,23 @@ Docs/报表交付/*.docx
 # Local build and release snapshots
 release/
 cache/wheelhouse/
+cache/
 MarketingCopilot-clean-source.zip
+
+# Local test evidence, scratch trees and generated databases
+.g4-*/
+.local-e2e-runs/
+.p0-*-temp*/
+.rollback-*/
+.s[0-9]*-evidence-*/
+.s[0-9]*-pytest-*/
+pytest-cache-files-*/
+test-artifacts/
+.tmp/
+.tmp-sync-staging/
+Docs/*.json
+*.duckdb
+*.duckdb.*
 
 # OS and tooling
 .DS_Store
