@@ -175,7 +175,16 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 # Bind slots are a shared per-route resource.  Releasing an
                 # idle worker's connections lets another business worker take
                 # the same bounded pool without creating one bind per worker.
-                await worker.run_until_idle(close_transports=True)
+                await worker.run_until_idle(close_transports=False)
+                drain = await worker.drain_transports()
+                if not drain.get("drained"):
+                    diagnostic(
+                        phase="response_drain_timeout",
+                        status="degraded",
+                        extra={"pending": int(drain.get("pending", 0) or 0)},
+                    )
+                await worker.close_transports()
+                worker.release_reader_caches()
                 publish_status(False)
                 after = worker.snapshot()["counters"].get("taken", 0)
                 if after == before:
@@ -206,6 +215,7 @@ class VNextRuntime:
                  worker_count: int = 4, virtual_partition_count: int = 256,
                  max_spool_bytes: int = 512 * 1024 * 1024, projection_queue_size: int = 8192,
                  max_inflight: int = 128, prefetch_per_partition: int = 64,
+                 projection_batch_size: int = 512,
                  start_method: str = "spawn", projection_flush_interval_seconds: float | None = None,
                  run_id: str = "", clock: BusinessClock | object | None = None,
                  business_timezone: str | object | None = None,
@@ -246,6 +256,7 @@ class VNextRuntime:
         self.worker_count = max(1, min(32, int(worker_count)))
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
+        self.projection_batch_size = max(1, min(4096, int(projection_batch_size)))
         self._mp_context = multiprocessing.get_context(start_method or "spawn")
         self.start_method = self._mp_context.get_start_method()
         if projection_flush_interval_seconds is None:
@@ -262,6 +273,7 @@ class VNextRuntime:
         self.diagnostics_root = self.root / "diagnostics"
         self.projection = ProjectionWriterProcess(
             self.root / "projection", queue_size=projection_queue_size,
+            batch_size=self.projection_batch_size,
             journal_paths=[self.progress_root / f"worker-{worker_id}.jsonl" for worker_id in range(max(1, int(worker_count)))],
             flush_interval_seconds=self.projection_flush_interval_seconds,
             start_method=self.start_method,
@@ -495,12 +507,18 @@ class VNextRuntime:
         spool = self.spool.status()
         journal_bytes = 0
         journal_paths = []
-        for path in sorted(self.progress_root.glob("worker-*.jsonl")):
-            try:
-                journal_bytes += int(path.stat().st_size)
-                journal_paths.append({"path": str(path), "bytes": int(path.stat().st_size)})
-            except OSError:
-                continue
+        for logical_path in sorted(self.progress_root.glob("worker-*.jsonl")):
+            journal = ProgressJournal(logical_path)
+            storage = journal.storage_snapshot()
+            journal_bytes += int(storage["total_bytes"])
+            journal_paths.extend(
+                {
+                    "path": str(path),
+                    "bytes": int(path.stat().st_size),
+                }
+                for path in journal.segment_paths()
+                if path.is_file()
+            )
         route_credits = {}
         for path in sorted(self.credits_root.glob("route-*.json")):
             try:

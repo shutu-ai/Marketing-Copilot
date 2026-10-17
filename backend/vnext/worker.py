@@ -176,8 +176,11 @@ class ShardWorker:
         event_id = str(context.get("event_id") or "")
         if not event_id:
             return
+        if response.get("unknown"):
+            state = "unknown"
+        else:
+            state = "submit_sm_resp_success" if bool(response.get("success")) else "submit_sm_resp_error"
         success = bool(response.get("success"))
-        state = "submit_sm_resp_success" if success else "submit_sm_resp_error"
         progress = WorkerProgress(
             event_id=f"{event_id}:resp:{int(response.get('sequence') or 0)}",
             partition_id=int(context.get("partition_id") or 0),
@@ -189,6 +192,7 @@ class ShardWorker:
             state=state,
             parts_written=0,
             parts_total=int(context.get("parts_total") or 1),
+            error=str(response.get("error") or response.get("reason") or ""),
             created_at=float(context.get("created_at") or time.time()),
             business_day=str(context.get("business_day") or ""),
             expires_at=float(context.get("expires_at") or 0.0),
@@ -196,12 +200,13 @@ class ShardWorker:
         await self._emit(
             progress,
             taken=0,
+            accepted=0,
             socket_written=0,
             write_failed=0,
-            unknown=0,
+            unknown=int(bool(response.get("unknown"))),
             expired=0,
-            response_success=int(success),
-            response_error=int(not success),
+            response_success=int(success and not response.get("unknown")),
+            response_error=int(not success and not response.get("unknown")),
         )
 
     async def _expire(self, record: SpoolRecord, reason: str) -> None:
@@ -319,10 +324,12 @@ class ShardWorker:
                         for item in parameters.values()
                     )
                 except (TypeError, ValueError):
+                    parameters = {}
                     accepts_kwargs = True
                 if not accepts_kwargs:
-                    kwargs.pop("before_write", None)
-                    kwargs.pop("progress_context", None)
+                    for optional_name in ("before_write", "progress_context"):
+                        if optional_name not in parameters:
+                            kwargs.pop(optional_name, None)
                 result = await send_task(**kwargs)
             except Exception as exc:
                 result = SocketWriteResult(
@@ -374,6 +381,45 @@ class ShardWorker:
                     await result
         self._transports.clear()
         self._transport_cursor.clear()
+
+    def release_reader_caches(self) -> None:
+        """Release bounded-pass reader state after all tasks are quiescent."""
+
+        if self._inflight:
+            return
+        self._number_locks.clear()
+        release = getattr(self.spool, "release_reader_cache", None)
+        if release:
+            release()
+
+    async def drain_transports(self, timeout: float | None = None) -> dict:
+        """Wait for the bounded response window before releasing bind leases.
+
+        A completed send pass only proves that bytes crossed the socket.  The
+        reader task owns the durable response event, so production callers and
+        acceptance harnesses must share this bounded lifecycle step.
+        """
+
+        if timeout is None:
+            configured = [
+                float(config.get("timeout", 10.0) or 10.0)
+                for config in self.route_configs.values()
+            ]
+            timeout = min(60.0, max([1.0, *configured]) + 1.0)
+        timeout = max(0.1, float(timeout))
+        deadline = time.monotonic() + timeout
+        while True:
+            snapshots = self.snapshot().get("transports", [])
+            pending = sum(int(item.get("window_inflight", 0) or 0) for item in snapshots)
+            if pending == 0:
+                return {"drained": True, "pending": 0, "timeout_seconds": timeout}
+            if time.monotonic() >= deadline:
+                return {
+                    "drained": False,
+                    "pending": pending,
+                    "timeout_seconds": timeout,
+                }
+            await asyncio.sleep(0.01)
 
     async def run_until_idle(self, *, max_tasks: int | None = None,
                              close_transports: bool = True) -> dict:

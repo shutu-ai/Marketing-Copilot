@@ -51,6 +51,45 @@ def _directory_bytes(root: Path) -> int:
     return total
 
 
+def _journal_bytes(journal_paths: list[Path]) -> int:
+    total = 0
+    for path in journal_paths:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _projection_caught_up(projection, journal_paths: list[Path]) -> bool:
+    """Require the writer to commit the current journal EOF before stopping.
+
+    A zero ``projection_lag_seconds`` only says that the last applied event was
+    recent.  It does not prove that the writer has consumed the journal tail.
+    The parent therefore compares the live journal bytes with the writer's
+    committed offset in addition to checking the writer's backlog counters.
+    """
+
+    try:
+        status = projection.snapshot()
+    except Exception:
+        return False
+    committed_offset = status.get("journal_committed_offset_bytes")
+    if committed_offset is None:
+        return False
+    try:
+        committed_offset = int(committed_offset)
+    except (TypeError, ValueError):
+        return False
+    return (
+        _journal_bytes(journal_paths) <= committed_offset
+        and int(status.get("journal_backlog_bytes", 0) or 0) <= 0
+        and int(status.get("journal_backlog_events_estimate", 0) or 0) <= 0
+        and int(status.get("journal_pending_events", 0) or 0) <= 0
+        and int(status.get("queue_depth", 0) or 0) <= 0
+    )
+
+
 def _process_tree_metrics(roots: list[int]) -> tuple[float, int, int]:
     """Return aggregate CPU%, RSS KiB, and process count for this Run."""
 
@@ -101,7 +140,8 @@ def _destination_campaign(destination: str) -> int | None:
 class CountingLoopbackSMSC:
     """Minimal loopback SMPP server with bounded event memory."""
 
-    def __init__(self, smpp, *, max_destination_keys: int = 100_000):
+    def __init__(self, smpp, *, max_destination_keys: int = 100_000,
+                 response_delay_seconds: float = 0.0):
         self._smpp = smpp
         self.server = None
         self.total_received = 0
@@ -115,6 +155,7 @@ class CountingLoopbackSMSC:
         self.campaign_pdus: Counter[int] = Counter()
         self.max_destination_keys = max(1, int(max_destination_keys))
         self.destination_tracking_truncated = False
+        self.response_delay_seconds = max(0.0, float(response_delay_seconds))
 
     async def _handle(self, reader, writer):
         bound = False
@@ -152,6 +193,8 @@ class CountingLoopbackSMSC:
                     campaign = _destination_campaign(destination)
                     if campaign is not None:
                         self.campaign_pdus[campaign] += 1
+                    if self.response_delay_seconds:
+                        await asyncio.sleep(self.response_delay_seconds)
                     response = self._smpp.cstring(f"VNEXT-{self.total_received:012d}")
                     writer.write(
                         self._smpp.HEADER.pack(
@@ -214,17 +257,12 @@ async def _drain_transport_responses(worker, *, timeout: float = 60.0) -> None:
     releases a physical bind slot for another worker.
     """
 
-    deadline = time.monotonic() + max(1.0, float(timeout))
-    while True:
-        snapshots = worker.snapshot().get("transports", [])
-        pending = sum(int(item.get("window_inflight", 0) or 0) for item in snapshots)
-        if pending == 0:
-            return
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"SMPP response drain exceeded {timeout:.1f}s; pending={pending}"
-            )
-        await asyncio.sleep(0.01)
+    result = await worker.drain_transports(timeout=timeout)
+    if not result.get("drained"):
+        raise TimeoutError(
+            f"SMPP response drain exceeded {timeout:.1f}s; "
+            f"pending={int(result.get('pending', 0) or 0)}"
+        )
 
 
 def _release_completed_worker_caches(spool, worker) -> None:
@@ -236,6 +274,10 @@ def _release_completed_worker_caches(spool, worker) -> None:
     the worker count during a long steady run.
     """
 
+    release = getattr(worker, "release_reader_caches", None)
+    if release:
+        release()
+        return
     event_index = getattr(spool, "_event_index", None)
     if isinstance(event_index, dict):
         event_index.clear()
@@ -333,6 +375,15 @@ def _sample(
         "projection_applied": int(projection_status.get("applied", 0) or 0),
         "projection_lag_seconds": float(projection_status.get("projection_lag_seconds", 0.0) or 0.0),
         "projection_queue_depth": int(projection_status.get("queue_depth", 0) or 0),
+        "projection_journal_committed_offset_bytes": int(
+            projection_status.get("journal_committed_offset_bytes", 0) or 0
+        ),
+        "projection_journal_backlog_bytes": int(
+            projection_status.get("journal_backlog_bytes", 0) or 0
+        ),
+        "projection_journal_backlog_events_estimate": int(
+            projection_status.get("journal_backlog_events_estimate", 0) or 0
+        ),
         "smpp_received": int(getattr(smsc, "total_received", 0)),
         "smpp_response_success": smsc.response_success,
     }
@@ -388,7 +439,9 @@ async def run(args: argparse.Namespace) -> dict:
 
     # Reuse the exact loopback protocol server already used by the frozen
     # P10/P100/P1K/P5500 acceptance tool; this harness only adds streaming.
-    smsc = CountingLoopbackSMSC(smpp)
+    smsc = CountingLoopbackSMSC(
+        smpp, response_delay_seconds=max(0.0, float(args.response_delay_ms)) / 1000.0
+    )
     port = await smsc.start()
     partition_map = PartitionMap.create(run_root / "partition-map.json", 256, args.workers)
     route_config = {
@@ -409,7 +462,8 @@ async def run(args: argparse.Namespace) -> dict:
     stop_event = context.Event()
     journal_paths = [run_root / "progress" / f"worker-{worker_id}.jsonl" for worker_id in range(args.workers)]
     projection = ProjectionWriterProcess(
-        run_root / "projection", batch_size=512, journal_paths=journal_paths
+        run_root / "projection", batch_size=args.projection_batch_size,
+        journal_paths=journal_paths, staging_mode=args.projection_staging_mode,
     )
     projection.start()
     processes = []
@@ -449,6 +503,8 @@ async def run(args: argparse.Namespace) -> dict:
         if args.steady_seconds > 0 else None
     )
     feed_stopped_at = None
+    projection_caught_up_at = None
+    projection_drain_deadline = None
 
     async def feed() -> None:
         while (
@@ -536,8 +592,25 @@ async def run(args: argparse.Namespace) -> dict:
                 await feed_task
                 if feed_stopped_at is None:
                     feed_stopped_at = time.monotonic()
+                    projection_drain_deadline = (
+                        feed_stopped_at + max(1.0, float(args.projection_drain_timeout))
+                    )
                 status = spool.lightweight_snapshot()
                 if int(status.get("pending_records", 0) or 0) == 0:
+                    if _projection_caught_up(projection, journal_paths):
+                        if projection_caught_up_at is None:
+                            projection_caught_up_at = time.monotonic()
+                        elif time.monotonic() - projection_caught_up_at >= 0.5:
+                            break
+                    else:
+                        projection_caught_up_at = None
+                else:
+                    projection_caught_up_at = None
+                if (
+                    projection_drain_deadline is not None
+                    and time.monotonic() >= projection_drain_deadline
+                ):
+                    guard_reason = "projection_drain_timeout"
                     break
             await asyncio.sleep(0.1)
     finally:
@@ -562,7 +635,11 @@ async def run(args: argparse.Namespace) -> dict:
         progress.extend(ProgressJournal(journal_path).read())
     task_events = [item for item in progress if not str(item.get("state", "")).startswith("submit_sm_resp_")]
     socket_events = [item for item in task_events if item.get("state") == "socket_written"]
-    response_events = [item for item in progress if item.get("state") == "submit_sm_resp_success"]
+    response_events = [item for item in progress if ":resp:" in str(item.get("event_id", ""))]
+    response_success_events = [
+        item for item in response_events if item.get("state") == "submit_sm_resp_success"
+    ]
+    response_unknown_events = [item for item in response_events if item.get("state") == "unknown"]
     campaign_tasks = Counter(int(item.get("campaign_id") or 0) for item in task_events)
     campaign_socket_tasks = Counter(int(item.get("campaign_id") or 0) for item in socket_events)
     campaign_pdus = Counter()
@@ -576,7 +653,11 @@ async def run(args: argparse.Namespace) -> dict:
     duplicate_destination_pdu_count = sum(value - 1 for value in destination_counts.values() if value > 1)
     spool_status = spool.status()
     projection_status = projection.snapshot()
-    journal_bytes = sum(path.stat().st_size for path in journal_paths if path.is_file())
+    journal_bytes = sum(
+        path.stat().st_size
+        for path in run_root.rglob("worker-*.jsonl")
+        if path.is_file()
+    )
     worker_results = []
     for process_index in range(args.workers):
         result_path = run_root / "workers" / f"worker-{process_index}.json"
@@ -607,11 +688,11 @@ async def run(args: argparse.Namespace) -> dict:
         and (finite_complete or steady_complete)
         and len(task_events) == generated_tasks
         and len(socket_events) == generated_tasks
-        # submit_sm_resp_success is a transport-level counter in the loopback
-        # server; the frozen worker journal intentionally contains one task
-        # event, not one event per multipart response PDU.
         and smsc.response_success == smpp_total
         and smpp_total == sum(campaign_pdus.values())
+        and len(response_events) == smpp_total
+        and len(response_success_events) == smsc.response_success
+        and not response_unknown_events
         and smsc.max_active_binds <= args.pool_size
         and not spool_status.get("pending_records")
         and int(projection_status.get("applied", 0) or 0) == len(progress)
@@ -630,14 +711,25 @@ async def run(args: argparse.Namespace) -> dict:
         "tps_scope": args.tps_scope,
         "configured_effective_total_tps": args.route_tps * args.pool_size if args.tps_scope == "per_bind" else args.route_tps,
         "window_size": args.window_size,
+        "projection_batch_size": args.projection_batch_size,
+        "projection_staging_mode": args.projection_staging_mode,
+        "response_delay_ms": float(args.response_delay_ms),
         "counts": counts,
         "total_tasks": generated_tasks,
         "accepted_message_count": generated_tasks,
         "socket_written_task_count": len(socket_events),
         "socket_written_pdu_count": sum(campaign_pdus.values()),
+        "journal_event_count": len(progress),
+        "response_event_count": len(response_events),
+        "response_success_event_count": len(response_success_events),
+        "response_unknown_event_count": len(response_unknown_events),
+        "events_per_task": round(len(progress) / generated_tasks, 6) if generated_tasks else 0.0,
+        "events_per_pdu": round(len(progress) / sum(campaign_pdus.values()), 6) if sum(campaign_pdus.values()) else 0.0,
         "submit_sm_resp_success": smsc.response_success,
         "projection_events_applied": int(projection_status.get("applied", 0) or 0),
         "projection_lag_seconds": float(projection_status.get("projection_lag_seconds", 0.0) or 0.0),
+        "projection_caught_up_before_stop": projection_caught_up_at is not None,
+        "projection_drain_timeout_seconds": float(args.projection_drain_timeout),
         "journal_bytes": journal_bytes,
         "drain_seconds": round(
             max(0.0, (time.monotonic() - feed_stopped_at))
@@ -709,11 +801,17 @@ def main() -> int:
     parser.add_argument("--tps-scope", choices=("route_shared", "per_bind"), default="per_bind")
     parser.add_argument("--window-size", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=250)
+    parser.add_argument("--projection-batch-size", type=int, default=512)
+    parser.add_argument("--projection-staging-mode", choices=("vectorized", "executemany"), default="vectorized")
+    parser.add_argument("--response-delay-ms", type=float, default=0.0,
+                        help="delay each loopback submit_sm_resp to exercise response draining")
     parser.add_argument("--feed-interval", type=float, default=0.05)
     parser.add_argument("--max-pending-records", type=int, default=20000)
     parser.add_argument("--sample-interval", type=float, default=1.0)
     parser.add_argument("--steady-seconds", type=float, default=0.0,
                         help="keep the bounded producer active for this duration before drain")
+    parser.add_argument("--projection-drain-timeout", type=float, default=600.0,
+                        help="maximum seconds to wait for journal EOF catch-up after feed stop")
     parser.add_argument("--max-run-bytes", type=int, default=5 * 1024 * 1024 * 1024)
     parser.add_argument("--max-rss-kib", type=int, default=2 * 1024 * 1024)
     parser.add_argument("--spool-max-bytes", type=int, default=512 * 1024 * 1024)
@@ -722,6 +820,8 @@ def main() -> int:
     args.workers = max(1, min(8, args.workers))
     args.pool_size = max(1, min(20, args.pool_size))
     args.window_size = max(1, min(1000, args.window_size))
+    args.projection_batch_size = max(1, min(4096, args.projection_batch_size))
+    args.projection_drain_timeout = max(1.0, min(3600.0, args.projection_drain_timeout))
     result = asyncio.run(run(args))
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -733,6 +833,9 @@ def main() -> int:
         "accepted_message_count": result["accepted_message_count"],
         "socket_written_task_count": result["socket_written_task_count"],
         "socket_written_pdu_count": result["socket_written_pdu_count"],
+        "journal_event_count": result["journal_event_count"],
+        "response_event_count": result["response_event_count"],
+        "response_unknown_event_count": result["response_unknown_event_count"],
         "submit_sm_resp_success": result["submit_sm_resp_success"],
         "projection_events_applied": result["projection_events_applied"],
         "max_active_binds": result["smpp"]["max_active_binds"],

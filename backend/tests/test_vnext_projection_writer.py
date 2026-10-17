@@ -6,6 +6,7 @@ import pytest
 
 from vnext.projection_writer import (
     ProjectionWriter,
+    ProjectionBackpressure,
     ProjectionWriterBusy,
     ProjectionWriterProcess,
     ProgressJournal,
@@ -90,3 +91,71 @@ def test_projection_process_flushes_low_rate_event_before_batch_size(tmp_path):
         assert process.snapshot()["flush_interval_seconds"] == 0.05
     finally:
         process.stop(timeout=10)
+
+
+def test_vectorized_staging_matches_executemany_and_reports_stage_metrics(tmp_path):
+    values = [event(f"vector-{index}", ordinal=index) for index in range(1, 129)]
+    values[3]["message"] = None
+    values[7]["error"] = None
+    summaries = {}
+    for mode in ("executemany", "vectorized"):
+        writer = ProjectionWriter(
+            tmp_path / f"{mode}.duckdb", batch_size=128, staging_mode=mode,
+        )
+        writer.start()
+        try:
+            for item in values:
+                writer.submit(item)
+            assert writer.flush() == len(values)
+            summary = writer._conn.execute(
+                "SELECT SUM(taken),SUM(socket_written),COUNT(*) FROM vnext_projection"
+            ).fetchone()
+            summaries[mode] = summary
+            metrics = writer.snapshot()["metrics"]
+            assert metrics["batches_total"] == 1
+            assert metrics["events_new"] == len(values)
+            assert metrics["events_replayed"] == 0
+            assert metrics["rows_prepare_ns"] >= 0
+            assert metrics["staging_load_ns"] >= 0
+            assert metrics["db_commit_ns"] >= 0
+            assert metrics["batch_size_p50"] == len(values)
+        finally:
+            writer.stop()
+    assert summaries["vectorized"] == summaries["executemany"] == (128, 128, 1)
+
+
+def test_journal_generation_recovery_reclaims_only_acknowledged_segments(tmp_path):
+    journal = ProgressJournal(
+        tmp_path / "worker-0.jsonl", max_event_bytes=1_024,
+        max_bytes=2_400, segment_bytes=1_200,
+    )
+    values = [event(f"segment-{index}", ordinal=index) for index in range(1, 30)]
+    appended = []
+    for item in values:
+        if not journal.can_append(item):
+            break
+        journal.append(item)
+        appended.append(item)
+    assert len(appended) >= 3
+    segments = journal.segment_paths()
+    assert len(segments) >= 2
+    active = segments[-1]
+    first = segments[0]
+    offsets = {str(first): first.stat().st_size}
+    assert journal.reclaim(offsets) == [str(first)]
+    assert active.exists()
+    assert all(path != first for path in journal.segment_paths())
+    assert journal.storage_snapshot(offsets)["reclaimable_bytes"] == 0
+    next_index = len(appended)
+    while next_index < len(values) and journal.can_append(values[next_index]):
+        journal.append(values[next_index])
+        next_index += 1
+    overflow = event("segment-overflow-0", ordinal=1000)
+    overflow_index = 1
+    while journal.can_append(overflow):
+        journal.append(overflow)
+        overflow = event(f"segment-overflow-{overflow_index}", ordinal=1000 + overflow_index)
+        overflow_index += 1
+    assert journal.storage_snapshot(offsets)["blocked"] is True
+    with pytest.raises(ProjectionBackpressure):
+        journal.append(overflow)

@@ -322,9 +322,7 @@ class AsyncSmppTransport:
                 stale_writer = self.writer
                 outstanding = list(self._pending.values())
                 self._pending.clear()
-                for _ in outstanding:
-                    self._window.release()
-                self.unknown_parts += len(outstanding)
+                await self._mark_pending_unknown(outstanding, "SMPP reader disconnected before response")
                 if stale_writer is not None and not stale_writer.is_closing():
                     stale_writer.close()
                 self.reader = None
@@ -334,6 +332,32 @@ class AsyncSmppTransport:
                 self.bind_slot = None
                 if lease is not None:
                     lease.release()
+
+    async def _mark_pending_unknown(self, outstanding: list[_Pending], reason: str) -> None:
+        """Release timed-out window slots without authorizing a resend."""
+
+        for pending in outstanding:
+            self._window.release()
+            self.unknown_parts += 1
+            if not self.response_callback:
+                continue
+            event = {
+                "route_id": self.route_id,
+                "sequence": pending.sequence,
+                "status": -1,
+                "success": False,
+                "unknown": True,
+                "latency_seconds": max(0.0, time.monotonic() - pending.sent_at),
+                "body_length": 0,
+                "error": reason,
+                "context": dict(pending.context or {}),
+            }
+            try:
+                result = self.response_callback(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                self.last_error = f"unknown response sink failed: {type(exc).__name__}: {exc}"
 
     async def send_task(self, *, destination_addr: str, message: str, flash_sms: bool = False,
                         reference: int = 1, source_addr: str | None = None,
@@ -443,10 +467,9 @@ class AsyncSmppTransport:
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
-        outstanding = len(self._pending)
+        pending = list(self._pending.values())
         self._pending.clear()
-        for _ in range(outstanding):
-            self._window.release()
+        await self._mark_pending_unknown(pending, "transport closed before response drain")
         self.reader = None
         self.writer = None
         lease = self._bind_lease

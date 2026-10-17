@@ -553,6 +553,20 @@ class TaskSpool:
                     except (OSError, ValueError, TypeError):
                         pass
 
+    def release_reader_cache(self) -> None:
+        """Drop decoded record indexes after a pass with no live iterators.
+
+        The append-only segment files and cursor/manifest files remain the
+        authority.  Marking the manifest stale makes the next reader rebuild
+        the cache from durable files instead of retaining every historical
+        record for the lifetime of a worker process.
+        """
+
+        with self._lock:
+            self._event_index.clear()
+            self._segment_offsets.clear()
+            self._manifest_signature = None
+
     def _disk_bytes(self) -> int:
         total = 0
         for path in self.root.glob("partition-*/*.jsonl"):
