@@ -34,6 +34,7 @@ except ImportError:  # standalone application runtime intentionally excludes tes
 TOOLS_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = Path(os.environ.get("MC_APP_BACKEND_DIR", str(TOOLS_DIR.parent))).resolve()
 REPO_ROOT = BACKEND_DIR.parent
+CANARY_HTTP_TIMEOUT_SECONDS = 300.0
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 if str(BACKEND_DIR) not in sys.path:
@@ -526,7 +527,7 @@ class CanaryRunner:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with self._url_opener.open(request, timeout=30) as response:
+            with self._url_opener.open(request, timeout=CANARY_HTTP_TIMEOUT_SECONDS) as response:
                 value = json.loads(response.read().decode("utf-8"))
                 return value if isinstance(value, dict) else {"value": value}
         except urllib.error.HTTPError as exc:

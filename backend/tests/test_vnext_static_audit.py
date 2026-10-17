@@ -184,6 +184,31 @@ def test_loopback_summary_isolated_between_campaigns(tmp_path):
     assert second["unexpected_count"] == 0
 
 
+def test_canary_api_uses_300_second_http_timeout():
+    runner = object.__new__(CanaryRunner)
+    runner.api_port = 19090
+    observed = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    class _Opener:
+        def open(self, _request, *, timeout):
+            observed["timeout"] = timeout
+            return _Response()
+
+    runner._url_opener = _Opener()
+    assert runner.api("GET", "/api/vnext/status") == {}
+    assert observed["timeout"] == 300.0
+
+
 def test_progress_observer_reads_journal_incrementally(tmp_path):
     journal = ProgressJournal(tmp_path / "vnext" / "progress" / "worker-0.jsonl")
     journal.append({"event_id": "one", "campaign_id": 1, "state": "socket_written"})
