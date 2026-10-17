@@ -68,13 +68,34 @@ def test_native_fault_capture_is_independent_and_persistent(tmp_path):
     path = enable_native_fault_capture(root, "audit-root")
     try:
         assert path is not None and path.exists()
+        api_path = enable_native_fault_capture(root, "api-main")
+        assert api_path == path
         metadata_path = write_process_metadata(root, "audit-root", phase="running")
         assert metadata_path is not None
         metadata = __import__("json").loads(metadata_path.read_text(encoding="utf-8"))
         assert metadata["native_fault_capture"] is True
         assert "native_module_versions" in metadata
+        disable_native_fault_capture("api-main")
+        metadata_path = write_process_metadata(root, "audit-root", phase="still-running")
+        metadata = __import__("json").loads(metadata_path.read_text(encoding="utf-8"))
+        assert metadata["native_fault_capture"] is True
     finally:
         disable_native_fault_capture("audit-root")
+
+
+def test_parent_observer_preserves_child_native_capture_fact(tmp_path):
+    root = tmp_path / "diagnostics"
+    path = write_process_metadata(
+        root,
+        "worker-0",
+        process_pid=4242,
+        extra={"native_fault_capture": True, "native_fault_log": "worker.log"},
+    )
+    assert path is not None
+    write_process_metadata(root, "worker-0", process_pid=4242, phase="stopped")
+    metadata = __import__("json").loads(path.read_text(encoding="utf-8"))
+    assert metadata["native_fault_capture"] is True
+    assert metadata["native_fault_log"] == "worker.log"
 
 
 def test_lightweight_snapshot_does_not_scan_segment_contents(tmp_path, monkeypatch):
@@ -135,12 +156,32 @@ def test_loopback_summary_uses_bounded_counter_reconciliation(tmp_path):
     ]))
     runner._received_counts = Counter()
     runner._received_observer_index = 0
+    runner._received_baselines = {}
     summary = runner.loopback_summary(7)
     assert summary["received"] == 2
     assert summary["duplicates"] == ["2511"]
     assert summary["missing"] == ["2512"]
     assert summary["unexpected"] == ["9999"]
     assert summary["unexpected_count"] == 1
+
+
+def test_loopback_summary_isolated_between_campaigns(tmp_path):
+    runner = object.__new__(CanaryRunner)
+    runner.run_root = Path(tmp_path)
+    runner.expected_destinations = {1: {"2511"}, 2: {"2512"}}
+    runner.smsc = SimpleNamespace(smsc=SimpleNamespace(received=[
+        {"destination": "2511"},
+        {"destination": "2512"},
+    ]))
+    runner._received_counts = Counter()
+    runner._received_observer_index = 0
+    runner._received_baselines = {2: Counter({"2511": 1})}
+    first = runner.loopback_summary(1)
+    second = runner.loopback_summary(2)
+    assert first["received"] == 1
+    assert first["unexpected_count"] == 1
+    assert second["received"] == 1
+    assert second["unexpected_count"] == 0
 
 
 def test_progress_observer_reads_journal_incrementally(tmp_path):
@@ -155,3 +196,8 @@ def test_progress_observer_reads_journal_incrementally(tmp_path):
     journal.append({"event_id": "two", "campaign_id": 1, "state": "socket_written"})
     assert {item["event_id"] for item in runner.progress_events()} == {"one", "two"}
     assert runner._progress_offsets[str(journal.path)] > first_offset
+
+
+def test_r2_phase_marker_is_explicit_in_acceptance_runner():
+    source = Path(__file__).resolve().parents[1] / "tools" / "vnext_runtime_canary_acceptance.py"
+    assert '"r2_campaign_begin"' in source.read_text(encoding="utf-8")

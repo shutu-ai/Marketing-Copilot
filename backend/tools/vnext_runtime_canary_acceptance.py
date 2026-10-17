@@ -42,12 +42,72 @@ if str(BACKEND_DIR) not in sys.path:
 from vnext.diagnostics import (
     disable_native_fault_capture,
     enable_native_fault_capture,
+    has_native_fault_capture,
     read_process_metadata,
     write_process_metadata,
 )
 from vnext.ingress import IngressRouter
 from vnext.projection_writer import ProgressJournal
 from vnext_loopback_acceptance import LoopbackSMSC
+
+
+_ALLOWED_GATES = ("r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "b2")
+
+
+def _parse_requested_gates(raw: str) -> list[str]:
+    values = [item.strip().lower() for item in str(raw or "").split(",") if item.strip()]
+    if not values:
+        raise ValueError("at least one gate must be requested")
+    unknown = [item for item in values if item not in _ALLOWED_GATES]
+    if unknown:
+        raise ValueError(f"unsupported gate(s): {','.join(unknown)}")
+    duplicates = sorted({item for item in values if values.count(item) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate gate(s): {','.join(duplicates)}")
+    return values
+
+
+def _validate_gate_contract(args: argparse.Namespace) -> list[str]:
+    values = _parse_requested_gates(getattr(args, "gates", ""))
+    if "r2" in values and not bool(getattr(args, "authorize_p5500", False)):
+        raise ValueError("R2 requires --authorize-p5500")
+    if "b2" in values and values != ["b2"]:
+        raise ValueError("B2 must run as the only requested gate")
+    stability_seconds = float(getattr(args, "stability_seconds", 0.0) or 0.0)
+    if stability_seconds < 0:
+        raise ValueError("stability-seconds must be non-negative")
+    if stability_seconds > 0 and "r7" not in values:
+        raise ValueError("stability-seconds > 0 requires explicit r7 in --gates")
+    b2_seconds = float(getattr(args, "b2_seconds", 42.0) or 0.0)
+    if not 40.0 <= b2_seconds <= 45.0:
+        raise ValueError("b2-seconds must be between 40 and 45")
+    return values
+
+
+def _validate_runtime_arguments(args: argparse.Namespace) -> None:
+    route_tps = float(getattr(args, "route_tps", 0.0))
+    response_delay_ms = float(getattr(args, "response_delay_ms", 0.0))
+    workers = int(getattr(args, "workers", 0))
+    partitions = int(getattr(args, "partitions", 0))
+    projection_queue = int(getattr(args, "projection_queue", 0))
+    max_inflight = int(getattr(args, "max_inflight", 0))
+    prefetch = int(getattr(args, "prefetch", 0))
+    if route_tps <= 0:
+        raise ValueError("route-tps must be greater than zero")
+    if response_delay_ms < 0:
+        raise ValueError("response-delay-ms must be non-negative")
+    if not 1 <= workers <= 4:
+        raise ValueError("workers must be between 1 and 4")
+    if not 16 <= partitions <= 256:
+        raise ValueError("partitions must be between 16 and 256")
+    if projection_queue < 128:
+        raise ValueError("projection-queue must be at least 128")
+    if not 1 <= max_inflight <= 256:
+        raise ValueError("max-inflight must be between 1 and 256")
+    if not 1 <= prefetch <= 128:
+        raise ValueError("prefetch must be between 1 and 128")
+    if getattr(args, "watchdog", "enabled") not in {"enabled", "disabled"}:
+        raise ValueError("watchdog must be enabled or disabled")
 
 
 def _free_port() -> int:
@@ -314,9 +374,15 @@ class CanaryRunner:
         self._progress_events_by_id: dict[str, dict] = {}
         self._received_counts: Counter[str] = Counter()
         self._received_observer_index = 0
+        self._received_baselines: dict[int, Counter[str]] = {}
         self._phase_marker_path = self.run_root / "diagnostics" / "phase-markers.jsonl"
         self._phase_sequence = 0
         self.native_fault_path: Path | None = None
+        self.api_native_fault_path: Path | None = None
+        _validate_runtime_arguments(args)
+        self.requested_gates = _validate_gate_contract(args)
+        self.executed_gates: list[str] = []
+        self._first_campaign_completed = False
         # The runner is loopback-only; do not let an inherited corporate proxy
         # intercept its local API or SMPP observations.
         self._url_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -338,6 +404,7 @@ class CanaryRunner:
             with self._phase_marker_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
                 handle.flush()
+                os.fsync(handle.fileno())
             write_process_metadata(
                 self.run_root / "diagnostics",
                 role,
@@ -348,6 +415,9 @@ class CanaryRunner:
                 extra={
                     "last_phase_marker": str(phase),
                     "phase_marker_path": str(self._phase_marker_path),
+                    "native_fault_log": str(
+                        self.api_native_fault_path if role == "api-main" else self.native_fault_path
+                    ) if (self.api_native_fault_path if role == "api-main" else self.native_fault_path) else "",
                 },
             )
         except OSError:
@@ -402,7 +472,7 @@ class CanaryRunner:
         self._mark_phase("environment_ready", progress={"watchdog": self.args.watchdog})
 
     def seed_database(self) -> None:
-        self._mark_phase("seed_start")
+        self._mark_phase("seed_begin")
         self.route_port = self.smsc.start()
         from database import close_root_connection, get_connection, init_db, set_database_file
 
@@ -427,7 +497,10 @@ class CanaryRunner:
         self._mark_phase("seed_complete", progress={"route_id": int(self.route_id)})
 
     def start_api(self) -> None:
-        self._mark_phase("api_starting", role="api-main")
+        self.api_native_fault_path = enable_native_fault_capture(
+            self.run_root / "diagnostics", "api-main"
+        )
+        self._mark_phase("api_start", role="api-main")
         if self.main is None:
             self.main = importlib.import_module("main")
         from services import vnext_service
@@ -526,7 +599,7 @@ class CanaryRunner:
         }
 
     def wait_idle(self, timeout: float = 300.0) -> dict:
-        self._mark_phase("wait_idle_start", progress={"timeout_seconds": float(timeout)})
+        self._mark_phase("wait_idle_begin", progress={"timeout_seconds": float(timeout)})
         result = self.api("GET", f"/api/vnext/idle?timeout={max(0.1, float(timeout))}")
         self._mark_phase(
             "wait_idle_complete",
@@ -575,20 +648,27 @@ class CanaryRunner:
         if self._received_observer_index > len(received_values):
             self._received_observer_index = 0
             self._received_counts.clear()
+            self._received_baselines.clear()
         for item in received_values[self._received_observer_index:]:
             self._received_counts[str(item["destination"])] += 1
         self._received_observer_index = len(received_values)
         expected = self.expected_destinations.get(int(campaign_id), set())
-        actual_keys = expected.intersection(self._received_counts)
-        duplicates = sorted(value for value in actual_keys if self._received_counts[value] > 1)
-        missing = expected.difference(self._received_counts)
+        baseline = self._received_baselines.get(int(campaign_id), Counter())
+        current_counts = Counter({
+            value: max(0, int(count) - int(baseline.get(value, 0)))
+            for value, count in self._received_counts.items()
+            if int(count) > int(baseline.get(value, 0))
+        })
+        actual_keys = expected.intersection(current_counts)
+        duplicates = sorted(value for value in actual_keys if current_counts[value] > 1)
+        missing = expected.difference(current_counts)
         unexpected = sorted(
-            value for value, count in self._received_counts.items()
+            value for value, count in current_counts.items()
             if count and value not in expected
         )
         return {
             "expected": len(expected),
-            "received": sum(self._received_counts[value] for value in actual_keys),
+            "received": sum(current_counts[value] for value in actual_keys),
             "duplicates": duplicates,
             "missing": sorted(missing)[:20],
             "missing_count": len(missing),
@@ -656,10 +736,47 @@ class CanaryRunner:
         finally:
             conn.close()
 
+    def _diagnostic_processes(self) -> list[dict]:
+        """Collect canary and VNext child records without exposing payload data."""
+
+        values: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for root in (
+            self.run_root / "diagnostics",
+            self.run_root / "vnext" / "diagnostics",
+        ):
+            for item in read_process_metadata(root):
+                key = (str(item.get("role") or ""), int(item.get("pid") or 0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                values.append(item)
+        return values
+
+    def _native_fault_logs(self) -> list[str]:
+        paths: list[str] = []
+        for root in (
+            self.run_root / "diagnostics" / "native-crash",
+            self.run_root / "vnext" / "diagnostics" / "native-crash",
+        ):
+            try:
+                paths.extend(str(path) for path in sorted(root.glob("*-faulthandler.log")))
+            except OSError:
+                continue
+        return paths
+
     def gate_live(self, name: str, campaign_id: int, batches: list[tuple[list[dict], str, int]], *,
                   expected: int, timeout: float = 300.0, retry_check: bool = False) -> dict:
         started = time.monotonic()
-        self._mark_phase("gate_start", progress={"gate": name, "campaign_id": int(campaign_id), "expected": int(expected)})
+        gate_progress = {
+            "gate": name,
+            "campaign_id": int(campaign_id),
+            "expected": int(expected),
+        }
+        self._mark_phase("gate_start", progress=gate_progress)
+        if str(name).lower().startswith("r2"):
+            self._mark_phase("r2_campaign_begin", progress=gate_progress)
+        self._received_baselines.setdefault(int(campaign_id), Counter(self._received_counts))
         accepted = duplicate = 0
         responses = []
         for rows, source_id, ordinal in batches:
@@ -667,6 +784,16 @@ class CanaryRunner:
             responses.append(self.response_summary(item))
             accepted += int(item.get("accepted", 0))
             duplicate += int(item.get("duplicate", 0))
+        self._mark_phase(
+            "batch_enqueued",
+            progress={
+                "gate": name,
+                "campaign_id": int(campaign_id),
+                "expected": int(expected),
+                "accepted": int(accepted),
+                "batch_count": len(batches),
+            },
+        )
         self._mark_phase("ingress_complete", progress={"gate": name, "campaign_id": int(campaign_id), "accepted": int(accepted)})
         if retry_check and batches:
             rows, source_id, ordinal = batches[0]
@@ -681,8 +808,34 @@ class CanaryRunner:
             if boundary["received"] >= expected:
                 break
             time.sleep(0.05)
+        self._mark_phase(
+            "projection_reconcile_begin",
+            progress={"gate": name, "campaign_id": int(campaign_id)},
+        )
         summary = self.campaign_summary(campaign_id)
         loopback = self.loopback_summary(campaign_id)
+        self._mark_phase(
+            "projection_reconcile_end",
+            progress={
+                "gate": name,
+                "campaign_id": int(campaign_id),
+                "socket_written": int(summary["states"].get("socket_written", 0)),
+                "loopback_received": int(loopback["received"]),
+            },
+        )
+        if not self._first_campaign_completed:
+            self._first_campaign_completed = True
+            self._mark_phase(
+                "first_campaign_completed",
+                progress={
+                    "gate": name,
+                    "campaign_id": int(campaign_id),
+                    "status": "PASS" if (
+                        summary["states"].get("socket_written", 0) == expected
+                        and loopback["received"] == expected
+                    ) else "FAIL",
+                },
+            )
         self._mark_phase("reconciliation_complete", progress={"gate": name, "campaign_id": int(campaign_id), "received": int(loopback["received"])})
         passed = (
             accepted == expected
@@ -876,14 +1029,129 @@ class CanaryRunner:
             result["max_writer_lag_seconds"] = max(float(item.get("writer_lag_seconds", 0.0) or 0.0) for item in samples)
         return result
 
+    def gate_b2(self) -> dict:
+        """Cross the historical elapsed-time boundary with a small real-main load.
+
+        B2 is deliberately separate from R7: it sends exactly 300 synthetic
+        messages once, then keeps the real API/status path active until a
+        bounded 40--45 second elapsed-time boundary.  This preserves the
+        diagnostic question without recreating the historical P5500 volume.
+        """
+
+        started = time.monotonic()
+        boundary_seconds = float(self.args.b2_seconds)
+        expected = 300
+        campaign_id = 1800
+        sampler = _Sampler(self, interval=1.0)
+        sampler.start()
+        self._mark_phase(
+            "b2_boundary_begin",
+            progress={
+                "campaign_id": campaign_id,
+                "expected": expected,
+                "health_seconds": boundary_seconds,
+            },
+        )
+        batches = [
+            (self.rows(campaign_id, 100, start=0), "b2-wave-1", 0),
+            (self.rows(campaign_id, 100, start=100), "b2-wave-2", 100),
+            (self.rows(campaign_id, 100, start=200), "b2-wave-3", 200),
+        ]
+        result = self.gate_live("B2", campaign_id, batches, expected=expected, timeout=300)
+        health_requests = 0
+        health_errors: list[str] = []
+        last_health = {}
+        health_started = time.monotonic()
+        deadline = started + boundary_seconds
+        self._mark_phase(
+            "b2_health_begin",
+            progress={"campaign_id": campaign_id, "expected": expected},
+        )
+        if result.get("status") == "PASS":
+            while time.monotonic() < deadline:
+                try:
+                    status = self.api("GET", "/api/vnext/status")
+                    projection = status.get("projection") or {}
+                    spool = status.get("spool") or {}
+                    last_health = {
+                        "started": bool(status.get("started")),
+                        "pending_records": int(spool.get("pending_records", 0) or 0),
+                        "projection_alive": bool(projection.get("alive", False)),
+                        "writer_lag_seconds": float(projection.get("projection_lag_seconds", 0.0) or 0.0),
+                    }
+                    health_requests += 1
+                except Exception as exc:
+                    health_errors.append(type(exc).__name__)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(1.0, remaining))
+        samples = sampler.stop()
+        elapsed = time.monotonic() - started
+        health_elapsed = max(0.0, time.monotonic() - health_started)
+        self._mark_phase(
+            "b2_health_end",
+            progress={
+                "campaign_id": campaign_id,
+                "health_requests": health_requests,
+                "health_errors": len(health_errors),
+            },
+        )
+        result.update({
+            "gate": "B2",
+            "boundary_seconds": boundary_seconds,
+            "expected_synthetic_messages": expected,
+            "health_activity_seconds": round(health_elapsed, 3),
+            "health_requests": health_requests,
+            "health_errors": health_errors,
+            "last_health": last_health,
+            "samples": samples,
+            "duration_seconds": round(elapsed, 3),
+        })
+        if samples:
+            result["peak_rss_bytes"] = max(item["process"]["rss_bytes"] for item in samples)
+            result["peak_fd_count"] = max(item["process"]["fd_count"] for item in samples)
+            result["peak_run_root_bytes"] = max(item["run_root_bytes"] for item in samples)
+            result["max_writer_lag_seconds"] = max(float(item.get("writer_lag_seconds", 0.0) or 0.0) for item in samples)
+        result["status"] = "PASS" if (
+            result.get("status") == "PASS"
+            and 40.0 <= elapsed <= 45.5
+            and health_requests > 0
+            and not health_errors
+            and last_health.get("started") is True
+            and last_health.get("projection_alive") is True
+            and int(last_health.get("pending_records", 1)) == 0
+            and samples
+        ) else "FAIL"
+        self._mark_phase(
+            "b2_boundary_complete",
+            progress={
+                "campaign_id": campaign_id,
+                "expected": expected,
+                "health_requests": health_requests,
+                "status": result["status"],
+            },
+        )
+        return result
+
     def run(self) -> dict:
-        self._mark_phase("run_start")
-        self.setup_environment()
-        self.seed_database()
-        self.start_api()
+        self._mark_phase(
+            "run_start",
+            progress={"requested_gates": list(self.requested_gates)},
+        )
+        self._mark_phase(
+            "native_modules_ready",
+            progress={
+                "faulthandler_enabled": bool(__import__("faulthandler").is_enabled()),
+                "native_fault_capture": has_native_fault_capture("canary-root"),
+            },
+        )
         gates = self._gates()
         results: dict[str, dict] = {}
         try:
+            self.setup_environment()
+            self.seed_database()
+            self.start_api()
             for name in gates:
                 try:
                     if name.lower() == "r7":
@@ -893,11 +1161,16 @@ class CanaryRunner:
                 except Exception as exc:
                     result = {"gate": name.upper(), "status": "FAIL", "error": f"{type(exc).__name__}: {exc}"}
                 results[name.upper()] = result
+                self.executed_gates.append(name)
                 if result.get("status") != "PASS":
                     break
         finally:
-            self.stop_api()
-            self.smsc.stop()
+            self._mark_phase("shutdown_begin", progress={"executed_gates": list(self.executed_gates)})
+            try:
+                self.stop_api()
+                self.smsc.stop()
+            finally:
+                self._mark_phase("shutdown_end", progress={"executed_gates": list(self.executed_gates)})
 
         events = self.progress_events()
         by_event = {str(item.get("event_id")): item for item in events if item.get("event_id")}
@@ -908,7 +1181,12 @@ class CanaryRunner:
             self.run_root / "vnext" / "projection" / "projection-writer-status.json",
         ]
         hashes = {str(path.relative_to(self.run_root)): _sha256(path) for path in source_files if path.exists()}
-        status = "PASS" if results and all(item.get("status") == "PASS" for item in results.values()) else "FAIL"
+        gate_contract_matches = self.executed_gates == self.requested_gates
+        status = "PASS" if (
+            results
+            and gate_contract_matches
+            and all(item.get("status") == "PASS" for item in results.values())
+        ) else "FAIL"
         try:
             filesystem = subprocess.check_output(["df", "-T", "."], text=True, stderr=subprocess.STDOUT).strip()
         except (OSError, subprocess.CalledProcessError):
@@ -935,12 +1213,22 @@ class CanaryRunner:
                 "watchdog": getattr(self.args, "watchdog", "enabled"),
                 "real_smsc": False,
                 "loopback_host": "127.0.0.1",
+                "b2_seconds": float(getattr(self.args, "b2_seconds", 42.0)),
+                "b2_expected_synthetic_messages": 300,
             },
             "preflight": {
                 "python": sys.version,
                 "executable": sys.executable,
                 "filesystem_df_T": filesystem,
                 "dependency_freeze": sorted(freeze),
+            },
+            "requested_gates": [item.upper() for item in self.requested_gates],
+            "executed_gates": [item.upper() for item in self.executed_gates],
+            "gate_contract": {
+                "requested_gates": [item.upper() for item in self.requested_gates],
+                "executed_gates": [item.upper() for item in self.executed_gates],
+                "matches": bool(gate_contract_matches),
+                "authorize_p5500": bool(self.args.authorize_p5500),
             },
             "gates": results,
             "loopback": {
@@ -965,21 +1253,16 @@ class CanaryRunner:
             },
             "diagnostics": {
                 "native_fault_log": str(self.native_fault_path) if self.native_fault_path else "",
+                "native_fault_logs": self._native_fault_logs(),
                 "phase_markers": str(self._phase_marker_path),
-                "processes": read_process_metadata(self.run_root / "diagnostics"),
+                "processes": self._diagnostic_processes(),
             },
             "historical_status": "VNEXT_PIPELINE_READY_FOR_CANARY",
             "legacy_status": "INTEGRATED_NO_GO",
         }
 
     def _gates(self) -> list[str]:
-        raw = str(self.args.gates or "r0,r1,r3,r4,r5,r6").strip().lower()
-        values = [item.strip().lower() for item in raw.split(",") if item.strip()]
-        if "r2" in values and not self.args.authorize_p5500:
-            values.remove("r2")
-        if self.args.stability_seconds > 0 and "r7" not in values:
-            values.append("r7")
-        return values
+        return list(self.requested_gates)
 
 
 def main() -> int:
@@ -990,6 +1273,7 @@ def main() -> int:
     parser.add_argument("--authorize-p5500", action="store_true",
                         help="explicitly authorize the R2/P5500 canary gate")
     parser.add_argument("--stability-seconds", type=float, default=0.0)
+    parser.add_argument("--b2-seconds", type=float, default=42.0)
     parser.add_argument("--idle-seconds", type=float, default=5.0)
     parser.add_argument("--route-tps", type=float, default=80.0)
     parser.add_argument("--response-delay-ms", type=float, default=2.0)
@@ -1003,9 +1287,15 @@ def main() -> int:
     run_root = Path(args.run_root).resolve()
     os.environ["PYTHONFAULTHANDLER"] = "1"
     native_fault_path = enable_native_fault_capture(run_root / "diagnostics", "canary-root")
-    runner = CanaryRunner(args)
-    runner.native_fault_path = native_fault_path
+    runner: CanaryRunner | None = None
+    requested_gates: list[str] = []
     try:
+        requested_gates = _validate_gate_contract(args)
+    except (TypeError, ValueError):
+        requested_gates = []
+    try:
+        runner = CanaryRunner(args)
+        runner.native_fault_path = native_fault_path
         result = runner.run()
     except BaseException as exc:
         result = {
@@ -1014,17 +1304,31 @@ def main() -> int:
             "captured_at": time.time(),
             "run_root": str(run_root),
             "exception": f"{type(exc).__name__}: {exc}",
+            "requested_gates": [item.upper() for item in requested_gates],
+            "executed_gates": [item.upper() for item in (runner.executed_gates if runner else [])],
+            "gate_contract": {
+                "requested_gates": [item.upper() for item in requested_gates],
+                "executed_gates": [item.upper() for item in (runner.executed_gates if runner else [])],
+                "matches": False,
+                "authorize_p5500": bool(args.authorize_p5500),
+            },
         }
-    output = Path(args.output).resolve() if args.output else runner.run_root / "canary-result.json"
+    output = Path(args.output).resolve() if args.output else run_root / "canary-result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps({
-        "status": result["status"],
-        "run_root": result["run_root"],
-        "gates": {key: value.get("status") for key, value in result.get("gates", {}).items()},
-        "projection": result.get("projection_database", {}),
-    }, ensure_ascii=False, sort_keys=True))
-    disable_native_fault_capture("canary-root")
+    try:
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        print(json.dumps({
+            "status": result["status"],
+            "run_root": result["run_root"],
+            "requested_gates": result.get("requested_gates", []),
+            "executed_gates": result.get("executed_gates", []),
+            "gate_contract_matches": bool((result.get("gate_contract") or {}).get("matches", False)),
+            "gates": {key: value.get("status") for key, value in result.get("gates", {}).items()},
+            "projection": result.get("projection_database", {}),
+        }, ensure_ascii=False, sort_keys=True))
+    finally:
+        disable_native_fault_capture("api-main")
+        disable_native_fault_capture("canary-root")
     return 0 if result["status"] == "PASS" else 2
 
 

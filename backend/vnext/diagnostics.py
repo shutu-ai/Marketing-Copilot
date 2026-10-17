@@ -22,7 +22,12 @@ from pathlib import Path
 from typing import Any
 
 
-_NATIVE_FAULTHANDLER_HANDLES: dict[str, object] = {}
+# ``faulthandler`` has one process-wide destination.  Keep one persistent
+# handle per process and let multiple logical roles in that process share it;
+# otherwise an API-role registration could silently replace the canary-root
+# destination, or disabling one role could close the only live crash log.
+_NATIVE_FAULTHANDLER_HANDLES: dict[int, dict[str, object]] = {}
+_NATIVE_FAULTHANDLER_ROLES: dict[str, int] = {}
 
 
 def _runtime_version() -> str:
@@ -81,15 +86,26 @@ def enable_native_fault_capture(
     if not root:
         return None
     safe_role = _safe_role(role)
-    if safe_role in _NATIVE_FAULTHANDLER_HANDLES:
-        return Path(_NATIVE_FAULTHANDLER_HANDLES[safe_role][1])
+    process_id = os.getpid()
+    existing = _NATIVE_FAULTHANDLER_HANDLES.get(process_id)
+    if existing is not None:
+        roles = existing.setdefault("roles", set())
+        if isinstance(roles, set):
+            roles.add(safe_role)
+        _NATIVE_FAULTHANDLER_ROLES[safe_role] = process_id
+        return Path(str(existing["path"]))
     directory = Path(root).resolve() / "native-crash"
     path = directory / f"{safe_role}-faulthandler.log"
     try:
         directory.mkdir(parents=True, exist_ok=True)
         handle = path.open("w", encoding="utf-8")
         faulthandler.enable(handle, all_threads=True)
-        _NATIVE_FAULTHANDLER_HANDLES[safe_role] = (handle, str(path))
+        _NATIVE_FAULTHANDLER_HANDLES[process_id] = {
+            "handle": handle,
+            "path": str(path),
+            "roles": {safe_role},
+        }
+        _NATIVE_FAULTHANDLER_ROLES[safe_role] = process_id
         return path
     except (OSError, ValueError):
         try:
@@ -102,18 +118,45 @@ def enable_native_fault_capture(
 def disable_native_fault_capture(role: str | None = None) -> None:
     """Close a capture handle after a graceful process shutdown."""
 
-    roles = [_safe_role(role)] if role else list(_NATIVE_FAULTHANDLER_HANDLES)
-    for value in roles:
-        item = _NATIVE_FAULTHANDLER_HANDLES.pop(value, None)
+    if role:
+        safe_role = _safe_role(role)
+        process_ids = [_NATIVE_FAULTHANDLER_ROLES.get(safe_role)]
+    else:
+        process_ids = list(_NATIVE_FAULTHANDLER_HANDLES)
+    for process_id in process_ids:
+        if process_id is None:
+            continue
+        item = _NATIVE_FAULTHANDLER_HANDLES.get(process_id)
         if item is None:
             continue
-        handle = item[0]
+        roles = item.get("roles")
+        if role and isinstance(roles, set):
+            roles.discard(_safe_role(role))
+            _NATIVE_FAULTHANDLER_ROLES.pop(_safe_role(role), None)
+            if roles:
+                continue
+        elif role:
+            continue
+        _NATIVE_FAULTHANDLER_HANDLES.pop(process_id, None)
+        if isinstance(roles, set):
+            for value in roles:
+                _NATIVE_FAULTHANDLER_ROLES.pop(value, None)
+        handle = item.get("handle")
         try:
             faulthandler.disable()
             handle.flush()
             handle.close()
-        except (OSError, ValueError):
+        except (AttributeError, OSError, ValueError):
             pass
+
+
+def has_native_fault_capture(role: str | None = None) -> bool:
+    """Return whether this process has a live capture handle for *role*."""
+
+    if role is None:
+        return bool(_NATIVE_FAULTHANDLER_HANDLES)
+    process_id = _NATIVE_FAULTHANDLER_ROLES.get(_safe_role(role))
+    return process_id in _NATIVE_FAULTHANDLER_HANDLES if process_id is not None else False
 
 
 def write_process_metadata(
@@ -146,6 +189,12 @@ def write_process_metadata(
                 current = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError, TypeError):
                 current = {}
+        native_fault_capture = has_native_fault_capture(role)
+        # A parent supervisor may update a child PID's record after the child
+        # exits. Preserve the child's own capture fact instead of replacing it
+        # with the parent's role map state.
+        if observed_pid != os.getpid() and "native_fault_capture" in current:
+            native_fault_capture = bool(current.get("native_fault_capture"))
         current.update(
             {
                 "pid": observed_pid,
@@ -160,7 +209,7 @@ def write_process_metadata(
                 "duckdb_version": _runtime_version(),
                 "native_module_versions": _native_module_versions(),
                 "faulthandler_enabled": bool(getattr(__import__("faulthandler"), "is_enabled", lambda: False)()),
-                "native_fault_capture": bool(_safe_role(role) in _NATIVE_FAULTHANDLER_HANDLES),
+                "native_fault_capture": native_fault_capture,
                 "thread_count": threading.active_count(),
                 "phase": str(phase or current.get("phase") or ""),
                 "status": str(status or "running"),

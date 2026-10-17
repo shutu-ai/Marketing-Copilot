@@ -33,12 +33,15 @@ STAGE="$WORK/$NAME"
 mkdir -p "$STAGE/backend/tests" "$STAGE/backend/tools" "$STAGE/wheels" "$STAGE/bin"
 cp "$ROOT/backend/tests/conftest.py" "$STAGE/backend/tests/"
 cp "$ROOT/backend/tests/test_vnext_runtime_canary_closure.py" "$STAGE/backend/tests/"
+cp "$ROOT/backend/tests/test_vnext_euleros_targeted_launcher.py" "$STAGE/backend/tests/"
 cp "$ROOT/backend/tools/perf_guard.py" "$STAGE/backend/tools/"
 cp "$ROOT/backend/tools/vnext_loopback_acceptance.py" "$STAGE/backend/tools/"
 cp "$ROOT/backend/tools/vnext_runtime_c0_repro.py" "$STAGE/backend/tools/"
 cp "$ROOT/backend/tools/vnext_runtime_canary_acceptance.py" "$STAGE/backend/tools/"
 cp "$ROOT/backend/tools/vnext_native_sigsegv_diagnostics.py" "$STAGE/backend/tools/"
-cp "$ROOT/deploy/vnext-runtime-canary-test-runner.sh" "$STAGE/bin/run-vnext-runtime-canary.sh"
+cp "$ROOT/backend/tools/vnext_static_audit_ab.py" "$STAGE/backend/tools/"
+cp "$ROOT/backend/tests/test_vnext_static_audit.py" "$STAGE/backend/tests/"
+tr -d '\r' < "$ROOT/deploy/vnext-runtime-canary-test-runner.sh" > "$STAGE/bin/run-vnext-runtime-canary.sh"
 chmod 0755 "$STAGE/bin/run-vnext-runtime-canary.sh"
 cp "$WHEEL_DIR"/*.whl "$STAGE/wheels/"
 cat > "$STAGE/requirements-test.txt" <<'REQ'
@@ -86,6 +89,10 @@ Run directory under `/home/paas/marketing-copilot-test/runs/`.
 The native-lifecycle diagnostic is available as
 `backend/tools/vnext_native_sigsegv_diagnostics.py`; it is a bounded local
 diagnostic only and does not prove a native stack without a core/native frame.
+
+The static-audit helper and focused regression test are included as test-only
+overlays for exact-candidate local verification. They are not copied into the
+formal application deployment package.
 README
 GIT_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
 WORKTREE_STATUS=$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null || true)
