@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import struct
 import time
 from dataclasses import dataclass
@@ -113,6 +114,7 @@ class _Pending:
     sequence: int
     sent_at: float
     route_id: str
+    context: dict | None = None
 
 
 class AsyncSmppTransport:
@@ -172,6 +174,23 @@ class AsyncSmppTransport:
         self.unknown_parts = 0
         self.write_failures = 0
         self.last_error = ""
+
+    def set_response_sink(self, callback: Callable[[dict], Awaitable[None] | None] | None) -> None:
+        """Attach the current worker's durable response sink."""
+
+        self.response_callback = callback
+
+    async def _admission_allowed(self, callback) -> bool:
+        if callback is None:
+            return True
+        try:
+            value = callback()
+            if inspect.isawaitable(value):
+                value = await value
+            return bool(value)
+        except Exception as exc:
+            self.last_error = f"socket admission check failed: {type(exc).__name__}: {exc}"
+            return False
 
     @property
     def connected(self) -> bool:
@@ -278,6 +297,7 @@ class AsyncSmppTransport:
                         "success": status == ESME_ROK,
                         "latency_seconds": max(0.0, time.monotonic() - pending.sent_at),
                         "body_length": len(body),
+                        "context": dict(pending.context or {}),
                     }
                     if self.response_callback:
                         result = self.response_callback(event)
@@ -316,7 +336,9 @@ class AsyncSmppTransport:
                     lease.release()
 
     async def send_task(self, *, destination_addr: str, message: str, flash_sms: bool = False,
-                        reference: int = 1, source_addr: str | None = None) -> SocketWriteResult:
+                        reference: int = 1, source_addr: str | None = None,
+                        before_write: Callable[[], bool | Awaitable[bool]] | None = None,
+                        progress_context: dict | None = None) -> SocketWriteResult:
         parts, _coding = _split_text(message)
         if not parts:
             return SocketWriteResult("write_failed", 0, 0, "empty message")
@@ -336,12 +358,27 @@ class AsyncSmppTransport:
             await self.credits.acquire(
                 self.route_id, self.tps, tps_scope=self.tps_scope, bind_slot=self.bind_slot,
             )
+            if not await self._admission_allowed(before_write):
+                if before_write is not None:
+                    state = "unknown" if written else "expired"
+                    return SocketWriteResult(
+                        state, written, len(parts),
+                        self.last_error or "business day cutoff reached before socket write",
+                    )
             try:
                 await asyncio.wait_for(self._window.acquire(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 self.write_failures += 1
                 self.last_error = "SMPP response window did not release before timeout"
                 return SocketWriteResult("write_failed", written, len(parts), self.last_error)
+            if not await self._admission_allowed(before_write):
+                if before_write is not None:
+                    self._window.release()
+                    state = "unknown" if written else "expired"
+                    return SocketWriteResult(
+                        state, written, len(parts),
+                        self.last_error or "business day cutoff reached before socket write",
+                    )
             sequence = self._next_sequence()
             packet = build_submit_sm(
                 sequence, source_addr=str(source_addr or self.source_addr),
@@ -352,10 +389,22 @@ class AsyncSmppTransport:
                 data_coding=(self.data_coding or None),
                 registered_delivery=0 if self.delivery_receipt_mode == "disabled" else 1,
             )
-            self._pending[sequence] = _Pending(sequence, time.monotonic(), self.route_id)
+            self._pending[sequence] = _Pending(
+                sequence, time.monotonic(), self.route_id,
+                dict(progress_context or {}),
+            )
             try:
                 assert self.writer is not None
                 async with self._write_lock:
+                    if not await self._admission_allowed(before_write):
+                        if before_write is not None:
+                            self._pending.pop(sequence, None)
+                            self._window.release()
+                            state = "unknown" if written else "expired"
+                            return SocketWriteResult(
+                                state, written, len(parts),
+                                "business day cutoff reached immediately before socket write",
+                            )
                     self.writer.write(packet)
                     await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
                 self.socket_written_parts += 1

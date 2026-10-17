@@ -6,7 +6,7 @@ import time
 
 from database import is_transient_write_error, read_transaction
 from services import (batch_campaign_service, realtime_campaign_service, sms_task_service,
-                      p1_service, ingestion_job_service)
+                      p1_service, ingestion_job_service, vnext_service)
 
 logger = logging.getLogger(__name__)
 _stop = threading.Event()
@@ -156,7 +156,11 @@ def _process_batches():
     # These operations are daily/window-boundary maintenance. Running them on
     # every three-second scheduler tick created unnecessary write contention.
     now = time.monotonic()
-    if now - _last_batch_reset >= _BATCH_RESET_INTERVAL:
+    if _vnext_active():
+        # VNext owns its durable business-day epoch.  Legacy reset/cancel SQL
+        # must not be allowed to stand in for the spool cutoff protocol.
+        _run_stage("vnext_daily_rollover", vnext_service.rollover_if_needed)
+    elif now - _last_batch_reset >= _BATCH_RESET_INTERVAL:
         _last_batch_reset = now
         _run_stage("batch_daily_reset", batch_campaign_service.reset_daily_batches)
     if now - _last_batch_cancel >= _BATCH_CANCEL_INTERVAL:

@@ -16,6 +16,7 @@ from .partition import (
 from .spool import (
     SpoolCapacityError,
     SpoolCorruptionError,
+    SpoolExpiredError,
     SpoolRecord,
     TaskSpool,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "PartitionMapError",
     "SpoolCapacityError",
     "SpoolCorruptionError",
+    "SpoolExpiredError",
     "SpoolRecord",
     "TaskSpool",
     "normalize_msisdn",

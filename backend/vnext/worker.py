@@ -30,6 +30,8 @@ class WorkerProgress:
     error: str = ""
     created_at: float = 0.0
     message: str = ""
+    business_day: str = ""
+    expires_at: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -46,6 +48,8 @@ class WorkerProgress:
             "error": self.error,
             "created_at": self.created_at or time.time(),
             "message": self.message,
+            "business_day": self.business_day,
+            "expires_at": float(self.expires_at or 0.0),
         }
 
 
@@ -57,6 +61,7 @@ class ShardWorker:
                  transport_factory: Callable | None = None,
                  progress_sink: Callable[[dict], Awaitable[None] | None] | None = None,
                  control_loader: Callable[[], list[dict] | None] | None = None,
+                 journal_admission: Callable[[SpoolRecord], bool] | None = None,
                  max_inflight: int = 64, prefetch_per_partition: int = 32,
                  metrics: VNextMetrics | None = None):
         self.worker_id = int(worker_id)
@@ -67,6 +72,7 @@ class ShardWorker:
         self.transport_factory = transport_factory or (lambda config, broker: AsyncSmppTransport(config, credits=broker))
         self.progress_sink = progress_sink
         self.control_loader = control_loader
+        self.journal_admission = journal_admission
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
         self.metrics = metrics or VNextMetrics()
@@ -135,13 +141,16 @@ class ShardWorker:
                 value = self.transport_factory(transport_config, self.credits)
                 if inspect.isawaitable(value):
                     value = await value
+                set_response_sink = getattr(value, "set_response_sink", None)
+                if set_response_sink:
+                    set_response_sink(self._response_event)
                 transports.append(value)
             cursor = self._transport_cursor.get(key, 0)
             value = transports[cursor % len(transports)]
             self._transport_cursor[key] = cursor + 1
             return value
 
-    async def _emit(self, progress: WorkerProgress) -> None:
+    async def _emit(self, progress: WorkerProgress, **overrides) -> None:
         event = progress.as_dict()
         event.update({
             "taken": int(not progress.error.startswith("dispatch checkpoint failed")),
@@ -150,7 +159,10 @@ class ShardWorker:
             "unknown": int(progress.state == "unknown"),
             "response_success": 0,
             "response_error": 0,
+            "expired": int(progress.state == "expired"),
+            "accepted": int(not progress.state.startswith("submit_sm_resp_")),
         })
+        event.update(overrides)
         self._progress_events.append(event)
         self.metrics.record(event)
         if not self.progress_sink:
@@ -158,6 +170,60 @@ class ShardWorker:
         result = self.progress_sink(event)
         if inspect.isawaitable(result):
             await result
+
+    async def _response_event(self, response: dict) -> None:
+        context = dict(response.get("context") or {})
+        event_id = str(context.get("event_id") or "")
+        if not event_id:
+            return
+        success = bool(response.get("success"))
+        state = "submit_sm_resp_success" if success else "submit_sm_resp_error"
+        progress = WorkerProgress(
+            event_id=f"{event_id}:resp:{int(response.get('sequence') or 0)}",
+            partition_id=int(context.get("partition_id") or 0),
+            ordinal=int(context.get("ordinal") or 0),
+            campaign_type=str(context.get("campaign_type") or ""),
+            campaign_id=int(context.get("campaign_id") or 0),
+            route_id=int(context.get("route_id") or 0),
+            normalized_msisdn=str(context.get("normalized_msisdn") or ""),
+            state=state,
+            parts_written=0,
+            parts_total=int(context.get("parts_total") or 1),
+            created_at=float(context.get("created_at") or time.time()),
+            business_day=str(context.get("business_day") or ""),
+            expires_at=float(context.get("expires_at") or 0.0),
+        )
+        await self._emit(
+            progress,
+            taken=0,
+            socket_written=0,
+            write_failed=0,
+            unknown=0,
+            expired=0,
+            response_success=int(success),
+            response_error=int(not success),
+        )
+
+    async def _expire(self, record: SpoolRecord, reason: str) -> None:
+        try:
+            self.spool.expire_record(record)
+        except Exception as exc:
+            await self._emit(WorkerProgress(
+                record.event_id, record.partition_id, record.ordinal,
+                record.campaign_type, record.campaign_id, record.route_id,
+                record.normalized_msisdn, "write_failed", 0, record.part_count_hint,
+                f"expiry checkpoint failed: {type(exc).__name__}: {exc}",
+                created_at=record.created_at, message=record.message,
+                business_day=record.business_day, expires_at=record.expires_at,
+            ))
+            return
+        await self._emit(WorkerProgress(
+            record.event_id, record.partition_id, record.ordinal,
+            record.campaign_type, record.campaign_id, record.route_id,
+            record.normalized_msisdn, "expired", 0, record.part_count_hint,
+            reason, created_at=record.created_at, message=record.message,
+            business_day=record.business_day, expires_at=record.expires_at,
+        ))
 
     async def _process(self, record: SpoolRecord) -> SpoolRecord | None:
         self.refresh_campaign_states(force=True)
@@ -167,6 +233,13 @@ class ShardWorker:
             # bounded prefetch buffer.  The next polling cycle will discover
             # it again from the durable spool.
             return None
+        if not self.spool.is_record_current(record):
+            await self._expire(record, "business day cutoff reached before dispatch")
+            return None
+        if self.journal_admission and not self.journal_admission(record):
+            # A result journal at its hard limit is a safe admission stop, not
+            # a reason to write a PDU whose outcome could not be recorded.
+            return record
         # Binding is a connection-lifecycle operation, not a dispatch fence.
         # Acquire a physical route slot before advancing the durable cursor so
         # a worker that is waiting behind pool_size can never lose a record.
@@ -184,6 +257,9 @@ class ShardWorker:
                 # blocks this partition for this pass and retries it from the
                 # durable cursor on the next pass.
                 return record
+        if not self.spool.is_record_current(record):
+            await self._expire(record, "business day cutoff reached after bind")
+            return None
         # Persist dispatch_taken before any socket call.  A crash after this
         # point is intentionally at-most-once-after-dispatch.
         try:
@@ -200,6 +276,9 @@ class ShardWorker:
         self.refresh_campaign_states(force=True)
         if key in self._paused_campaigns and key not in self._cancelled_campaigns:
             return
+        if not self.spool.is_record_current(record):
+            await self._expire(record, "business day cutoff reached before socket write")
+            return None
         if key in self._cancelled_campaigns:
             await self._emit(WorkerProgress(
                 record.event_id, record.partition_id, record.ordinal,
@@ -211,13 +290,40 @@ class ShardWorker:
         lock = self._number_locks.setdefault(record.normalized_msisdn, asyncio.Lock())
         async with lock:
             try:
-                result: SocketWriteResult = await transport.send_task(
-                    destination_addr=record.normalized_msisdn,
-                    message=record.message,
-                    flash_sms=record.flash_sms,
-                    reference=(record.ordinal % 255) or 1,
-                    source_addr=record.source_addr or None,
-                )
+                kwargs = {
+                    "destination_addr": record.normalized_msisdn,
+                    "message": record.message,
+                    "flash_sms": record.flash_sms,
+                    "reference": (record.ordinal % 255) or 1,
+                    "source_addr": record.source_addr or None,
+                    "before_write": lambda: self.spool.is_record_current(record),
+                    "progress_context": {
+                        "event_id": record.event_id,
+                        "partition_id": record.partition_id,
+                        "ordinal": record.ordinal,
+                        "campaign_type": record.campaign_type,
+                        "campaign_id": record.campaign_id,
+                        "route_id": record.route_id,
+                        "normalized_msisdn": record.normalized_msisdn,
+                        "parts_total": record.part_count_hint,
+                        "created_at": record.created_at,
+                        "business_day": record.business_day,
+                        "expires_at": record.expires_at,
+                    },
+                }
+                send_task = transport.send_task
+                try:
+                    parameters = inspect.signature(send_task).parameters
+                    accepts_kwargs = any(
+                        item.kind is inspect.Parameter.VAR_KEYWORD
+                        for item in parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    accepts_kwargs = True
+                if not accepts_kwargs:
+                    kwargs.pop("before_write", None)
+                    kwargs.pop("progress_context", None)
+                result = await send_task(**kwargs)
             except Exception as exc:
                 result = SocketWriteResult(
                     "unknown", 0, max(1, record.part_count_hint),
@@ -227,7 +333,9 @@ class ShardWorker:
                 record.event_id, record.partition_id, record.ordinal,
                 record.campaign_type, record.campaign_id, record.route_id,
                 record.normalized_msisdn, result.state, result.parts_written,
-                result.parts_total, result.error, message=record.message,
+                result.parts_total, result.error, created_at=record.created_at,
+                message=record.message, business_day=record.business_day,
+                expires_at=record.expires_at,
             ))
         return None
 

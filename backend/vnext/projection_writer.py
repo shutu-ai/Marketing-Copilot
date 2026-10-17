@@ -26,15 +26,29 @@ class ProjectionBackpressure(RuntimeError):
 class ProgressJournal:
     """Compact append-only progress events, independent of DuckDB."""
 
-    def __init__(self, path: str | os.PathLike[str], *, max_event_bytes: int = 64 * 1024):
+    def __init__(self, path: str | os.PathLike[str], *, max_event_bytes: int = 64 * 1024,
+                 max_bytes: int = 512 * 1024 * 1024):
         self.path = Path(path).resolve()
         self.max_event_bytes = max(1024, int(max_event_bytes))
+        self.max_bytes = max(self.max_event_bytes, int(max_bytes))
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def size(self) -> int:
+        try:
+            return int(self.path.stat().st_size)
+        except FileNotFoundError:
+            return 0
+
+    def can_append(self, event: dict) -> bool:
+        encoded = (json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        return len(encoded) <= self.max_event_bytes and self.size() + len(encoded) <= self.max_bytes
 
     def append(self, event: dict) -> None:
         encoded = (json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         if len(encoded) > self.max_event_bytes:
             raise ValueError("progress event exceeds bounded size")
+        if self.size() + len(encoded) > self.max_bytes:
+            raise ProjectionBackpressure("progress journal capacity exhausted")
         with self.path.open("ab") as handle:
             handle.write(encoded)
             handle.flush()
@@ -49,6 +63,8 @@ class ProgressJournal:
             if len(line) > self.max_event_bytes:
                 raise ValueError("progress event exceeds bounded size")
             encoded.append(line)
+        if self.size() + sum(len(line) for line in encoded) > self.max_bytes:
+            raise ProjectionBackpressure("progress journal capacity exhausted")
         with self.path.open("ab") as handle:
             for line in encoded:
                 handle.write(line)
@@ -111,11 +127,28 @@ class ProjectionWriter:
         self._last_event_at = 0.0
         self._last_applied_at = 0.0
         self._last_flush_monotonic = time.monotonic()
+        self._sql_statements = 0
+        self._last_batch_new = 0
+        self._last_batch_duplicates = 0
+
+    def _table_columns(self, table: str) -> set[str]:
+        try:
+            rows = self._conn.execute(f"DESCRIBE {table}").fetchall()
+        except Exception:
+            return set()
+        return {str(row[0]) for row in rows}
 
     def start(self) -> None:
         import duckdb
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(self.db_path)
+        legacy_projection = False
+        projection_columns = self._table_columns("vnext_projection")
+        if projection_columns and "business_day" not in projection_columns:
+            # Preserve an old projection as an explicitly unattributed
+            # compatibility source, then create the day-isolated table.
+            self._conn.execute("ALTER TABLE vnext_projection RENAME TO vnext_projection_legacy")
+            legacy_projection = True
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS vnext_progress_events (
                 event_id VARCHAR PRIMARY KEY,
@@ -130,14 +163,23 @@ class ProjectionWriter:
                 parts_total INTEGER NOT NULL,
                 message VARCHAR NOT NULL DEFAULT '',
                 error VARCHAR NOT NULL DEFAULT '',
-                created_at DOUBLE NOT NULL
+                created_at DOUBLE NOT NULL,
+                business_day VARCHAR NOT NULL DEFAULT '',
+                expires_at DOUBLE NOT NULL DEFAULT 0
             )
         """)
         self._conn.execute(
             "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS message VARCHAR DEFAULT ''"
         )
+        self._conn.execute(
+            "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS business_day VARCHAR DEFAULT ''"
+        )
+        self._conn.execute(
+            "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS expires_at DOUBLE DEFAULT 0"
+        )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS vnext_projection (
+                business_day VARCHAR NOT NULL DEFAULT '',
                 campaign_type VARCHAR NOT NULL,
                 campaign_id BIGINT NOT NULL,
                 partition_id INTEGER NOT NULL,
@@ -148,16 +190,37 @@ class ProjectionWriter:
                 write_failed BIGINT NOT NULL DEFAULT 0,
                 unknown BIGINT NOT NULL DEFAULT 0,
                 cancelled BIGINT NOT NULL DEFAULT 0,
+                accepted BIGINT NOT NULL DEFAULT 0,
+                expired BIGINT NOT NULL DEFAULT 0,
                 response_success BIGINT NOT NULL DEFAULT 0,
                 response_error BIGINT NOT NULL DEFAULT 0,
                 last_ordinal BIGINT NOT NULL DEFAULT 0,
                 updated_at DOUBLE NOT NULL,
-                PRIMARY KEY(campaign_type,campaign_id,partition_id,route_id)
+                PRIMARY KEY(business_day,campaign_type,campaign_id,partition_id,route_id)
             )
         """)
         self._conn.execute(
             "ALTER TABLE vnext_projection ADD COLUMN IF NOT EXISTS cancelled BIGINT DEFAULT 0"
         )
+        self._conn.execute(
+            "ALTER TABLE vnext_projection ADD COLUMN IF NOT EXISTS accepted BIGINT DEFAULT 0"
+        )
+        self._conn.execute(
+            "ALTER TABLE vnext_projection ADD COLUMN IF NOT EXISTS expired BIGINT DEFAULT 0"
+        )
+        if legacy_projection:
+            legacy_columns = self._table_columns("vnext_projection_legacy")
+            if legacy_columns:
+                self._conn.execute(
+                    """INSERT INTO vnext_projection(
+                        business_day,campaign_type,campaign_id,partition_id,route_id,
+                        queued,taken,socket_written,write_failed,unknown,cancelled,
+                        accepted,expired,response_success,response_error,last_ordinal,updated_at
+                    ) SELECT '',campaign_type,campaign_id,partition_id,route_id,
+                        queued,taken,socket_written,write_failed,unknown,cancelled,
+                        0,0,response_success,response_error,last_ordinal,updated_at
+                    FROM vnext_projection_legacy"""
+                )
 
     def stop(self) -> None:
         if self._conn is not None:
@@ -173,68 +236,126 @@ class ProjectionWriter:
     def pause(self, seconds: float) -> None:
         self._paused_until = max(self._paused_until, time.monotonic() + max(0.0, float(seconds)))
 
-    def _apply(self, event: dict) -> bool:
+    @staticmethod
+    def _event_row(event: dict) -> tuple:
+        state = str(event.get("state", ""))
+        return (
+            str(event["event_id"]), int(event["partition_id"]), int(event["ordinal"]),
+            str(event["campaign_type"]), int(event["campaign_id"]), int(event["route_id"]),
+            str(event["normalized_msisdn"]), state,
+            int(event.get("parts_written", 0)), int(event.get("parts_total", 0)),
+            str(event.get("message", "")), str(event.get("error", "")),
+            float(event.get("created_at") or time.time()),
+            str(event.get("business_day") or ""), float(event.get("expires_at") or 0.0),
+            int(event.get("queued", 0)), int(event.get("taken", 0)),
+            int(event.get("accepted", 0)),
+            int(event.get("socket_written", state == "socket_written")),
+            int(event.get("write_failed", state == "write_failed")),
+            int(event.get("unknown", state == "unknown")),
+            int(event.get("cancelled", state == "cancelled")),
+            int(event.get("expired", state == "expired")),
+            int(event.get("response_success", state == "submit_sm_resp_success")),
+            int(event.get("response_error", state == "submit_sm_resp_error")),
+        )
+
+    def _apply_batch(self, batch: list[dict]) -> int:
+        """Apply one bounded batch with set-based event and aggregate DML."""
+
         if self._conn is None:
             raise RuntimeError("projection writer is not started")
-        event_id = str(event["event_id"])
-        inserted = self._conn.execute(
-            """INSERT INTO vnext_progress_events(
+        unique: dict[str, dict] = {}
+        for event in batch:
+            unique.setdefault(str(event["event_id"]), event)
+        duplicate_in_batch = len(batch) - len(unique)
+        self._sql_statements += 7 + int(bool(unique))
+        self._conn.execute("DROP TABLE IF EXISTS _vnext_projection_batch")
+        self._conn.execute("DROP TABLE IF EXISTS _vnext_projection_new")
+        self._conn.execute("""
+            CREATE TEMPORARY TABLE _vnext_projection_batch (
+                event_id VARCHAR, partition_id INTEGER, ordinal BIGINT,
+                campaign_type VARCHAR, campaign_id BIGINT, route_id BIGINT,
+                normalized_msisdn VARCHAR, state VARCHAR, parts_written INTEGER,
+                parts_total INTEGER, message VARCHAR, error VARCHAR, created_at DOUBLE,
+                business_day VARCHAR, expires_at DOUBLE, queued BIGINT, taken BIGINT,
+                accepted BIGINT, socket_written BIGINT, write_failed BIGINT,
+                unknown BIGINT, cancelled BIGINT, expired BIGINT,
+                response_success BIGINT, response_error BIGINT
+            )
+        """)
+        rows = [self._event_row(event) for event in unique.values()]
+        if rows:
+            self._conn.executemany(
+                "INSERT INTO _vnext_projection_batch VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+        self._conn.execute("""
+            CREATE TEMPORARY TABLE _vnext_projection_new AS
+            SELECT b.*
+            FROM _vnext_projection_batch b
+            LEFT JOIN vnext_progress_events p ON p.event_id=b.event_id
+            WHERE p.event_id IS NULL
+        """)
+        new_count = int(self._conn.execute(
+            "SELECT COUNT(*) FROM _vnext_projection_new"
+        ).fetchone()[0])
+        self._conn.execute("""
+            INSERT INTO vnext_progress_events(
                 event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
-                normalized_msisdn,state,parts_written,parts_total,message,error,created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(event_id) DO NOTHING RETURNING event_id""",
-            (
-                event_id, int(event["partition_id"]), int(event["ordinal"]),
-                str(event["campaign_type"]), int(event["campaign_id"]), int(event["route_id"]),
-                str(event["normalized_msisdn"]), str(event["state"]),
-                int(event.get("parts_written", 0)), int(event.get("parts_total", 0)),
-                str(event.get("message", "")),
-                str(event.get("error", "")), float(event.get("created_at") or time.time()),
-            ),
-        ).fetchone()
-        if not inserted:
-            self._duplicates += 1
-            return False
-        state = str(event.get("state", ""))
-        values = {
-            "queued": int(event.get("queued", 0)),
-            "taken": int(event.get("taken", 0)),
-            "socket_written": int(event.get("socket_written", state == "socket_written")),
-            "write_failed": int(event.get("write_failed", state == "write_failed")),
-            "unknown": int(event.get("unknown", state == "unknown")),
-            "cancelled": int(event.get("cancelled", state == "cancelled")),
-            "response_success": int(event.get("response_success", 0)),
-            "response_error": int(event.get("response_error", 0)),
-        }
-        self._conn.execute(
-            """INSERT INTO vnext_projection(
-                campaign_type,campaign_id,partition_id,route_id,queued,taken,
-                socket_written,write_failed,unknown,cancelled,response_success,response_error,
-                last_ordinal,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(campaign_type,campaign_id,partition_id,route_id) DO UPDATE SET
+                normalized_msisdn,state,parts_written,parts_total,message,error,created_at,
+                business_day,expires_at
+            ) SELECT event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
+                normalized_msisdn,state,parts_written,parts_total,message,error,created_at,
+                business_day,expires_at
+            FROM _vnext_projection_new
+        """)
+        self._conn.execute("""
+            INSERT INTO vnext_projection(
+                business_day,campaign_type,campaign_id,partition_id,route_id,
+                queued,taken,socket_written,write_failed,unknown,cancelled,
+                accepted,expired,response_success,response_error,last_ordinal,updated_at
+            ) SELECT business_day,campaign_type,campaign_id,partition_id,route_id,
+                SUM(queued),SUM(taken),SUM(socket_written),SUM(write_failed),SUM(unknown),
+                SUM(cancelled),SUM(accepted),SUM(expired),SUM(response_success),SUM(response_error),
+                MAX(ordinal),MAX(created_at)
+            FROM _vnext_projection_new
+            GROUP BY business_day,campaign_type,campaign_id,partition_id,route_id
+            ON CONFLICT(business_day,campaign_type,campaign_id,partition_id,route_id)
+            DO UPDATE SET
                 queued=vnext_projection.queued+excluded.queued,
                 taken=vnext_projection.taken+excluded.taken,
                 socket_written=vnext_projection.socket_written+excluded.socket_written,
                 write_failed=vnext_projection.write_failed+excluded.write_failed,
                 unknown=vnext_projection.unknown+excluded.unknown,
                 cancelled=vnext_projection.cancelled+excluded.cancelled,
+                accepted=vnext_projection.accepted+excluded.accepted,
+                expired=vnext_projection.expired+excluded.expired,
                 response_success=vnext_projection.response_success+excluded.response_success,
                 response_error=vnext_projection.response_error+excluded.response_error,
                 last_ordinal=GREATEST(vnext_projection.last_ordinal,excluded.last_ordinal),
-                updated_at=excluded.updated_at""",
-            (
-                str(event["campaign_type"]), int(event["campaign_id"]), int(event["partition_id"]),
-                int(event["route_id"]), values["queued"], values["taken"],
-                values["socket_written"], values["write_failed"], values["unknown"],
-                values["cancelled"],
-                values["response_success"], values["response_error"], int(event["ordinal"]),
-                float(event.get("created_at") or time.time()),
-            ),
-        )
-        self._applied += 1
-        self._last_applied_at = time.time()
-        return True
+                updated_at=excluded.updated_at
+        """)
+        self._duplicates += duplicate_in_batch + (len(unique) - new_count)
+        self._applied += new_count
+        self._last_batch_new = new_count
+        self._last_batch_duplicates = duplicate_in_batch + (len(unique) - new_count)
+        if batch:
+            self._last_applied_at = time.time()
+        return new_count
+
+    def _apply(self, event: dict) -> bool:
+        """Compatibility wrapper for callers that apply one event directly."""
+
+        if self._conn is None:
+            raise RuntimeError("projection writer is not started")
+        self._conn.execute("BEGIN TRANSACTION")
+        try:
+            inserted = self._apply_batch([event])
+            self._conn.execute("COMMIT")
+            return bool(inserted)
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("ROLLBACK")
+            raise
 
     def flush(self, *, max_events: int | None = None) -> int:
         if time.monotonic() < self._paused_until:
@@ -249,8 +370,7 @@ class ProjectionWriter:
             return 0
         try:
             self._conn.execute("BEGIN TRANSACTION")
-            for event in batch:
-                self._apply(event)
+            self._apply_batch(batch)
             self._conn.execute("COMMIT")
         except Exception:
             with contextlib.suppress(Exception):
@@ -270,6 +390,23 @@ class ProjectionWriter:
             total += self.flush()
         return total
 
+    def daily_summary(self, business_day: str | None = None) -> list[dict]:
+        """Read only the requested business-day aggregate from the writer DB."""
+
+        if self._conn is None:
+            self.start()
+        if business_day is None:
+            query = "SELECT * FROM vnext_projection ORDER BY campaign_type,campaign_id,partition_id,route_id"
+            rows = self._conn.execute(query).fetchall()
+        else:
+            query = (
+                "SELECT * FROM vnext_projection WHERE business_day=? "
+                "ORDER BY campaign_type,campaign_id,partition_id,route_id"
+            )
+            rows = self._conn.execute(query, (str(business_day),)).fetchall()
+        columns = [str(item[0]) for item in self._conn.description]
+        return [dict(zip(columns, row)) for row in rows]
+
     def snapshot(self) -> dict:
         return {
             "db_path": self.db_path,
@@ -277,6 +414,10 @@ class ProjectionWriter:
             "queue_capacity": self.queue_size,
             "applied": self._applied,
             "duplicates": self._duplicates,
+            "last_batch_new": self._last_batch_new,
+            "last_batch_duplicates": self._last_batch_duplicates,
+            "sql_statements": self._sql_statements,
+            "projection_storage": "one_writer_one_duckdb",
             "flush_interval_seconds": self.flush_interval_seconds,
             "flush_due": bool(self._queue and time.monotonic() - self._last_flush_monotonic >= self.flush_interval_seconds),
             "projection_lag_seconds": max(0.0, self._last_event_at - self._last_applied_at) if self._last_applied_at else 0.0,
@@ -356,6 +497,7 @@ def _process_main(
     pending_events: list[dict] = []
     pending_offsets: dict[str, int] = {}
     graceful_stop = False
+    journal_cursor = 0
 
     def status() -> dict:
         value = writer.snapshot()
@@ -415,15 +557,31 @@ def _process_main(
                 budget = writer.batch_size
                 batch: list[dict] = []
                 candidates: dict[str, int] = {}
-                for journal in journals:
-                    if budget <= 0:
-                        break
-                    key = str(journal.path)
-                    events, new_offset = journal.read_from(offsets.get(key, 0), max_events=budget)
-                    if events:
-                        batch.extend(events)
-                        candidates[key] = new_offset
-                        budget -= len(events)
+                if journals:
+                    # A bounded quantum per journal prevents a hot worker or
+                    # large campaign from consuming the whole batch budget.
+                    # The cursor rotates even when the current journal is
+                    # empty, so a newly active small campaign gets a prompt
+                    # turn without another persistent queue.
+                    count = len(journals)
+                    quantum = (
+                        writer.batch_size if count == 1 else
+                        max(1, min(64, (writer.batch_size + count - 1) // count))
+                    )
+                    for offset in range(count):
+                        if budget <= 0:
+                            break
+                        index = (journal_cursor + offset) % count
+                        journal = journals[index]
+                        key = str(journal.path)
+                        events, new_offset = journal.read_from(
+                            offsets.get(key, 0), max_events=min(quantum, budget)
+                        )
+                        if events:
+                            batch.extend(events)
+                            candidates[key] = new_offset
+                            budget -= len(events)
+                    journal_cursor = (journal_cursor + 1) % count
                 if batch:
                     for event in batch:
                         writer.submit(event)

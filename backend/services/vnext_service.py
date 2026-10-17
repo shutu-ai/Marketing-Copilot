@@ -168,6 +168,12 @@ def stop() -> None:
         value.stop()
 
 
+def rollover_if_needed() -> dict:
+    """Advance the VNext business-day epoch without touching legacy tables."""
+
+    return runtime().rollover_if_needed()
+
+
 def _template_map(campaign_type: str, campaign: dict) -> dict:
     from services import sms_task_service
 
@@ -359,10 +365,11 @@ def _select_template_content(template_map: dict, payload: dict, sms_task_service
     return content, str(template.get("source_addr") or "")
 
 
-def _progress_events() -> list[dict]:
+def _progress_events(business_day: str | None = None) -> list[dict]:
     """Read worker journals, never the DuckDB owned by ProjectionWriter."""
 
     value = runtime()
+    selected_day = str(business_day or value.spool.current_business_day)
     events: dict[str, dict] = {}
     for path in sorted(value.progress_root.glob("worker-*.jsonl")):
         try:
@@ -371,6 +378,8 @@ def _progress_events() -> list[dict]:
                     if not line.strip():
                         continue
                     event = json.loads(line)
+                    if str(event.get("business_day") or "") != selected_day:
+                        continue
                     event_id = str(event.get("event_id") or "")
                     if event_id:
                         events.setdefault(event_id, event)
@@ -380,12 +389,13 @@ def _progress_events() -> list[dict]:
 
 
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
-               smpp_config_id: int = -1, cursor: Optional[int] = None) -> dict:
+               smpp_config_id: int = -1, cursor: Optional[int] = None,
+               business_day: str | None = None) -> dict:
     del cursor
     page = max(1, int(page))
     page_size = max(1, min(200, int(page_size)))
     offset = (page - 1) * page_size
-    events = [item for item in _progress_events()
+    events = [item for item in _progress_events(business_day)
               if (not status or str(item.get("state")) == str(status))
               and (not campaign_type or str(item.get("campaign_type")) == str(campaign_type))
               and (int(smpp_config_id) < 0 or int(item.get("route_id") or 0) == int(smpp_config_id))]
@@ -407,8 +417,8 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
             "items": items, "next_cursor": page + 1 if has_more else None, "has_more": has_more}
 
 
-def task_stats() -> dict:
-    events = _progress_events()
+def task_stats(business_day: str | None = None) -> dict:
+    events = _progress_events(business_day)
     result: dict[str, int | float | str] = {}
     for event in events:
         state = str(event.get("state") or "unknown")

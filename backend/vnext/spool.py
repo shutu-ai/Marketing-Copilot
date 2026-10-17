@@ -13,6 +13,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .business_day import BusinessClock, ensure_clock, normalize_business_day
+
 
 SPOOL_SCHEMA_VERSION = 1
 
@@ -23,6 +25,10 @@ class SpoolError(RuntimeError):
 
 class SpoolCapacityError(SpoolError):
     """The configured hard spool budget would be exceeded."""
+
+
+class SpoolExpiredError(SpoolError):
+    """A record belongs to a closed business day or passed its cutoff."""
 
 
 class SpoolCorruptionError(SpoolError):
@@ -48,6 +54,10 @@ class SpoolRecord:
     crc: str = ""
     flash_sms: bool = False
     source_addr: str = ""
+    # These fields are optional on read so a V1 spool can be inspected safely.
+    # New admissions are normalized by TaskSpool before they are persisted.
+    business_day: str = ""
+    expires_at: float = 0.0
 
     def unsigned_dict(self) -> dict:
         value = {
@@ -73,7 +83,19 @@ class SpoolRecord:
             value["flash_sms"] = True
         if self.source_addr:
             value["source_addr"] = str(self.source_addr)
+        if self.business_day:
+            value["business_day"] = normalize_business_day(self.business_day)
+        if self.expires_at:
+            value["expires_at"] = float(self.expires_at)
         return value
+
+    def is_expired(self, now: float | None = None) -> bool:
+        # A record without both durable routing fields cannot be safely
+        # assigned to a live business epoch.  Legacy V1 data is inspectable
+        # for recovery, but it must never cross the socket fence.
+        if not self.business_day or self.expires_at <= 0:
+            return True
+        return float(now if now is not None else time.time()) >= float(self.expires_at)
 
     def with_crc(self) -> "SpoolRecord":
         value = json.dumps(self.unsigned_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -112,11 +134,18 @@ class SpoolRecord:
             crc=str(value["crc"]),
             flash_sms=bool(value.get("flash_sms", False)),
             source_addr=str(value.get("source_addr", "")),
+            business_day=str(value.get("business_day", "") or ""),
+            expires_at=float(value.get("expires_at", 0.0) or 0.0),
         )
         if item.schema_version != SPOOL_SCHEMA_VERSION:
             raise SpoolCorruptionError(f"unsupported spool schema: {item.schema_version}")
         if not item.event_id or not item.normalized_msisdn:
             raise SpoolCorruptionError("spool event_id and normalized_msisdn are required")
+        if item.business_day:
+            try:
+                normalize_business_day(item.business_day)
+            except ValueError as exc:
+                raise SpoolCorruptionError(str(exc)) from exc
         if verify_crc and item.with_crc().crc != item.crc:
             raise SpoolCorruptionError(f"spool CRC mismatch for event {item.event_id}")
         return item
@@ -155,7 +184,9 @@ class TaskSpool:
 
     def __init__(self, root: str | os.PathLike[str], *, virtual_partition_count: int = 256,
                  segment_max_records: int = 1000, segment_max_bytes: int = 4 * 1024 * 1024,
-                 max_bytes: int = 512 * 1024 * 1024, fsync: bool = True):
+                 max_bytes: int = 512 * 1024 * 1024, fsync: bool = True,
+                 clock: BusinessClock | object | None = None,
+                 business_timezone: str | object | None = None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.virtual_partition_count = int(virtual_partition_count)
@@ -163,6 +194,7 @@ class TaskSpool:
         self.segment_max_bytes = max(1024, int(segment_max_bytes))
         self.max_bytes = max(1, int(max_bytes))
         self.fsync = bool(fsync)
+        self.clock = ensure_clock(clock, business_timezone)
         self._lock = threading.RLock()
         self._manifest_path = self.root / "manifest.json"
         self._cursor_path = self.root / "cursors.json"
@@ -183,6 +215,15 @@ class TaskSpool:
         self._lightweight_taken_pending = {
             key: set(value) for key, value in self._taken_pending.items()
         }
+        self._current_business_day = str(
+            self._manifest.get("current_business_day") or self.clock.business_day()
+        )
+        self._manifest["current_business_day"] = self._current_business_day
+        self._manifest.setdefault("business_timezone", self.clock.timezone_name)
+        self._manifest.setdefault("business_epoch", 1)
+        self._manifest.setdefault("closed_days", {})
+        self._manifest.setdefault("daily_records", {})
+        self._manifest.setdefault("daily_bytes", {})
         self._recover_index()
 
     @staticmethod
@@ -196,6 +237,150 @@ class TaskSpool:
     def _add_recovery_issue(self, value: str) -> None:
         if value not in self._recovery_issues:
             self._recovery_issues.append(value)
+
+    @property
+    def current_business_day(self) -> str:
+        return str(self._current_business_day)
+
+    @property
+    def business_epoch(self) -> int:
+        return int(self._manifest.get("business_epoch", 1) or 1)
+
+    def _now(self) -> float:
+        return float(self.clock.timestamp())
+
+    def _today_business_day(self) -> str:
+        return self.clock.business_day()
+
+    def _rebuild_daily_metadata(self) -> None:
+        records: dict[str, int] = {}
+        bytes_by_day: dict[str, int] = {}
+        for record in self._event_index.values():
+            day = str(record.business_day or "")
+            records[day] = records.get(day, 0) + 1
+            # The exact segment byte count is retained separately in the
+            # manifest.  This estimate is only a bounded status hint.
+            bytes_by_day[day] = bytes_by_day.get(day, 0) + len(
+                json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")
+            ) + 1
+        self._manifest["daily_records"] = records
+        self._manifest["daily_bytes"] = bytes_by_day
+
+    def _refresh_current_day_locked(self) -> None:
+        value = str(self._manifest.get("current_business_day") or "")
+        if value:
+            self._current_business_day = value
+
+    def _rollover_locked(self, target_day: str) -> dict:
+        target_day = normalize_business_day(target_day)
+        old_day = self.current_business_day
+        if target_day == old_day:
+            return {
+                "changed": False,
+                "business_day": target_day,
+                "previous_business_day": old_day,
+                "business_epoch": self.business_epoch,
+            }
+        summary = self._day_summary_locked(old_day)
+        closed = self._manifest.setdefault("closed_days", {})
+        summary.update({"closed_at": self._now(), "state": "closed"})
+        closed[old_day] = summary
+        self._current_business_day = target_day
+        self._manifest["current_business_day"] = target_day
+        self._manifest["business_epoch"] = self.business_epoch + 1
+        self._persist_manifest()
+        self._manifest_signature = self._file_signature(self._manifest_path)
+        return {
+            "changed": True,
+            "business_day": target_day,
+            "previous_business_day": old_day,
+            "business_epoch": self.business_epoch,
+            "closed": summary,
+        }
+
+    def _day_summary_locked(self, day: str) -> dict:
+        total = 0
+        pending = 0
+        for record in self._event_index.values():
+            if record.business_day != day:
+                continue
+            total += 1
+            taken = int(record.ordinal) <= self.cursor(record.partition_id)
+            taken = taken or int(record.ordinal) in self._taken_pending.get(
+                str(record.partition_id), set()
+            )
+            if not taken:
+                pending += 1
+        return {
+            "business_day": day,
+            "total_records": total,
+            "pending_records": pending,
+            "reclaimed_records": 0,
+        }
+
+    def rollover_if_needed(self, now=None) -> dict:
+        """Advance the durable epoch when the injected wall clock changes day."""
+
+        with self._lock:
+            self.refresh()
+            if now is None:
+                value = self._today_business_day()
+            elif isinstance(now, str):
+                value = normalize_business_day(now)
+            else:
+                value = ensure_clock(now, self.clock.timezone_name).business_day()
+            return self._rollover_locked(value)
+
+    def rotate_business_day(self, business_day: str | None = None) -> dict:
+        """Durably close the old day and fence all old socket admissions."""
+
+        with self._lock:
+            self.refresh()
+            target = business_day or self._today_business_day()
+            return self._rollover_locked(normalize_business_day(target))
+
+    def _normalize_for_append(self, record: SpoolRecord) -> SpoolRecord:
+        if record.event_id in self._event_index:
+            return record
+        current = self.current_business_day
+        business_day = str(record.business_day or current)
+        try:
+            business_day = normalize_business_day(business_day)
+        except ValueError as exc:
+            raise SpoolExpiredError(str(exc)) from exc
+        if business_day != current:
+            raise SpoolExpiredError(
+                f"record business_day={business_day} is not current day={current}"
+            )
+        expires_at = float(record.expires_at or self.clock.cutoff(business_day))
+        if expires_at <= self._now():
+            raise SpoolExpiredError(f"business day {business_day} has expired")
+        return replace(record, business_day=business_day, expires_at=expires_at)
+
+    def is_record_current(self, record: SpoolRecord, now: float | None = None) -> bool:
+        """Return whether a record may cross the next socket-write fence."""
+
+        with self._lock:
+            today = self._today_business_day()
+            if today != self.current_business_day:
+                # Refresh only when a day transition is observed.  The worker
+                # calls this fence for every record; rebuilding all cursor and
+                # taken state on every call made concurrent Windows workers
+                # spend most of their time scanning 256 partition files.
+                self.refresh()
+                if today != self.current_business_day:
+                    self._rollover_locked(today)
+            return (
+                bool(record.business_day)
+                and record.business_day == self.current_business_day
+                and not record.is_expired(self._now() if now is None else now)
+            )
+
+    def expire_record(self, record: SpoolRecord) -> None:
+        """Advance the durable cursor for a record that can no longer send."""
+
+        self.checkpoint(record.partition_id, record.ordinal)
 
     def _load_manifest(self) -> dict:
         if self._manifest_path.exists():
@@ -214,39 +399,50 @@ class TaskSpool:
             "total_records": 0,
             "total_bytes": 0,
             "updated_at": time.time(),
+            "current_business_day": self.clock.business_day(),
+            "business_timezone": self.clock.timezone_name,
+            "business_epoch": 1,
+            "closed_days": {},
+            "daily_records": {},
+            "daily_bytes": {},
         }
 
     def _load_cursors(self) -> dict:
         combined = {}
-        if self._cursor_path.exists():
+        try:
             with self._cursor_path.open("r", encoding="utf-8") as handle:
                 combined = json.load(handle)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            combined = {}
         values = {}
         for index in range(self.virtual_partition_count):
             path = self._cursor_dir / f"partition-{index:04d}.json"
-            if path.exists():
-                try:
-                    values[str(index)] = int(json.loads(path.read_text(encoding="utf-8")).get("cursor", 0))
-                    continue
-                except (OSError, ValueError, TypeError):
-                    pass
+            try:
+                values[str(index)] = int(json.loads(path.read_text(encoding="utf-8")).get("cursor", 0))
+                continue
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                pass
             values[str(index)] = int(combined.get(str(index), 0))
         return values
 
     def _load_taken(self) -> dict[str, set[int]]:
         combined = {}
-        if self._taken_path.exists():
+        try:
             with self._taken_path.open("r", encoding="utf-8") as handle:
                 combined = json.load(handle)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            combined = {}
         values = {}
         for index in range(self.virtual_partition_count):
             path = self._taken_dir / f"partition-{index:04d}.json"
-            if path.exists():
-                try:
-                    values[str(index)] = {int(item) for item in json.loads(path.read_text(encoding="utf-8")).get("taken", [])}
-                    continue
-                except (OSError, ValueError, TypeError):
-                    pass
+            try:
+                values[str(index)] = {
+                    int(item)
+                    for item in json.loads(path.read_text(encoding="utf-8")).get("taken", [])
+                }
+                continue
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                pass
             values[str(index)] = {int(item) for item in combined.get(str(index), [])}
         return values
 
@@ -258,6 +454,7 @@ class TaskSpool:
 
     def _recover_index(self) -> None:
         with self._lock:
+            self._event_index.clear()
             self._segment_offsets = {}
             for partition_id in range(self.virtual_partition_count):
                 entries = self._manifest["segments"].get(str(partition_id), [])
@@ -269,6 +466,7 @@ class TaskSpool:
                     self._scan_segment(path, start=0)
             self._manifest["total_records"] = len(self._event_index)
             self._manifest["total_bytes"] = self._disk_bytes()
+            self._rebuild_daily_metadata()
             self._manifest_signature = self._file_signature(self._manifest_path)
 
     def _scan_segment(self, path: Path, *, start: int = 0) -> None:
@@ -320,6 +518,7 @@ class TaskSpool:
                     loaded = None
                 if loaded is not None:
                     self._manifest = loaded
+                    self._refresh_current_day_locked()
                     for value in range(self.virtual_partition_count):
                         entries = self._manifest["segments"].get(str(value), [])
                         for entry in entries:
@@ -416,26 +615,38 @@ class TaskSpool:
             manifest_signature = self._file_signature(self._manifest_path)
             self._lightweight_manifest_signature = manifest_signature
             self._refresh_lightweight_cursor_state()
+            current_day = str(manifest.get("current_business_day") or self.current_business_day)
             pending_by_partition = {}
             for partition in range(self.virtual_partition_count):
                 key = str(partition)
-                records = sum(
-                    int(entry.get("records", 0))
-                    for entry in manifest.get("segments", {}).get(key, [])
-                )
-                pending_by_partition[key] = max(
-                    0,
-                    records
-                    - int(self._lightweight_cursors.get(key, 0))
-                    - len(self._lightweight_taken_pending.get(key, set())),
-                )
+                cursor = int(self._lightweight_cursors.get(key, 0))
+                taken = self._lightweight_taken_pending.get(key, set())
+                pending = 0
+                for entry in manifest.get("segments", {}).get(key, []):
+                    if str(entry.get("business_day") or "") != current_day:
+                        continue
+                    records = int(entry.get("records", 0) or 0)
+                    first = int(entry.get("first_ordinal", 0) or 0)
+                    last = int(entry.get("last_ordinal", first + records - 1) or 0)
+                    consumed = max(0, min(last, cursor) - first + 1)
+                    taken_in_segment = sum(
+                        1 for ordinal in taken if first <= int(ordinal) <= last
+                    )
+                    pending += max(0, records - consumed - taken_in_segment)
+                pending_by_partition[key] = pending
             return {
                 "schema_version": SPOOL_SCHEMA_VERSION,
                 "virtual_partition_count": self.virtual_partition_count,
                 "total_records": int(manifest.get("total_records", 0) or 0),
                 "total_bytes": int(manifest.get("total_bytes", 0) or 0),
+                "business_day": current_day,
+                "business_epoch": int(manifest.get("business_epoch", 1) or 1),
+                "business_timezone": str(manifest.get("business_timezone") or self.clock.timezone_name),
                 "pending_records": sum(pending_by_partition.values()),
                 "pending_by_partition": pending_by_partition,
+                "pending_by_business_day": {
+                    current_day: sum(pending_by_partition.values()),
+                },
                 "cursors": dict(self._lightweight_cursors),
                 "taken_pending": {
                     key: sorted(value)
@@ -469,16 +680,22 @@ class TaskSpool:
             {"partition_id": partition, "taken": sorted(self._taken_pending.get(str(partition), set()))},
         )
 
-    def _active_segment(self, partition_id: int, encoded_size: int) -> tuple[dict, Path]:
+    def _active_segment(self, partition_id: int, encoded_size: int,
+                        business_day: str) -> tuple[dict, Path]:
         key = str(int(partition_id))
         entries = self._manifest["segments"].setdefault(key, [])
         if entries:
             current = entries[-1]
-            if (int(current["records"]) < self.segment_max_records
+            if (str(current.get("business_day") or "") == business_day
+                    and int(current["records"]) < self.segment_max_records
                     and int(current["bytes"]) + encoded_size <= self.segment_max_bytes):
                 return current, self._segment_path(partition_id, str(current["filename"]))
         filename = f"segment-{len(entries) + 1:08d}.jsonl"
-        current = {"filename": filename, "records": 0, "bytes": 0, "first_ordinal": 0, "last_ordinal": 0}
+        current = {
+            "filename": filename, "records": 0, "bytes": 0,
+            "first_ordinal": 0, "last_ordinal": 0,
+            "business_day": business_day,
+        }
         entries.append(current)
         return current, self._segment_path(partition_id, filename)
 
@@ -488,6 +705,7 @@ class TaskSpool:
             raise ValueError("record partition_id out of range")
         if record.event_id in self._event_index:
             return self._event_index[record.event_id]
+        record = self._normalize_for_append(record)
         next_ordinal = int(self._manifest["next_ordinal"].get(str(partition_id), 1))
         if int(record.ordinal) <= 0:
             record = replace(record, ordinal=next_ordinal)
@@ -505,7 +723,9 @@ class TaskSpool:
         projected = int(self._manifest.get("total_bytes", 0)) + len(encoded)
         if projected > self.max_bytes:
             raise SpoolCapacityError(f"spool byte budget exhausted: {projected}>{self.max_bytes}")
-        entry, path = self._active_segment(partition_id, len(encoded))
+        entry, path = self._active_segment(
+            partition_id, len(encoded), record.business_day,
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         handle = handle_cache.get(path)
         if handle is None:
@@ -519,6 +739,10 @@ class TaskSpool:
         self._manifest["next_ordinal"][str(partition_id)] = int(record.ordinal) + 1
         self._manifest["total_records"] = int(self._manifest.get("total_records", 0)) + 1
         self._manifest["total_bytes"] = projected
+        daily_records = self._manifest.setdefault("daily_records", {})
+        daily_bytes = self._manifest.setdefault("daily_bytes", {})
+        daily_records[record.business_day] = int(daily_records.get(record.business_day, 0)) + 1
+        daily_bytes[record.business_day] = int(daily_bytes.get(record.business_day, 0)) + len(encoded)
         self._event_index[record.event_id] = record
         return record
 
@@ -526,8 +750,14 @@ class TaskSpool:
         """Append one record; return ``(record, inserted)``."""
 
         with self._lock:
+            today = self._today_business_day()
+            if today != self.current_business_day:
+                self.refresh()
+                if today != self.current_business_day:
+                    self._rollover_locked(today)
             if record.event_id in self._event_index:
                 return self._event_index[record.event_id], False
+            record = self._normalize_for_append(record)
             handles: dict[Path, object] = {}
             try:
                 inserted = self._append_locked(record, handles)
@@ -548,11 +778,24 @@ class TaskSpool:
         if not values:
             return [], 0
         with self._lock:
+            today = self._today_business_day()
+            if today != self.current_business_day:
+                self.refresh()
+                if today != self.current_business_day:
+                    self._rollover_locked(today)
+            # Validate the complete batch before opening any segment.  A late
+            # source chunk therefore cannot leave a mixed-day partial append.
+            prepared = []
+            for record in values:
+                prepared.append(
+                    record if record.event_id in self._event_index
+                    else self._normalize_for_append(record)
+                )
             handles: dict[Path, object] = {}
             appended: list[SpoolRecord] = []
             inserted_count = 0
             try:
-                for record in values:
+                for record in prepared:
                     before = record.event_id in self._event_index
                     item = self._append_locked(record, handles)
                     appended.append(item)
@@ -573,7 +816,14 @@ class TaskSpool:
         partition = int(partition_id)
         if not 0 <= partition < self.virtual_partition_count:
             raise ValueError("partition_id out of range")
+        today = self._today_business_day()
+        if today != self.current_business_day:
+            with self._lock:
+                self.refresh()
+                if today != self.current_business_day:
+                    self._rollover_locked(today)
         self.refresh(partition)
+        current_day = self.current_business_day
         entries = list(self._manifest["segments"].get(str(partition), []))
         for entry in entries:
             path = self._segment_path(partition, str(entry["filename"]))
@@ -587,7 +837,11 @@ class TaskSpool:
                         record = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
                     except (ValueError, UnicodeError, SpoolError) as exc:
                         raise SpoolCorruptionError(f"invalid record in {path}: {exc}") from exc
-                    if record.ordinal > int(cursor) and record.ordinal not in self._taken_pending.get(str(partition), set()):
+                    # A missing business day is deliberately fail-closed: it
+                    # may be inspected for recovery, but it is never sent.
+                    if (record.business_day == current_day
+                            and record.ordinal > int(cursor)
+                            and record.ordinal not in self._taken_pending.get(str(partition), set())):
                         yield record
 
     def checkpoint(self, partition_id: int, ordinal: int) -> None:
@@ -618,31 +872,152 @@ class TaskSpool:
 
     def status(self) -> dict:
         with self._lock:
+            self.rollover_if_needed()
             self.refresh()
             pending_by_partition = {}
+            pending_by_day: dict[str, int] = {}
+            expired = 0
             for partition in range(self.virtual_partition_count):
                 cursor = self.cursor(partition)
-                entries = self._manifest["segments"].get(str(partition), [])
-                records = sum(int(entry.get("records", 0)) for entry in entries)
-                pending_by_partition[str(partition)] = max(
-                    0, records - cursor - len(self._taken_pending.get(str(partition), set()))
-                )
+                pending = 0
+                taken = self._taken_pending.get(str(partition), set())
+                for record in self._event_index.values():
+                    if record.partition_id != partition or record.business_day != self.current_business_day:
+                        continue
+                    if record.is_expired(self._now()):
+                        expired += 1
+                    if int(record.ordinal) > cursor and int(record.ordinal) not in taken:
+                        pending += 1
+                pending_by_partition[str(partition)] = pending
+            for record in self._event_index.values():
+                if record.business_day:
+                    pending_by_day.setdefault(record.business_day, 0)
+                    if (record.business_day == self.current_business_day
+                            and record.ordinal > self.cursor(record.partition_id)
+                            and record.ordinal not in self._taken_pending.get(str(record.partition_id), set())):
+                        pending_by_day[record.business_day] += 1
             return {
                 "schema_version": SPOOL_SCHEMA_VERSION,
                 "virtual_partition_count": self.virtual_partition_count,
                 "total_records": len(self._event_index),
                 "total_bytes": self._disk_bytes(),
+                "business_day": self.current_business_day,
+                "business_epoch": self.business_epoch,
+                "business_timezone": self.clock.timezone_name,
                 "pending_records": sum(pending_by_partition.values()),
                 "pending_by_partition": pending_by_partition,
+                "pending_by_business_day": pending_by_day,
+                "expired_records": expired,
+                "closed_days": dict(self._manifest.get("closed_days", {})),
                 "cursors": dict(self._cursors),
                 "taken_pending": {key: sorted(value) for key, value in self._taken_pending.items() if value},
                 "recovery_issues": list(self._recovery_issues),
             }
 
+    def reclaim_business_day(self, business_day: str, *, force: bool = False) -> dict:
+        """Remove only fully attributable, closed-day segment files.
+
+        The method is intentionally explicit.  Runtime rollover fences old
+        admissions first; callers should invoke reclamation after workers have
+        stopped or otherwise released their old-epoch references.  Segments
+        containing an unattributed V1 record are retained rather than guessed
+        into a new day.
+        """
+
+        day = normalize_business_day(business_day)
+        with self._lock:
+            self.refresh()
+            if day == self.current_business_day:
+                return {"business_day": day, "reclaimed": False, "reason": "current_day"}
+            closed = self._manifest.setdefault("closed_days", {}).get(day)
+            if not closed and not force:
+                return {"business_day": day, "reclaimed": False, "reason": "not_closed"}
+            removed_records = 0
+            removed_bytes = 0
+            retained_segments = 0
+            for partition in range(self.virtual_partition_count):
+                key = str(partition)
+                entries = list(self._manifest["segments"].get(key, []))
+                retained = []
+                for entry in entries:
+                    entry_day = str(entry.get("business_day") or "")
+                    path = self._segment_path(partition, str(entry["filename"]))
+                    removable = entry_day == day
+                    if not removable and not entry_day:
+                        # Legacy entries have no trustworthy day metadata.
+                        # Scan only this candidate and remove it iff every
+                        # complete record explicitly belongs to the closed day.
+                        candidate_records = []
+                        try:
+                            with path.open("rb") as handle:
+                                for raw in handle:
+                                    if not raw.endswith(b"\n"):
+                                        removable = False
+                                        break
+                                    item = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
+                                    candidate_records.append(item)
+                            removable = bool(candidate_records) and all(
+                                item.business_day == day for item in candidate_records
+                            )
+                        except (OSError, ValueError, UnicodeError, SpoolError):
+                            removable = False
+                    if removable:
+                        try:
+                            size = int(path.stat().st_size)
+                        except OSError:
+                            size = 0
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        removed_records += int(entry.get("records", 0) or 0)
+                        removed_bytes += size
+                    else:
+                        retained.append(entry)
+                        retained_segments += 1
+                self._manifest["segments"][key] = retained
+                directory = self.root / f"partition-{partition:04d}"
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+            if removed_records:
+                self._event_index = {
+                    key: item for key, item in self._event_index.items()
+                    if item.business_day != day
+                }
+                self._manifest["total_records"] = len(self._event_index)
+                self._manifest["total_bytes"] = self._disk_bytes()
+                closed = self._manifest.setdefault("closed_days", {}).setdefault(day, {})
+                closed.update({
+                    "state": "reclaimed",
+                    "reclaimed_records": removed_records,
+                    "reclaimed_bytes": removed_bytes,
+                })
+                self._rebuild_daily_metadata()
+                self._persist_manifest()
+                self._manifest_signature = self._file_signature(self._manifest_path)
+            return {
+                "business_day": day,
+                "reclaimed": bool(removed_records),
+                "reclaimed_records": removed_records,
+                "reclaimed_bytes": removed_bytes,
+                "retained_segments": retained_segments,
+                "reason": "complete" if removed_records else "unattributed_or_empty",
+            }
+
+    def cleanup_closed_days(self, *, force: bool = False) -> list[dict]:
+        with self._lock:
+            days = list(self._manifest.get("closed_days", {}))
+        return [self.reclaim_business_day(day, force=force) for day in days]
+
     def recovery_report(self) -> dict:
         return {
             "root": str(self.root),
             "total_records": len(self._event_index),
+            "business_day": self.current_business_day,
+            "business_epoch": self.business_epoch,
+            "closed_days": dict(self._manifest.get("closed_days", {})),
             "issues": list(self._recovery_issues),
             "crc_verified": True,
         }

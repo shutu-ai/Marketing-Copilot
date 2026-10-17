@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
 from .partition import normalize_msisdn, partition_for_msisdn
 from .pressure import StageCredit
-from .spool import SpoolCapacityError, SpoolRecord, TaskSpool
+from .spool import SpoolCapacityError, SpoolExpiredError, SpoolRecord, TaskSpool
 
 
 @dataclass
@@ -44,10 +43,11 @@ class IngressRouter:
 
     @staticmethod
     def event_id(*, campaign_type: str, campaign_id: int, source_id: str,
-                 row_ordinal: int, campaign_generation: int) -> str:
+                 row_ordinal: int, campaign_generation: int,
+                 business_day: str = "") -> str:
         value = (
             f"{campaign_type}:{int(campaign_id)}:{source_id}:"
-            f"{int(row_ordinal)}:{int(campaign_generation)}"
+            f"{int(row_ordinal)}:{int(campaign_generation)}:{business_day}"
         )
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -69,8 +69,20 @@ class IngressRouter:
                       route_id: int = 0, phone_prefix: str = "",
                       source_id: str = "source", payload_ref: str = "",
                       row_ordinal_start: int = 0, flash_sms: bool = False,
-                      source_addr: str = "") -> IngressResult:
+                      source_addr: str = "", business_day: str | None = None,
+                      expires_at: float | None = None) -> IngressResult:
         result = IngressResult()
+        self.spool.rollover_if_needed()
+        active_day = self.spool.current_business_day
+        if business_day is not None and str(business_day) != active_day:
+            result.rejected = sum(1 for _ in rows)
+            result.rejected_reasons["expired_business_day"] += result.rejected
+            return result
+        business_day = active_day
+        record_expiry = float(expires_at or self.spool.clock.cutoff(business_day))
+        if record_expiry <= self.spool.clock.timestamp():
+            result.rejected_reasons["expired_business_day"] += 1
+            return result
         records: list[SpoolRecord] = []
         for index, row in enumerate(rows, 1):
             raw_msisdn = row.get("msisdn", row.get("phone", row.get("mobile", "")))
@@ -88,6 +100,7 @@ class IngressRouter:
                 campaign_type=campaign_type, campaign_id=campaign_id,
                 source_id=source_id, row_ordinal=int(row_ordinal_start) + index,
                 campaign_generation=campaign_generation,
+                business_day=business_day,
             )
             partition_id = partition_for_msisdn(normalized, self.spool.virtual_partition_count)
             records.append(SpoolRecord(
@@ -104,9 +117,11 @@ class IngressRouter:
                 message=message,
                 part_count_hint=1,
                 source_id=str(source_id),
-                created_at=time.time(),
+                created_at=self.spool.clock.timestamp(),
                 flash_sms=bool(flash_sms),
                 source_addr=str(row.get("source_addr", source_addr) or ""),
+                business_day=business_day,
+                expires_at=record_expiry,
             ))
         if not records:
             return result
@@ -124,6 +139,10 @@ class IngressRouter:
                 result.by_partition[item.partition_id] += 1
                 result.by_campaign[(item.campaign_type, item.campaign_id)] += 1
                 result.accepted_msisdns.append(item.normalized_msisdn)
+        except SpoolExpiredError:
+            result.rejected += len(records)
+            result.rejected_reasons["expired_business_day"] += len(records)
+            return result
         finally:
             if reservation and self.ingress_credit:
                 self.ingress_credit.release(reservation)

@@ -23,7 +23,7 @@ class VNextMetrics:
             self._samples.append(dict(event))
             for key in (
                 "queued", "taken", "socket_written", "write_failed", "unknown",
-                "response_success", "response_error",
+                "cancelled", "expired", "accepted", "response_success", "response_error",
             ):
                 if event.get(key):
                     self._counters[key] += int(event[key])

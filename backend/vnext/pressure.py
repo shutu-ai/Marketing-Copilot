@@ -30,6 +30,8 @@ class StageCredit:
         self.max_age = max(0.1, float(max_age))
         self._condition = asyncio.Condition()
         self._thread_lock = threading.Lock()
+        self._wake_seq = 0
+        self._wait_loop = None
         self._next_id = 1
         self._reservations: dict[int, CreditReservation] = {}
         self.used_items = 0
@@ -61,10 +63,10 @@ class StageCredit:
     def try_reserve(self, items: int = 1, bytes_count: int = 0) -> CreditReservation | None:
         count = max(0, int(items))
         size = max(0, int(bytes_count))
-        if count > self.limit_items or size > self.limit_bytes:
-            self.blocked_reason = "reservation_exceeds_stage_limit"
-            return None
         with self._thread_lock:
+            if count > self.limit_items or size > self.limit_bytes:
+                self.blocked_reason = "reservation_exceeds_stage_limit"
+                return None
             if not self._available(count, size):
                 self.blocked_reason = "high_water" if self._is_high() else (self.blocked_reason or "capacity")
                 return None
@@ -78,11 +80,18 @@ class StageCredit:
 
     async def reserve(self, items: int = 1, bytes_count: int = 0, *, timeout: float | None = None) -> CreditReservation:
         async def wait_for_capacity():
-            while True:
-                reservation = self.try_reserve(items, bytes_count)
-                if reservation:
-                    return reservation
-                async with self._condition:
+            # Hold the condition before checking the predicate.  The wake
+            # sequence closes the small gap between a failed reservation and
+            # entering ``wait`` when release happens on another thread/loop.
+            async with self._condition:
+                self._wait_loop = asyncio.get_running_loop()
+                while True:
+                    observed = self._wake_seq
+                    reservation = self.try_reserve(items, bytes_count)
+                    if reservation:
+                        return reservation
+                    if observed != self._wake_seq:
+                        continue
                     await self._condition.wait()
         if timeout is None:
             return await wait_for_capacity()
@@ -99,15 +108,22 @@ class StageCredit:
             if progress:
                 self.progress_seq += 1
                 self.last_progress_at = time.monotonic()
+            self._wake_seq += 1
             if self.blocked_reason and self._is_low():
                 self.blocked_reason = ""
                 self.resumed_at = time.time()
                 self.resume_count += 1
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        loop = self._wait_loop
+        if loop is None or not loop.is_running():
             return
-        loop.create_task(self._notify())
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            loop.create_task(self._notify())
+        else:
+            loop.call_soon_threadsafe(lambda: loop.create_task(self._notify()))
 
     async def _notify(self) -> None:
         async with self._condition:

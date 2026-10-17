@@ -13,9 +13,11 @@ import threading
 import time
 from pathlib import Path
 
+from .business_day import BusinessClock, ensure_clock
 from .ingress import IngressRouter
 from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
 from .projection_writer import ProjectionWriterProcess, ProgressJournal
+from .pressure import StageCredit
 from .route_credits import RouteCreditBroker
 from .spool import TaskSpool
 from .supervisor import WorkerSupervisor
@@ -51,9 +53,13 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     spool = TaskSpool(
         context["spool_root"], virtual_partition_count=int(context["virtual_partition_count"]),
         max_bytes=int(context["max_spool_bytes"]),
+        business_timezone=context.get("business_timezone"),
     )
     credits = RouteCreditBroker(context["credits_root"])
-    journal = ProgressJournal(Path(context["progress_root"]) / f"worker-{worker_id}.jsonl")
+    journal = ProgressJournal(
+        Path(context["progress_root"]) / f"worker-{worker_id}.jsonl",
+        max_bytes=int(context.get("max_journal_bytes", 512 * 1024 * 1024)),
+    )
     projection_queue = context.get("projection_queue")
     worker_status_path = Path(context["progress_root"]) / f"worker-{worker_id}.status.json"
     worker_ref = {"value": None}
@@ -95,6 +101,27 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 # the single DB owner is temporarily behind.
                 pass
 
+    def journal_admission(record) -> bool:
+        # Conservative admission estimate: if the result fence cannot hold a
+        # full event with this message, stop before dispatch_taken/socket I/O.
+        estimated = {
+            "event_id": record.event_id,
+            "partition_id": record.partition_id,
+            "ordinal": record.ordinal,
+            "campaign_type": record.campaign_type,
+            "campaign_id": record.campaign_id,
+            "route_id": record.route_id,
+            "normalized_msisdn": record.normalized_msisdn,
+            "state": "socket_written",
+            "parts_written": record.part_count_hint,
+            "parts_total": record.part_count_hint,
+            "message": record.message,
+            "business_day": record.business_day,
+            "expires_at": record.expires_at,
+            "created_at": record.created_at,
+        }
+        return journal.can_append(estimated)
+
     control_signature = None
 
     def load_controls() -> list[dict] | None:
@@ -126,6 +153,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         progress_sink=emit, max_inflight=int(context["max_inflight"]),
         prefetch_per_partition=int(context["prefetch_per_partition"]),
         control_loader=load_controls,
+        journal_admission=journal_admission,
     )
     worker_ref["value"] = worker
 
@@ -174,7 +202,9 @@ class VNextRuntime:
                  max_spool_bytes: int = 512 * 1024 * 1024, projection_queue_size: int = 8192,
                  max_inflight: int = 128, prefetch_per_partition: int = 64,
                  start_method: str = "spawn", projection_flush_interval_seconds: float | None = None,
-                 run_id: str = ""):
+                 run_id: str = "", clock: BusinessClock | object | None = None,
+                 business_timezone: str | object | None = None,
+                 max_journal_bytes: int | None = None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.spool_root = self.root / "spool"
@@ -183,11 +213,24 @@ class VNextRuntime:
         self.control_state_path = self.root / "control-state.json"
         self.virtual_partition_count = int(virtual_partition_count)
         self.max_spool_bytes = int(max_spool_bytes)
+        self.clock = ensure_clock(clock, business_timezone)
+        self.max_journal_bytes = max(
+            16 * 1024 * 1024,
+            int(max_journal_bytes or max_spool_bytes),
+        )
         self.spool = TaskSpool(
             self.spool_root, virtual_partition_count=self.virtual_partition_count,
             max_bytes=self.max_spool_bytes,
+            clock=self.clock,
         )
-        self.ingress = IngressRouter(self.spool)
+        self.ingress_credit = StageCredit(
+            "ingress",
+            limit_items=max(1024, min(1_000_000, self.max_spool_bytes // 1024)),
+            limit_bytes=self.max_spool_bytes,
+            high_water=0.95,
+            low_water=0.70,
+        )
+        self.ingress = IngressRouter(self.spool, ingress_credit=self.ingress_credit)
         self.route_configs = {str(key): dict(value) for key, value in route_configs.items()}
         self.worker_count = max(1, min(32, int(worker_count)))
         self.max_inflight = max(1, int(max_inflight))
@@ -225,6 +268,8 @@ class VNextRuntime:
         self._projection_watchdog_thread: threading.Thread | None = None
         self._projection_restart_failures = 0
         self._projection_restart_not_before = 0.0
+        self._daily_epoch_stop = threading.Event()
+        self._daily_epoch_thread: threading.Thread | None = None
         write_process_metadata(
             self.diagnostics_root,
             "runtime-parent",
@@ -233,6 +278,20 @@ class VNextRuntime:
             phase="initialized",
             status="initialized",
         )
+
+    def rollover_if_needed(self) -> dict:
+        """Run the cheap wall-clock fence and return its durable transition."""
+
+        return self.spool.rollover_if_needed()
+
+    def _daily_epoch_loop(self) -> None:
+        while not self._daily_epoch_stop.wait(0.25):
+            try:
+                self.rollover_if_needed()
+            except (OSError, RuntimeError, ValueError):
+                # The next tick retries; a delayed maintenance tick cannot
+                # reopen an old socket because workers check the spool fence.
+                continue
 
     def _load_control_state(self) -> dict:
         if not self.control_state_path.exists():
@@ -302,6 +361,7 @@ class VNextRuntime:
         if self._started:
             return
         self.progress_root.mkdir(parents=True, exist_ok=True)
+        self.rollover_if_needed()
         with self._control_lock:
             self._load_control_state()
             if not self.control_state_path.exists():
@@ -314,6 +374,8 @@ class VNextRuntime:
             "control_state_path": str(self.control_state_path),
             "virtual_partition_count": self.virtual_partition_count,
             "max_spool_bytes": self.max_spool_bytes,
+            "max_journal_bytes": self.max_journal_bytes,
+            "business_timezone": self.clock.timezone_name,
             "route_configs": self.route_configs,
             "worker_count": self.worker_count,
             "max_inflight": self.max_inflight,
@@ -347,6 +409,11 @@ class VNextRuntime:
             target=self._projection_watchdog, name="mc-vnext-projection-watchdog", daemon=True,
         )
         self._projection_watchdog_thread.start()
+        self._daily_epoch_stop.clear()
+        self._daily_epoch_thread = threading.Thread(
+            target=self._daily_epoch_loop, name="mc-vnext-daily-epoch", daemon=True,
+        )
+        self._daily_epoch_thread.start()
 
     def _worker_progress(self) -> list[dict]:
         values = []
@@ -361,6 +428,11 @@ class VNextRuntime:
         if self.supervisor:
             self.supervisor.stop()
         if self._started:
+            self._daily_epoch_stop.set()
+            daily_thread = self._daily_epoch_thread
+            self._daily_epoch_thread = None
+            if daily_thread and daily_thread.is_alive() and daily_thread is not threading.current_thread():
+                daily_thread.join(timeout=1.0)
             self._projection_watchdog_stop.set()
             watchdog = self._projection_watchdog_thread
             self._projection_watchdog_thread = None
@@ -370,6 +442,13 @@ class VNextRuntime:
             # worker journal remains the recovery source if the bounded
             # shutdown deadline is ever exceeded.
             self.projection.stop(timeout=30.0)
+            # Reclamation is deliberately after worker shutdown.  Closed-day
+            # evidence remains in journals/projection; only old spool payloads
+            # are eligible for deletion.
+            try:
+                self.spool.cleanup_closed_days()
+            except (OSError, RuntimeError, ValueError):
+                pass
         self.supervisor = None
         self._started = False
         self.started_at = 0.0
@@ -385,6 +464,7 @@ class VNextRuntime:
     def enqueue_chunk(self, *args, **kwargs):
         if not self._started:
             raise RuntimeError("VNext runtime is not started")
+        self.rollover_if_needed()
         return self.ingress.enqueue_chunk(*args, **kwargs)
 
     def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str) -> None:
@@ -424,6 +504,13 @@ class VNextRuntime:
             "projection": self.projection.snapshot(),
             "worker_progress": self._worker_progress(),
             "journal": {"retained_bytes": journal_bytes, "paths": journal_paths},
+            "daily_epoch": {
+                "business_day": self.spool.current_business_day,
+                "business_epoch": self.spool.business_epoch,
+                "timezone": self.clock.timezone_name,
+                "closed_days": dict(self.spool._manifest.get("closed_days", {})),
+            },
+            "ingress_credit": self.ingress_credit.snapshot(),
             "route_credits": route_credits,
             "control_version": int(self._control_version),
             "controls": [

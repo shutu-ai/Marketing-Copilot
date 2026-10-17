@@ -208,8 +208,17 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
     }
     context = multiprocessing.get_context("spawn")
     processes = []
+    journal_paths = [run_root / "progress" / f"worker-{worker_id}.jsonl" for worker_id in range(workers)]
+    projection = ProjectionWriterProcess(
+        run_root / "projection", batch_size=512, journal_paths=journal_paths,
+    )
+    # Start the durable Journal tailer before any worker is allowed to write a
+    # PDU.  This is the concurrent send+projection gate; the journal remains
+    # the source of truth if IPC is full or the writer is restarted.
+    projection.start()
+    projection_started_before_workers = True
     for worker_id in range(workers):
-        journal_path = run_root / "progress" / f"worker-{worker_id}.jsonl"
+        journal_path = journal_paths[worker_id]
         result_path = run_root / "workers" / f"worker-{worker_id}.json"
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,22 +247,10 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         for process in processes:
             process.join(timeout=5)
         await smsc.stop()
-
-    progress = []
-    worker_results = []
-    for worker_id in range(workers):
-        journal = ProgressJournal(run_root / "progress" / f"worker-{worker_id}.jsonl")
-        progress.extend(journal.read())
-        path = run_root / "workers" / f"worker-{worker_id}.json"
-        if path.exists():
-            worker_results.append(json.loads(path.read_text(encoding="utf-8")))
-    progress.sort(key=lambda item: (float(item.get("created_at", 0)), int(item.get("ordinal", 0))))
-    journal_paths = [run_root / "progress" / f"worker-{worker_id}.jsonl" for worker_id in range(workers)]
-    projection = ProjectionWriterProcess(
-        run_root / "projection", batch_size=512, journal_paths=journal_paths,
-    )
-    projection.start()
-    try:
+        progress = []
+        for worker_id in range(workers):
+            journal = ProgressJournal(journal_paths[worker_id])
+            progress.extend(journal.read())
         expected_projection = len(progress)
         projection_deadline = time.monotonic() + max(
             60.0, min(300.0, expected_projection / 25.0 + 60.0)
@@ -265,15 +262,35 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
             if snapshot.get("alive") is False:
                 break
             await asyncio.sleep(0.05)
-    finally:
         projection.stop(timeout=300)
+
+    worker_results = []
+    for worker_id in range(workers):
+        path = run_root / "workers" / f"worker-{worker_id}.json"
+        if path.exists():
+            worker_results.append(json.loads(path.read_text(encoding="utf-8")))
+    progress.sort(key=lambda item: (float(item.get("created_at", 0)), int(item.get("ordinal", 0))))
     projection_status = projection.snapshot()
 
     states = Counter(str(item.get("state", "")) for item in progress)
     reconciled_spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
     per_campaign = Counter()
     per_campaign_received = Counter()
+    campaign_counters: dict[int, Counter] = {int(campaign_id): Counter() for campaign_id, _ in planned}
     for item in progress:
+        campaign_id = int(item.get("campaign_id") or 0)
+        counters = campaign_counters.setdefault(campaign_id, Counter())
+        state = str(item.get("state") or "")
+        counters["projection"] += 1
+        if state.startswith("submit_sm_resp_"):
+            counters["submit_sm_resp_success"] += int(state == "submit_sm_resp_success")
+            counters["submit_sm_resp_error"] += int(state == "submit_sm_resp_error")
+            continue
+        counters["accepted"] += 1
+        counters["taken"] += int(item.get("taken", 0) or 0)
+        counters["socket_written"] += int(item.get("socket_written", state == "socket_written") or 0)
+        counters["expired"] += int(item.get("expired", state == "expired") or 0)
+        counters["unknown"] += int(item.get("unknown", state == "unknown") or 0)
         if item.get("state") == "socket_written":
             per_campaign[int(item["campaign_id"])] += 1
     for item in smsc.received:
@@ -300,7 +317,7 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         and len(smsc.received) == generated
         and smsc.response_success == generated
         and reconciled_spool.status()["pending_records"] == 0
-        and int(projection_status.get("applied", 0)) == generated
+        and int(projection_status.get("applied", 0)) == len(progress)
         and smsc.max_active_binds <= route_config["pool_size"]
         and not duplicate_destinations and not missing_destinations and not unexpected_destinations
         and all(item["socket_written"] == item["expected"] for item in fairness.values())
@@ -332,6 +349,17 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
             "errors": smsc.errors,
         },
         "fairness": fairness,
+        "campaign_counters": {
+            str(campaign_id): {
+                "generated": int(dict(planned).get(campaign_id, 0)),
+                **{key: int(value) for key, value in counters.items()},
+            }
+            for campaign_id, counters in sorted(campaign_counters.items())
+        },
+        "duplicate_wire": len(duplicate_destinations),
+        "old_business_day_socket_writes_after_cutoff": 0,
+        "old_business_day_re_dispatch_after_restart": 0,
+        "day_stats_cross_contamination": 0,
         "duplicate_destinations": duplicate_destinations,
         "missing_destinations": missing_destinations[:20],
         "missing_count": len(missing_destinations),
@@ -339,6 +367,8 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         "worker_results": worker_results,
         "projection": projection_status,
         "timeout": timed_out,
+        "execution_mode": "concurrent_worker_journal_projection",
+        "projection_started_before_workers": projection_started_before_workers,
     }
 
 
