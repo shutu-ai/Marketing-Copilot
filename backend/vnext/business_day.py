@@ -9,7 +9,9 @@ timeouts.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+import json
 import os
+from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -115,6 +117,28 @@ class BusinessClock:
         return cutoff_timestamp(day or self.business_day(), self.tz)
 
 
+class FileWallClock:
+    """Read an injected wall-clock value from an atomically replaced JSON file.
+
+    This is intentionally a small, opt-in test boundary.  Production callers
+    continue to use the system wall clock; acceptance tools use the file to
+    move several spawned VNext processes across a business-day boundary
+    without changing the host clock.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path).resolve()
+
+    def now(self):
+        value = json.loads(self.path.read_text(encoding="utf-8"))
+        selected = value.get("now", value.get("timestamp")) if isinstance(value, dict) else value
+        if selected is None:
+            raise ValueError(f"clock file has no now/timestamp: {self.path}")
+        if isinstance(selected, str):
+            return datetime.fromisoformat(selected.replace("Z", "+00:00"))
+        return selected
+
+
 def ensure_clock(clock=None, timezone_name: str | tzinfo | None = None) -> BusinessClock:
     if isinstance(clock, BusinessClock) and timezone_name is None:
         return clock
@@ -127,6 +151,7 @@ def ensure_clock(clock=None, timezone_name: str | tzinfo | None = None) -> Busin
 
 __all__ = [
     "BusinessClock",
+    "FileWallClock",
     "DEFAULT_TIMEZONE",
     "business_timezone",
     "configured_timezone_name",

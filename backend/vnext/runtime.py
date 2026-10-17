@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from .business_day import BusinessClock, ensure_clock
+from .business_day import BusinessClock, FileWallClock, ensure_clock
 from .ingress import IngressRouter
 from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
 from .projection_writer import ProjectionWriterProcess, ProgressJournal
@@ -50,10 +50,15 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         progress={"worker_id": int(worker_id)},
         extra={"native_fault_log": str(native_fault_path) if native_fault_path else ""},
     )
+    test_clock_file = str(context.get("test_clock_file") or "").strip()
+    worker_clock = (
+        BusinessClock(FileWallClock(test_clock_file), context.get("business_timezone"))
+        if test_clock_file else None
+    )
     spool = TaskSpool(
         context["spool_root"], virtual_partition_count=int(context["virtual_partition_count"]),
-        max_bytes=int(context["max_spool_bytes"]),
-        business_timezone=context.get("business_timezone"),
+        max_bytes=int(context["max_spool_bytes"]), clock=worker_clock,
+        business_timezone=context.get("business_timezone") if not worker_clock else None,
     )
     credits = RouteCreditBroker(context["credits_root"])
     journal = ProgressJournal(
@@ -213,7 +218,13 @@ class VNextRuntime:
         self.control_state_path = self.root / "control-state.json"
         self.virtual_partition_count = int(virtual_partition_count)
         self.max_spool_bytes = int(max_spool_bytes)
-        self.clock = ensure_clock(clock, business_timezone)
+        self.test_clock_file = str(os.environ.get("MC_VNEXT_TEST_CLOCK_FILE") or "").strip()
+        if self.test_clock_file:
+            self.clock = BusinessClock(
+                FileWallClock(self.test_clock_file), business_timezone,
+            )
+        else:
+            self.clock = ensure_clock(clock, business_timezone)
         self.max_journal_bytes = max(
             16 * 1024 * 1024,
             int(max_journal_bytes or max_spool_bytes),
@@ -376,6 +387,7 @@ class VNextRuntime:
             "max_spool_bytes": self.max_spool_bytes,
             "max_journal_bytes": self.max_journal_bytes,
             "business_timezone": self.clock.timezone_name,
+            "test_clock_file": self.test_clock_file,
             "route_configs": self.route_configs,
             "worker_count": self.worker_count,
             "max_inflight": self.max_inflight,

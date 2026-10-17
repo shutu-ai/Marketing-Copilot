@@ -160,7 +160,14 @@ def _worker_process(worker_id: int, partitions: tuple[int, ...], spool_root: str
     Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
 
 
-def _campaign_plan(count: int) -> list[tuple[int, int]]:
+def _campaign_plan(count: int, campaign_counts: str = "") -> list[tuple[int, int]]:
+    if str(campaign_counts or "").strip():
+        values = [int(item.strip()) for item in str(campaign_counts).split(",") if item.strip()]
+        if len(values) < 2 or any(item <= 0 for item in values):
+            raise ValueError("--campaign-counts requires at least two positive integers")
+        if sum(values) != int(count):
+            raise ValueError("--campaign-counts must sum to --count")
+        return [(index, value) for index, value in enumerate(values, start=1)]
     total = max(1, int(count))
     if total == 5500:
         return [(1, 2500), (2, 2500), (3, 250), (4, 250)]
@@ -170,15 +177,15 @@ def _campaign_plan(count: int) -> list[tuple[int, int]]:
 async def run_gate(*, count: int, run_root: Path, workers: int = 4,
                    pool_size: int | None = None, route_tps: float = 0.0,
                    tps_scope: str = "route_shared", window_size: int = 50,
-                   timeout: float = 300.0) -> dict:
+                   timeout: float = 300.0, campaign_counts: str = "") -> dict:
     run_root = Path(run_root).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     spool_root = run_root / "spool"
     credits_root = run_root / "route-credits"
     spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
     ingress = IngressRouter(spool)
-    planned = _campaign_plan(count)
-    expected: dict[str, dict] = {}
+    planned = _campaign_plan(count, campaign_counts)
+    expected: dict[tuple[str, int, int], dict] = {}
     generated = 0
     for campaign_id, campaign_count in planned:
         rows = []
@@ -186,7 +193,10 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
             msisdn = f"090{campaign_id:02d}{index:07d}"
             rows.append({"msisdn": msisdn, "message": f"VNext campaign={campaign_id} event={index}"})
             normalized = f"251{msisdn[1:]}"
-            expected[normalized] = {"campaign_id": campaign_id, "index": index}
+            expected[("batch", campaign_id, index + 1)] = {
+                "campaign_id": campaign_id, "index": index,
+                "destination": normalized,
+            }
         result = ingress.enqueue_chunk(
             rows, campaign_type="batch", campaign_id=campaign_id,
             phone_prefix="251", source_id=f"synthetic-campaign-{campaign_id}",
@@ -293,16 +303,32 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         counters["unknown"] += int(item.get("unknown", state == "unknown") or 0)
         if item.get("state") == "socket_written":
             per_campaign[int(item["campaign_id"])] += 1
-    for item in smsc.received:
-        campaign = expected.get(str(item["destination"]), {}).get("campaign_id")
-        if campaign is not None:
-            per_campaign_received[int(campaign)] += 1
-    received_destinations = [str(item["destination"]) for item in smsc.received]
-    duplicate_destinations = sorted(
-        destination for destination, value in Counter(received_destinations).items() if value > 1
+    expected_destinations = Counter(
+        str(item["destination"]) for item in expected.values()
     )
-    missing_destinations = sorted(set(expected).difference(received_destinations))
-    unexpected_destinations = sorted(set(received_destinations).difference(expected))
+    expected_campaign_by_destination = {
+        str(item["destination"]): int(item["campaign_id"])
+        for item in expected.values()
+    }
+    for item in smsc.received:
+        destination = str(item["destination"])
+        campaign_id = expected_campaign_by_destination.get(destination)
+        if campaign_id is not None:
+            per_campaign_received[campaign_id] += 1
+    received_destinations = [str(item["destination"]) for item in smsc.received]
+    received_counts = Counter(received_destinations)
+    duplicate_destinations = sorted(
+        destination for destination, value in received_counts.items()
+        if value > expected_destinations.get(destination, 0)
+    )
+    missing_destinations = sorted(
+        destination for destination, value in expected_destinations.items()
+        for _ in range(max(0, value - received_counts.get(destination, 0)))
+    )
+    unexpected_destinations = sorted(
+        destination for destination, value in received_counts.items()
+        if value > expected_destinations.get(destination, 0)
+    )
     fairness = {
         str(campaign_id): {
             "expected": campaign_count,
@@ -357,9 +383,18 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
             for campaign_id, counters in sorted(campaign_counters.items())
         },
         "duplicate_wire": len(duplicate_destinations),
-        "old_business_day_socket_writes_after_cutoff": 0,
-        "old_business_day_re_dispatch_after_restart": 0,
-        "day_stats_cross_contamination": 0,
+        "campaign_plan": [
+            {"campaign_id": int(campaign_id), "count": int(campaign_count)}
+            for campaign_id, campaign_count in planned
+        ],
+        "identity_key_schema": ["business_day", "campaign_type", "campaign_id", "event_id", "part_index"],
+        "business_day_checks": {
+            "executed": False,
+            "reason": "not_exercised_by_same_day_loopback_gate",
+        },
+        "old_business_day_socket_writes_after_cutoff": None,
+        "old_business_day_re_dispatch_after_restart": None,
+        "day_stats_cross_contamination": None,
         "duplicate_destinations": duplicate_destinations,
         "missing_destinations": missing_destinations[:20],
         "missing_count": len(missing_destinations),
@@ -384,6 +419,8 @@ def main() -> int:
     parser.add_argument("--window-size", type=int, default=50,
                         help="PDU window per physical bind")
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--campaign-counts", default="",
+                        help="comma-separated campaign sizes; must sum to --count")
     parser.add_argument("--run-root", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--quiet", action="store_true", help="print only the bounded result summary")
@@ -395,6 +432,7 @@ def main() -> int:
         pool_size=max(1, min(20, args.pool_size)) if args.pool_size else None,
         route_tps=max(0.0, args.route_tps), tps_scope=args.tps_scope,
         window_size=max(1, min(1000, args.window_size)), timeout=args.timeout,
+        campaign_counts=args.campaign_counts,
     ))
     output = Path(args.output).resolve() if args.output else root / "result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
