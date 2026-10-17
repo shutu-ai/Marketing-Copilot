@@ -23,6 +23,9 @@ from vnext.spool import SpoolCapacityError
 
 _LOCK = threading.RLock()
 _RUNTIME: VNextRuntime | None = None
+_CONFIG_RESTART_REQUIRED = False
+_CONFIG_CHANGE_AT = 0.0
+_CONFIG_CHANGE_REASON = ""
 
 
 def pipeline_mode() -> str:
@@ -58,6 +61,21 @@ def _env_bytes(name: str, default: int) -> int:
     return max(16 * 1024 * 1024, value)
 
 
+def mark_config_change(reason: str = "SMPP configuration changed") -> None:
+    """Mark a control-plane change that takes effect on a safe restart.
+
+    VNext deliberately does not hot-swap sockets or route credentials while a
+    PDU may be in flight.  The API/UI can therefore report the pending state
+    instead of claiming that a stale worker snapshot is already effective.
+    """
+
+    global _CONFIG_RESTART_REQUIRED, _CONFIG_CHANGE_AT, _CONFIG_CHANGE_REASON
+    with _LOCK:
+        _CONFIG_RESTART_REQUIRED = True
+        _CONFIG_CHANGE_AT = time.time()
+        _CONFIG_CHANGE_REASON = str(reason or "SMPP configuration changed")
+
+
 def run_root() -> Path:
     configured = str(os.environ.get("MC_VNEXT_RUN_ROOT", "") or "").strip()
     if configured:
@@ -70,7 +88,9 @@ def _load_routes() -> dict[str, dict]:
     def read(conn):
         return conn.execute(
             """SELECT id,host,port,system_id,password,source_addr,window_size,
-                      timeout,tps,address_ton,address_npi,data_coding,enabled
+                      timeout,tps,tps_scope,pool_size,bind_type,enquire_interval,
+                      reconnect_max_seconds,delivery_receipt_mode,priority,
+                      address_ton,address_npi,data_coding,enabled
                  FROM smpp_configs WHERE enabled=1 ORDER BY priority,id"""
         ).fetchall()
 
@@ -86,6 +106,13 @@ def _load_routes() -> dict[str, dict]:
             "window_size": int(row["window_size"] or 10),
             "timeout": float(row["timeout"] or 10),
             "tps": float(row["tps"] or 0),
+            "tps_scope": str(row["tps_scope"] or "route_shared"),
+            "pool_size": max(1, int(row["pool_size"] or 1)),
+            "bind_type": str(row["bind_type"] or "transceiver"),
+            "enquire_interval": float(row["enquire_interval"] or 30),
+            "reconnect_max_seconds": float(row["reconnect_max_seconds"] or 60),
+            "delivery_receipt_mode": str(row["delivery_receipt_mode"] or "optional"),
+            "priority": int(row["priority"] or 100),
             "address_ton": int(row["address_ton"] or 0),
             "address_npi": int(row["address_npi"] or 0),
             "data_coding": int(row["data_coding"] or 0),
@@ -94,10 +121,21 @@ def _load_routes() -> dict[str, dict]:
     }
 
 
+def _default_route_id(route_configs: dict[str, dict]) -> int:
+    candidates = [dict(value) for value in route_configs.values()]
+    if not candidates:
+        return 0
+    selected = min(
+        candidates,
+        key=lambda item: (int(item.get("priority", 100) or 100), int(item.get("route_id", 0) or 0)),
+    )
+    return int(selected.get("route_id") or 0)
+
+
 def start() -> VNextRuntime | None:
     """Start VNext and return its runtime; explicit legacy mode is test-only."""
 
-    global _RUNTIME
+    global _RUNTIME, _CONFIG_RESTART_REQUIRED, _CONFIG_CHANGE_REASON, _CONFIG_CHANGE_AT
     if pipeline_mode() in {"legacy", "test"}:
         return None
     with _LOCK:
@@ -115,6 +153,9 @@ def start() -> VNextRuntime | None:
         )
         value.start()
         _RUNTIME = value
+        _CONFIG_RESTART_REQUIRED = False
+        _CONFIG_CHANGE_AT = 0.0
+        _CONFIG_CHANGE_REASON = ""
         return value
 
 
@@ -200,7 +241,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
     value = runtime()
     route_id = campaign.get("smpp_config_id")
     if route_id is None or int(route_id or 0) <= 0:
-        route_id = min((int(key) for key in value.route_configs), default=0)
+        route_id = _default_route_id(value.route_configs)
     route_id = int(route_id or 0)
     if str(route_id) not in value.route_configs:
         return {"success": False, "message": "no enabled SMPP route configured", "created": 0}
@@ -386,10 +427,48 @@ def status() -> dict:
     result = value.status()
     result["pipeline"] = "vnext"
     result["run_root"] = str(value.root)
-    result["routes"] = [
-        {key: config.get(key) for key in ("route_id", "host", "port", "source_addr", "window_size", "tps")}
-        for config in value.route_configs.values()
-    ]
+    active_by_route: dict[str, set[int]] = {}
+    for worker in result.get("worker_progress") or []:
+        snapshot = worker.get("snapshot") or {}
+        for transport in snapshot.get("transports") or []:
+            if transport.get("connected"):
+                route_key = str(transport.get("route_id"))
+                slot = int(transport.get("bind_slot") or 0)
+                active_by_route.setdefault(route_key, set()).add(slot)
+    result["routes"] = []
+    for config in value.route_configs.values():
+        route_key = str(config.get("route_id"))
+        tps = float(config.get("tps") or 0)
+        scope = str(config.get("tps_scope") or "route_shared")
+        result["routes"].append({
+            key: config.get(key) for key in (
+                "route_id", "host", "port", "source_addr", "bind_type", "pool_size",
+                "window_size", "tps", "tps_scope", "priority", "delivery_receipt_mode",
+                "enquire_interval", "reconnect_max_seconds", "address_ton", "address_npi",
+                "data_coding",
+            )
+        } | {
+            "active_bind_count": len(active_by_route.get(route_key, set())),
+            "active_bind_slots": sorted(active_by_route.get(route_key, set())),
+            "configured_per_bind_tps": tps if scope == "per_bind" else None,
+            "effective_total_limit_tps": (
+                tps * int(config.get("pool_size") or 1)
+                if scope == "per_bind" else tps
+            ),
+            "tps_unit": "submit_sm_parts/s",
+        })
+    result["config_contract"] = {
+        "source": "smpp_configs",
+        "effective_at": value.started_at or None,
+        "restart_required": bool(_CONFIG_RESTART_REQUIRED),
+        "restart_reason": _CONFIG_CHANGE_REASON,
+        "restart_marked_at": _CONFIG_CHANGE_AT or None,
+        "worker_count": int(value.worker_count),
+        "worker_semantics": "business_data_concurrency",
+        "bind_semantics": "physical_bind_per_route_pool_size",
+        "window_semantics": "submit_sm_pdu_inflight_per_physical_bind",
+        "tps_semantics": "submit_sm_parts_per_second",
+    }
     result["task_stats"] = task_stats()
     return result
 

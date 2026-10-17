@@ -14,12 +14,28 @@ _STATS_CACHE_TTL = 2.0
 _STATS_CACHE_LOCK = threading.Lock()
 
 
+def _validate_tps_scope(scope: str | None) -> None:
+    value = str(scope or "route_shared").strip().lower()
+    if value == "per_bind":
+        from services import vnext_service
+        if vnext_service.pipeline_mode() in {"legacy", "test"}:
+            raise ValueError(
+                "tps_scope=per_bind is supported only by the VNext pipeline; "
+                "use route_shared for legacy/test mode"
+            )
+
+
 def _invalidate_gateway_config_cache() -> None:
     try:
         from services.smpp_gateway import gateway
         gateway.invalidate_config_cache()
     except Exception:
         logger.debug("Unable to invalidate SMPP gateway config cache", exc_info=True)
+    try:
+        from services import vnext_service
+        vnext_service.mark_config_change()
+    except Exception:
+        logger.debug("Unable to mark VNext config restart requirement", exc_info=True)
 
 _BIND_STATUS_MESSAGES = {
     0x00000003: "命令无效 (ESME_RINVCMDID)",
@@ -35,6 +51,18 @@ def _masked(row) -> dict:
     return result
 
 
+def _config_response(row: dict) -> dict:
+    result = _masked(row)
+    try:
+        from services import vnext_service
+        active = vnext_service.is_active()
+    except Exception:
+        active = False
+    result["restart_required"] = bool(active)
+    result["effective_state"] = "pending_restart" if active else "next_start"
+    return result
+
+
 def get_all_configs() -> list:
     rows = read_transaction(
         lambda conn: conn.execute(
@@ -42,7 +70,7 @@ def get_all_configs() -> list:
         ).fetchall(),
         operation="smpp.configs.list",
     )
-    return [_masked(r) for r in rows]
+    return [_config_response(dict(r)) for r in rows]
 
 
 def get_config(config_id: int) -> Optional[dict]:
@@ -52,7 +80,7 @@ def get_config(config_id: int) -> Optional[dict]:
         ).fetchone(),
         operation="smpp.config.get",
     )
-    return _masked(row) if row else None
+    return _config_response(dict(row)) if row else None
 
 
 def _get_config_row(config_id: int) -> Optional[dict]:
@@ -67,30 +95,33 @@ def _get_config_row(config_id: int) -> Optional[dict]:
 
 
 def create_config(data: SmppConfigCreate) -> dict:
+    _validate_tps_scope(data.tps_scope)
     def write(conn):
         cursor = conn.execute(
             """INSERT INTO smpp_configs (name,host,port,system_id,password,source_addr,
                bind_type,address_ton,address_npi,data_coding,pool_size,window_size,enquire_interval,timeout,
-               tps,priority,reconnect_max_seconds,delivery_receipt_mode)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               tps,tps_scope,priority,reconnect_max_seconds,delivery_receipt_mode)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (data.name, data.host, data.port, data.system_id, data.password, data.source_addr,
              data.bind_type, data.address_ton, data.address_npi, data.data_coding,
              data.pool_size, data.window_size, data.enquire_interval, data.timeout, data.tps,
+             data.tps_scope,
              data.priority, data.reconnect_max_seconds, data.delivery_receipt_mode),
         )
         return dict(conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone())
 
     row = write_transaction(write, operation="smpp.config.create")
     _invalidate_gateway_config_cache()
-    return _masked(row)
+    return _config_response(row)
 
 
 def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
+    _validate_tps_scope(data.tps_scope)
     fields = {}
     for field in ["name", "host", "port", "system_id", "password", "source_addr",
                    "bind_type", "address_ton", "address_npi", "data_coding",
                    "pool_size", "window_size", "enquire_interval", "timeout", "tps", "priority",
-                   "reconnect_max_seconds", "delivery_receipt_mode", "enabled"]:
+                   "tps_scope", "reconnect_max_seconds", "delivery_receipt_mode", "enabled"]:
         val = getattr(data, field, None)
         if val is not None:
             # Empty or masked password means "keep the stored one" on edit.
@@ -117,7 +148,7 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     if row is None:
         return None
     _invalidate_gateway_config_cache()
-    return _masked(row)
+    return _config_response(row)
 
 
 def delete_config(config_id: int) -> bool:
@@ -214,6 +245,9 @@ def _get_config_stats() -> dict:
         stats = []
         for cfg in configs:
             cfg_id = cfg["id"]
+            tps_scope = str(cfg.get("tps_scope") or "route_shared")
+            configured_tps = float(cfg.get("tps") or 0) if cfg.get("enabled") else 0.0
+            pool_size = max(1, int(cfg.get("pool_size") or 1))
             where, params = _where(cfg_id)
             submitted_1m = _window_count(where, params, "submitted_at", 1)
             submitted_5m = _window_count(where, params, "submitted_at", 5)
@@ -250,15 +284,14 @@ def _get_config_stats() -> dict:
                 "enabled": cfg.get("enabled", 0),
                 "priority": cfg.get("priority", 100),
                 "tps": cfg.get("tps", 0),
-                "pool_size": cfg.get("pool_size", 1),
+                "pool_size": pool_size,
                 "window_size": cfg.get("window_size", 10),
-                # The gateway reserves one shared route clock per config.
-                # Keep the scope explicit so pool_size is not mistaken for a
-                # multiplication of the SMSC/account allowance.
-                "configured_route_tps": float(cfg.get("tps") or 0) if cfg.get("enabled") else 0.0,
-                "configured_per_bind_tps": None,
-                "effective_total_limit_tps": float(cfg.get("tps") or 0) if cfg.get("enabled") else 0.0,
-                "tps_scope": "route_shared",
+                "configured_route_tps": configured_tps if tps_scope == "route_shared" else 0.0,
+                "configured_per_bind_tps": configured_tps if tps_scope == "per_bind" else None,
+                "effective_total_limit_tps": (
+                    configured_tps * pool_size if tps_scope == "per_bind" else configured_tps
+                ),
+                "tps_scope": tps_scope,
                 "tps_unit": "submit_sm_parts/s",
                 "queue_size": _count(where, params, "status IN ('queued','retrying')"),
                 "sending": _count(where, params, "status='sending'"),

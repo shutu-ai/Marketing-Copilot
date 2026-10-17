@@ -70,3 +70,31 @@ async def _test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_
     # Campaign 2 must get service before all Campaign 1 failures finish.
     first_success = next(index for index, item in enumerate(progress) if item["state"] == "socket_written")
     assert any(item["campaign_id"] == 2 for item in progress[:first_success + 1])
+
+
+def test_worker_bind_target_can_use_multiple_physical_transports(tmp_path):
+    return asyncio.run(_test_worker_bind_target_can_use_multiple_physical_transports(tmp_path))
+
+
+async def _test_worker_bind_target_can_use_multiple_physical_transports(tmp_path):
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000)
+    spool.append_many([
+        _record("one", 1, 1, 1, 0),
+        _record("two", 2, 1, 1, 0),
+    ])
+    created = []
+
+    def factory(config, credits):
+        transport = FakeTransport(config, credits, [])
+        created.append(transport)
+        return transport
+
+    worker = ShardWorker(
+        0, (0,), spool, {1: {"route_id": 1, "_worker_bind_target": 2}},
+        transport_factory=factory, max_inflight=2, prefetch_per_partition=2,
+    )
+    snapshot = await worker.run_until_idle(close_transports=False)
+
+    assert len(created) == 2
+    assert len(snapshot["transports"]) == 2
+    await worker.close_transports()

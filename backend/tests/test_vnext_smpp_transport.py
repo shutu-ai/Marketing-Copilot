@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from vnext.route_credits import RouteCreditBroker
+from vnext.route_credits import RouteCreditBroker, RouteCreditError
 from vnext.smpp_transport import (
+    BIND_RECEIVER,
+    BIND_TRANSMITTER,
     BIND_TRANSCEIVER,
     HEADER,
     RESPONSE_MASK,
     SUBMIT_SM,
     AsyncSmppTransport,
     build_submit_sm,
+    build_bind,
     read_pdu,
 )
 
@@ -86,6 +89,25 @@ def test_submit_sm_multipart_contains_standard_concat_udh():
     assert b"\x05\x00\x03\x09\x03\x01" in packet
 
 
+def test_smpp_bind_and_submit_honor_route_protocol_fields():
+    _length, command, _status, _sequence = HEADER.unpack(
+        build_bind(1, "sid", "pwd", bind_type="transmitter")[:16]
+    )
+    assert command == BIND_TRANSMITTER
+    _length, command, _status, _sequence = HEADER.unpack(
+        build_bind(1, "sid", "pwd", bind_type="receiver")[:16]
+    )
+    assert command == BIND_RECEIVER
+
+    packet = build_submit_sm(
+        9, source_addr="VNEXT", destination_addr="251900000001", message="hello",
+        source_ton=5, source_npi=6, destination_ton=2, destination_npi=3,
+        data_coding=8, registered_delivery=0,
+    )
+    assert b"\x05\x06VNEXT\x00\x02\x03" in packet
+    assert b"\x00\x00\x08\x00\x05hello" in packet
+
+
 def test_file_route_credit_schedule_is_shared_by_two_brokers(tmp_path):
     return asyncio.run(_test_file_route_credit_schedule_is_shared_by_two_brokers(tmp_path))
 
@@ -101,6 +123,8 @@ async def _test_file_route_credit_schedule_is_shared_by_two_brokers(tmp_path):
     state = (tmp_path / "credits" / "route-route-a.json").read_text(encoding="utf-8")
     value = __import__("json").loads(state)
     assert value["next_at"] - value["updated_at"] >= 0.15
+    assert first.snapshot()["file_credit_refills"] == 1
+    assert second.snapshot()["file_credit_refills"] == 1
 
 
 def test_file_route_credit_broker_handles_four_process_like_bursts(tmp_path):
@@ -114,3 +138,42 @@ async def _test_file_route_credit_broker_handles_four_process_like_bursts(tmp_pa
         for broker in brokers
         for _ in range(32)
     ])
+
+
+def test_route_credit_batching_and_per_bind_scope_are_explicit(tmp_path):
+    return asyncio.run(_test_route_credit_batching_and_per_bind_scope_are_explicit(tmp_path))
+
+
+async def _test_route_credit_batching_and_per_bind_scope_are_explicit(tmp_path):
+    broker = RouteCreditBroker(tmp_path / "credits")
+    for _ in range(65):
+        await broker.acquire("route-batched", 100, tps_scope="route_shared")
+    snapshot = broker.snapshot()
+    assert snapshot["reservations"] == 65
+    assert snapshot["file_credit_refills"] == 9
+    assert snapshot["credit_lease_size"] == 8
+
+    per_bind = RouteCreditBroker(tmp_path / "per-bind")
+    await asyncio.gather(*[
+        per_bind.acquire("route-scoped", 100, tps_scope="per_bind", bind_slot=slot)
+        for slot in (1, 2)
+        for _ in range(32)
+    ])
+    assert len(list((tmp_path / "per-bind").glob("route-route-scoped_bind_*.json"))) == 2
+
+
+def test_local_bind_pool_is_bounded_and_reusable():
+    return asyncio.run(_test_local_bind_pool_is_bounded_and_reusable())
+
+
+async def _test_local_bind_pool_is_bounded_and_reusable():
+    broker = RouteCreditBroker()
+    first = await broker.acquire_bind("route", 2, timeout=0.1)
+    second = await broker.acquire_bind("route", 2, timeout=0.1)
+    with pytest.raises(RouteCreditError, match="timed out acquiring SMPP bind slot"):
+        await broker.acquire_bind("route", 2, timeout=0.1)
+    first.release()
+    replacement = await broker.acquire_bind("route", 2, timeout=0.1)
+    assert replacement.slot == first.slot
+    second.release()
+    replacement.release()

@@ -30,8 +30,9 @@ export const useSmppStore = defineStore('smpp', () => {
   }
 
   async function removeConfig(id: number) {
-    await api.deleteSmppConfig(id)
+    const res = await api.deleteSmppConfig(id)
     await fetchConfigs()
+    return res.data
   }
 
   async function testConnection(data: { config_id?: number; host: string; port: number; system_id: string; password: string; bind_type: string }) {

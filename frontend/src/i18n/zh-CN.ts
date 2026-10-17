@@ -289,6 +289,9 @@ export default {
     dataCoding: '编码格式',
     poolSize: '连接池大小',
     windowSize: '并发窗口大小',
+    tpsScope: 'TPS作用域',
+    routeShared: '路由共享',
+    perBind: '每个Bind',
     enquireInterval: '心跳间隔(秒)',
     timeout: '超时(秒)',
     deliveryReceiptMode: 'DLR策略',
@@ -303,6 +306,7 @@ export default {
     addSuccess: '添加SMPP配置成功',
     updateSuccess: '更新SMPP配置成功',
     deleteSuccess: '删除SMPP配置成功',
+    restartRequired: 'SMPP配置已保存，VNext将在安全重启后生效。',
   },
   smsContent: {
     title: '短信内容配置',

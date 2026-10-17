@@ -13,6 +13,7 @@ export interface SmppConfig {
   pool_size: number
   window_size: number
   tps: number
+  tps_scope: 'route_shared' | 'per_bind'
   priority: number
   reconnect_max_seconds: number
   delivery_receipt_mode: 'required' | 'optional' | 'disabled'
@@ -37,6 +38,7 @@ export interface SmppConfigForm {
   pool_size: number
   window_size: number
   tps: number
+  tps_scope: 'route_shared' | 'per_bind'
   priority: number
   reconnect_max_seconds: number
   delivery_receipt_mode: 'required' | 'optional' | 'disabled'

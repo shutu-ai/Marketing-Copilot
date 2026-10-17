@@ -30,6 +30,8 @@ from vnext.partition import PartitionMap
 from vnext.projection_writer import ProjectionWriterProcess, ProgressJournal
 from vnext.route_credits import RouteCreditBroker
 from vnext.smpp_transport import (
+    BIND_RECEIVER,
+    BIND_TRANSMITTER,
     BIND_TRANSCEIVER,
     ENQUIRE_LINK,
     HEADER,
@@ -67,15 +69,22 @@ class LoopbackSMSC:
         self.responses = 0
         self.response_success = 0
         self.binds = 0
+        self.active_binds = 0
+        self.max_active_binds = 0
         self.errors: list[str] = []
         self.response_delay = max(0.0, float(response_delay))
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        bound = False
         try:
             while True:
                 command, _status, sequence, body = await read_pdu(reader)
-                if command == BIND_TRANSCEIVER:
-                    self.binds += 1
+                if command in {BIND_RECEIVER, BIND_TRANSMITTER, BIND_TRANSCEIVER}:
+                    if not bound:
+                        bound = True
+                        self.binds += 1
+                        self.active_binds += 1
+                        self.max_active_binds = max(self.max_active_binds, self.active_binds)
                     response = cstring("VNEXT-SMSC")
                     writer.write(HEADER.pack(16 + len(response), command | RESPONSE_MASK, 0, sequence) + response)
                     await writer.drain()
@@ -110,6 +119,8 @@ class LoopbackSMSC:
         except Exception as exc:
             self.errors.append(f"{type(exc).__name__}: {exc}")
         finally:
+            if bound:
+                self.active_binds = max(0, self.active_binds - 1)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -128,12 +139,20 @@ class LoopbackSMSC:
 
 def _worker_process(worker_id: int, partitions: tuple[int, ...], spool_root: str,
                     credits_root: str, route_config: dict, journal_path: str,
-                    result_path: str, max_inflight: int, prefetch: int) -> None:
+                    result_path: str, max_inflight: int, prefetch: int,
+                    worker_count: int) -> None:
     spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
     credits = RouteCreditBroker(credits_root)
     journal = ProgressJournal(journal_path)
+    worker_route_config = dict(route_config)
+    worker_route_config["_worker_bind_target"] = max(
+        1,
+        (int(route_config.get("pool_size", 1)) + max(1, int(worker_count)) - 1)
+        // max(1, int(worker_count)),
+    )
     worker = ShardWorker(
-        worker_id, tuple(partitions), spool, {str(route_config["route_id"]): route_config},
+        worker_id, tuple(partitions), spool,
+        {str(route_config["route_id"]): worker_route_config},
         credits=credits, progress_sink=journal.append,
         max_inflight=max_inflight, prefetch_per_partition=prefetch,
     )
@@ -149,7 +168,9 @@ def _campaign_plan(count: int) -> list[tuple[int, int]]:
 
 
 async def run_gate(*, count: int, run_root: Path, workers: int = 4,
-                   route_tps: float = 0.0, timeout: float = 300.0) -> dict:
+                   pool_size: int | None = None, route_tps: float = 0.0,
+                   tps_scope: str = "route_shared", window_size: int = 50,
+                   timeout: float = 300.0) -> dict:
     run_root = Path(run_root).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     spool_root = run_root / "spool"
@@ -181,7 +202,9 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
     route_config = {
         "route_id": 1, "host": "127.0.0.1", "port": port,
         "system_id": "test", "password": "test", "source_addr": "VNEXT",
-        "window_size": 50, "tps": max(0.0, float(route_tps)), "timeout": 10,
+        "pool_size": max(1, int(pool_size or workers)),
+        "window_size": max(1, int(window_size)), "tps": max(0.0, float(route_tps)),
+        "tps_scope": str(tps_scope or "route_shared"), "timeout": 10,
     }
     context = multiprocessing.get_context("spawn")
     processes = []
@@ -193,7 +216,8 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         process = context.Process(
             target=_worker_process,
             args=(worker_id, partition_map.partitions_for_worker(worker_id), str(spool_root),
-                  str(credits_root), route_config, str(journal_path), str(result_path), 128, 64),
+                  str(credits_root), route_config, str(journal_path), str(result_path),
+                  128, 64, workers),
             name=f"mc-vnext-acceptance-worker-{worker_id}", daemon=True,
         )
         process.start()
@@ -224,13 +248,25 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         if path.exists():
             worker_results.append(json.loads(path.read_text(encoding="utf-8")))
     progress.sort(key=lambda item: (float(item.get("created_at", 0)), int(item.get("ordinal", 0))))
-    projection = ProjectionWriterProcess(run_root / "projection")
+    journal_paths = [run_root / "progress" / f"worker-{worker_id}.jsonl" for worker_id in range(workers)]
+    projection = ProjectionWriterProcess(
+        run_root / "projection", batch_size=512, journal_paths=journal_paths,
+    )
     projection.start()
     try:
-        for item in progress:
-            projection.submit(item, timeout=2)
+        expected_projection = len(progress)
+        projection_deadline = time.monotonic() + max(
+            60.0, min(300.0, expected_projection / 25.0 + 60.0)
+        )
+        while time.monotonic() < projection_deadline:
+            snapshot = projection.snapshot()
+            if int(snapshot.get("applied", 0) or 0) >= expected_projection:
+                break
+            if snapshot.get("alive") is False:
+                break
+            await asyncio.sleep(0.05)
     finally:
-        projection.stop(timeout=60)
+        projection.stop(timeout=300)
     projection_status = projection.snapshot()
 
     states = Counter(str(item.get("state", "")) for item in progress)
@@ -265,6 +301,7 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         and smsc.response_success == generated
         and reconciled_spool.status()["pending_records"] == 0
         and int(projection_status.get("applied", 0)) == generated
+        and smsc.max_active_binds <= route_config["pool_size"]
         and not duplicate_destinations and not missing_destinations and not unexpected_destinations
         and all(item["socket_written"] == item["expected"] for item in fairness.values())
     )
@@ -274,14 +311,23 @@ async def run_gate(*, count: int, run_root: Path, workers: int = 4,
         "status": "PASS" if passed else "FAIL",
         "run_root": str(run_root),
         "workers": workers,
+        "pool_size": route_config["pool_size"],
+        "window_size": route_config["window_size"],
         "route_tps": route_tps,
+        "tps_scope": route_config["tps_scope"],
+        "configured_effective_total_tps": (
+            float(route_tps) * route_config["pool_size"]
+            if route_config["tps_scope"] == "per_bind" else float(route_tps)
+        ),
         "duration_seconds": round(time.monotonic() - started, 3),
         "generated": generated,
         "spool": reconciled_spool.status(),
         "states": dict(states),
         "socket_written": states["socket_written"],
         "smpp": {
-            "binds": smsc.binds, "submit_sm_received": len(smsc.received),
+            "binds": smsc.binds, "active_binds": smsc.active_binds,
+            "max_active_binds": smsc.max_active_binds,
+            "submit_sm_received": len(smsc.received),
             "submit_sm_resp_success": smsc.response_success,
             "errors": smsc.errors,
         },
@@ -301,7 +347,12 @@ def main() -> int:
     parser.add_argument("--gate", choices=("p10", "p100", "p1k", "p5500"), default="p100")
     parser.add_argument("--count", type=int, default=0)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--pool-size", type=int, default=0,
+                        help="physical bind cap; defaults to workers for the legacy synthetic gate")
     parser.add_argument("--route-tps", type=float, default=0.0)
+    parser.add_argument("--tps-scope", choices=("route_shared", "per_bind"), default="route_shared")
+    parser.add_argument("--window-size", type=int, default=50,
+                        help="PDU window per physical bind")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--run-root", default="")
     parser.add_argument("--output", default="")
@@ -311,7 +362,9 @@ def main() -> int:
     root = Path(args.run_root).resolve() if args.run_root else Path(__import__("tempfile").mkdtemp(prefix="mc-vnext-loopback-"))
     result = asyncio.run(run_gate(
         count=count, run_root=root, workers=max(1, min(8, args.workers)),
-        route_tps=max(0.0, args.route_tps), timeout=args.timeout,
+        pool_size=max(1, min(20, args.pool_size)) if args.pool_size else None,
+        route_tps=max(0.0, args.route_tps), tps_scope=args.tps_scope,
+        window_size=max(1, min(1000, args.window_size)), timeout=args.timeout,
     ))
     output = Path(args.output).resolve() if args.output else root / "result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -322,6 +375,7 @@ def main() -> int:
             "duration_seconds": result["duration_seconds"],
             "generated": result["generated"], "socket_written": result["socket_written"],
             "submit_sm_received": result["smpp"]["submit_sm_received"],
+            "max_active_binds": result["smpp"]["max_active_binds"],
             "submit_sm_resp_success": result["smpp"]["submit_sm_resp_success"],
             "projection_applied": result["projection"].get("applied"),
             "pending": result["spool"].get("pending_records"),

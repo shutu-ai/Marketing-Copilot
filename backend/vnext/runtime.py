@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import multiprocessing
 import os
 import queue
@@ -110,8 +111,18 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         except (OSError, ValueError, TypeError):
             return None
 
+    worker_count = max(1, int(context.get("worker_count", 1)))
+    route_configs = {}
+    for key, original in context["route_configs"].items():
+        config = dict(original)
+        pool_size = max(1, int(config.get("pool_size", 1) or 1))
+        # A worker may own more than one physical bind when pool_size is
+        # larger than the business-worker count.  The shared bind lease still
+        # enforces the route-wide physical cap across all worker processes.
+        config["_worker_bind_target"] = max(1, math.ceil(pool_size / worker_count))
+        route_configs[str(key)] = config
     worker = ShardWorker(
-        worker_id, tuple(partitions), spool, context["route_configs"], credits=credits,
+        worker_id, tuple(partitions), spool, route_configs, credits=credits,
         progress_sink=emit, max_inflight=int(context["max_inflight"]),
         prefetch_per_partition=int(context["prefetch_per_partition"]),
         control_loader=load_controls,
@@ -128,7 +139,10 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 worker.refresh_campaign_states(force=True)
                 before = worker.snapshot()["counters"].get("taken", 0)
                 publish_status(True)
-                await worker.run_until_idle(close_transports=False)
+                # Bind slots are a shared per-route resource.  Releasing an
+                # idle worker's connections lets another business worker take
+                # the same bounded pool without creating one bind per worker.
+                await worker.run_until_idle(close_transports=True)
                 publish_status(False)
                 after = worker.snapshot()["counters"].get("taken", 0)
                 if after == before:
@@ -203,6 +217,7 @@ class VNextRuntime:
         )
         self.supervisor: WorkerSupervisor | None = None
         self._started = False
+        self.started_at = 0.0
         self._control_state: dict[tuple[str, int], str] = {}
         self._control_version = 0
         self._control_lock = threading.RLock()
@@ -300,6 +315,7 @@ class VNextRuntime:
             "virtual_partition_count": self.virtual_partition_count,
             "max_spool_bytes": self.max_spool_bytes,
             "route_configs": self.route_configs,
+            "worker_count": self.worker_count,
             "max_inflight": self.max_inflight,
             "prefetch_per_partition": self.prefetch_per_partition,
             "projection_queue": self.projection.queue,
@@ -316,6 +332,7 @@ class VNextRuntime:
         )
         self.supervisor.start()
         self._started = True
+        self.started_at = time.time()
         write_process_metadata(
             self.diagnostics_root,
             "runtime-parent",
@@ -355,6 +372,7 @@ class VNextRuntime:
             self.projection.stop(timeout=30.0)
         self.supervisor = None
         self._started = False
+        self.started_at = 0.0
         write_process_metadata(
             self.diagnostics_root,
             "runtime-parent",

@@ -1,5 +1,13 @@
 <template>
   <div class="smpp-config">
+    <el-alert
+      v-if="restartRequired"
+      type="warning"
+      :closable="false"
+      show-icon
+      :title="$t('smpp.restartRequired')"
+      class="restart-alert"
+    />
     <div class="page-header">
       <h2>{{ $t('smpp.title') }}</h2>
       <el-button type="primary" @click="openDialog()">
@@ -20,6 +28,7 @@
         <el-table-column prop="pool_size" :label="$t('remaining.x64cea34e')" width="80" />
         <el-table-column prop="window_size" :label="$t('smpp.windowSize')" width="100" />
         <el-table-column prop="tps" label="TPS" width="70" />
+        <el-table-column prop="tps_scope" :label="$t('smpp.tpsScope')" width="120" />
         <el-table-column :label="$t('common.status')" width="80">
           <template #default="{ row }">
             <StatusTag :status="row.enabled ? 'enabled' : 'disabled'" />
@@ -143,11 +152,19 @@
               <el-input-number v-model="form.window_size" :min="1" :max="100" style="width: 100%" />
             </el-form-item>
           </el-col>
+          <el-col :span="12">
+            <el-form-item :label="$t('smpp.tpsScope')">
+              <el-select v-model="form.tps_scope" style="width: 100%">
+                <el-option :label="$t('smpp.routeShared')" value="route_shared" />
+                <el-option :label="$t('smpp.perBind')" value="per_bind" />
+              </el-select>
+            </el-form-item>
+          </el-col>
         </el-row>
         <el-row :gutter="20" class="smpp-throughput-row">
           <el-col :span="12">
             <el-form-item :label="$t('smpp.enquireInterval')">
-              <el-input-number v-model="form.enquire_interval" :min="5" :max="300" style="width: 100%" />
+              <el-input-number v-model="form.enquire_interval" :min="0" :max="300" style="width: 100%" />
             </el-form-item>
           </el-col>
         </el-row>
@@ -166,12 +183,12 @@
         <el-row :gutter="20">
           <el-col :span="12">
             <el-form-item :label="$t('legacy.x7c8fbe80')">
-              <el-input-number v-model="form.tps" :min="1" :max="10000" style="width: 100%" />
+              <el-input-number v-model="form.tps" :min="0" :max="10000" style="width: 100%" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
             <el-form-item :label="$t('legacy.x62072bea')">
-              <el-input-number v-model="form.reconnect_max_seconds" :min="1" :max="300" style="width: 100%" />
+              <el-input-number v-model="form.reconnect_max_seconds" :min="0" :max="300" style="width: 100%" />
             </el-form-item>
           </el-col>
         </el-row>
@@ -202,9 +219,10 @@ const defaultForm: SmppConfigForm = {
   name: '', host: '', port: 2775, system_id: '', password: '',
   source_addr: '', bind_type: 'transceiver', address_ton: 0, address_npi: 0,
   data_coding: 0, pool_size: 1, window_size: 10, enquire_interval: 30, timeout: 10,
-  tps: 10, priority: 100, reconnect_max_seconds: 60, delivery_receipt_mode: 'optional',
+  tps: 20, tps_scope: 'route_shared', priority: 100, reconnect_max_seconds: 60, delivery_receipt_mode: 'optional',
 }
 const form = ref<SmppConfigForm>({ ...defaultForm })
+const restartRequired = ref(false)
 
 onMounted(() => store.fetchConfigs())
 
@@ -218,7 +236,7 @@ function openDialog(row?: SmppConfig) {
       address_ton: row.address_ton, address_npi: row.address_npi,
       data_coding: row.data_coding, pool_size: row.pool_size, window_size: row.window_size || 10,
       enquire_interval: row.enquire_interval, timeout: row.timeout,
-      tps: row.tps, priority: row.priority, reconnect_max_seconds: row.reconnect_max_seconds,
+      tps: row.tps, tps_scope: row.tps_scope || 'route_shared', priority: row.priority, reconnect_max_seconds: row.reconnect_max_seconds,
       delivery_receipt_mode: row.delivery_receipt_mode || 'optional',
     }
   } else {
@@ -231,7 +249,8 @@ function openDialog(row?: SmppConfig) {
 async function handleDelete(id: number) {
   try {
     await ElMessageBox.confirm(i18n.global.t('legacy.xb28efaa0'), i18n.global.t('legacy.x02d9819d'))
-    await store.removeConfig(id)
+    const response = await store.removeConfig(id)
+    restartRequired.value = Boolean(response?.restart_required) || restartRequired.value
     ElMessage.success(i18n.global.t('legacy.x0007d170'))
   } catch {}
 }
@@ -239,10 +258,12 @@ async function handleDelete(id: number) {
 async function handleSave() {
   try {
     if (editingId.value) {
-      await store.editConfig(editingId.value, form.value)
+      const response = await store.editConfig(editingId.value, form.value)
+      restartRequired.value = Boolean((response as any)?.restart_required) || restartRequired.value
       ElMessage.success(i18n.global.t('legacy.x55aa6366'))
     } else {
-      await store.addConfig(form.value)
+      const response = await store.addConfig(form.value)
+      restartRequired.value = Boolean((response as any)?.restart_required) || restartRequired.value
       ElMessage.success(i18n.global.t('legacy.xa5bfd70d'))
     }
     dialogVisible.value = false
@@ -277,6 +298,7 @@ async function testConfig(row: SmppConfig) {
   justify-content: space-between;
   margin-bottom: 16px;
 }
+.restart-alert { margin-bottom: 16px; }
 .page-header.embedded {
   justify-content: flex-end;
 }

@@ -9,10 +9,12 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from .route_credits import RouteCreditBroker
+from .route_credits import RouteBindLease, RouteCreditBroker
 
 
 HEADER = struct.Struct("!IIII")
+BIND_RECEIVER = 0x00000001
+BIND_TRANSMITTER = 0x00000002
 BIND_TRANSCEIVER = 0x00000009
 SUBMIT_SM = 0x00000004
 ENQUIRE_LINK = 0x00000015
@@ -48,20 +50,31 @@ def _split_text(message: str) -> tuple[list[bytes], int]:
     return [encoded[index:index + 134] for index in range(0, len(encoded), 134)], 0
 
 
-def build_bind(sequence: int, system_id: str, password: str, system_type: str = "") -> bytes:
+def build_bind(sequence: int, system_id: str, password: str, system_type: str = "",
+               bind_type: str = "transceiver") -> bytes:
+    command_id = {
+        "receiver": BIND_RECEIVER,
+        "transmitter": BIND_TRANSMITTER,
+        "transceiver": BIND_TRANSCEIVER,
+    }.get(str(bind_type or "transceiver").strip().lower(), BIND_TRANSCEIVER)
     body = b"".join([
         cstring(system_id), cstring(password), cstring(system_type),
         bytes((0x34, 0, 0)), cstring(""),
     ])
-    return HEADER.pack(16 + len(body), BIND_TRANSCEIVER, 0, int(sequence)) + body
+    return HEADER.pack(16 + len(body), command_id, 0, int(sequence)) + body
 
 
 def build_submit_sm(sequence: int, *, source_addr: str, destination_addr: str,
                     message: str, part: int = 1, total_parts: int = 1,
-                    reference: int = 1, flash_sms: bool = False) -> bytes:
-    parts, data_coding = _split_text(message)
+                    reference: int = 1, flash_sms: bool = False,
+                    source_ton: int = 0, source_npi: int = 0,
+                    destination_ton: int = 1, destination_npi: int = 1,
+                    data_coding: int | None = None,
+                    registered_delivery: int = 1) -> bytes:
+    parts, detected_coding = _split_text(message)
     if len(parts) != int(total_parts):
         raise ValueError("total_parts does not match encoded message parts")
+    effective_coding = detected_coding if data_coding is None else int(data_coding)
     body_message = parts[int(part) - 1]
     esm_class = 0x20 if flash_sms else 0
     if total_parts > 1:
@@ -71,10 +84,10 @@ def build_submit_sm(sequence: int, *, source_addr: str, destination_addr: str,
     if len(body_message) > 255:
         raise ValueError("SMPP short_message exceeds 255 octets")
     body = b"".join([
-        cstring(""), bytes((5, 0)), cstring(source_addr),
-        bytes((1, 1)), cstring(destination_addr),
+        cstring(""), bytes((int(source_ton) & 0xFF, int(source_npi) & 0xFF)), cstring(source_addr),
+        bytes((int(destination_ton) & 0xFF, int(destination_npi) & 0xFF)), cstring(destination_addr),
         bytes((esm_class, 0, 0)), cstring(""), cstring(""),
-        bytes((0, 0, data_coding, 0, len(body_message))), body_message,
+        bytes((int(registered_delivery) & 0xFF, 0, int(effective_coding) & 0xFF, 0, len(body_message))), body_message,
     ])
     return HEADER.pack(16 + len(body), SUBMIT_SM, 0, int(sequence)) + body
 
@@ -114,14 +127,34 @@ class AsyncSmppTransport:
         self.system_id = str(self.config.get("system_id", "test"))
         self.password = str(self.config.get("password", "test"))
         self.source_addr = str(self.config.get("source_addr", "VNEXT"))
+        self.bind_type = str(self.config.get("bind_type", "transceiver") or "transceiver").strip().lower()
+        if self.bind_type not in {"receiver", "transmitter", "transceiver"}:
+            self.bind_type = "transceiver"
+        self.pool_size = max(1, int(self.config.get("pool_size", 1) or 1))
         self.window_size = max(1, int(self.config.get("window_size", 50)))
         self.tps = max(0.0, float(self.config.get("tps", self.config.get("rate_tps", 0.0)) or 0.0))
+        self.tps_scope = str(self.config.get("tps_scope", "route_shared") or "route_shared").strip().lower()
+        if self.tps_scope not in {"route_shared", "per_bind"}:
+            self.tps_scope = "route_shared"
+        self.source_ton = int(self.config.get("address_ton", 0) or 0)
+        self.source_npi = int(self.config.get("address_npi", 0) or 0)
+        self.data_coding = int(self.config.get("data_coding", 0) or 0)
+        self.delivery_receipt_mode = str(
+            self.config.get("delivery_receipt_mode", "optional") or "optional"
+        ).strip().lower()
+        if self.delivery_receipt_mode not in {"required", "optional", "disabled"}:
+            self.delivery_receipt_mode = "optional"
         self.timeout = max(0.2, float(self.config.get("timeout", 10.0)))
+        self.enquire_interval = max(0.0, float(self.config.get("enquire_interval", 30.0) or 0.0))
+        self.reconnect_max_seconds = max(
+            0.0, float(self.config.get("reconnect_max_seconds", 60.0) or 0.0)
+        )
         self.credits = credits or RouteCreditBroker()
         self.response_callback = response_callback
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._window = asyncio.Semaphore(self.window_size)
@@ -129,6 +162,10 @@ class AsyncSmppTransport:
         self._sequence = 1
         self._connected = False
         self._closing = False
+        self._bind_lease: RouteBindLease | None = None
+        self.bind_slot: int | None = None
+        self._reconnect_failures = 0
+        self._reconnect_not_before = 0.0
         self.socket_written_parts = 0
         self.response_success = 0
         self.response_error = 0
@@ -144,30 +181,79 @@ class AsyncSmppTransport:
         self._sequence = (self._sequence % 0x7FFFFFFE) + 1
         return self._sequence
 
+    def _schedule_reconnect(self) -> None:
+        self._reconnect_failures += 1
+        if self.reconnect_max_seconds <= 0:
+            self._reconnect_not_before = 0.0
+            return
+        delay = min(
+            self.reconnect_max_seconds,
+            0.25 * (2 ** min(self._reconnect_failures - 1, 8)),
+        )
+        self._reconnect_not_before = time.monotonic() + delay
+
+    async def _heartbeat(self) -> None:
+        try:
+            while self.connected and self.enquire_interval > 0:
+                await asyncio.sleep(self.enquire_interval)
+                if not self.connected or self.writer is None:
+                    return
+                sequence = self._next_sequence()
+                async with self._write_lock:
+                    self.writer.write(HEADER.pack(16, ENQUIRE_LINK, 0, sequence))
+                    await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            await self.close()
+
     async def connect(self) -> None:
         if self.connected:
             return
         async with self._connect_lock:
             if self.connected:
                 return
-            self.reader, self.writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port), timeout=self.timeout
-            )
-            sequence = 1
             try:
+                wait = self._reconnect_not_before - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._bind_lease = await self.credits.acquire_bind(
+                    self.route_id, self.pool_size,
+                    timeout=max(self.timeout, self.reconnect_max_seconds, 30.0),
+                )
+                self.bind_slot = self._bind_lease.slot
+                self.reader, self.writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port), timeout=self.timeout
+                )
+                sequence = 1
                 async with self._write_lock:
-                    self.writer.write(build_bind(sequence, self.system_id, self.password))
+                    self.writer.write(build_bind(
+                        sequence, self.system_id, self.password, bind_type=self.bind_type,
+                    ))
                     await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
                 command_id, status, response_sequence, _ = await asyncio.wait_for(
                     read_pdu(self.reader), timeout=self.timeout
                 )
-                if command_id != (BIND_TRANSCEIVER | RESPONSE_MASK) or response_sequence != sequence or status != ESME_ROK:
+                bind_command = {
+                    "receiver": BIND_RECEIVER,
+                    "transmitter": BIND_TRANSMITTER,
+                    "transceiver": BIND_TRANSCEIVER,
+                }[self.bind_type]
+                if command_id != (bind_command | RESPONSE_MASK) or response_sequence != sequence or status != ESME_ROK:
                     raise SmppTransportError(f"bind failed status=0x{status:08x} command=0x{command_id:08x}")
                 self._connected = True
                 self._closing = False
+                self._reconnect_failures = 0
+                self._reconnect_not_before = 0.0
                 self._reader_task = asyncio.create_task(self._read_responses(), name=f"vnext-smpp-reader-{self.route_id}")
+                if self.enquire_interval > 0:
+                    self._heartbeat_task = asyncio.create_task(
+                        self._heartbeat(), name=f"vnext-smpp-heartbeat-{self.route_id}"
+                    )
             except Exception:
                 await self.close()
+                self._schedule_reconnect()
                 raise
 
     async def _read_responses(self) -> None:
@@ -202,6 +288,9 @@ class AsyncSmppTransport:
                         async with self._write_lock:
                             self.writer.write(HEADER.pack(16, ENQUIRE_LINK | RESPONSE_MASK, 0, sequence))
                             await self.writer.drain()
+                elif command_id == (ENQUIRE_LINK | RESPONSE_MASK):
+                    # Heartbeat response; no PDU window credit is involved.
+                    continue
                 elif command_id == (UNBIND | RESPONSE_MASK):
                     return
         except (asyncio.IncompleteReadError, ConnectionError, OSError, SmppTransportError) as exc:
@@ -220,12 +309,22 @@ class AsyncSmppTransport:
                     stale_writer.close()
                 self.reader = None
                 self.writer = None
+                lease = self._bind_lease
+                self._bind_lease = None
+                self.bind_slot = None
+                if lease is not None:
+                    lease.release()
 
     async def send_task(self, *, destination_addr: str, message: str, flash_sms: bool = False,
                         reference: int = 1, source_addr: str | None = None) -> SocketWriteResult:
         parts, _coding = _split_text(message)
         if not parts:
             return SocketWriteResult("write_failed", 0, 0, "empty message")
+        if self.bind_type == "receiver":
+            return SocketWriteResult(
+                "write_failed", 0, len(parts),
+                "receiver bind cannot submit_sm; choose transmitter or transceiver",
+            )
         try:
             await self.connect()
         except Exception as exc:
@@ -234,7 +333,9 @@ class AsyncSmppTransport:
             return SocketWriteResult("write_failed", 0, len(parts), self.last_error)
         written = 0
         for index in range(1, len(parts) + 1):
-            await self.credits.acquire(self.route_id, self.tps)
+            await self.credits.acquire(
+                self.route_id, self.tps, tps_scope=self.tps_scope, bind_slot=self.bind_slot,
+            )
             try:
                 await asyncio.wait_for(self._window.acquire(), timeout=self.timeout)
             except asyncio.TimeoutError:
@@ -247,6 +348,9 @@ class AsyncSmppTransport:
                 destination_addr=str(destination_addr), message=message,
                 part=index, total_parts=len(parts), reference=reference,
                 flash_sms=flash_sms,
+                source_ton=self.source_ton, source_npi=self.source_npi,
+                data_coding=(self.data_coding or None),
+                registered_delivery=0 if self.delivery_receipt_mode == "disabled" else 1,
             )
             self._pending[sequence] = _Pending(sequence, time.monotonic(), self.route_id)
             try:
@@ -268,6 +372,12 @@ class AsyncSmppTransport:
     async def close(self) -> None:
         self._closing = True
         self._connected = False
+        heartbeat = self._heartbeat_task
+        self._heartbeat_task = None
+        if heartbeat and heartbeat is not asyncio.current_task():
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat
         task = self._reader_task
         self._reader_task = None
         if task and task is not asyncio.current_task():
@@ -290,18 +400,37 @@ class AsyncSmppTransport:
             self._window.release()
         self.reader = None
         self.writer = None
+        lease = self._bind_lease
+        self._bind_lease = None
+        self.bind_slot = None
+        if lease is not None:
+            lease.release()
         self._closing = False
 
     def snapshot(self) -> dict:
         return {
             "route_id": self.route_id,
             "connected": self.connected,
+            "bind_type": self.bind_type,
+            "bind_slot": self.bind_slot,
+            "pool_size": self.pool_size,
             "window_size": self.window_size,
+            "tps": self.tps,
+            "tps_scope": self.tps_scope,
+            "effective_total_limit_tps": self.tps * self.pool_size if self.tps_scope == "per_bind" else self.tps,
+            "tps_unit": "submit_sm_parts/s",
+            "delivery_receipt_mode": self.delivery_receipt_mode,
+            "enquire_interval": self.enquire_interval,
+            "reconnect_max_seconds": self.reconnect_max_seconds,
             "window_inflight": len(self._pending),
             "socket_written_parts": self.socket_written_parts,
             "response_success": self.response_success,
             "response_error": self.response_error,
             "unknown_parts": self.unknown_parts,
             "write_failures": self.write_failures,
+            "reconnect_failures": self._reconnect_failures,
+            "reconnect_backoff_seconds": round(
+                max(0.0, self._reconnect_not_before - time.monotonic()), 3
+            ),
             "last_error": self.last_error,
         }

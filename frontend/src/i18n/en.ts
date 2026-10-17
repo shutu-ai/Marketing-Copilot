@@ -284,6 +284,9 @@ export default {
     dataCoding: 'Data Coding',
     poolSize: 'Pool Size',
     windowSize: 'Window Size',
+    tpsScope: 'TPS scope',
+    routeShared: 'Route shared',
+    perBind: 'Per Bind',
     enquireInterval: 'Enquire Interval (s)',
     timeout: 'Timeout (s)',
     deliveryReceiptMode: 'DLR mode',
@@ -298,6 +301,7 @@ export default {
     addSuccess: 'SMPP config added',
     updateSuccess: 'SMPP config updated',
     deleteSuccess: 'SMPP config deleted',
+    restartRequired: 'SMPP changes are saved and will take effect after a safe VNext restart.',
   },
   smsContent: {
     title: 'SMS Content Config',

@@ -73,7 +73,9 @@ class ShardWorker:
         self._stop = asyncio.Event()
         self._paused_campaigns: set[tuple[str, int]] = set()
         self._cancelled_campaigns: set[tuple[str, int]] = set()
-        self._transports: dict[str, object] = {}
+        self._transports: dict[str, list[object]] = {}
+        self._transport_creation_locks: dict[str, asyncio.Lock] = {}
+        self._transport_cursor: dict[str, int] = {}
         self._number_locks: dict[str, asyncio.Lock] = {}
         self._progress_events: deque[dict] = deque(maxlen=10_000)
         self._group_cursor = 0
@@ -120,17 +122,24 @@ class ShardWorker:
 
     async def _transport(self, route_id: int):
         key = str(int(route_id))
-        if key not in self._transports:
-            config = self.route_configs.get(key)
-            if not config:
-                return None
-            config = dict(config)
-            config.setdefault("route_id", key)
-            value = self.transport_factory(config, self.credits)
-            if inspect.isawaitable(value):
-                value = await value
-            self._transports[key] = value
-        return self._transports[key]
+        config = self.route_configs.get(key)
+        if not config:
+            return None
+        lock = self._transport_creation_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            transports = self._transports.setdefault(key, [])
+            target = max(1, int(config.get("_worker_bind_target", 1) or 1))
+            while len(transports) < target:
+                transport_config = dict(config)
+                transport_config.setdefault("route_id", key)
+                value = self.transport_factory(transport_config, self.credits)
+                if inspect.isawaitable(value):
+                    value = await value
+                transports.append(value)
+            cursor = self._transport_cursor.get(key, 0)
+            value = transports[cursor % len(transports)]
+            self._transport_cursor[key] = cursor + 1
+            return value
 
     async def _emit(self, progress: WorkerProgress) -> None:
         event = progress.as_dict()
@@ -150,14 +159,31 @@ class ShardWorker:
         if inspect.isawaitable(result):
             await result
 
-    async def _process(self, record: SpoolRecord) -> None:
+    async def _process(self, record: SpoolRecord) -> SpoolRecord | None:
         self.refresh_campaign_states(force=True)
         key = (record.campaign_type, record.campaign_id)
         if key in self._paused_campaigns and key not in self._cancelled_campaigns:
             # Do not checkpoint a record that became paused while it was in a
             # bounded prefetch buffer.  The next polling cycle will discover
             # it again from the durable spool.
-            return
+            return None
+        # Binding is a connection-lifecycle operation, not a dispatch fence.
+        # Acquire a physical route slot before advancing the durable cursor so
+        # a worker that is waiting behind pool_size can never lose a record.
+        transport = await self._transport(record.route_id)
+        if transport is None:
+            return record
+        connect = getattr(transport, "connect", None)
+        if connect:
+            try:
+                result = connect()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                # The record remains before the spool cursor.  The caller
+                # blocks this partition for this pass and retries it from the
+                # durable cursor on the next pass.
+                return record
         # Persist dispatch_taken before any socket call.  A crash after this
         # point is intentionally at-most-once-after-dispatch.
         try:
@@ -170,7 +196,7 @@ class ShardWorker:
                 f"dispatch checkpoint failed: {type(exc).__name__}: {exc}",
                 message=record.message,
             ))
-            return
+            return None
         self.refresh_campaign_states(force=True)
         if key in self._paused_campaigns and key not in self._cancelled_campaigns:
             return
@@ -181,19 +207,9 @@ class ShardWorker:
                 record.normalized_msisdn, "cancelled", 0, record.part_count_hint,
                 "campaign cancelled", message=record.message,
             ))
-            return
+            return None
         lock = self._number_locks.setdefault(record.normalized_msisdn, asyncio.Lock())
         async with lock:
-            transport = await self._transport(record.route_id)
-            if transport is None:
-                await self._emit(WorkerProgress(
-                    record.event_id, record.partition_id, record.ordinal,
-                    record.campaign_type, record.campaign_id, record.route_id,
-                    record.normalized_msisdn, "write_failed", 0, record.part_count_hint,
-                    "route configuration unavailable",
-                    message=record.message,
-                ))
-                return
             try:
                 result: SocketWriteResult = await transport.send_task(
                     destination_addr=record.normalized_msisdn,
@@ -213,6 +229,7 @@ class ShardWorker:
                 record.normalized_msisdn, result.state, result.parts_written,
                 result.parts_total, result.error, message=record.message,
             ))
+        return None
 
     def _seed_buffers(self):
         iterators = {partition: iter(self.spool.iter_from(partition, self.spool.cursor(partition))) for partition in self.partitions}
@@ -240,29 +257,34 @@ class ShardWorker:
         return iterators, buffers, counts, exhausted, group_order, fill
 
     async def close_transports(self) -> None:
-        for transport in self._transports.values():
+        transports = [transport for values in self._transports.values() for transport in values]
+        for transport in transports:
             close = getattr(transport, "close", None)
             if close:
                 result = close()
                 if inspect.isawaitable(result):
                     await result
         self._transports.clear()
+        self._transport_cursor.clear()
 
     async def run_until_idle(self, *, max_tasks: int | None = None,
                              close_transports: bool = True) -> dict:
         iterators, buffers, counts, exhausted, group_order, fill = self._seed_buffers()
         pending: set[asyncio.Task] = set()
+        blocked_partitions: set[int] = set()
         processed = 0
         fill()
         try:
             while not self._stop.is_set() and (group_order or pending) and (max_tasks is None or processed < int(max_tasks)):
+                for partition in blocked_partitions:
+                    exhausted.add(partition)
                 fill()
                 eligible_group = None
                 for offset in range(len(group_order)):
                     index = (self._group_cursor + offset) % len(group_order)
                     group = group_order[index]
                     queue = buffers[group]
-                    if queue and self._eligible(queue[0]):
+                    if queue and group[0] not in blocked_partitions and self._eligible(queue[0]):
                         eligible_group = group
                         self._group_cursor = (index + 1) % len(group_order)
                         break
@@ -277,7 +299,15 @@ class ShardWorker:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     self._inflight = len(pending)
                     for task in done:
-                        task.result()
+                        deferred = task.result()
+                        if deferred is not None:
+                            group = (
+                                deferred.partition_id, deferred.campaign_type,
+                                deferred.campaign_id, deferred.route_id,
+                            )
+                            buffers[group].appendleft(deferred)
+                            counts[deferred.partition_id] += 1
+                            blocked_partitions.add(deferred.partition_id)
                     continue
                 if all(not buffers[group] for group in group_order):
                     fill()
@@ -304,7 +334,9 @@ class ShardWorker:
             "progress_events": len(self._progress_events),
             "inflight": int(self._inflight),
             "transports": [
-                transport.snapshot() for transport in self._transports.values()
+                transport.snapshot()
+                for values in self._transports.values()
+                for transport in values
                 if hasattr(transport, "snapshot")
             ],
         }

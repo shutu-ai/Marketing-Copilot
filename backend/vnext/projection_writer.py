@@ -96,7 +96,7 @@ class ProjectionWriter:
     """A bounded writer object; in production it is owned by one process."""
 
     def __init__(self, db_path: str | os.PathLike[str], *, queue_size: int = 8192,
-                 batch_size: int = 128, retry_seconds: float = 0.05,
+                 batch_size: int = 512, retry_seconds: float = 0.05,
                  flush_interval_seconds: float = 0.1):
         self.db_path = str(Path(db_path).resolve())
         self.queue_size = max(1, int(queue_size))
@@ -511,7 +511,7 @@ class ProjectionWriterProcess:
     """Multiprocess owner wrapper used by V4/runtime integration."""
 
     def __init__(self, root: str | os.PathLike[str], *, db_name: str = "vnext-projection.duckdb",
-                 queue_size: int = 8192, batch_size: int = 128,
+                 queue_size: int = 8192, batch_size: int = 512,
                  journal_paths: list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...] = (),
                  flush_interval_seconds: float = 0.1, start_method: str = "spawn",
                  mp_context=None, diagnostics_root: str | os.PathLike[str] | None = None,
