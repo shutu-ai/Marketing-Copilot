@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from .critical_path_profiler import CriticalPathProfiler
 from .metrics import VNextMetrics
 from .route_credits import RouteCreditBroker
 from .smpp_transport import AsyncSmppTransport, SocketWriteResult
@@ -63,7 +64,8 @@ class ShardWorker:
                  control_loader: Callable[[], list[dict] | None] | None = None,
                  journal_admission: Callable[[SpoolRecord], bool] | None = None,
                  max_inflight: int = 64, prefetch_per_partition: int = 32,
-                 metrics: VNextMetrics | None = None):
+                  metrics: VNextMetrics | None = None,
+                  profiler: CriticalPathProfiler | None = None):
         self.worker_id = int(worker_id)
         self.partitions = tuple(int(item) for item in partitions)
         self.spool = spool
@@ -76,6 +78,7 @@ class ShardWorker:
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
         self.metrics = metrics or VNextMetrics()
+        self.profiler = profiler
         self._stop = asyncio.Event()
         self._paused_campaigns: set[tuple[str, int]] = set()
         self._cancelled_campaigns: set[tuple[str, int]] = set()
@@ -144,6 +147,9 @@ class ShardWorker:
                 set_response_sink = getattr(value, "set_response_sink", None)
                 if set_response_sink:
                     set_response_sink(self._response_event)
+                set_profiler = getattr(value, "set_profiler", None)
+                if set_profiler:
+                    set_profiler(self.profiler)
                 transports.append(value)
             cursor = self._transport_cursor.get(key, 0)
             value = transports[cursor % len(transports)]
@@ -165,11 +171,20 @@ class ShardWorker:
         event.update(overrides)
         self._progress_events.append(event)
         self.metrics.record(event)
+        if self.profiler:
+            self.profiler.inc("progress_events")
+            self.profiler.inc(f"progress_state_{progress.state}")
+            if progress.state.startswith("submit_sm_resp_") or progress.state == "unknown":
+                self.profiler.inc("response_events_emitted")
         if not self.progress_sink:
+            if self.profiler:
+                self.profiler.publish_if_due()
             return
         result = self.progress_sink(event)
         if inspect.isawaitable(result):
             await result
+        if self.profiler:
+            self.profiler.publish_if_due()
 
     async def _response_event(self, response: dict) -> None:
         context = dict(response.get("context") or {})
@@ -181,6 +196,8 @@ class ShardWorker:
         else:
             state = "submit_sm_resp_success" if bool(response.get("success")) else "submit_sm_resp_error"
         success = bool(response.get("success"))
+        if self.profiler:
+            self.profiler.inc("response_callback_events")
         progress = WorkerProgress(
             event_id=f"{event_id}:resp:{int(response.get('sequence') or 0)}",
             partition_id=int(context.get("partition_id") or 0),
@@ -278,6 +295,10 @@ class ShardWorker:
                 message=record.message,
             ))
             return None
+        if self.profiler:
+            self.profiler.inc("task_taken")
+            self.profiler.mark("last_task_taken_monotonic")
+            self.profiler.publish_if_due()
         self.refresh_campaign_states(force=True)
         if key in self._paused_campaigns and key not in self._cancelled_campaigns:
             return

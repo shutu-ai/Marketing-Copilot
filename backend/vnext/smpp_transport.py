@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from .critical_path_profiler import CriticalPathProfiler
 from .route_credits import RouteBindLease, RouteCreditBroker
 
 
@@ -121,7 +122,8 @@ class AsyncSmppTransport:
     """One non-blocking SMPP bind with a continuously running response reader."""
 
     def __init__(self, config: dict, *, credits: RouteCreditBroker | None = None,
-                 response_callback: Callable[[dict], Awaitable[None] | None] | None = None):
+                 response_callback: Callable[[dict], Awaitable[None] | None] | None = None,
+                 profiler: CriticalPathProfiler | None = None):
         self.config = dict(config)
         self.route_id = str(self.config.get("route_id", self.config.get("id", "default")))
         self.host = str(self.config.get("host", "127.0.0.1"))
@@ -153,6 +155,7 @@ class AsyncSmppTransport:
         )
         self.credits = credits or RouteCreditBroker()
         self.response_callback = response_callback
+        self.profiler = profiler
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task | None = None
@@ -179,6 +182,11 @@ class AsyncSmppTransport:
         """Attach the current worker's durable response sink."""
 
         self.response_callback = callback
+
+    def set_profiler(self, profiler: CriticalPathProfiler | None) -> None:
+        """Attach an optional process-local critical-path profiler."""
+
+        self.profiler = profiler
 
     async def _admission_allowed(self, callback) -> bool:
         if callback is None:
@@ -281,9 +289,16 @@ class AsyncSmppTransport:
             while True:
                 command_id, status, sequence, body = await read_pdu(self.reader)
                 if command_id == (SUBMIT_SM | RESPONSE_MASK):
+                    response_received_at = time.monotonic()
+                    if self.profiler:
+                        self.profiler.inc("response_pdus_received")
+                        self.profiler.mark("last_smpp_response_received_monotonic", response_received_at)
                     pending = self._pending.pop(sequence, None)
                     if pending is None:
                         self.unknown_parts += 1
+                        if self.profiler:
+                            self.profiler.inc("unknown_response_pdus")
+                            self.profiler.publish_if_due()
                         continue
                     if status == ESME_ROK:
                         self.response_success += 1
@@ -299,10 +314,26 @@ class AsyncSmppTransport:
                         "body_length": len(body),
                         "context": dict(pending.context or {}),
                     }
+                    if self.profiler:
+                        self.profiler.observe_ns(
+                            "smpp_response_latency",
+                            int(max(0.0, response_received_at - pending.sent_at) * 1_000_000_000),
+                        )
                     if self.response_callback:
-                        result = self.response_callback(event)
-                        if asyncio.iscoroutine(result):
-                            await result
+                        callback_started_ns = time.perf_counter_ns()
+                        try:
+                            result = self.response_callback(event)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        finally:
+                            if self.profiler:
+                                self.profiler.observe_ns(
+                                    "response_callback",
+                                    time.perf_counter_ns() - callback_started_ns,
+                                )
+                    if self.profiler:
+                        self.profiler.gauge("window_inflight", len(self._pending))
+                        self.profiler.publish_if_due()
                 elif command_id == ENQUIRE_LINK:
                     if self.writer and not self.writer.is_closing():
                         async with self._write_lock:
@@ -379,9 +410,12 @@ class AsyncSmppTransport:
             return SocketWriteResult("write_failed", 0, len(parts), self.last_error)
         written = 0
         for index in range(1, len(parts) + 1):
+            credit_started_ns = time.perf_counter_ns()
             await self.credits.acquire(
                 self.route_id, self.tps, tps_scope=self.tps_scope, bind_slot=self.bind_slot,
             )
+            if self.profiler:
+                self.profiler.observe_ns("tps_credit_wait", time.perf_counter_ns() - credit_started_ns)
             if not await self._admission_allowed(before_write):
                 if before_write is not None:
                     state = "unknown" if written else "expired"
@@ -389,12 +423,19 @@ class AsyncSmppTransport:
                         state, written, len(parts),
                         self.last_error or "business day cutoff reached before socket write",
                     )
+            window_started_ns = time.perf_counter_ns()
             try:
                 await asyncio.wait_for(self._window.acquire(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 self.write_failures += 1
                 self.last_error = "SMPP response window did not release before timeout"
+                if self.profiler:
+                    self.profiler.observe_ns("response_window_wait", time.perf_counter_ns() - window_started_ns)
+                    self.profiler.inc("response_window_timeouts")
+                    self.profiler.publish_if_due()
                 return SocketWriteResult("write_failed", written, len(parts), self.last_error)
+            if self.profiler:
+                self.profiler.observe_ns("response_window_wait", time.perf_counter_ns() - window_started_ns)
             if not await self._admission_allowed(before_write):
                 if before_write is not None:
                     self._window.release()
@@ -429,15 +470,30 @@ class AsyncSmppTransport:
                                 state, written, len(parts),
                                 "business day cutoff reached immediately before socket write",
                             )
-                    self.writer.write(packet)
-                    await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+                    socket_started_ns = time.perf_counter_ns()
+                    try:
+                        self.writer.write(packet)
+                        await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+                    finally:
+                        if self.profiler:
+                            self.profiler.observe_ns(
+                                "socket_write_drain", time.perf_counter_ns() - socket_started_ns
+                            )
                 self.socket_written_parts += 1
                 written += 1
+                if self.profiler:
+                    self.profiler.inc("socket_written_pdu")
+                    self.profiler.mark("last_socket_write_monotonic")
+                    self.profiler.gauge("window_inflight", len(self._pending))
+                    self.profiler.publish_if_due()
             except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
                 self._pending.pop(sequence, None)
                 self._window.release()
                 self.write_failures += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
+                if self.profiler:
+                    self.profiler.inc("socket_write_failures")
+                    self.profiler.publish_if_due()
                 state = "unknown" if written or self.writer and self.writer.is_closing() else "write_failed"
                 return SocketWriteResult(state, written, len(parts), self.last_error)
         return SocketWriteResult("socket_written", written, len(parts))

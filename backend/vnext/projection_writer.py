@@ -12,6 +12,7 @@ import contextlib
 from collections import deque
 from pathlib import Path
 
+from .critical_path_profiler import CriticalPathProfiler
 from .diagnostics import enable_native_fault_capture, write_process_metadata
 
 
@@ -37,12 +38,14 @@ class ProgressJournal:
 
     def __init__(self, path: str | os.PathLike[str], *, max_event_bytes: int = 64 * 1024,
                  max_bytes: int = 512 * 1024 * 1024,
-                 segment_bytes: int | None = None):
+                 segment_bytes: int | None = None,
+                 profiler: CriticalPathProfiler | None = None):
         self.path = Path(path).resolve()
         self.max_event_bytes = max(1024, int(max_event_bytes))
         self.max_bytes = max(self.max_event_bytes, int(max_bytes))
         requested_segment_bytes = int(segment_bytes or min(self.max_bytes, 64 * 1024 * 1024))
         self.segment_bytes = max(self.max_event_bytes, min(self.max_bytes, requested_segment_bytes))
+        self.profiler = profiler
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._read_metrics = {
             "journal_read_ns": 0,
@@ -75,14 +78,22 @@ class ProgressJournal:
     def segment_paths(self) -> list[Path]:
         """Return existing segments in append order, retaining the base path."""
 
-        paths = [self.path] if self.path.exists() else []
-        pattern = f"{self.path.stem}.g*{self.path.suffix}"
-        generated = [
-            candidate for candidate in self.path.parent.glob(pattern)
-            if self._generation(candidate) >= 0
-        ]
-        paths.extend(sorted(generated, key=self._generation))
-        return paths or [self.path]
+        started_ns = time.perf_counter_ns()
+        try:
+            paths = [self.path] if self.path.exists() else []
+            pattern = f"{self.path.stem}.g*{self.path.suffix}"
+            generated = [
+                candidate for candidate in self.path.parent.glob(pattern)
+                if self._generation(candidate) >= 0
+            ]
+            paths.extend(sorted(generated, key=self._generation))
+            return paths or [self.path]
+        finally:
+            if self.profiler:
+                self.profiler.inc("journal_segment_scan_count")
+                self.profiler.observe_ns(
+                    "journal_segment_scan", time.perf_counter_ns() - started_ns
+                )
 
     def active_path(self) -> Path:
         return self.segment_paths()[-1]
@@ -105,12 +116,16 @@ class ProgressJournal:
         return len(encoded) <= self.max_event_bytes and self.size() + len(encoded) <= self.max_bytes
 
     def _append_encoded(self, encoded: list[bytes]) -> None:
+        append_started_ns = time.perf_counter_ns()
         if not encoded:
             return
         if any(len(line) > self.max_event_bytes for line in encoded):
             raise ValueError("progress event exceeds bounded size")
         if self.size() + sum(len(line) for line in encoded) > self.max_bytes:
             raise ProjectionBackpressure("progress journal capacity exhausted")
+        if self.profiler:
+            self.profiler.inc("journal_append_event_count", len(encoded))
+            self.profiler.inc("journal_append_bytes", sum(len(line) for line in encoded))
         handles: dict[Path, object] = {}
         try:
             active = self.active_path()
@@ -119,27 +134,70 @@ class ProgressJournal:
                     active_size = int(active.stat().st_size)
                 except FileNotFoundError:
                     active_size = 0
+                if self.profiler:
+                    self.profiler.inc("journal_active_stat_count")
                 if active_size and active_size + len(line) > self.segment_bytes:
                     generations = [self._generation(path) for path in self.segment_paths()]
                     active = self._generation_path(max(generations or [-1]) + 1)
                 handle = handles.get(active)
                 if handle is None:
                     active.parent.mkdir(parents=True, exist_ok=True)
+                    open_started_ns = time.perf_counter_ns()
                     handle = active.open("ab")
+                    if self.profiler:
+                        self.profiler.observe_ns(
+                            "journal_open", time.perf_counter_ns() - open_started_ns
+                        )
                     handles[active] = handle
+                write_started_ns = time.perf_counter_ns()
                 handle.write(line)
+                if self.profiler:
+                    self.profiler.observe_ns(
+                        "journal_write", time.perf_counter_ns() - write_started_ns
+                    )
             for handle in handles.values():
                 handle.flush()
+                fsync_started_ns = time.perf_counter_ns()
                 os.fsync(handle.fileno())
+                if self.profiler:
+                    self.profiler.observe_ns(
+                        "journal_fsync", time.perf_counter_ns() - fsync_started_ns
+                    )
         finally:
             for handle in handles.values():
                 handle.close()
+            if self.profiler:
+                self.profiler.observe_ns(
+                    "journal_append", time.perf_counter_ns() - append_started_ns
+                )
+                self.profiler.publish_if_due()
 
     def append(self, event: dict) -> None:
-        self._append_encoded([self._encode(event)])
+        started_ns = time.perf_counter_ns()
+        encoded = self._encode(event)
+        if self.profiler:
+            self.profiler.observe_ns("journal_json_encode", time.perf_counter_ns() - started_ns)
+        self._append_encoded([encoded])
+        if self.profiler:
+            self.profiler.inc("journal_events_durable")
+            self.profiler.mark("last_journal_durable_monotonic")
+            if ":resp:" in str(event.get("event_id") or ""):
+                self.profiler.mark("last_response_journal_durable_monotonic")
+            self.profiler.publish_if_due()
 
     def append_many(self, events: list[dict]) -> None:
-        self._append_encoded([self._encode(event) for event in events])
+        started_ns = time.perf_counter_ns()
+        encoded = [self._encode(event) for event in events]
+        if self.profiler:
+            self.profiler.observe_ns("journal_json_encode", time.perf_counter_ns() - started_ns)
+        self._append_encoded(encoded)
+        if self.profiler:
+            self.profiler.inc("journal_events_durable", len(events))
+            self.profiler.mark("last_journal_durable_monotonic")
+            for event in events:
+                if ":resp:" in str(event.get("event_id") or ""):
+                    self.profiler.mark("last_response_journal_durable_monotonic")
+            self.profiler.publish_if_due()
 
     def read(self) -> list[dict]:
         result: list[dict] = []
@@ -264,7 +322,8 @@ class ProjectionWriter:
     def __init__(self, db_path: str | os.PathLike[str], *, queue_size: int = 8192,
                  batch_size: int = 512, retry_seconds: float = 0.05,
                  flush_interval_seconds: float = 0.1,
-                 staging_mode: str = "vectorized", reuse_staging: bool = True):
+                 staging_mode: str = "vectorized", reuse_staging: bool = True,
+                 profiler: CriticalPathProfiler | None = None):
         self.db_path = str(Path(db_path).resolve())
         self.queue_size = max(1, int(queue_size))
         self.batch_size = max(1, int(batch_size))
@@ -274,6 +333,7 @@ class ProjectionWriter:
         if self.staging_mode not in {"executemany", "vectorized"}:
             raise ValueError("staging_mode must be executemany or vectorized")
         self.reuse_staging = bool(reuse_staging)
+        self.profiler = profiler
         self._queue: deque[dict] = deque(maxlen=self.queue_size)
         self._conn = None
         self._paused_until = 0.0
@@ -628,7 +688,12 @@ class ProjectionWriter:
             commit_started_ns = time.perf_counter_ns()
             self._conn.execute("COMMIT")
             self._metrics["db_commit_ns"] += time.perf_counter_ns() - commit_started_ns
+            if self.profiler:
+                self.profiler.mark("last_projection_db_commit_monotonic")
+                self.profiler.inc("projection_commits")
             self._metrics["batch_end_to_end_ns"] += time.perf_counter_ns() - batch_started_ns
+            if self.profiler:
+                self.profiler.publish_if_due()
         except Exception:
             with contextlib.suppress(Exception):
                 self._conn.execute("ROLLBACK")
@@ -766,12 +831,20 @@ def _process_main(
     start_method: str = "spawn",
     staging_mode: str = "vectorized",
     reuse_staging: bool = True,
+    profile_root: str = "",
+    profile_interval_seconds: float = 1.0,
 ) -> None:
     status_file = Path(status_path)
     role = "projection-writer"
     native_fault_path = enable_native_fault_capture(diagnostic_root, role)
+    profiler = CriticalPathProfiler(
+        profile_root,
+        role,
+        interval_seconds=float(profile_interval_seconds or 1.0),
+    )
 
     def diagnostic(**kwargs) -> None:
+        started_ns = time.perf_counter_ns()
         try:
             write_process_metadata(
                 diagnostic_root,
@@ -782,6 +855,9 @@ def _process_main(
             )
         except Exception:
             pass
+        finally:
+            profiler.observe_ns("diagnostic_write", time.perf_counter_ns() - started_ns)
+            profiler.publish_if_due()
 
     diagnostic(
         phase="starting",
@@ -794,8 +870,9 @@ def _process_main(
         flush_interval_seconds=flush_interval_seconds,
         staging_mode=staging_mode,
         reuse_staging=reuse_staging,
+        profiler=profiler,
     )
-    journals = tuple(ProgressJournal(path) for path in journal_paths)
+    journals = tuple(ProgressJournal(path, profiler=profiler) for path in journal_paths)
     offsets_file = Path(offsets_path) if offsets_path else None
     offsets = _load_offsets(offsets_file) if offsets_file else {}
     pending_events: list[dict] = []
@@ -859,7 +936,16 @@ def _process_main(
             "journal_events_read": journal_events_read,
             "journal_bytes_read": journal_bytes_read,
         })
+        if profiler.enabled:
+            value["critical_path"] = profiler.snapshot()
         return value
+
+    def write_status(*, force_metrics: bool = False) -> None:
+        started_ns = time.perf_counter_ns()
+        _write_process_status(status_file, status(force_metrics=force_metrics))
+        profiler.inc("process_status_write_count")
+        profiler.observe_ns("process_status_write", time.perf_counter_ns() - started_ns)
+        profiler.publish_if_due()
 
     try:
         writer.start()
@@ -876,7 +962,7 @@ def _process_main(
                             extra={"last_error": f"{type(exc).__name__}: {exc}"},
                         )
                         time.sleep(writer.retry_seconds)
-                        _write_process_status(status_file, status())
+                        write_status()
                         continue
                     if flushed != len(pending_events):
                         raise RuntimeError("projection writer flushed an incomplete journal batch")
@@ -884,7 +970,11 @@ def _process_main(
                         offsets.update(pending_offsets)
                         offset_started_ns = time.perf_counter_ns()
                         _persist_offsets(offsets_file, offsets)
-                        writer._metrics["offset_persist_ns"] += time.perf_counter_ns() - offset_started_ns
+                        offset_elapsed_ns = time.perf_counter_ns() - offset_started_ns
+                        writer._metrics["offset_persist_ns"] += offset_elapsed_ns
+                        profiler.inc("offset_persist_count")
+                        profiler.observe_ns("offset_persist", offset_elapsed_ns)
+                        profiler.mark("last_projection_offset_durable_monotonic")
                         removed_segments: list[str] = []
                         for journal in journals:
                             removed_segments.extend(journal.reclaim(offsets))
@@ -893,7 +983,11 @@ def _process_main(
                                 offsets.pop(removed, None)
                             offset_started_ns = time.perf_counter_ns()
                             _persist_offsets(offsets_file, offsets)
-                            writer._metrics["offset_persist_ns"] += time.perf_counter_ns() - offset_started_ns
+                            offset_elapsed_ns = time.perf_counter_ns() - offset_started_ns
+                            writer._metrics["offset_persist_ns"] += offset_elapsed_ns
+                            profiler.inc("offset_persist_count")
+                            profiler.observe_ns("offset_persist", offset_elapsed_ns)
+                            profiler.mark("last_projection_offset_durable_monotonic")
                     pending_events = []
                     pending_offsets = {}
                     diagnostic(
@@ -901,7 +995,7 @@ def _process_main(
                         status="running",
                         progress={"applied": writer.snapshot().get("applied", 0), "queue_depth": 0},
                     )
-                    _write_process_status(status_file, status())
+                    write_status()
                     continue
 
                 try:
@@ -968,7 +1062,7 @@ def _process_main(
                     continue
                 if graceful_stop or (stop_event.is_set() and not pending_events):
                     break
-                _write_process_status(status_file, status())
+                write_status()
                 time.sleep(min(0.05, writer.flush_interval_seconds))
         else:
             while True:
@@ -989,7 +1083,7 @@ def _process_main(
                             time.sleep(writer.retry_seconds)
                     if stop_event.is_set() and not writer._queue:
                         break
-                    _write_process_status(status_file, status())
+                    write_status()
                     continue
                 except (EOFError, OSError):
                     break
@@ -1015,7 +1109,7 @@ def _process_main(
                     phase="event", status="running",
                     progress={"applied": writer.snapshot().get("applied", 0), "queue_depth": len(writer._queue)},
                 )
-                _write_process_status(status_file, status())
+                write_status()
             while writer._queue:
                 try:
                     writer.flush()
@@ -1028,7 +1122,7 @@ def _process_main(
                         extra={"last_error": f"{type(exc).__name__}: {exc}"},
                     )
                     time.sleep(writer.retry_seconds)
-        _write_process_status(status_file, status(force_metrics=True))
+        write_status(force_metrics=True)
         diagnostic(
             phase="stopped", status="stopped",
             progress={"applied": writer.snapshot(force_metrics=True).get("applied", 0), "queue_depth": len(writer._queue)},
@@ -1041,6 +1135,7 @@ def _process_main(
         raise
     finally:
         writer.stop()
+        profiler.publish(force=True)
 
 
 class ProjectionWriterProcess:
@@ -1052,7 +1147,9 @@ class ProjectionWriterProcess:
                  flush_interval_seconds: float = 0.1, start_method: str = "spawn",
                  mp_context=None, diagnostics_root: str | os.PathLike[str] | None = None,
                  run_id: str = "", staging_mode: str = "vectorized",
-                 reuse_staging: bool = True):
+                  reuse_staging: bool = True,
+                  profile_root: str | os.PathLike[str] | None = None,
+                  profile_interval_seconds: float = 1.0):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / db_name
@@ -1064,6 +1161,8 @@ class ProjectionWriterProcess:
         if self.staging_mode not in {"executemany", "vectorized"}:
             raise ValueError("staging_mode must be executemany or vectorized")
         self.reuse_staging = bool(reuse_staging)
+        self.profile_root = Path(profile_root).resolve() if profile_root else None
+        self.profile_interval_seconds = max(0.1, float(profile_interval_seconds))
         self._mp_context = mp_context or multiprocessing.get_context(start_method or "spawn")
         self.start_method = self._mp_context.get_start_method()
         self.journal_paths = tuple(str(Path(path).resolve()) for path in journal_paths)
@@ -1090,6 +1189,8 @@ class ProjectionWriterProcess:
                 self.batch_size, self.journal_paths, str(self.offsets_path),
                 self.flush_interval_seconds, str(self.diagnostics_root), self.run_id,
                 self.start_method, self.staging_mode, self.reuse_staging,
+                str(self.profile_root) if self.profile_root else "",
+                self.profile_interval_seconds,
             ),
             name="mc-vnext-projection-writer",
             daemon=True,

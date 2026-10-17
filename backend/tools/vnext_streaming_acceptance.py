@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import multiprocessing
 import os
@@ -308,8 +309,11 @@ def _worker_process(
     worker_count: int,
     feeder_done,
     stop_event,
+    profile_root: str = "",
+    profile_interval_seconds: float = 1.0,
 ) -> None:
     _install_source(source_root)
+    from vnext.critical_path_profiler import CriticalPathProfiler
     from vnext.projection_writer import ProgressJournal
     from vnext.route_credits import RouteCreditBroker
     from vnext.spool import TaskSpool
@@ -317,7 +321,12 @@ def _worker_process(
 
     spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
     credits = RouteCreditBroker(credits_root)
-    journal = ProgressJournal(journal_path)
+    profiler = CriticalPathProfiler(
+        profile_root,
+        f"worker-{int(worker_id)}",
+        interval_seconds=profile_interval_seconds,
+    )
+    journal = ProgressJournal(journal_path, profiler=profiler)
     worker_route_config = dict(route_config)
     worker_route_config["_worker_bind_target"] = max(
         1,
@@ -333,6 +342,7 @@ def _worker_process(
         progress_sink=journal.append,
         max_inflight=128,
         prefetch_per_partition=64,
+        profiler=profiler,
     )
 
     async def loop() -> None:
@@ -356,14 +366,18 @@ def _worker_process(
         return worker.snapshot()
 
     result = asyncio.run(loop())
+    profiler.publish(force=True)
     result["process_pid"] = os.getpid()
     result["process_role"] = "stream-worker"
+    if profiler.enabled:
+        result["critical_path"] = profiler.snapshot()
     Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
 
 
 def _sample(
     *, run_root: Path, process_roots: list[int], application_roots: list[int] | None = None,
-    process_roles: dict | None = None, spool, projection, smsc, started: float
+    process_roles: dict | None = None, spool, projection, smsc, started: float,
+    profile_root: Path | None = None,
 ) -> dict:
     application_roots = list(application_roots or process_roots)
     harness_cpu, harness_rss_kib, harness_process_count = _process_tree_metrics(process_roots)
@@ -415,6 +429,101 @@ def _sample(
     }
 
 
+def _read_critical_path_profiles(profile_root: Path | None) -> list[dict]:
+    if profile_root is None:
+        return []
+    values = []
+    for path in sorted((profile_root / "profiles").glob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(value, dict):
+            values.append(value)
+    return values
+
+
+def _aggregate_critical_path_profiles(profile_root: Path | None) -> dict:
+    profiles = _read_critical_path_profiles(profile_root)
+    counters: Counter[str] = Counter()
+    gauges: dict[str, object] = {}
+    timestamps: dict[str, float] = {}
+    duration_values: dict[str, list[dict]] = {}
+    for profile in profiles:
+        counters.update({
+            str(key): int(value or 0)
+            for key, value in (profile.get("counters") or {}).items()
+            if isinstance(value, (int, float))
+        })
+        gauges.update(profile.get("gauges") or {})
+        for key, value in (profile.get("timestamps") or {}).items():
+            try:
+                timestamps[str(key)] = max(timestamps.get(str(key), 0.0), float(value))
+            except (TypeError, ValueError):
+                continue
+        for name, value in (profile.get("durations") or {}).items():
+            if isinstance(value, dict):
+                duration_values.setdefault(str(name), []).append(value)
+    durations = {}
+    for name, values in duration_values.items():
+        durations[name] = {
+            "count": int(counters.get(f"{name}_count", 0)),
+            "p50_ms_max": max(float(item.get("p50_ms", 0.0) or 0.0) for item in values),
+            "p95_ms_max": max(float(item.get("p95_ms", 0.0) or 0.0) for item in values),
+            "p99_ms_max": max(float(item.get("p99_ms", 0.0) or 0.0) for item in values),
+            "max_ms_max": max(float(item.get("max_ms", 0.0) or 0.0) for item in values),
+            "total_ns": int(counters.get(f"{name}_total_ns", 0)),
+        }
+    return {
+        "enabled": bool(profiles),
+        "profile_count": len(profiles),
+        "roles": [str(item.get("role") or "") for item in profiles],
+        "counters": dict(sorted(counters.items())),
+        "gauges": dict(sorted(gauges.items())),
+        "timestamps": dict(sorted(timestamps.items())),
+        "durations": dict(sorted(durations.items())),
+        "profiles": profiles,
+    }
+
+
+def _profile_sample_row(sample: dict) -> dict:
+    critical = sample.get("critical_path") or {}
+    counters = critical.get("counters") or {}
+    durations = critical.get("durations") or {}
+
+    def duration_p95(name: str):
+        value = (durations.get(name) or {}).get("p95_ms_max")
+        return round(float(value), 3) if value is not None else ""
+
+    return {
+        "at_seconds": sample.get("at_seconds", 0.0),
+        "socket_written_pdu": counters.get("socket_written_pdu", 0),
+        "response_pdus_received": counters.get("response_pdus_received", 0),
+        "journal_events_durable": counters.get("journal_events_durable", 0),
+        "projection_committed_events": sample.get("projection_applied", 0),
+        "journal_backlog_bytes": sample.get("projection_journal_backlog_bytes", 0),
+        "journal_backlog_events_estimate": sample.get("projection_journal_backlog_events_estimate", 0),
+        "response_callback_p95_ms": duration_p95("response_callback"),
+        "journal_append_p95_ms": duration_p95("journal_append"),
+        "journal_fsync_p95_ms": duration_p95("journal_fsync"),
+        "tps_credit_wait_p95_ms": duration_p95("tps_credit_wait"),
+        "response_window_wait_p95_ms": duration_p95("response_window_wait"),
+        "socket_write_drain_p95_ms": duration_p95("socket_write_drain"),
+        "projection_status_write_p95_ms": duration_p95("process_status_write"),
+    }
+
+
+def _write_critical_path_samples(run_root: Path, samples: list[dict]) -> str:
+    path = run_root / "critical-path-samples.csv"
+    fields = list(_profile_sample_row(samples[0]).keys()) if samples else ["at_seconds"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for sample in samples:
+            writer.writerow(_profile_sample_row(sample))
+    return str(path)
+
+
 async def run(args: argparse.Namespace) -> dict:
     _install_source(args.source_root)
     from vnext.ingress import IngressRouter
@@ -454,6 +563,9 @@ async def run(args: argparse.Namespace) -> dict:
 
     run_root = Path(args.run_root).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
+    profile_root = Path(args.profile_root).resolve() if args.profile_root else None
+    if profile_root:
+        profile_root.mkdir(parents=True, exist_ok=True)
     spool_root = run_root / "spool"
     credits_root = run_root / "route-credits"
     spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=args.spool_max_bytes)
@@ -492,6 +604,11 @@ async def run(args: argparse.Namespace) -> dict:
         "journal_paths": journal_paths,
         "staging_mode": args.projection_staging_mode,
     }
+    if profile_root:
+        projection_kwargs.update({
+            "profile_root": str(profile_root),
+            "profile_interval_seconds": args.profile_interval,
+        })
     try:
         projection = ProjectionWriterProcess(
             run_root / "projection",
@@ -526,6 +643,8 @@ async def run(args: argparse.Namespace) -> dict:
                 args.workers,
                 feeder_done,
                 stop_event,
+                str(args.profile_root) if args.profile_root else "",
+                args.profile_interval,
             ),
             name=f"mc-vnext-stream-worker-{worker_id}",
             daemon=True,
@@ -627,7 +746,9 @@ async def run(args: argparse.Namespace) -> dict:
                     projection=projection,
                     smsc=smsc,
                     started=started,
+                    profile_root=profile_root,
                 )
+                sample["critical_path"] = _aggregate_critical_path_profiles(profile_root)
                 samples.append(sample)
                 next_sample += max(0.1, args.sample_interval)
                 if sample["run_bytes"] > args.max_run_bytes:
@@ -767,6 +888,10 @@ async def run(args: argparse.Namespace) -> dict:
         and all(item["socket_written_tasks"] == item["tasks"] for item in expected_campaigns.values())
     )
     samples_sorted = sorted(samples, key=lambda item: float(item.get("at_seconds", 0.0)))
+    critical_path = _aggregate_critical_path_profiles(profile_root)
+    critical_path_samples_path = (
+        _write_critical_path_samples(run_root, samples) if profile_root else None
+    )
 
     def _peak(key: str) -> int:
         return max((int(item.get(key, 0) or 0) for item in samples_sorted), default=0)
@@ -785,17 +910,71 @@ async def run(args: argparse.Namespace) -> dict:
             return 0.0
         return round((float(end.get(key, 0) or 0) - float(start.get(key, 0) or 0)) / seconds, 3)
 
+    def _counter_value(sample: dict, name: str) -> int:
+        return int(((sample.get("critical_path") or {}).get("counters") or {}).get(name, 0) or 0)
+
+    def _rate_summary(value_getter) -> dict:
+        rates = []
+        previous = None
+        for sample in samples_sorted:
+            if previous is not None:
+                seconds = float(sample.get("at_seconds", 0.0)) - float(previous.get("at_seconds", 0.0))
+                if seconds > 0:
+                    rates.append(
+                        max(0.0, (float(value_getter(sample)) - float(value_getter(previous))) / seconds)
+                    )
+            previous = sample
+        if not rates:
+            return {"sample_count": 0, "p50": None, "p95": None, "max": None}
+        ordered = sorted(rates)
+
+        def percentile(percentile: float) -> float:
+            index = (len(ordered) - 1) * percentile
+            lower = int(index)
+            upper = min(len(ordered) - 1, lower + 1)
+            fraction = index - lower
+            return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 3)
+
+        return {
+            "sample_count": len(rates),
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "max": round(max(ordered), 3),
+        }
+
+    timeline_timestamps = critical_path.get("timestamps") or {}
+
+    def _timeline_value(name: str):
+        value = timeline_timestamps.get(name)
+        return round(float(value), 6) if value is not None else None
+
+    def _after_feed_stop(name: str):
+        value = timeline_timestamps.get(name)
+        if value is None or feed_stopped_at is None:
+            return None
+        return round(max(0.0, float(value) - float(feed_stopped_at)), 3)
+
     producer_active_seconds = (
-        max(0.0, feed_stopped_at - started) if feed_stopped_at is not None else 0.0
+        round(max(0.0, feed_stopped_at - started), 3) if feed_stopped_at is not None else None
     )
     smpp_drain_seconds = (
-        max(0.0, smpp_drained_at - feed_stopped_at)
-        if feed_stopped_at is not None and smpp_drained_at is not None else 0.0
+        round(max(0.0, smpp_drained_at - feed_stopped_at), 3)
+        if feed_stopped_at is not None and smpp_drained_at is not None else None
     )
     projection_drain_seconds = (
-        max(0.0, projection_caught_up_at - feed_stopped_at)
-        if feed_stopped_at is not None and projection_caught_up_at is not None else 0.0
+        round(max(0.0, projection_caught_up_at - feed_stopped_at), 3)
+        if feed_stopped_at is not None and projection_caught_up_at is not None else None
     )
+    last_timestamps = {
+        "feed_start_monotonic": round(started, 6),
+        "feed_stop_monotonic": round(feed_stopped_at, 6) if feed_stopped_at is not None else None,
+        "last_task_taken_monotonic": _timeline_value("last_task_taken_monotonic"),
+        "last_socket_write_monotonic": _timeline_value("last_socket_write_monotonic"),
+        "last_smpp_response_received_monotonic": _timeline_value("last_smpp_response_received_monotonic"),
+        "last_response_journal_durable_monotonic": _timeline_value("last_response_journal_durable_monotonic"),
+        "last_projection_db_commit_monotonic": _timeline_value("last_projection_db_commit_monotonic"),
+        "last_projection_offset_durable_monotonic": _timeline_value("last_projection_offset_durable_monotonic"),
+    }
     return {
         "status": "PASS" if passed else "FAIL",
         "failure_reason": failure_reason,
@@ -838,10 +1017,49 @@ async def run(args: argparse.Namespace) -> dict:
         "projection_caught_up_before_stop": projection_caught_up_at is not None,
         "projection_drain_timeout_seconds": float(args.projection_drain_timeout),
         "journal_bytes": journal_bytes,
-        "producer_active_seconds": round(producer_active_seconds, 3),
-        "smpp_drain_seconds": round(smpp_drain_seconds, 3),
-        "projection_drain_seconds": round(projection_drain_seconds, 3),
-        "drain_seconds": round(projection_drain_seconds, 3),
+        "producer_active_seconds": producer_active_seconds,
+        "smpp_drain_seconds": smpp_drain_seconds,
+        "projection_drain_seconds": projection_drain_seconds,
+        "drain_seconds": projection_drain_seconds,
+        "critical_path_timeline": {
+            **last_timestamps,
+            "feed_active_seconds": producer_active_seconds,
+            "pending_send_drain_seconds": _after_feed_stop("last_socket_write_monotonic"),
+            "smpp_response_drain_seconds": _after_feed_stop("last_smpp_response_received_monotonic"),
+            "response_journal_drain_seconds": _after_feed_stop("last_response_journal_durable_monotonic"),
+            "projection_commit_drain_seconds": _after_feed_stop("last_projection_db_commit_monotonic"),
+            "offset_durable_drain_seconds": _after_feed_stop("last_projection_offset_durable_monotonic"),
+            "journal_backlog_bytes_timeline": [
+                {
+                    "at_seconds": item.get("at_seconds"),
+                    "bytes": item.get("projection_journal_backlog_bytes"),
+                }
+                for item in samples_sorted
+            ],
+            "journal_backlog_events_estimate_timeline": [
+                {
+                    "at_seconds": item.get("at_seconds"),
+                    "events": item.get("projection_journal_backlog_events_estimate"),
+                }
+                for item in samples_sorted
+            ],
+        },
+        "critical_path_rates": {
+            "socket_written_pdu_per_second": _rate_summary(
+                lambda item: _counter_value(item, "socket_written_pdu")
+            ),
+            "response_received_pdu_per_second": _rate_summary(
+                lambda item: _counter_value(item, "response_pdus_received")
+            ),
+            "journal_durable_events_per_second": _rate_summary(
+                lambda item: _counter_value(item, "journal_events_durable")
+            ),
+            "projection_committed_events_per_second": _rate_summary(
+                lambda item: item.get("projection_applied", 0)
+            ),
+        },
+        "critical_path": critical_path,
+        "critical_path_samples_csv": critical_path_samples_path,
         "steady_seconds_requested": float(args.steady_seconds),
         "producer": {
             "batches": int(feed_stats["batches"]),
@@ -931,6 +1149,12 @@ def main() -> int:
     parser.add_argument("--projection-staging-mode", choices=("vectorized", "executemany"), default="vectorized")
     parser.add_argument("--projection-status-interval", type=float, default=1.0,
                         help="status/diagnostic write interval in seconds")
+    parser.add_argument("--instrumentation", choices=("off", "on"), default="off",
+                        help="enable bounded critical-path profiles and per-second CSV")
+    parser.add_argument("--profile-root", default="",
+                        help="profile output root; defaults to <run-root>/critical-path when enabled")
+    parser.add_argument("--profile-interval", type=float, default=1.0,
+                        help="maximum profile snapshot frequency in seconds")
     parser.add_argument("--response-delay-ms", type=float, default=0.0,
                         help="delay each loopback submit_sm_resp to exercise response draining")
     parser.add_argument("--feed-interval", type=float, default=0.05)
@@ -953,6 +1177,11 @@ def main() -> int:
     args.window_size = max(1, min(1000, args.window_size))
     args.projection_batch_size = max(1, min(4096, args.projection_batch_size))
     args.projection_status_interval = min(60.0, max(0.1, float(args.projection_status_interval)))
+    args.profile_interval = min(60.0, max(0.1, float(args.profile_interval)))
+    if args.instrumentation == "on" and not args.profile_root:
+        args.profile_root = str(Path(args.run_root).resolve() / "critical-path")
+    elif args.profile_root:
+        args.profile_root = str(Path(args.profile_root).resolve())
     args.projection_drain_timeout = max(1.0, min(3600.0, args.projection_drain_timeout))
     args.resource_profile = str(args.resource_profile).upper()
     if args.max_rss_kib is None:

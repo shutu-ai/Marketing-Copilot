@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .business_day import BusinessClock, FileWallClock, ensure_clock
+from .critical_path_profiler import CriticalPathProfiler
 from .ingress import IngressRouter
 from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
 from .projection_writer import ProjectionWriterProcess, ProgressJournal
@@ -28,11 +29,17 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     diagnostic_root = str(context.get("diagnostics_root") or "")
     run_id = str(context.get("run_id") or "")
     start_method = str(context.get("start_method") or "spawn")
+    profiler = CriticalPathProfiler(
+        context.get("profile_root"),
+        f"worker-{int(worker_id)}",
+        interval_seconds=float(context.get("profile_interval_seconds", 1.0) or 1.0),
+    )
     native_fault_path = enable_native_fault_capture(
         diagnostic_root, f"worker-{int(worker_id)}"
     )
 
     def diagnostic(**kwargs) -> None:
+        started_ns = time.perf_counter_ns()
         try:
             write_process_metadata(
                 diagnostic_root,
@@ -43,6 +50,9 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             )
         except Exception:
             pass
+        finally:
+            profiler.observe_ns("diagnostic_write", time.perf_counter_ns() - started_ns)
+            profiler.publish_if_due()
 
     diagnostic(
         phase="starting",
@@ -64,6 +74,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     journal = ProgressJournal(
         Path(context["progress_root"]) / f"worker-{worker_id}.jsonl",
         max_bytes=int(context.get("max_journal_bytes", 512 * 1024 * 1024)),
+        profiler=profiler,
     )
     projection_queue = context.get("projection_queue")
     worker_status_path = Path(context["progress_root"]) / f"worker-{worker_id}.status.json"
@@ -78,11 +89,13 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             "snapshot": current.snapshot() if current is not None else {},
         }
         temporary = worker_status_path.with_name(f".{worker_status_path.name}.{os.getpid()}.tmp")
+        status_started_ns = time.perf_counter_ns()
         try:
             temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
             os.replace(temporary, worker_status_path)
         except OSError:
             pass
+        profiler.observe_ns("worker_status_write", time.perf_counter_ns() - status_started_ns)
         snapshot = current.snapshot() if current is not None else {}
         diagnostic(
             phase="active" if active else "idle",
@@ -100,11 +113,13 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         if projection_queue is not None:
             try:
                 projection_queue.put_nowait(event)
+                profiler.inc("projection_hint_put")
             except queue.Full:
                 # The journal is the durable source of truth.  IPC is only a
                 # low-latency wake-up hint and must never kill a worker when
                 # the single DB owner is temporarily behind.
-                pass
+                profiler.inc("projection_hint_queue_full")
+        profiler.publish_if_due()
 
     def journal_admission(record) -> bool:
         # Conservative admission estimate: if the result fence cannot hold a
@@ -159,6 +174,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         prefetch_per_partition=int(context["prefetch_per_partition"]),
         control_loader=load_controls,
         journal_admission=journal_admission,
+        profiler=profiler,
     )
     worker_ref["value"] = worker
 
@@ -206,6 +222,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         raise
     finally:
         diagnostic(phase="stopped", status="stopped")
+        profiler.publish(force=True)
 
 
 class VNextRuntime:
@@ -219,7 +236,9 @@ class VNextRuntime:
                  start_method: str = "spawn", projection_flush_interval_seconds: float | None = None,
                  run_id: str = "", clock: BusinessClock | object | None = None,
                  business_timezone: str | object | None = None,
-                 max_journal_bytes: int | None = None):
+                  max_journal_bytes: int | None = None,
+                  profile_root: str | os.PathLike[str] | None = None,
+                  profile_interval_seconds: float = 1.0):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.spool_root = self.root / "spool"
@@ -270,6 +289,8 @@ class VNextRuntime:
             5.0, max(0.01, float(projection_flush_interval_seconds))
         )
         self.run_id = str(run_id or os.environ.get("MC_RUN_ID") or self.root.name)
+        self.profile_root = Path(profile_root).resolve() if profile_root else None
+        self.profile_interval_seconds = max(0.1, float(profile_interval_seconds))
         self.diagnostics_root = self.root / "diagnostics"
         self.projection = ProjectionWriterProcess(
             self.root / "projection", queue_size=projection_queue_size,
@@ -280,6 +301,8 @@ class VNextRuntime:
             mp_context=self._mp_context,
             diagnostics_root=self.diagnostics_root,
             run_id=self.run_id,
+            profile_root=self.profile_root,
+            profile_interval_seconds=self.profile_interval_seconds,
         )
         self.supervisor: WorkerSupervisor | None = None
         self._started = False
@@ -408,6 +431,8 @@ class VNextRuntime:
             "diagnostics_root": str(self.diagnostics_root),
             "run_id": self.run_id,
             "start_method": self.start_method,
+            "profile_root": str(self.profile_root) if self.profile_root else "",
+            "profile_interval_seconds": self.profile_interval_seconds,
         }
         self.supervisor = WorkerSupervisor(
             self.root, worker_count=self.worker_count,

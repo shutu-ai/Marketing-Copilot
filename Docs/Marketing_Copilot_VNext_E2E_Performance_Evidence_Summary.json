@@ -1,0 +1,113 @@
+{
+  "task_id": "MC-VNEXT-E2E-CRITICAL-PATH-PROFILING-CLOSURE-20261017",
+  "baseline_sha": "24708c8eb183d689d4f1e8e3df7f63a0ed81c222",
+  "current_source": {
+    "head_sha": "24708c8eb183d689d4f1e8e3df7f63a0ed81c222",
+    "working_tree_fileset_sha256": "9fba337f0672c0b68fb0f6daea4f64c81abeace465d317d17eddcdb8976105fa",
+    "instrumentation_only_optimization": true,
+    "candidate_promoted": false
+  },
+  "server": {
+    "hostname": "paas-core",
+    "os": "EulerOS 2.0 SP15 x86_64",
+    "kernel": "6.6.0-72.0.0.76.h21510.1170.eulerosv2r15.x86_64",
+    "cpu_count": 64,
+    "memory_gib_approx": 375,
+    "swap_gib": 8,
+    "filesystem": "ext4",
+    "python": "3.11.6",
+    "duckdb": "1.2.0",
+    "psutil": "6.1.1",
+    "cgroup_memory_limit": "unavailable",
+    "run_root": "/home/paas/marketing-copilot-test/runs/vnext-e2e-critical-20261017-codex01"
+  },
+  "instrumentation": {
+    "p5500_off_median_duration_s": 111.65,
+    "p5500_on_median_duration_s": 112.384,
+    "overhead_pct": 0.657,
+    "application_rss_delta_kib": 4228,
+    "harness_rss_delta_kib": 18404,
+    "response_callback_p95_ms_median": 6.972,
+    "journal_fsync_p95_ms_median": 6.672,
+    "response_window_wait_p95_ms_median": 1643.032,
+    "smpp_response_latency_p95_ms_median": 1228.032,
+    "tps_credit_wait_p95_ms_median": 678.15,
+    "socket_write_drain_p95_ms_median": 21.486
+  },
+  "r2": {
+    "b0_pure_writer": {
+      "status": "PASS",
+      "events": 11000,
+      "batch_sizes": [256, 512, 1024, 2048],
+      "all_correct": true,
+      "events_per_second_range": [183.335, 185.436]
+    },
+    "b1_p5500": {
+      "status": "PASS",
+      "pairs": 3,
+      "tasks_per_run": 5500,
+      "journal_events_per_run": 11000,
+      "projection_events_per_run": 11000
+    },
+    "b2_window_delay": {
+      "status": "PASS",
+      "runs": [
+        {"delay_ms": 0, "window": 10, "wall_s": 20.017, "response_latency_p95_ms": 650.35, "window_wait_p95_ms": 912.529, "projection_drain_s": 16.96},
+        {"delay_ms": 0, "window": 50, "wall_s": 21.131, "response_latency_p95_ms": 866.995, "window_wait_p95_ms": 398.634, "projection_drain_s": 18.066},
+        {"delay_ms": 5, "window": 10, "wall_s": 18.989, "response_latency_p95_ms": 671.291, "window_wait_p95_ms": 834.438, "projection_drain_s": 16.352},
+        {"delay_ms": 5, "window": 50, "wall_s": 18.88, "response_latency_p95_ms": 1127.906, "window_wait_p95_ms": 575.676, "projection_drain_s": 16.499}
+      ]
+    },
+    "b3_50k": {
+      "status": "PASS",
+      "tasks": 50000,
+      "pdu": 50000,
+      "responses": 50000,
+      "journal_events": 100000,
+      "projection_events": 100000,
+      "wall_s": 1041.312,
+      "producer_s": 85.605,
+      "smpp_drain_s": 33.044,
+      "projection_drain_s": 947.194,
+      "application_rss_kib": 759100,
+      "harness_rss_kib": 1177100,
+      "staging_load_s": 1005.957,
+      "batch_end_to_end_s": 1025.36
+    },
+    "b4_multipart": {"status": "PASS", "tasks": 5500, "pdu": 8250, "responses": 8250, "journal_events": 13750, "wall_s": 144.667},
+    "b5_steady_precheck": {"status": "PASS", "steady_request_s": 20, "tasks": 6450, "pdu": 6450, "responses": 6450, "journal_events": 12900, "wall_s": 104.848}
+  },
+  "r3": {
+    "status": "NO_CHANGE",
+    "candidate": "projection-staging-mode=executemany",
+    "control_median_wall_s": 21.131,
+    "candidate_runs_wall_s": [23.03, 24.036, 24.023],
+    "candidate_median_wall_s": 24.023,
+    "candidate_change_pct": 13.68,
+    "reason": "candidate slower; no production promotion"
+  },
+  "r4": {
+    "native_full_pytest": "424 passed, 2 skipped, 4 warnings",
+    "native_full_seconds": 248.68,
+    "windows_targeted": "10 passed",
+    "native_prod8g_smoke": "80/80 PASS",
+    "native_lowmem2g_smoke": "80/80 PASS",
+    "unknown_response_events": 0,
+    "automatic_resend": false
+  },
+  "r5": {
+    "prod8g_application_guard": "PASS on actual EulerOS server; not hardware-equivalent 8 GiB sizing",
+    "prod16g": "NOT_VERIFIED",
+    "lowmem2g": "smoke only",
+    "euleros_600s_800pdu": "NOT_VERIFIED",
+    "canary": "NO-GO"
+  },
+  "final_card": {
+    "primary_limiting_stage": "ProjectionWriter vectorized staging load",
+    "secondary_limiting_stage": "SMPP response-window/TPS-credit wait",
+    "feed_stop_projection_commit_delta_s_median": 102.913,
+    "feed_stop_offset_durable_delta_s_median": 102.914,
+    "backlog_peak_bytes_median": 4308095,
+    "commit_push": "NOT_REQUESTED"
+  }
+}
