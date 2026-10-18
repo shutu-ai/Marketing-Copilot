@@ -31,6 +31,85 @@ RESOURCE_PROFILE_RSS_KIB = {
     "PROD_16G": 12 * 1024 * 1024,
 }
 
+SUPPORTED_WORKER_COUNTS = (8, 12, 16, 24)
+MAX_WORKERS = max(SUPPORTED_WORKER_COUNTS)
+WORKER_JOIN_TIMEOUT_SECONDS = 120.0
+
+
+def _validate_worker_count(value: object) -> int:
+    """Validate the bounded worker matrix without silently changing it."""
+
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "--workers must be one of 8, 12, 16, or 24"
+        ) from exc
+    if workers not in SUPPORTED_WORKER_COUNTS:
+        choices = ", ".join(str(item) for item in SUPPORTED_WORKER_COUNTS)
+        raise ValueError(f"--workers must be one of {choices}; received {workers}")
+    return workers
+
+
+def _parse_worker_count(value: object) -> int:
+    """argparse adapter for the explicit worker matrix."""
+
+    try:
+        return _validate_worker_count(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _worker_bind_target(pool_size: int, worker_count: int) -> int:
+    """Return each worker's local target while RouteCredit keeps the pool shared."""
+
+    workers = max(1, int(worker_count))
+    return max(1, (int(pool_size) + workers - 1) // workers)
+
+
+def _partition_assignment_evidence(partition_map, worker_count: int) -> dict:
+    """Summarize the immutable 256-partition assignment for run evidence."""
+
+    worker_count = int(worker_count)
+    assignments = partition_map.to_dict().get("assignments") or {}
+    worker_partitions = [
+        tuple(partition_map.partitions_for_worker(worker_id))
+        for worker_id in range(worker_count)
+    ]
+    flattened = [partition_id for partitions in worker_partitions for partition_id in partitions]
+    expected = set(range(int(partition_map.virtual_partition_count)))
+    observed = set(flattened)
+    owner_distribution = {
+        str(worker_id): len(worker_partitions[worker_id])
+        for worker_id in range(worker_count)
+    }
+    assignment_owner_distribution = {str(worker_id): 0 for worker_id in range(worker_count)}
+    for assignment in assignments.values():
+        owner = str(int(assignment.get("worker_id", -1)))
+        assignment_owner_distribution[owner] = assignment_owner_distribution.get(owner, 0) + 1
+    duplicate_count = len(flattened) - len(observed)
+    return {
+        "virtual_partition_count": int(partition_map.virtual_partition_count),
+        "worker_count": worker_count,
+        "owner_distribution": owner_distribution,
+        "assignment_owner_distribution": assignment_owner_distribution,
+        "assigned_partition_count": len(flattened),
+        "unique_partition_count": len(observed),
+        "missing_partition_count": len(expected - observed),
+        "duplicate_partition_count": duplicate_count,
+        "assignment_count": len(assignments),
+        "valid": (
+            len(assignments) == int(partition_map.virtual_partition_count)
+            and observed == expected
+            and duplicate_count == 0
+            and owner_distribution == assignment_owner_distribution
+        ),
+        "worker_partitions": {
+            str(worker_id): list(partitions)
+            for worker_id, partitions in enumerate(worker_partitions)
+        },
+    }
+
 
 def _install_source(source_root: str) -> None:
     root = Path(source_root).resolve()
@@ -789,10 +868,8 @@ def _worker_process(
     )
     journal = ProgressJournal(journal_path, profiler=profiler)
     worker_route_config = dict(route_config)
-    worker_route_config["_worker_bind_target"] = max(
-        1,
-        (int(route_config.get("pool_size", 1)) + max(1, int(worker_count)) - 1)
-        // max(1, int(worker_count)),
+    worker_route_config["_worker_bind_target"] = _worker_bind_target(
+        route_config.get("pool_size", 1), worker_count
     )
     worker = ShardWorker(
         worker_id,
@@ -1124,6 +1201,7 @@ def _throughput_observability(
 
 
 async def run(args: argparse.Namespace) -> dict:
+    args.workers = _validate_worker_count(args.workers)
     _install_source(args.source_root)
     from vnext.ingress import IngressRouter
     from vnext.partition import PartitionMap
@@ -1181,6 +1259,13 @@ async def run(args: argparse.Namespace) -> dict:
     )
     port = await smsc.start()
     partition_map = PartitionMap.create(run_root / "partition-map.json", 256, args.workers)
+    partition_evidence = _partition_assignment_evidence(partition_map, args.workers)
+    if not partition_evidence["valid"]:
+        raise RuntimeError(f"invalid partition assignment: {partition_evidence}")
+    worker_partitions = [
+        tuple(partition_map.partitions_for_worker(worker_id))
+        for worker_id in range(args.workers)
+    ]
     route_config = {
         "route_id": 1,
         "host": "127.0.0.1",
@@ -1223,6 +1308,7 @@ async def run(args: argparse.Namespace) -> dict:
         projection = ProjectionWriterProcess(run_root / "projection", **projection_kwargs)
     projection.start()
     processes = []
+    workers_alive_peak = 0
     for worker_id in range(args.workers):
         journal_path = journal_paths[worker_id]
         result_path = run_root / "workers" / f"worker-{worker_id}.json"
@@ -1233,7 +1319,7 @@ async def run(args: argparse.Namespace) -> dict:
             args=(
                 str(Path(args.source_root).resolve()),
                 worker_id,
-                partition_map.partitions_for_worker(worker_id),
+                worker_partitions[worker_id],
                 str(spool_root),
                 str(credits_root),
                 route_config,
@@ -1250,6 +1336,10 @@ async def run(args: argparse.Namespace) -> dict:
         )
         process.start()
         processes.append(process)
+        workers_alive_peak = max(
+            workers_alive_peak,
+            sum(1 for item in processes if item.is_alive()),
+        )
 
     started = time.monotonic()
     samples: list[dict] = []
@@ -1338,6 +1428,8 @@ async def run(args: argparse.Namespace) -> dict:
         while True:
             elapsed = time.monotonic() - started
             if elapsed >= next_sample:
+                workers_alive = sum(1 for process in processes if process.is_alive())
+                workers_alive_peak = max(workers_alive_peak, workers_alive)
                 sample = _sample(
                     run_root=run_root,
                     process_roots=[os.getpid()]
@@ -1357,6 +1449,7 @@ async def run(args: argparse.Namespace) -> dict:
                     profile_root=profile_root,
                     sampler_state=sampler_state,
                 )
+                sample["workers_alive"] = workers_alive
                 sample["critical_path"] = _aggregate_critical_path_profiles(profile_root)
                 samples.append(sample)
                 next_sample += max(0.1, args.sample_interval)
@@ -1425,11 +1518,15 @@ async def run(args: argparse.Namespace) -> dict:
         else:
             stop_event.set()
         for process in processes:
-            await asyncio.to_thread(process.join, 15)
+            await asyncio.to_thread(process.join, WORKER_JOIN_TIMEOUT_SECONDS)
         for process in processes:
             if process.is_alive():
                 process.terminate()
                 await asyncio.to_thread(process.join, 5)
+        workers_alive_peak = max(
+            workers_alive_peak,
+            sum(1 for process in processes if process.is_alive()),
+        )
         await smsc.stop()
         projection.stop(timeout=300)
 
@@ -1464,10 +1561,30 @@ async def run(args: argparse.Namespace) -> dict:
         if path.is_file()
     )
     worker_results = []
+    worker_result_paths = []
     for process_index in range(args.workers):
         result_path = run_root / "workers" / f"worker-{process_index}.json"
         if result_path.is_file():
+            worker_result_paths.append(result_path)
             worker_results.append(json.loads(result_path.read_text(encoding="utf-8")))
+    worker_result_files_count = len(worker_result_paths)
+    workers_exited_cleanly_count = sum(
+        1 for process in processes if process.exitcode == 0
+    )
+    worker_processes = [
+        {
+            "worker_id": index,
+            "pid": int(process.pid or 0),
+            "exitcode": process.exitcode,
+            "alive": bool(process.is_alive()),
+            "result_file": str(run_root / "workers" / f"worker-{index}.json"),
+            "result_file_exists": (run_root / "workers" / f"worker-{index}.json").is_file(),
+            "journal_file": str(journal_paths[index]),
+            "journal_file_exists": journal_paths[index].is_file(),
+            "partition_count": len(worker_partitions[index]),
+        }
+        for index, process in enumerate(processes)
+    ]
     expected_campaigns = {
         str(campaign_id): {
             "tasks": int(feed_stats[f"campaign_{campaign_id}_accepted"]),
@@ -1524,6 +1641,10 @@ async def run(args: argparse.Namespace) -> dict:
         and not spool_status.get("pending_records")
         and int(projection_status.get("applied", 0) or 0) == len(progress)
         and projection_caught_up_at is not None
+        and partition_evidence["valid"]
+        and len(processes) == args.workers
+        and worker_result_files_count == args.workers
+        and workers_exited_cleanly_count == args.workers
         and all(item["socket_written_tasks"] == item["tasks"] for item in expected_campaigns.values())
     )
     samples_sorted = sorted(samples, key=lambda item: float(item.get("at_seconds", 0.0)))
@@ -1637,6 +1758,18 @@ async def run(args: argparse.Namespace) -> dict:
         "started_epoch": time.time() - (time.monotonic() - started),
         "duration_seconds": round(time.monotonic() - started, 3),
         "workers": args.workers,
+        "requested_workers": args.workers,
+        "effective_workers": len(processes),
+        "worker_processes_started_count": len(processes),
+        "worker_result_files_count": worker_result_files_count,
+        "workers_alive_peak": workers_alive_peak,
+        "workers_exited_cleanly_count": workers_exited_cleanly_count,
+        "worker_join_timeout_seconds": WORKER_JOIN_TIMEOUT_SECONDS,
+        "worker_processes": worker_processes,
+        "partition_owner_distribution": partition_evidence["owner_distribution"],
+        "partition_assignment_evidence": partition_evidence,
+        "journal_paths_count": len(journal_paths),
+        "journal_files_count": sum(1 for path in journal_paths if path.is_file()),
         "pool_size": args.pool_size,
         "route_tps": args.route_tps,
         "tps_scope": args.tps_scope,
@@ -1795,7 +1928,12 @@ def main() -> int:
     parser.add_argument("--counts", default="20000,20000,5000,5000")
     parser.add_argument("--multipart-campaigns", default="",
                         help="campaign ids for the separate multipart experiment")
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--workers",
+        type=_parse_worker_count,
+        default=8,
+        help="worker matrix entry: 8, 12, 16, or 24 (default: 8)",
+    )
     parser.add_argument("--pool-size", type=int, default=4)
     parser.add_argument("--route-tps", type=float, default=200.0)
     parser.add_argument("--tps-scope", choices=("route_shared", "per_bind"), default="per_bind")
@@ -1828,7 +1966,7 @@ def main() -> int:
     parser.add_argument("--spool-max-bytes", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    args.workers = max(1, min(8, args.workers))
+    args.workers = _validate_worker_count(args.workers)
     args.pool_size = max(1, min(20, args.pool_size))
     args.window_size = max(1, min(1000, args.window_size))
     args.projection_batch_size = max(1, min(4096, args.projection_batch_size))
@@ -1861,6 +1999,12 @@ def main() -> int:
         "submit_sm_resp_success": result["submit_sm_resp_success"],
         "projection_events_applied": result["projection_events_applied"],
         "max_active_binds": result["smpp"]["max_active_binds"],
+        "requested_workers": result["requested_workers"],
+        "effective_workers": result["effective_workers"],
+        "worker_result_files_count": result["worker_result_files_count"],
+        "workers_alive_peak": result["workers_alive_peak"],
+        "workers_exited_cleanly_count": result["workers_exited_cleanly_count"],
+        "partition_owner_distribution": result["partition_owner_distribution"],
         "failure_reason": result["failure_reason"],
         "resource_gate": result["resource_gate"],
         "completion_state": result["completion_state"],

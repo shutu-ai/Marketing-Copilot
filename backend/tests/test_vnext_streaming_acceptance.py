@@ -3,7 +3,10 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from tools import vnext_streaming_acceptance as acceptance
+from vnext.partition import PartitionMap
 from tools.vnext_streaming_acceptance import _projection_caught_up
 
 
@@ -21,6 +24,41 @@ class _DurableProjection(_Projection):
         self.status_path = root / "projection-writer-status.json"
         self.offsets_path = root / "journal-offsets.json"
         self.status_path.write_text(json.dumps(status), encoding="utf-8")
+
+
+@pytest.mark.parametrize("workers", [8, 12, 16, 24])
+def test_worker_matrix_values_are_accepted_without_clamping(workers):
+    assert acceptance._parse_worker_count(str(workers)) == workers
+    assert acceptance._validate_worker_count(workers) == workers
+
+
+@pytest.mark.parametrize("workers", [0, -1, 1, 7, 25, 32])
+def test_worker_matrix_rejects_unsupported_values(workers):
+    with pytest.raises(acceptance.argparse.ArgumentTypeError):
+        acceptance._parse_worker_count(str(workers))
+    with pytest.raises(ValueError, match="--workers must be one of"):
+        acceptance._validate_worker_count(workers)
+
+
+@pytest.mark.parametrize("workers", [8, 12, 16, 24])
+def test_partition_assignment_evidence_covers_all_partitions(workers, tmp_path: Path):
+    partition_map = PartitionMap.create(tmp_path / "partition-map.json", 256, workers)
+    evidence = acceptance._partition_assignment_evidence(partition_map, workers)
+
+    assert evidence["valid"] is True
+    assert evidence["virtual_partition_count"] == 256
+    assert evidence["assigned_partition_count"] == 256
+    assert evidence["unique_partition_count"] == 256
+    assert evidence["missing_partition_count"] == 0
+    assert evidence["duplicate_partition_count"] == 0
+    assert sum(evidence["owner_distribution"].values()) == 256
+
+
+def test_worker_scaling_does_not_expand_shared_physical_bind_target():
+    assert [
+        acceptance._worker_bind_target(4, workers)
+        for workers in (8, 12, 16, 24)
+    ] == [1, 1, 1, 1]
 
 
 def test_process_rows_accepts_sles_ps_and_ignores_headers_or_short_lines():
