@@ -1,0 +1,424 @@
+{
+  "schema_version": "1.0",
+  "task": "Marketing_Copilot_VNext_SLES_Strict_Source_AB_and_SMPP_Isolation_Codex_Task",
+  "generated_at": "2026-10-18",
+  "verdict": {
+    "status": "ROOT_CAUSE_INCONCLUSIVE",
+    "source_regression_confirmed": false,
+    "smp_loopback_bottleneck_confirmed": false,
+    "network_cause_confirmed": false,
+    "host_cause_confirmed": false,
+    "application_credit_window_staging_priority": true,
+    "fifty_k_run": "NOT_RUN",
+    "fifty_k_reason": "The repeated 5K A/B result reversed between pairs and did not establish a reproducible source delta; L0 loopback was already much faster than E2E."
+  },
+  "final_output_card": {
+    "historical_50k_pdu_per_second": 528.2,
+    "prior_current_reference_pdu_per_second": "162-169 (REFERENCE_NOT_RERUN)",
+    "strict_5k_a_median_pdu_per_second": 116.656167611582,
+    "strict_5k_b_median_pdu_per_second": 100.57529066259,
+    "l0_loopback_5k_pdu_per_second": 14239.716,
+    "strict_50k_a_pdu_per_second": null,
+    "strict_50k_b_pdu_per_second": null,
+    "source_regression": "NOT_VERIFIED",
+    "smp_loopback_bottleneck": "NOT_CONFIRMED",
+    "host_root_cause": "NOT_CONFIRMED"
+  },
+  "historical_reference": {
+    "historical_50k_e2e_pdu_per_second": 528.2,
+    "prior_current_reference_pdu_per_second": [
+      162.0,
+      169.0
+    ],
+    "prior_current_reference_status": "REFERENCE_NOT_RERUN",
+    "strict_ab_median_a_pdu_per_second": 116.656167611582,
+    "strict_ab_median_b_pdu_per_second": 100.57529066259,
+    "historical_to_strict_a_median_ratio": 4.52783604,
+    "comparability_note": "The historical and prior-current values are retained as references from the task and earlier reports; this run does not silently treat them as identical parameter sets."
+  },
+  "provenance": {
+    "repo_head": "2579d8d26c1881b42d3c480fe3056e73b982492e",
+    "origin_main": "2579d8d26c1881b42d3c480fe3056e73b982492e",
+    "source_a_commit": "450e84d82cca2b8ef5d4d34efe0f2ced604e3c2e",
+    "source_b_commit": "3e73ab8030b46b78e109cbf1f23e330c72d2d136",
+    "source_a_archive_sha256": "97DF322C883EF04A00887F503AAAFD4546C1D63586F94785A1CB26E105CFDDD4",
+    "source_b_archive_sha256": "805BEC45F8E7EC6576A729704ECCB405BA8C5CB7B0B145D82474FC2832F4B551",
+    "common_harness_a_archive_sha256": "AA5481A6AEA8BD172AD71A7674363EBA2ABEE60FC8FCA9CA527E3F054E0D0082",
+    "formal_results_tar_sha256": "31332f64b5ad76815b14d333d0922442e014e522e081ed1ff0b15fcbc90c1a60",
+    "raw_evidence_root": "/home/paas/mc-vnext-strict-ab-20261018/runs"
+  },
+  "environment": {
+    "host": "paas-core01",
+    "os": "SUSE Linux Enterprise Server 12 SP5",
+    "kernel": "4.12.14-122.307-default",
+    "architecture": "x86_64",
+    "filesystem": {
+      "device": "/dev/sda2",
+      "type": "ext4",
+      "formal_test_workspace": true,
+      "df_t_recorded": true,
+      "available_before_formal_runs_bytes": 13411930112,
+      "available_after_strict_runs_bytes": 13360025600
+    },
+    "python": "3.11.5",
+    "duckdb": "1.2.0",
+    "wheelhouse_sha256": "504043E2E0FBF31E6C8DCA572392519836289F0F415DE933309BCC6AD5578BDA",
+    "network_mode": "synthetic_local_loopback_only",
+    "production_changes": false,
+    "shared_host": true,
+    "cpu_affinity": "all available CPUs; not pinned",
+    "nice": 0
+  },
+  "parameters": {
+    "workers": 8,
+    "pool_size": 4,
+    "per_bind_tps": 200.0,
+    "configured_total_tps_ceiling": 800.0,
+    "window": 50,
+    "producer_batch": 250,
+    "projection_batch": 512,
+    "projection_mode": "vectorized",
+    "campaigns": 4,
+    "response_delay_seconds": 0.0,
+    "status_interval_seconds": 0.1,
+    "instrumentation": true,
+    "projection_drain_timeout_seconds": 120.0,
+    "smsc": "local synthetic simulator"
+  },
+  "source_diff": {
+    "files": 5,
+    "insertions": 976,
+    "deletions": 80,
+    "production_files": [
+      "backend/vnext/route_credits.py",
+      "backend/vnext/smpp_transport.py",
+      "backend/vnext/worker.py"
+    ],
+    "test_and_harness_files": [
+      "backend/tools/vnext_streaming_acceptance.py",
+      "backend/tests/test_vnext_streaming_acceptance.py"
+    ],
+    "behavior_summary": "B adds route-credit and SMPP bind/window observability, centralizes bind lease release, and adds worker snapshot fields; no intentional pacing or batch-size change was identified in the production diff."
+  },
+  "runs": [
+    {
+      "id": "common-a-1k-01",
+      "layer": "E2E_smoke",
+      "product_source": "A",
+      "harness": "common_B_harness",
+      "count": 1000,
+      "duration_seconds": 10.015,
+      "pdu_per_second": 99.850224663005,
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "resource_gate": "PASS",
+      "accepted": 1000,
+      "socket_written": 1000,
+      "submit_sm_resp_success": 1000,
+      "response_unknown": 0,
+      "journal_events": 2000,
+      "projection_events": 2000,
+      "max_active_binds": 4,
+      "result_sha256": "330426a3a5bd66faf1d0eafe4f9f741f287699dc139bb4e827436c7521018106",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/common-a-1k-01/result.json"
+    },
+    {
+      "id": "b-1k-01",
+      "layer": "E2E_smoke",
+      "product_source": "B",
+      "harness": "B_harness",
+      "count": 1000,
+      "duration_seconds": 39.959,
+      "pdu_per_second": 25.025676569113,
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "resource_gate": "PASS",
+      "accepted": 1000,
+      "socket_written": 1000,
+      "submit_sm_resp_success": 1000,
+      "response_unknown": 0,
+      "journal_events": 2000,
+      "projection_events": 2000,
+      "max_active_binds": 4,
+      "result_sha256": "7bbcd1a388763793f366902b7a9ccbec07312a4dc266c1041713a02a4d464831",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/b-1k-01/result.json",
+      "interpretation": "Smoke-only observation on a shared host; not used as the source-regression decision."
+    },
+    {
+      "id": "common-a-5k-pair-01",
+      "layer": "E2E_strict_ab",
+      "product_source": "A",
+      "harness": "common_B_harness",
+      "count": 5000,
+      "duration_seconds": 41.369,
+      "pdu_per_second": 120.863448475912,
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "resource_gate": "PASS",
+      "accepted": 5000,
+      "socket_written": 5000,
+      "submit_sm_resp_success": 5000,
+      "response_unknown": 0,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "write_failed": 0,
+      "max_active_binds": 4,
+      "result_sha256": "eb0cea77d986fcc7ea21d07a08d25dcb473e66519f47395a4dfff46e28eb4dbd",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/common-a-5k-pair-01/result.json",
+      "critical_path_p95_ms": {
+        "response_window_wait": 442.916,
+        "smpp_response_latency": 658.088,
+        "tps_credit_wait": 488.225,
+        "staging_bind_execute": 1972.614
+      }
+    },
+    {
+      "id": "b-5k-pair-01",
+      "layer": "E2E_strict_ab",
+      "product_source": "B",
+      "harness": "B_harness",
+      "count": 5000,
+      "duration_seconds": 56.078,
+      "pdu_per_second": 89.161525018724,
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "resource_gate": "PASS",
+      "accepted": 5000,
+      "socket_written": 5000,
+      "submit_sm_resp_success": 5000,
+      "response_unknown": 0,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "write_failed": 0,
+      "max_active_binds": 4,
+      "result_sha256": "46dd248e7d3d6cd00f842268f1cc72198afe2fd24a5eacc28c53aae659c16106",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/b-5k-pair-01/result.json",
+      "critical_path_p95_ms": {
+        "response_window_wait": 611.682,
+        "smpp_response_latency": 716.582,
+        "tps_credit_wait": 577.268,
+        "staging_bind_execute": 1965.352
+      },
+      "route_credit_snapshot": {
+        "bind_acquires": 37,
+        "credit_consumed_units": 4370,
+        "credit_wait_count": 4252,
+        "credit_wait_seconds": 808.029684,
+        "credit_refill_cost_seconds": 2.45921,
+        "credit_granted_units": 4456,
+        "credit_remaining_units": 86,
+        "credit_wasted_units": 86
+      }
+    },
+    {
+      "id": "common-a-5k-pair-02",
+      "layer": "E2E_strict_ab",
+      "product_source": "A",
+      "harness": "common_B_harness",
+      "count": 5000,
+      "duration_seconds": 44.353,
+      "pdu_per_second": 112.731945978851,
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "resource_gate": "PASS",
+      "accepted": 5000,
+      "socket_written": 5000,
+      "submit_sm_resp_success": 5000,
+      "response_unknown": 0,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "write_failed": 0,
+      "max_active_binds": 4,
+      "result_sha256": "71c63bfd1eb56fb91a718c2bbd41983f2847ef2d1e1fc109b1c0e997c9d40765",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/common-a-5k-pair-02/result.json",
+      "critical_path_p95_ms": {
+        "response_window_wait": 463.73,
+        "smpp_response_latency": 682.749,
+        "tps_credit_wait": 556.343,
+        "staging_bind_execute": 2136.318
+      }
+    },
+    {
+      "id": "b-5k-pair-02",
+      "layer": "E2E_strict_ab",
+      "product_source": "B",
+      "harness": "B_harness",
+      "count": 5000,
+      "duration_seconds": 43.35,
+      "pdu_per_second": 115.340253748558,
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "resource_gate": "PASS",
+      "accepted": 5000,
+      "socket_written": 5000,
+      "submit_sm_resp_success": 5000,
+      "response_unknown": 0,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "write_failed": 0,
+      "max_active_binds": 4,
+      "result_sha256": "d908ac20c1ab860ef0e497da73494958ddb06860cb34db494df2f4c1136a3f82",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/b-5k-pair-02/result.json",
+      "critical_path_p95_ms": {
+        "response_window_wait": 448.824,
+        "smpp_response_latency": 667.374,
+        "tps_credit_wait": 542.082,
+        "staging_bind_execute": 2115.034
+      },
+      "route_credit_snapshot": {
+        "bind_acquires": 46,
+        "credit_consumed_units": 5000,
+        "credit_wait_count": 4827,
+        "credit_wait_seconds": 828.69547,
+        "credit_refill_cost_seconds": 2.985724,
+        "credit_granted_units": 5072,
+        "credit_remaining_units": 72,
+        "credit_wasted_units": 72
+      }
+    },
+    {
+      "id": "a-5k-pair-01",
+      "layer": "diagnostic_old_harness",
+      "product_source": "A",
+      "harness": "A_old_harness",
+      "count": 5000,
+      "duration_seconds": 125.291,
+      "pdu_per_second": 39.907024470659,
+      "status": "FAIL",
+      "failure_reason": "projection_drain_timeout",
+      "accepted": 5000,
+      "socket_written": 5000,
+      "submit_sm_resp_success": 5000,
+      "response_unknown": 0,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "write_failed": 0,
+      "max_active_binds": 4,
+      "included_in_strict_ab_decision": false,
+      "result_sha256": "9460562a3fe66c1e3146a42874a02f005986b80749cea88049a3aa84a0cc3c9d",
+      "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/a-5k-pair-01/result.json",
+      "interpretation": "Harness stop-condition false negative: data-plane and durable projection counts were complete."
+    }
+  ],
+  "l0_loopback": {
+    "id": "l0-5k-fast",
+    "count": 5000,
+    "status": "PASS",
+    "host": "127.0.0.1",
+    "pool_size": 4,
+    "window": 50,
+    "simulator_tps": 0.0,
+    "elapsed_seconds": 0.351,
+    "client_submit_sm_per_second": 14239.716,
+    "client_response_per_second": 14239.716,
+    "client_latency_ms": {
+      "p50": 13.613,
+      "p95": 15.879,
+      "p99": 18.259
+    },
+    "simulator_latency_ms": {
+      "p50": 0.041,
+      "p95": 0.056,
+      "p99": 0.081
+    },
+    "received": 5000,
+    "responded": 5000,
+    "response_failed": 0,
+    "unknown": 0,
+    "pending_at_close": 0,
+    "bind_attempts": 4,
+    "bind_count": 4,
+    "max_inflight": 150,
+    "audit_status": "VERIFIED",
+    "audit_backlog": 0,
+    "audit_overflow": 0,
+    "result_sha256": "68f346c65b4cc0e060a8559828bc16f38e5865e22da9ab0e023a466f33e9b0fe",
+    "raw_result": "/home/paas/mc-vnext-strict-ab-20261018/runs/l0-5k-fast/result.json"
+  },
+  "bind_lifecycle": {
+    "e2e_runs": [
+      {
+        "run": "common-a-5k-pair-01",
+        "binds": 48,
+        "max_active_binds": 4,
+        "active_binds_at_end": 0
+      },
+      {
+        "run": "b-5k-pair-01",
+        "binds": 43,
+        "max_active_binds": 4,
+        "active_binds_at_end": 0
+      },
+      {
+        "run": "common-a-5k-pair-02",
+        "binds": 47,
+        "max_active_binds": 4,
+        "active_binds_at_end": 0
+      },
+      {
+        "run": "b-5k-pair-02",
+        "binds": 46,
+        "max_active_binds": 4,
+        "active_binds_at_end": 0
+      }
+    ],
+    "interpretation": "Bind lifecycle count varies with reconnect/lease behavior, but simultaneous active binds stayed at the configured pool size and drained to zero."
+  },
+  "host_observations": {
+    "common_a_pair_01_first_iostat_interval": {
+      "cpu_user_percent": 9.74,
+      "cpu_system_percent": 3.09,
+      "cpu_iowait_percent": 0.28,
+      "cpu_idle_percent": 86.88,
+      "sdb_util_percent": 22.33
+    },
+    "loadavg_pre_post": {
+      "common_a_pair_01": {
+        "pre": [
+          6.92,
+          8.95,
+          8.19
+        ],
+        "post": [
+          8.96,
+          9.19,
+          8.3
+        ]
+      },
+      "b_pair_01": {
+        "pre": [
+          7.37,
+          8.69,
+          8.17
+        ],
+        "post": [
+          10.71,
+          9.61,
+          8.53
+        ]
+      },
+      "b_pair_02": {
+        "pre": [
+          6.56,
+          8.63,
+          8.26
+        ],
+        "post": [
+          9.13,
+          9.03,
+          8.41
+        ]
+      }
+    },
+    "memory": "Approximately 375G total, approximately 114G free during formal runs; swap approximately 158M used.",
+    "interpretation": "The host is shared and not CPU-pinned. The sampled interval is not CPU or iowait saturated, but host noise remains an uncontrolled variable; host root cause is not confirmed."
+  },
+  "next_gate": {
+    "run_50k_only_if": [
+      "A/B difference is reproducible across additional matched pairs",
+      "host is quiet or isolated",
+      "same ext4 workspace, source freeze and dependency freeze are retained"
+    ],
+    "recommended_followup": "Separate credit/window gating from projection staging on a quiet SLES host before any 50K rerun."
+  }
+}
