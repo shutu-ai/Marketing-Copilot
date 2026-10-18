@@ -1,0 +1,324 @@
+{
+  "schema_version": 1,
+  "task_id": "MC-VNEXT-LAYERED-THROUGHPUT-ISOLATION-20261018",
+  "BASELINE_HEAD": "3a9a1a4e6029fa965b4b7fff4ca4c49fddd54b58",
+  "source": {
+    "source_id": "source-b-3e73ab80",
+    "source_root": "/home/paas/mc-vnext-strict-ab-20261018/sources/source-b-3e73ab80",
+    "layered_harness_sha256": "5af36e93e8cabb58b4218da4d01500d62350868d4f9d65d50cbc27aaf0be6c11",
+    "product_code_changed": "NO"
+  },
+  "SERVER_OS_FILESYSTEM": {
+    "host": "paas-core01",
+    "os": "SLES 12 SP5",
+    "kernel": "4.12.14-122.307-default",
+    "arch": "x86_64",
+    "filesystem": "ext4",
+    "device": "/dev/sda2",
+    "formal_workspace": "/home/paas/mc-vnext-strict-ab-20261018",
+    "python": "3.11.5",
+    "dependency_freeze": [
+      "duckdb==1.2.0"
+    ],
+    "disk_preflight_available_bytes": 13292040192,
+    "disk_final_available_1k_blocks": 12938220,
+    "disk_final_available_bytes_approx": 13248737280
+  },
+  "SERVER_AUTHORIZED": true,
+  "RUNNER_DETACHED_AND_CLEANED": true,
+  "SERVER_HOST_LOAD_AND_IOWAIT": {
+    "shared_host": true,
+    "cpu_count": 80,
+    "loadavg_pre": [7.97, 7.15, 6.71],
+    "loadavg_post": [8.59, 7.55, 6.88],
+    "iostat_first_interval_percent": {
+      "user": 9.73,
+      "system": 3.09,
+      "iowait": 0.28,
+      "idle": 86.89
+    },
+    "sdb_util_percent": 56.19,
+    "source": "runs/layer-l4-5k/host-preflight.txt, host-postflight.txt, iostat.txt"
+  },
+  "APP_RSS_SAMPLE_VALID": {
+    "L1_L2_L3": "NOT_MEASURED",
+    "L4": "VALID_RESOURCE_GATE_PASS_APPLICATION_SCOPE",
+    "note": "The layered diagnostic tool is not an RSS acceptance sampler; L4 retained the existing application RSS/resource gate."
+  },
+  "INSTRUMENTATION_COMPARABILITY": {
+    "state": "COMPARABLE_ON",
+    "all_formal_layers": "instrumentation=ON",
+    "cross_runs": "instrumentation=ON",
+    "off_control": "NOT_RUN",
+    "reason": "Repeatability was stable; no instrumentation-induced winner was required to decide the boundary."
+  },
+  "parameters": {
+    "campaigns": 4,
+    "workers_L1_L2_L3": 1,
+    "workers_L4": 8,
+    "pool_size": 4,
+    "per_bind_tps": 200,
+    "tps_scope": "per_bind",
+    "total_tps_ceiling": 800,
+    "window_size": 50,
+    "bounded_pass_size_L2_L3": 250,
+    "projection_batch_size_L4": 512,
+    "projection_staging_mode_L4": "vectorized",
+    "response_delay_seconds": 0.0,
+    "instrumentation": true,
+    "counts_1k": [250, 250, 250, 250],
+    "counts_5k": [1250, 1250, 1250, 1250]
+  },
+  "layers": {
+    "L0": {
+      "result": "REUSED_EXISTING_REFERENCE",
+      "pdu_per_second": 14239.716,
+      "source_run": "/home/paas/mc-vnext-strict-ab-20261018/runs/l0-5k-fast",
+      "validation": "5000/5000, unknown=0, pending=0"
+    },
+    "L1": {
+      "one_k": {
+        "stage_active_pdu_rate": 788.078,
+        "response_phase_pdu_rate": 788.039,
+        "e2e_wall_pdu_rate": 779.044,
+        "validation": "PASS"
+      },
+      "five_k": {
+        "stage_active_pdu_rate": 793.045,
+        "response_phase_pdu_rate": 793.039,
+        "e2e_wall_pdu_rate": 791.372,
+        "bind_count": 4,
+        "credit_consumed_units": 5000,
+        "credit_granted_units": 5024,
+        "credit_wasted_units": 24,
+        "validation": "PASS"
+      },
+      "timing": {
+        "first_socket_write_monotonic": 2843412.797063238,
+        "last_socket_write_monotonic": 2843419.101873905,
+        "first_response_monotonic": 2843412.797582472,
+        "last_response_monotonic": 2843419.101924305,
+        "wall_seconds": 6.318141
+      }
+    },
+    "L2": {
+      "one_k": {
+        "stage_active_pdu_rate": 441.928,
+        "response_phase_pdu_rate": 441.916,
+        "e2e_wall_pdu_rate": 415.681,
+        "bind_count": 16,
+        "validation": "PASS"
+      },
+      "five_k": {
+        "stage_active_pdu_rate": 260.86,
+        "response_phase_pdu_rate": 260.859,
+        "e2e_wall_pdu_rate": 255.996,
+        "bind_count": 80,
+        "pass_count": 20,
+        "connect_setup_proxy_seconds": 10.194855,
+        "close_seconds": 0.021701,
+        "close_rebind_wall_share": 0.5223079,
+        "validation": "PASS"
+      },
+      "critical_path_recent_sample_p95_ms": {
+        "response_window_wait": 11.59,
+        "smpp_response_latency": 40.965,
+        "tps_credit_wait": 101.267,
+        "sample_count_each": 4096,
+        "counter_count_each": 5000
+      }
+    },
+    "L3": {
+      "one_k": {
+        "stage_active_pdu_rate": 322.28,
+        "response_phase_pdu_rate": 322.223,
+        "e2e_wall_pdu_rate": 307.581,
+        "journal_events_durable": 2000,
+        "response_events_durable": 1000,
+        "bind_count": 16,
+        "validation": "PASS"
+      },
+      "five_k": {
+        "stage_active_pdu_rate": 197.14,
+        "response_phase_pdu_rate": 197.133,
+        "e2e_wall_pdu_rate": 194.221,
+        "journal_events_durable": 10000,
+        "response_events_durable": 5000,
+        "fsync_count": 10000,
+        "bind_count": 80,
+        "pass_count": 20,
+        "journal_append_total_ns": 4308081420,
+        "journal_fsync_total_ns": 2362700184,
+        "journal_fsync_recent_sample_count": 4096,
+        "journal_fsync_recent_p95_ms": 0.339,
+        "validation": "PASS"
+      }
+    },
+    "L4": {
+      "one_k": {
+        "stage_active_pdu_rate": 322.798,
+        "response_phase_pdu_rate": 322.795,
+        "e2e_wall_pdu_rate": 40.061,
+        "duration_seconds": 24.962,
+        "bind_count": 23,
+        "accepted": 1000,
+        "socket_written": 1000,
+        "responses": 1000,
+        "journal_events": 2000,
+        "projection_events": 2000,
+        "validation": "PASS"
+      },
+      "five_k": {
+        "stage_active_pdu_rate": 384.391,
+        "response_phase_pdu_rate": 384.391,
+        "e2e_wall_pdu_rate": 85.953,
+        "duration_seconds": 58.171,
+        "bind_count": 46,
+        "accepted": 5000,
+        "socket_written": 5000,
+        "responses": 5000,
+        "journal_events": 10000,
+        "projection_events": 10000,
+        "unknown_response": 0,
+        "write_failed": 0,
+        "duplicate": 0,
+        "projection_queue_depth": 0,
+        "projection_journal_backlog_bytes": 0,
+        "offsets": "EOF",
+        "response_journal_drain_seconds": 4.068,
+        "projection_commit_drain_seconds": 31.621,
+        "staging_bind_execute_count": 23,
+        "staging_bind_execute_p95_ms_max_of_process_local_p95": 2055.263,
+        "staging_bind_execute_p50_ms_max_of_process_local_p50": 1999.232,
+        "validation": "PASS"
+      }
+    }
+  },
+  "L1_CREDIT_TRANSPORT_STAGE_RATE": 793.045,
+  "L2_WORKER_SPOOL_STAGE_RATE": 260.86,
+  "L3_DURABLE_JOURNAL_STAGE_RATE": 197.14,
+  "L4_FULL_E2E_STAGE_RATE": 384.391,
+  "L4_FULL_E2E_WALL_RATE": 85.953,
+  "L0_EXISTING_REFERENCE_PDU_PER_SEC": 14239.716,
+  "STAGING_BIND_P95_ORIGIN_AND_AGGREGATION": "L4 critical_path.durations.staging_bind_execute; projection-writer process-local P95, aggregate takes max across process-local P95s; not pooled/global; count=23.",
+  "STAGING_2S_ANOMALY": "YES_OBSERVED_P95_2055.263_MS_P50_1999.232_MS",
+  "BIND_LIFECYCLE_5K_AND_TIME_SHARE": {
+    "L1": {
+      "bind_count": 4,
+      "acquired": 4,
+      "released": 4,
+      "close_seconds": 0.001261,
+      "pass_start_to_first_write_proxy_seconds": 0.006463,
+      "proxy_wall_share": 0.001223
+    },
+    "L2": {
+      "bind_count": 80,
+      "acquired": 80,
+      "released": 80,
+      "close_seconds": 0.021701,
+      "pass_start_to_first_write_proxy_seconds": 10.194855,
+      "proxy_wall_share": 0.5223079
+    },
+    "L3": {
+      "bind_count": 80,
+      "acquired": 80,
+      "released": 80,
+      "close_seconds": 0.021537,
+      "pass_start_to_first_write_proxy_seconds": 10.610777,
+      "proxy_wall_share": 0.4113004
+    },
+    "L2_keep_transport_control": {
+      "bind_count": 4,
+      "acquired": 4,
+      "released": 4,
+      "stage_active_pdu_rate": 258.431,
+      "e2e_wall_pdu_rate": 253.587,
+      "pass_start_to_first_write_proxy_seconds": 0.34173,
+      "close_seconds": 0.001304,
+      "proxy_wall_share": 0.017398,
+      "interpretation": "No meaningful throughput improvement; proxy includes worker scheduling and credit wait, not pure TCP bind time."
+    },
+    "L4": {
+      "bind_count": 46,
+      "max_active_binds": 4,
+      "active_binds_at_end": 0
+    }
+  },
+  "boundary_cross_runs": [
+    {
+      "id": "AB-01",
+      "order": "L1->L2",
+      "L1_stage": 795.415,
+      "L1_wall": 793.726,
+      "L2_stage": 261.927,
+      "L2_wall": 256.903,
+      "L1_result_sha256": "ba828d048f82788b96f4bca6e3839f69753541695278ec910c1ccfd94681b2a6",
+      "L2_result_sha256": "d4827ffb095ff4312f6a006a7e4fd68a67c30cc469e75982dad3eaa584a0bacf"
+    },
+    {
+      "id": "BA-02",
+      "order": "L2->L1",
+      "L1_stage": 795.014,
+      "L1_wall": 793.276,
+      "L2_stage": 259.089,
+      "L2_wall": 254.102,
+      "L1_result_sha256": "46d9755004e61091594e1b650bc6b609f433ada16e962dc21091ffdeecfb045f",
+      "L2_result_sha256": "0646201b1c2fa9ea07457cdb777fc3c45a3a84289e3eb2d25807bfc83450968f"
+    },
+    {
+      "id": "AB-03",
+      "order": "L1->L2",
+      "L1_stage": 794.678,
+      "L1_wall": 792.954,
+      "L2_stage": 257.302,
+      "L2_wall": 252.599,
+      "L1_result_sha256": "d16f27eec9c6e62cb63d0f5f770bb8b1fdb7bbf37894104765ae958dc09b23c9",
+      "L2_result_sha256": "f8cf572918126af7054539a44781ce1fbe557f06741a63ad283c76f9bb9b6046"
+    }
+  ],
+  "result_sha256": {
+    "L1_1K": "8d1a821a47dd8b9006e5067883580981a0c77d519989335fac4fb60b30e99325",
+    "L1_5K": "a15a01e27247a9c16066434a1f800954fe1a7c06d56dea7ff2099f2605527dd9",
+    "L2_1K": "b43433ebc3e6e261a786d24e1a65278adba3f9b0552562a3d21f9967da2791ca",
+    "L2_5K": "71e61955290849f28c2f63eb844ab5ac728f88deb9cd6de1171009b6f773490c",
+    "L3_1K": "7b5892d45e8df9cf1244489b462a0608491a5e692fd36909813a4ea6979b251d",
+    "L3_5K": "a7393c5a9c0c6edc36296875f4e83e8aa665e22f9cada58720101a7edd558fbb",
+    "L4_1K": "2172cb2309ff59785e916744efc80f57f4442b903fa36896dd8196d2450f6123",
+    "L4_5K": "dbb290ba380a98ecc35d85de812fd348729870b56cc8b7270271418e08115a6f",
+    "L2_5K_KEEP_TRANSPORTS": "1ec14d7ff7423041e83bae5012fcb4b1dff4ae326e61872459a0a24470bc82ab"
+  },
+  "CREDIT_AND_WINDOW_CONFORMANCE": {
+    "configured_per_bind_tps": 200,
+    "configured_pool_size": 4,
+    "configured_total_ceiling": 800,
+    "configured_window_size": 50,
+    "all_rate_keys": 200,
+    "credit_consumed_equals_successful_pdus": true,
+    "window_bound_respected": true,
+    "response_drain_before_close": true
+  },
+  "APP_ROUTE_TPS_DEFAULT_CHANGED": "NO",
+  "PROJECTION_DEFAULT_CHANGED": "NO",
+  "DUPLICATE_PDU": 0,
+  "UNKNOWN_RESPONSE": 0,
+  "L4_JOURNAL_PROJECTION_RECONCILED": true,
+  "T6_CROSS_DAY": "NOT_RUN_BY_SCOPE",
+  "T7_EXISTING_6_OF_6": "REUSED_EXISTING_6_OF_6",
+  "PRODUCT_CODE_CHANGED": "NO",
+  "CANDIDATE_PAIRED_E2E_DELTA": {
+    "product_candidate": "NONE",
+    "L2_keep_vs_close_control_percent": -0.941,
+    "interpretation": "No candidate patch; control delta is not a product win."
+  },
+  "PRIMARY_DROP_BOUNDARY": "L1->L2",
+  "CAUSE_CONFIDENCE": {
+    "boundary": "HIGH",
+    "single_subcomponent": "MEDIUM",
+    "summary": "Worker/spool/credit bounded-pass scheduling is reproducible; close/rebind alone is not causal; L2->L3 journal cost is separately reproducible."
+  },
+  "50K_RUN": "NOT_RUN_BY_SCOPE",
+  "600S_800PDU": "NOT_RUN",
+  "CANARY_READY": "NO",
+  "FINAL_DECISION": "NO_CHANGE_WITH_EVIDENCE",
+  "COMMIT_PUSH": "NOT_REQUESTED"
+}
