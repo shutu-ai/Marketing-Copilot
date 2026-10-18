@@ -1,0 +1,96 @@
+{
+  "schema": "marketing-copilot-vnext-a0-a2-r0-freeze-v1",
+  "generated_at": "2026-10-18",
+  "task": "Marketing_Copilot_VNext_A0_A2_Batch_Sizing_EulerOS_E2E_Closure_Codex_Task.md",
+  "baseline": {
+    "head": "cd8e63537d264a623d347735f38c946caada4f75",
+    "origin_main": "cd8e63537d264a623d347735f38c946caada4f75",
+    "backend_source_changes": 0,
+    "commit_or_push": "NOT_REQUESTED",
+    "preserved_user_changes": [
+      "AGENTS.md",
+      "frontend/package-lock.json"
+    ]
+  },
+  "frozen_contract": {
+    "single_projection_writer": true,
+    "single_db_owner": true,
+    "journal_fsync_unchanged": true,
+    "dedup_semantics_unchanged": true,
+    "unknown_semantics_unchanged": true,
+    "default_projection_batch": 512,
+    "arrow_production_integration": "NOT_APPROVED"
+  },
+  "source_envelope": {
+    "source_archive_sha256": "a22a2ea692a0c50d30f7f2b3aeec035daa0c580ee3d652f0a2305b288fe0cd91",
+    "seed": 20261018,
+    "campaigns": 4,
+    "events_per_task": 2,
+    "business_days": 2,
+    "synthetic_only": true,
+    "real_smsc_or_production_db": false
+  },
+  "dependency_freeze": {
+    "pip_freeze": [
+      "duckdb==1.2.0",
+      "numpy==1.26.4",
+      "pandas==2.3.2",
+      "pyarrow==12.0.1",
+      "python-dateutil==2.9.0.post0",
+      "pytz==2026.5",
+      "six==1.17.0",
+      "tzdata==2026.5"
+    ],
+    "pip_freeze_sha256": "502422a5a1be6e2cea2e0ae206c01940b3104c6d906545d8219cdbda72a04227",
+    "packages": {
+      "duckdb": "1.2.0",
+      "numpy": "1.26.4",
+      "pandas": "2.3.2",
+      "pyarrow": "12.0.1"
+    },
+    "selected_package_lines_sha256": "fdf13e6dc972a619b42136d685b756f9575353932d8d9480c54f7ae1afcbc8ae",
+    "production_wheelhouse_pyarrow": "ABSENT",
+    "online_dependency_download": "TIMEOUT"
+  },
+  "environments": {
+    "wsl_formal": {
+      "distribution": "AlmaLinux-8",
+      "filesystem": "native ext4",
+      "python": "3.11.13",
+      "glibc": "2.28",
+      "formal_cpu_affinity": [0, 1, 2, 3],
+      "nice": 10,
+      "ionice": "REQUESTED_IDLE_BUT_KERNEL_IGNORED_CLASS_DATA"
+    },
+    "provided_test_server": {
+      "actual_os": "SLES 12 SP5",
+      "expected_target": "EulerOS",
+      "target_match": false,
+      "python": "3.11.4",
+      "glibc": "2.22",
+      "cpu_count": 80,
+      "memory_total_kib": 393924412,
+      "filesystem": "ext4",
+      "source_archive_sha256": "a22a2ea692a0c50d30f7f2b3aeec035daa0c580ee3d652f0a2305b288fe0cd91",
+      "application_deployment": "NOT_PERFORMED"
+    }
+  },
+  "gates": {
+    "R0_SOURCE_ENV": "PASS",
+    "R1_PLATFORM_DIFFERENCE": "NOT_VERIFIED_BLOCKED_ENV",
+    "R2_PAIRED_CORRECTNESS": "PASS",
+    "R2_SUSTAINED_BENEFIT": "PASS_MICROBENCHMARK",
+    "R3_PRODUCT_OPT_IN": "PASS_EXPERIMENT_ONLY",
+    "R4_E2E_INTEGRITY": "PASS_WITH_T7_SCOPE_LIMIT",
+    "R4_E2E_BENEFIT": "NOT_VERIFIED_NO_CHANGE",
+    "R5_600S_800PDU": "NOT_APPLICABLE_BLOCKED_BY_R4"
+  },
+  "decision": {
+    "status": "NO_CHANGE_WITH_EVIDENCE",
+    "canary_ready": false,
+    "winning_production_arm": "NONE",
+    "experimental_best_arm": "C1",
+    "default_ingest_mode_changed": false,
+    "euleros_discrepancy_closed": false
+  }
+}
