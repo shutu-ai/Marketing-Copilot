@@ -506,6 +506,7 @@ class ShardWorker:
             "worker_id": self.worker_id,
             "partitions": list(self.partitions),
             "counters": counters,
+            "route_credits": self.credits.snapshot() if hasattr(self.credits, "snapshot") else {},
             "progress_events": len(self._progress_events),
             "inflight": int(self._inflight),
             "transports": [

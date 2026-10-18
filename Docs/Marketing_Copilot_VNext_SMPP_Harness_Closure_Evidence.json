@@ -1,0 +1,493 @@
+{
+  "task_id": "MC-VNEXT-SMPP-THROUGHPUT-HARNESS-CLOSURE-20261018",
+  "source": {
+    "baseline_head": "2c847b55abe4eddfa9dfafba34ce207fa0847313",
+    "origin_main_verified": "2c847b55abe4eddfa9dfafba34ce207fa0847313",
+    "working_tree_head": "2c847b55abe4eddfa9dfafba34ce207fa0847313",
+    "unrelated_worktree_changes_preserved": true,
+    "product_code_change": "NONE",
+    "product_default_changed": false,
+    "server_source_archives": {
+      "r3": {
+        "sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+        "used_for": "1K, 5K S0-S3"
+      },
+      "r4": {
+        "sha256": "7F1F6A8CC2D3D5BFDBB39606470CE4F4392678ECDA927F302A214538995C2753",
+        "used_for": "50K S0 and S2"
+      },
+      "r5": {
+        "sha256": "76A6782D445EA50C03E0B53603C10382A2A945DF8FC50F1D005D7CA7DA8AFCF7",
+        "used_for": "T6 and T7"
+      },
+      "r6": {
+        "sha256": "13DC3295D19B06518E5858098C1BB0B3DA2E996D932718A9642F95C8345DE418",
+        "used_for": "final 5K observability verification"
+      }
+    },
+    "changed_files": [
+      "backend/tools/vnext_streaming_acceptance.py",
+      "backend/vnext/route_credits.py",
+      "backend/vnext/smpp_transport.py",
+      "backend/vnext/worker.py",
+      "backend/tests/test_vnext_streaming_acceptance.py",
+      "Docs/Marketing_Copilot_VNext_Harness_Reliability_and_Resource_RCA.md",
+      "Docs/Marketing_Copilot_VNext_SMPP_Credit_Window_Throughput_AB_Report.md",
+      "Docs/Marketing_Copilot_VNext_SLES_Sustained_Capacity_and_Canary_Decision.md",
+      "Docs/Marketing_Copilot_VNext_SMPP_Harness_Closure_Evidence.json"
+    ]
+  },
+  "implementation": {
+    "resource_sampler": {
+      "primary": "/proc",
+      "fallbacks": [
+        "targeted psutil",
+        "targeted ps diagnostics"
+      ],
+      "invalid_sample_policy": "null_and_NOT_VERIFIED",
+      "diagnostics": "resource-sampler-diagnostics.jsonl"
+    },
+    "completion_detection": {
+      "evidence": [
+        "durable projection offsets",
+        "Journal EOF",
+        "final backlog",
+        "status mtime and age"
+      ],
+      "states": [
+        "COMPLETED",
+        "STALE_STATUS",
+        "INCOMPLETE",
+        "SAMPLER_ERROR",
+        "TIMEOUT"
+      ]
+    },
+    "throughput_observability": [
+      "route",
+      "credit",
+      "bind",
+      "SMPP window",
+      "worker",
+      "producer",
+      "loopback",
+      "writer"
+    ]
+  },
+  "environment": {
+    "server": {
+      "hostname": "paas-core01",
+      "os": "SLES 12 SP5-compatible",
+      "kernel": "4.12.14-122.307-default",
+      "filesystem": "ext4",
+      "python": "3.11.4",
+      "duckdb": "1.2.0",
+      "cpu_logical": 80,
+      "memory": "375G",
+      "loadavg_at_metadata_capture": [
+        13.92,
+        11.63,
+        10.83
+      ],
+      "root_filesystem_used_percent": 90,
+      "environment_metadata_sha256": "74D9348EF458F6AE3A987C3ADF0E7E96844E43A17D345DB2D0A5F6183AA5394A",
+      "environment_metadata_path": ".tmp/server-first-20261018-evidence-r3/server-environment-r3.txt",
+      "dependency_freeze": {
+        "packages": [
+          "duckdb==1.2.0",
+          "numpy==1.26.4",
+          "pandas==2.3.2",
+          "pyarrow==12.0.1",
+          "python-dateutil==2.9.0.post0",
+          "pytz==2026.5",
+          "six==1.17.0",
+          "tzdata==2026.5"
+        ],
+        "captured_in": "server-environment-r3.txt"
+      }
+    },
+    "wsl": {
+      "distribution": "AlmaLinux-8",
+      "filesystem": "ext4",
+      "df_type": "ext4",
+      "python": "3.11.5",
+      "dependency_freeze_sha256": "603093866ab369ac7ac3e1993d33b1407905d80546a1153041a764bf5c56c18b",
+      "native_stage": "/tmp/mc-vnext-smpp-wsl-current-20261018"
+    },
+    "windows": {
+      "python_environment": ".p0-test-venv",
+      "filesystem_role": "compatibility_and_full_backend_regression"
+    },
+    "hardware_equivalence": "NOT_VERIFIED"
+  },
+  "runs": [
+    {
+      "id": "R1-1K-S0",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "parameters": {
+        "counts": [
+          250,
+          250,
+          250,
+          250
+        ],
+        "route_tps_per_bind": 200,
+        "tps_scope": "per_bind",
+        "window": 50,
+        "projection_status_interval_seconds": 1.0
+      },
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 14.302,
+      "accepted": 1000,
+      "socket_written": 1000,
+      "responses": 1000,
+      "journal_events": 2000,
+      "projection_events": 2000,
+      "application_rss_peak_kib": 130636,
+      "harness_rss_peak_kib": 372972,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/1k-c0-r2/result.json",
+      "result_sha256": "853DA7DADF8E49221A788264DAC652E2F16C501297995D534E2FC172735ACAAD"
+    },
+    {
+      "id": "R1-5K-S0-run-1",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "parameters": {
+        "counts": [
+          1250,
+          1250,
+          1250,
+          1250
+        ],
+        "route_tps_per_bind": 200,
+        "tps_scope": "per_bind",
+        "window": 50,
+        "projection_status_interval_seconds": 1.0
+      },
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 37.722,
+      "completion_detection_lag_ms": 880.095,
+      "status_age_ms": 6.234,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "application_rss_peak_kib": 165488,
+      "harness_rss_peak_kib": 439512,
+      "loopback_receive_pdu_per_second": 151.587,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/5k-c0-1s-1/result.json",
+      "result_sha256": "06B96468D1C3857483134B22574C3922897C6C7F1B149B20FA472C4B1E0419E5"
+    },
+    {
+      "id": "R1-5K-S0-run-2",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 37.873,
+      "completion_detection_lag_ms": 838.794,
+      "status_age_ms": 20.958,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "application_rss_peak_kib": 165488,
+      "harness_rss_peak_kib": 435504,
+      "loopback_receive_pdu_per_second": 151.584,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/5k-c0-1s-2/result.json",
+      "result_sha256": "6E537C246C7EB0AF914998B08C05153160706312B88E04FAFA1FEA2F53515F28"
+    },
+    {
+      "id": "R1-5K-S0-run-3",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 37.58,
+      "completion_detection_lag_ms": 898.7,
+      "status_age_ms": 28.62,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "application_rss_peak_kib": 165380,
+      "harness_rss_peak_kib": 440332,
+      "loopback_receive_pdu_per_second": 152.126,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/5k-c0-1s-3/result.json",
+      "result_sha256": "E139F3F27C2BB1FBF0BD822BB813C266FCD691FED8C8A815C954F0D180686133"
+    },
+    {
+      "id": "S1-5K-window-100",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "status": "PASS",
+      "duration_seconds": 35.26,
+      "configured_total_tps": 800,
+      "window": 100,
+      "loopback_receive_pdu_per_second": 171.719,
+      "window_wait_p95_ms": 773.422,
+      "credit_wait_p95_ms": 500.697,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/S1-5k-w100/result.json",
+      "result_sha256": "EEB76FB704350547924E5AA4A99588936DAE829F56BB0873FDE41451600C1EDC"
+    },
+    {
+      "id": "S2-5K-synthetic-250-window-50",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "status": "PASS",
+      "duration_seconds": 40.152,
+      "configured_total_tps": 1000,
+      "window": 50,
+      "loopback_receive_pdu_per_second": 143.265,
+      "window_wait_p95_ms": 2573.327,
+      "credit_wait_p95_ms": 281.243,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/S2-5k-t250-w50/result.json",
+      "result_sha256": "8125B21B4CC82D33F9E202B436C0DB8275A8603FC67BE6833AE26B21B7BB829D"
+    },
+    {
+      "id": "S3-5K-synthetic-250-window-100",
+      "source_archive_sha256": "AAB254F36C8921CE7B1C7A21A82ECC35E7DC61640AE5841C08BD534E2659F61A",
+      "status": "PASS",
+      "duration_seconds": 50.144,
+      "configured_total_tps": 1000,
+      "window": 100,
+      "loopback_receive_pdu_per_second": 171.931,
+      "window_wait_p95_ms": 953.539,
+      "credit_wait_p95_ms": 382.799,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "result_path": ".tmp/server-first-20261018-evidence-r1/runs/S3-5k-t250-w100/result.json",
+      "result_sha256": "26D5B89A33A1F03D0CC50669B353D90739BB870D59A5878DF8BBE1F184421ACA"
+    },
+    {
+      "id": "S0-50K",
+      "source_archive_sha256": "7F1F6A8CC2D3D5BFDBB39606470CE4F4392678ECDA927F302A214538995C2753",
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 308.882,
+      "configured_tps_per_bind": 200,
+      "configured_total_tps": 800,
+      "window": 50,
+      "loopback_receive_pdu_per_second": 169.112,
+      "response_pdu_per_second": 169.112,
+      "window_wait_p95_ms": 2532.409,
+      "credit_wait_p95_ms": 426.99,
+      "credit_wait_count": 47615,
+      "credit_wait_seconds": 5660.168357,
+      "credit_refill_cost_seconds": 29.20065,
+      "credit_wasted_units": 48,
+      "accepted": 50000,
+      "socket_written": 50000,
+      "responses": 50000,
+      "journal_events": 100000,
+      "projection_events": 100000,
+      "final_backlog": 0,
+      "application_rss_peak_kib": 396024,
+      "harness_rss_peak_kib": 873116,
+      "result_path": ".tmp/server-first-20261018-evidence-r2/runs/50k-c0-r2/result.json",
+      "result_sha256": "70CE4103C2F3E956F8564E44E7C23F5BEF0F98901DBA2D7EE5BEEFA08AD4DA40",
+      "diagnostics_path": ".tmp/server-first-20261018-evidence-r2/runs/50k-c0-r2/resource-sampler-diagnostics.jsonl",
+      "diagnostics_sha256": "AC0444E5E758C414B6872066CD14058BC2AB2DFDD00DF6C97A66EDCF580A6A10"
+    },
+    {
+      "id": "S2-50K-synthetic",
+      "source_archive_sha256": "7F1F6A8CC2D3D5BFDBB39606470CE4F4392678ECDA927F302A214538995C2753",
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 311.61,
+      "configured_tps_per_bind": 250,
+      "configured_total_tps": 1000,
+      "window": 50,
+      "loopback_receive_pdu_per_second": 166.361,
+      "response_pdu_per_second": 166.361,
+      "window_wait_p95_ms": 2574.787,
+      "credit_wait_p95_ms": 293.637,
+      "credit_wait_count": 45252,
+      "credit_wait_seconds": 2650.491671,
+      "credit_refill_cost_seconds": 29.939606,
+      "credit_wasted_units": 48,
+      "accepted": 50000,
+      "socket_written": 50000,
+      "responses": 50000,
+      "journal_events": 100000,
+      "projection_events": 100000,
+      "final_backlog": 0,
+      "application_rss_peak_kib": 395452,
+      "harness_rss_peak_kib": 851632,
+      "result_path": ".tmp/server-first-20261018-evidence-r2/runs/50k-S2-t250-w50/result.json",
+      "result_sha256": "F41D489732B05B52CB41EEC62CC2BCB9077AAD66ABE70F9F9107C1BA15FA46DC",
+      "diagnostics_path": ".tmp/server-first-20261018-evidence-r2/runs/50k-S2-t250-w50/resource-sampler-diagnostics.jsonl",
+      "diagnostics_sha256": "7F82E4184305CF41BDE3B3100D63964E9DEEE440BAE2E1317E7D1870E9FE100D"
+    },
+    {
+      "id": "r6-final-observability-5K",
+      "source_archive_sha256": "13DC3295D19B06518E5858098C1BB0B3DA2E996D932718A9642F95C8345DE418",
+      "status": "PASS",
+      "completion_state": "COMPLETED",
+      "duration_seconds": 36.162,
+      "completion_detection_lag_ms": 884.521,
+      "status_age_ms": 38.514,
+      "configured_tps_per_bind": 200,
+      "configured_total_tps": 800,
+      "window": 50,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "responses": 5000,
+      "unknown_responses": 0,
+      "journal_events": 10000,
+      "projection_events": 10000,
+      "application_rss_peak_kib": 161944,
+      "harness_rss_peak_kib": 432392,
+      "worker_count": 4,
+      "non_empty_transport_snapshot_count": 2,
+      "non_empty_bind_snapshot_count": 2,
+      "result_path": ".tmp/server-first-20261018-evidence-r3/result.json",
+      "result_sha256": "5DC849159A21FB80025E48B5F12292A9675958D1E93570AF02BCEFC9FA04ACD5",
+      "diagnostics_path": ".tmp/server-first-20261018-evidence-r3/resource-sampler-diagnostics.jsonl",
+      "diagnostics_sha256": "0B74FA7C3D46CC06016EEDE12E76C71FE0BAAFF7610E272F19FEFFE6F82BB58A"
+    }
+  ],
+  "recovery": {
+    "T6": {
+      "status": "PASS",
+      "old_day_socket_after_cutoff": 0,
+      "old_day_redispatch_after_restart": 0,
+      "new_day_socket_received": 8,
+      "new_day_stats_contamination": 0,
+      "closed_day_reclaimed_records": 8,
+      "closed_day_reclaimed_bytes": 3400,
+      "result_path": ".tmp/server-first-20261018-evidence-r2/runs/t6-current/daily-result.json",
+      "result_sha256": "9FF0A3F1EAE3827AA24AB1942CCB7DA15CDD50F67E5052DB068774B858A29DD1"
+    },
+    "T7": {
+      "status": "PASS",
+      "passed_scenarios": [
+        "T7-4",
+        "T7-5",
+        "T7-6",
+        "T7-7",
+        "T7-8",
+        "T7-9"
+      ],
+      "result_path": ".tmp/server-first-20261018-evidence-r2/runs/t7-current/result.json",
+      "result_sha256": "E133827C8B82B0DA58639C0C54B77950A59041270D6A24B0E60AC3DB29EEA19A"
+    }
+  },
+  "test_suites": {
+    "new_streaming_acceptance_tests": {
+      "status": "PASS",
+      "passed": 8
+    },
+    "windows_backend": {
+      "status": "PASS",
+      "passed": 429,
+      "skipped": 5,
+      "warnings": 4
+    },
+    "windows_related_smpp_suite": {
+      "status": "PASS",
+      "passed": 23,
+      "note": "one transient os.replace PermissionError was rerun successfully"
+    },
+    "wsl_native_ext4_backend": {
+      "status": "PASS",
+      "passed": 432,
+      "skipped": 2,
+      "warnings": 6,
+      "filesystem": "ext4",
+      "python": "3.11.5"
+    }
+  },
+  "r4": {
+    "status": "NOT_RUN",
+    "reason": "S2/S3 synthetic supply did not approach 800 PDU/s and R4 prerequisite requires sustained headroom; shared host disk was 90% used.",
+    "actual_socket_pdu": null,
+    "average_socket_pdu_per_second": null,
+    "min_60s_rate": null,
+    "responses": null,
+    "journal_events": null,
+    "projection_events": null,
+    "application_rss_peak": null,
+    "backlog_trend": null
+  },
+  "final_output_card": {
+    "SOURCE_HEAD": "2c847b55abe4eddfa9dfafba34ce207fa0847313",
+    "CHANGED_FILES": [
+      "backend/tools/vnext_streaming_acceptance.py",
+      "backend/vnext/route_credits.py",
+      "backend/vnext/smpp_transport.py",
+      "backend/vnext/worker.py",
+      "backend/tests/test_vnext_streaming_acceptance.py",
+      "Docs/Marketing_Copilot_VNext_Harness_Reliability_and_Resource_RCA.md",
+      "Docs/Marketing_Copilot_VNext_SMPP_Credit_Window_Throughput_AB_Report.md",
+      "Docs/Marketing_Copilot_VNext_SLES_Sustained_Capacity_and_Canary_Decision.md",
+      "Docs/Marketing_Copilot_VNext_SMPP_Harness_Closure_Evidence.json"
+    ],
+    "UNRELATED_WORKTREE_CHANGES_PRESERVED": "YES",
+    "TEST_SERVER_OS_AND_AUTHORIZATION": "paas-core01 / SLES 12 SP5-compatible / authorized synthetic loopback",
+    "TARGET_OS": "SLES12SP5",
+    "R1_RSS_SAMPLER_ROOT_CAUSE": "SLES ps parse failure was previously converted to zero; /proc primary sampling now reports invalid samples explicitly",
+    "R1_RSS_SAMPLER_VALID": "PASS",
+    "R1_APPLICATION_RSS_PEAK_KIB": 396024,
+    "R1_HARNESS_RSS_PEAK_KIB": 873116,
+    "R1_STATUS_TIMEOUT_ROOT_CAUSE": "stale status was previously accepted as the only completion signal; durable offsets and Journal EOF are now checked",
+    "R1_5K_STATUS_INTERVAL_1S_THREE_RUNS": "PASS",
+    "R1_HARNESS_RELIABILITY": "PASS",
+    "RATE_LIMIT_CONFORMANCE": "PASS",
+    "S0_CONFIGURED_TPS_PER_BIND": 200,
+    "S0_CONFIGURED_TOTAL_TPS_CEILING": 800,
+    "S0_MEASURED_SOCKET_PDU_PER_SEC": 169.112,
+    "S0_MEASURED_RESPONSE_PDU_PER_SEC": 169.112,
+    "S0_CREDIT_WAIT_P95_MS": 426.99,
+    "S0_WINDOW_WAIT_P95_MS": 2532.409,
+    "S0_BIND_UTILIZATION": null,
+    "S1_WINDOW_SENSITIVITY": "DEMONSTRATED: 5K window=100 measured 171.719 PDU/s and 773.422 ms P95",
+    "S2_TEST_ONLY_TPS_HEADROOM": "NOT_VERIFIED",
+    "S3_TEST_ONLY_WINDOW_HEADROOM": "NOT_VERIFIED",
+    "PRIMARY_BOTTLENECK": "WINDOW",
+    "SERVER_50K_CORRECTNESS": "PASS",
+    "JOURNAL_PROJECTION_BACKLOG_END": 0,
+    "T6_CROSS_DAY": "PASS",
+    "T7_CURRENT_6_OF_6": "PASS",
+    "R4_600S_COMPLETED": "NO",
+    "R4_600S_ACTUAL_SOCKET_PDU": null,
+    "R4_600S_AVG_SOCKET_PDU_PER_SEC": null,
+    "R4_600S_MIN_60S_RATE": null,
+    "R4_600S_RESPONSE_COUNT": null,
+    "R4_600S_JOURNAL_EVENTS": null,
+    "R4_600S_PROJECTION_EVENTS": null,
+    "R4_600S_APPLICATION_RSS_PEAK": null,
+    "R4_600S_BACKLOG_TREND": null,
+    "TARGET_MEMORY_HARDWARE_EQUIVALENCE": "NOT_VERIFIED",
+    "PRODUCT_DEFAULT_CHANGED": "NO",
+    "FINAL_DECISION": "HARNESS_LOOPBACK_LIMITED",
+    "CANARY_READY": "NO",
+    "COMMIT_PUSH": "NOT_REQUESTED"
+  },
+  "evidence_files": [
+    {
+      "path": ".tmp/server-first-20261018-evidence-r3/server-environment-r3.txt",
+      "sha256": "74D9348EF458F6AE3A987C3ADF0E7E96844E43A17D345DB2D0A5F6183AA5394A"
+    },
+    {
+      "path": ".tmp/server-first-20261018-evidence-r2/runs/50k-c0-r2/resource-sampler-diagnostics.jsonl",
+      "sha256": "AC0444E5E758C414B6872066CD14058BC2AB2DFDD00DF6C97A66EDCF580A6A10"
+    },
+    {
+      "path": ".tmp/server-first-20261018-evidence-r2/runs/50k-S2-t250-w50/resource-sampler-diagnostics.jsonl",
+      "sha256": "7F82E4184305CF41BDE3B3100D63964E9DEEE440BAE2E1317E7D1870E9FE100D"
+    }
+  ]
+}

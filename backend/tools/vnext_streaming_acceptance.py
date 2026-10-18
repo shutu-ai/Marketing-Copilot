@@ -16,6 +16,7 @@ import multiprocessing
 import os
 from collections import Counter
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -72,70 +73,439 @@ def _journal_bytes(journal_paths: list[Path]) -> int:
     return total
 
 
-def _projection_caught_up(projection, journal_paths: list[Path]) -> bool:
-    """Require the writer to commit the current journal EOF before stopping.
+def _parse_process_rows(output: str) -> dict[int, dict]:
+    """Parse the numeric four-column ``ps`` form used on SLES and WSL.
 
-    A zero ``projection_lag_seconds`` only says that the last applied event was
-    recent.  It does not prove that the writer has consumed the journal tail.
-    The parent therefore compares the live journal bytes with the writer's
-    committed offset in addition to checking the writer's backlog counters.
+    ``ps`` implementations differ in whitespace and header behavior.  The
+    parser intentionally accepts extra trailing columns while requiring the
+    first four fields to be numeric.  The raw output is retained by the
+    sampler diagnostic writer, so malformed lines remain auditable.
     """
 
-    try:
-        status = projection.snapshot()
-    except Exception:
-        return False
-    committed_offset = status.get("journal_committed_offset_bytes")
-    if committed_offset is None:
-        return False
-    try:
-        committed_offset = int(committed_offset)
-    except (TypeError, ValueError):
-        return False
-    return (
-        _journal_bytes(journal_paths) <= committed_offset
-        and int(status.get("journal_backlog_bytes", 0) or 0) <= 0
-        and int(status.get("journal_backlog_events_estimate", 0) or 0) <= 0
-        and int(status.get("journal_pending_events", 0) or 0) <= 0
-        and int(status.get("queue_depth", 0) or 0) <= 0
-    )
-
-
-def _process_tree_metrics(roots: list[int]) -> tuple[float, int, int]:
-    """Return aggregate CPU%, RSS KiB, and process count for this Run."""
-
-    try:
-        output = subprocess.check_output(
-            ["ps", "-eo", "pid=,ppid=,pcpu=,rss="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return 0.0, 0, 0
-    rows: dict[int, tuple[int, float, int]] = {}
-    for line in output.splitlines():
+    rows: dict[int, dict] = {}
+    for line in str(output or "").splitlines():
         parts = line.split()
-        if len(parts) != 4:
+        if len(parts) < 4:
             continue
         try:
             pid, ppid = int(parts[0]), int(parts[1])
             cpu, rss = float(parts[2]), int(parts[3])
-        except ValueError:
+        except (TypeError, ValueError):
             continue
-        rows[pid] = (ppid, cpu, rss)
-    selected = set(int(pid) for pid in roots if int(pid) > 0)
+        if pid <= 0 or ppid < 0 or rss < 0:
+            continue
+        rows[pid] = {
+            "ppid": ppid,
+            "cpu_percent": cpu,
+            "rss_kib": rss,
+            "state": "?",
+        }
+    return rows
+
+
+def _select_process_tree(rows: dict[int, dict], roots: list[int]) -> set[int]:
+    selected = {int(pid) for pid in roots if int(pid) > 0 and int(pid) in rows}
     changed = True
     while changed:
         changed = False
-        for pid, (ppid, _cpu, _rss) in rows.items():
-            if pid not in selected and ppid in selected:
+        for pid, row in rows.items():
+            if pid not in selected and int(row.get("ppid", -1)) in selected:
                 selected.add(pid)
                 changed = True
-    return (
-        round(sum(rows[pid][1] for pid in selected if pid in rows), 3),
-        sum(rows[pid][2] for pid in selected if pid in rows),
-        len(selected),
+    return selected
+
+
+def _read_proc_rows() -> tuple[dict[int, dict], dict]:
+    """Read Linux process rows without depending on a ps dialect or psutil."""
+
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        raise RuntimeError("/proc is unavailable")
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    rows: dict[int, dict] = {}
+    status_checked = 0
+    status_mismatches = 0
+    read_errors = 0
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat_text = (entry / "stat").read_text(encoding="ascii")
+            closing = stat_text.rfind(")")
+            if closing < 0:
+                raise ValueError("invalid /proc stat comm field")
+            fields = stat_text[closing + 2:].split()
+            # fields[0] is state, fields[1] ppid, fields[11]/[12] are utime/stime.
+            if len(fields) < 13:
+                raise ValueError("incomplete /proc stat")
+            state = str(fields[0])
+            ppid = int(fields[1])
+            cpu_ticks = int(fields[11]) + int(fields[12])
+            statm = (entry / "statm").read_text(encoding="ascii").split()
+            if len(statm) < 2:
+                raise ValueError("incomplete /proc statm")
+            rss_kib = int(statm[1]) * page_size // 1024
+            status_rss_kib = None
+            try:
+                status_text = (entry / "status").read_text(encoding="ascii")
+                match = re.search(r"^VmRSS:\s+(\d+)\s+kB$", status_text, re.MULTILINE)
+                if match:
+                    status_rss_kib = int(match.group(1))
+                    status_checked += 1
+                    if status_rss_kib != rss_kib:
+                        status_mismatches += 1
+            except (OSError, UnicodeError):
+                pass
+            rows[pid] = {
+                "ppid": ppid,
+                "cpu_ticks": cpu_ticks,
+                "rss_kib": rss_kib,
+                "status_rss_kib": status_rss_kib,
+                "state": state,
+            }
+        except (OSError, UnicodeError, TypeError, ValueError):
+            # A process can exit between /proc directory enumeration and the
+            # individual reads.  It is a normal sampling race, not a zero RSS.
+            read_errors += 1
+            continue
+    if not rows:
+        raise RuntimeError("/proc contained no readable process rows")
+    return rows, {
+        "source": "proc",
+        "status_rss_checked": status_checked,
+        "status_rss_mismatches": status_mismatches,
+        "read_errors": read_errors,
+    }
+
+
+def _read_ps_rows(pids: list[int] | None = None) -> tuple[dict[int, dict], dict]:
+    command = ["ps", "-o", "pid=,ppid=,pcpu=,rss="]
+    if pids:
+        command.extend(["-p", ",".join(str(pid) for pid in sorted(set(pids)) if int(pid) > 0)])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        return {}, {
+            "source": "ps",
+            "command": command,
+            "returncode": 127,
+            "stderr": f"{type(exc).__name__}: {exc}",
+            "stdout": "",
+            "error": f"ps unavailable: {type(exc).__name__}: {exc}",
+        }
+    rows = _parse_process_rows(completed.stdout)
+    error = None
+    if completed.returncode != 0:
+        error = f"ps exited {completed.returncode}"
+    elif not rows:
+        error = "ps returned no parseable rows"
+    return rows, {
+        "source": "ps",
+        "command": command,
+        "returncode": int(completed.returncode),
+        "stderr": str(completed.stderr or "")[-2048:],
+        "stdout": str(completed.stdout or ""),
+        "error": error,
+    }
+
+
+def _read_psutil_rows(roots: list[int] | None = None) -> tuple[dict[int, dict], dict]:
+    try:
+        import psutil  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("psutil is unavailable") from exc
+    rows: dict[int, dict] = {}
+    errors = 0
+    processes = []
+    if roots:
+        seen: set[int] = set()
+        for root in roots:
+            try:
+                process = psutil.Process(int(root))
+                candidates = [process, *process.children(recursive=True)]
+            except (psutil.Error, OSError, ValueError):
+                continue
+            for candidate in candidates:
+                if int(candidate.pid) not in seen:
+                    seen.add(int(candidate.pid))
+                    processes.append(candidate)
+    else:
+        processes = list(psutil.process_iter(["pid", "ppid", "cpu_percent", "memory_info"]))
+    for process in processes:
+        try:
+            info = process.as_dict(attrs=["pid", "ppid", "cpu_percent", "memory_info"])
+            memory = info.get("memory_info")
+            rows[int(info["pid"])] = {
+                "ppid": int(info.get("ppid") or 0),
+                "cpu_percent": float(info.get("cpu_percent") or 0.0),
+                "rss_kib": int(getattr(memory, "rss", 0) or 0) // 1024,
+                "state": "?",
+            }
+        except (OSError, psutil.Error, TypeError, ValueError, KeyError):
+            errors += 1
+    if not rows:
+        raise RuntimeError("psutil contained no readable process rows")
+    return rows, {"source": "psutil", "read_errors": errors}
+
+
+def _append_sampler_diagnostic(path: Path | None, value: dict) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        # A diagnostic write must never change the acceptance path.
+        pass
+
+
+def _process_tree_metrics(
+    roots: list[int], *, sampler_state: dict | None = None, label: str = "",
+    diagnostic_path: Path | None = None,
+) -> dict:
+    """Collect valid process-tree metrics or explicitly report NOT_CAPTURED.
+
+    Linux ``/proc`` is primary because it works on SLES and WSL without adding
+    a dependency.  ``ps`` is retained as a targeted cross-check and fallback;
+    optional psutil is used only on platforms without ``/proc`` and without a
+    usable ps command.  No failure is converted into a numeric zero.
+    """
+
+    roots = [int(pid) for pid in roots if int(pid) > 0]
+    state = sampler_state if sampler_state is not None else {}
+    sampler_label = str(label or "default")
+    primary_rows: dict[int, dict] = {}
+    primary_diag: dict = {}
+    source = ""
+    errors: list[str] = []
+    try:
+        primary_rows, primary_diag = _read_proc_rows()
+        source = "proc"
+    except Exception as exc:
+        errors.append(f"proc: {type(exc).__name__}: {exc}")
+        try:
+            primary_rows, primary_diag = _read_psutil_rows(roots)
+            source = "psutil"
+        except Exception as psutil_exc:
+            errors.append(f"psutil: {type(psutil_exc).__name__}: {psutil_exc}")
+            primary_rows, primary_diag = _read_ps_rows(None)
+            if primary_rows:
+                source = "ps"
+            else:
+                errors.append(f"ps: {primary_diag.get('error') or 'no rows'}")
+
+    selected = _select_process_tree(primary_rows, roots)
+    selected_rows = {
+        pid: row for pid, row in primary_rows.items()
+        if pid in selected and str(row.get("state", "")).upper() not in {"Z", "ZOMBIE", "DEAD"}
+    }
+    ps_rows: dict[int, dict] = {}
+    ps_diag: dict = {}
+    if source == "proc":
+        if selected:
+            ps_rows, ps_diag = _read_ps_rows(sorted(selected))
+        else:
+            ps_diag = {
+                "source": "ps",
+                "error": "no selected process ids for targeted cross-check",
+            }
+        if ps_diag.get("error"):
+            ps_diag["cross_check_error"] = ps_diag["error"]
+        for pid, row in selected_rows.items():
+            ps_row = ps_rows.get(pid)
+            if ps_row is not None:
+                row["ps_rss_kib"] = int(ps_row.get("rss_kib", 0) or 0)
+                row["ps_cpu_percent"] = float(ps_row.get("cpu_percent", 0.0) or 0.0)
+        primary_diag = {**primary_diag, "ps_cross_check": ps_diag}
+
+    sampled_at = time.time()
+    now_monotonic = time.monotonic()
+    cpu_total = 0.0
+    cpu_valid = False
+    rss_total = 0
+    cpu_state = state.setdefault(sampler_label, {})
+    for pid, row in selected_rows.items():
+        rss_total += int(row.get("rss_kib", 0) or 0)
+        cpu_value = row.get("cpu_percent")
+        if cpu_value is None and row.get("cpu_ticks") is not None:
+            previous = cpu_state.get(pid)
+            current_ticks = int(row.get("cpu_ticks") or 0)
+            cpu_state[pid] = (current_ticks, now_monotonic)
+            if previous:
+                previous_ticks, previous_at = previous
+                elapsed = now_monotonic - float(previous_at)
+                if elapsed > 0:
+                    clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+                    cpu_value = ((current_ticks - int(previous_ticks)) / clock_ticks) / elapsed * 100.0
+            if cpu_value is None:
+                cpu_value = 0.0
+        if cpu_value is not None:
+            cpu_total += float(cpu_value)
+            cpu_valid = True
+
+    sampler_ok = bool(selected_rows)
+    sampler_error = None if sampler_ok else "; ".join(errors) or "no live process rows for roots"
+    diagnostic = {
+        "sampled_at_epoch": sampled_at,
+        "label": sampler_label,
+        "roots": roots,
+        "selected_pids": sorted(selected_rows),
+        "source": source or "none",
+        "sampler_ok": sampler_ok,
+        "sampler_error": sampler_error,
+        "primary": primary_diag,
+    }
+    _append_sampler_diagnostic(diagnostic_path, diagnostic)
+    return {
+        "sampler_ok": sampler_ok,
+        "sampler_error": sampler_error,
+        "sampled_pid_count": len(selected_rows),
+        "sampled_pids": sorted(selected_rows),
+        "sampling_source": source or "none",
+        "sampled_at_epoch": sampled_at,
+        "cpu_percent": round(cpu_total, 3) if cpu_valid else None,
+        "rss_kib": int(rss_total) if sampler_ok else None,
+        "diagnostic_path": str(diagnostic_path) if diagnostic_path else None,
+        "diagnostic": diagnostic,
+    }
+
+
+def _load_durable_offsets(projection) -> tuple[dict[str, int] | None, str | None]:
+    path = getattr(projection, "offsets_path", None)
+    if path is None:
+        return None, "projection offsets path unavailable"
+    path = Path(path)
+    try:
+        if not path.exists():
+            return None, "durable offsets file does not exist"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return None, "durable offsets file is not an object"
+        return {str(key): max(0, int(item)) for key, item in value.items()}, None
+    except (OSError, TypeError, ValueError) as exc:
+        return None, f"durable offsets unreadable: {type(exc).__name__}: {exc}"
+
+
+def _projection_completion_evidence(
+    projection, journal_paths: list[Path], *, max_status_age_seconds: float = 2.0,
+) -> dict:
+    """Return durable completion evidence, including stale-status diagnostics.
+
+    The offset file is fsynced after the ProjectionWriter DB transaction.  It
+    is therefore a stronger completion signal than a potentially old status
+    JSON.  The status remains useful for queue/backlog diagnostics and is
+    reported with its age rather than silently trusted.
+    """
+
+    try:
+        status = projection.snapshot()
+    except Exception as exc:
+        status = {}
+        status_error = f"snapshot: {type(exc).__name__}: {exc}"
+    else:
+        status_error = str(status.get("snapshot_error") or "") or None
+    status_path = getattr(projection, "status_path", None)
+    status_mtime_epoch = None
+    status_age_ms = None
+    if status_path is not None:
+        try:
+            status_mtime_epoch = float(Path(status_path).stat().st_mtime)
+            status_age_ms = round(max(0.0, time.time() - status_mtime_epoch) * 1000.0, 3)
+        except OSError:
+            status_error = status_error or "status file is unavailable"
+
+    offsets, offsets_error = _load_durable_offsets(projection)
+    durable = None
+    if offsets is not None:
+        try:
+            from vnext.projection_writer import ProgressJournal
+
+            total_bytes = committed_bytes = backlog_bytes = 0
+            backlog_events = 0
+            for journal_path in journal_paths:
+                storage = ProgressJournal(journal_path).storage_snapshot(offsets)
+                total_bytes += int(storage.get("total_bytes", 0) or 0)
+                committed_bytes += int(storage.get("committed_bytes", 0) or 0)
+                backlog_bytes += int(storage.get("backlog_bytes", 0) or 0)
+                backlog_events += int(storage.get("backlog_events_estimate", 0) or 0)
+            durable = {
+                "total_bytes": total_bytes,
+                "committed_bytes": committed_bytes,
+                "backlog_bytes": backlog_bytes,
+                "backlog_events_estimate": backlog_events,
+                "offsets_file": str(Path(getattr(projection, "offsets_path"))),
+            }
+        except Exception as exc:
+            offsets_error = f"durable journal check failed: {type(exc).__name__}: {exc}"
+
+    status_committed = status.get("journal_committed_offset_bytes")
+    try:
+        status_committed = int(status_committed) if status_committed is not None else None
+    except (TypeError, ValueError):
+        status_committed = None
+    status_backlog = int(status.get("journal_backlog_bytes", 0) or 0)
+    status_pending = int(status.get("journal_pending_events", 0) or 0)
+    status_queue = status.get("queue_depth")
+    try:
+        status_queue = int(status_queue) if status_queue is not None else None
+    except (TypeError, ValueError):
+        status_queue = None
+    live_journal_bytes = _journal_bytes(journal_paths)
+    status_complete = (
+        status_committed is not None
+        and live_journal_bytes <= status_committed
+        and status_backlog <= 0
+        and int(status.get("journal_backlog_events_estimate", 0) or 0) <= 0
+        and status_pending <= 0
+        and (status_queue is None or status_queue <= 0)
     )
+    durable_complete = bool(durable is not None and durable["backlog_bytes"] <= 0)
+    status_fresh = bool(
+        (status_age_ms is not None and status_age_ms <= max_status_age_seconds * 1000.0)
+        or (status_path is None and status_error is None)
+    )
+    complete = durable_complete or (durable is None and status_complete and status_fresh)
+    if complete:
+        state = "COMPLETED"
+    elif status_error or offsets_error or not status_fresh:
+        state = "STALE_STATUS"
+    else:
+        state = "INCOMPLETE"
+    durable_offset_mtime_epoch = None
+    offset_path = getattr(projection, "offsets_path", None)
+    if offset_path is not None:
+        try:
+            durable_offset_mtime_epoch = float(Path(offset_path).stat().st_mtime)
+        except OSError:
+            durable_offset_mtime_epoch = None
+    return {
+        "state": state,
+        "complete": complete,
+        "status_age_ms": status_age_ms,
+        "status_fresh": status_fresh,
+        "status_error": status_error,
+        "offsets_error": offsets_error,
+        "status_committed_offset_bytes": status_committed,
+        "status_backlog_bytes": status_backlog,
+        "status_pending_events": status_pending,
+        "status_queue_depth": status_queue,
+        "live_journal_bytes": live_journal_bytes,
+        "durable": durable,
+        "durable_offset_mtime_epoch": durable_offset_mtime_epoch,
+    }
+
+
+def _projection_caught_up(projection, journal_paths: list[Path]) -> bool:
+    """Require durable journal EOF before stopping, even if status is stale."""
+
+    return bool(_projection_completion_evidence(projection, journal_paths).get("complete"))
 
 
 def _destination_campaign(destination: str) -> int | None:
@@ -167,9 +537,16 @@ class CountingLoopbackSMSC:
         self.max_destination_keys = max(1, int(max_destination_keys))
         self.destination_tracking_truncated = False
         self.response_delay_seconds = max(0.0, float(response_delay_seconds))
+        self.started_monotonic: float | None = None
+        self.first_received_monotonic: float | None = None
+        self.last_received_monotonic: float | None = None
+        self.first_response_monotonic: float | None = None
+        self.last_response_monotonic: float | None = None
+        self._connection_stats: dict[int, dict] = {}
 
     async def _handle(self, reader, writer):
         bound = False
+        connection_id = None
         try:
             while True:
                 command, _status, sequence, body = await self._smpp.read_pdu(reader)
@@ -181,6 +558,18 @@ class CountingLoopbackSMSC:
                     if not bound:
                         bound = True
                         self.binds += 1
+                        connection_id = self.binds
+                        self._connection_stats[connection_id] = {
+                            "connection_id": connection_id,
+                            "received": 0,
+                            "responses": 0,
+                            "bound_at_monotonic": time.monotonic(),
+                            "first_received_monotonic": None,
+                            "last_received_monotonic": None,
+                            "first_response_monotonic": None,
+                            "last_response_monotonic": None,
+                            "closed_at_monotonic": None,
+                        }
                         self.active_binds += 1
                         self.max_active_binds = max(self.max_active_binds, self.active_binds)
                     response = self._smpp.cstring("VNEXT-STREAM-SMSC")
@@ -194,6 +583,17 @@ class CountingLoopbackSMSC:
                 elif command == self._smpp.SUBMIT_SM:
                     destination = self._smpp.parse_destination(body)
                     self.total_received += 1
+                    received_at = time.monotonic()
+                    if self.first_received_monotonic is None:
+                        self.first_received_monotonic = received_at
+                    self.last_received_monotonic = received_at
+                    if connection_id is not None:
+                        stats = self._connection_stats[connection_id]
+                        stats["received"] += 1
+                        stats["first_received_monotonic"] = (
+                            stats["first_received_monotonic"] or received_at
+                        )
+                        stats["last_received_monotonic"] = received_at
                     if (
                         destination in self.destination_counts
                         or len(self.destination_counts) < self.max_destination_keys
@@ -216,6 +616,17 @@ class CountingLoopbackSMSC:
                     await writer.drain()
                     self.responses += 1
                     self.response_success += 1
+                    responded_at = time.monotonic()
+                    if self.first_response_monotonic is None:
+                        self.first_response_monotonic = responded_at
+                    self.last_response_monotonic = responded_at
+                    if connection_id is not None:
+                        stats = self._connection_stats[connection_id]
+                        stats["responses"] += 1
+                        stats["first_response_monotonic"] = (
+                            stats["first_response_monotonic"] or responded_at
+                        )
+                        stats["last_response_monotonic"] = responded_at
                 elif command == self._smpp.ENQUIRE_LINK:
                     writer.write(
                         self._smpp.HEADER.pack(
@@ -241,6 +652,8 @@ class CountingLoopbackSMSC:
         finally:
             if bound:
                 self.active_binds = max(0, self.active_binds - 1)
+                if connection_id is not None:
+                    self._connection_stats[connection_id]["closed_at_monotonic"] = time.monotonic()
             writer.close()
             try:
                 await writer.wait_closed()
@@ -248,6 +661,7 @@ class CountingLoopbackSMSC:
                 pass
 
     async def start(self) -> int:
+        self.started_monotonic = time.monotonic()
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         return int(self.server.sockets[0].getsockname()[1])
 
@@ -255,6 +669,53 @@ class CountingLoopbackSMSC:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+
+    @staticmethod
+    def _rate(count: int, start: float | None, end: float | None) -> float | None:
+        if start is None or end is None or end <= start:
+            return None
+        return round(float(count) / max(0.001, end - start), 3)
+
+    def snapshot(self) -> dict:
+        return {
+            "received": int(self.total_received),
+            "responses": int(self.responses),
+            "response_success": int(self.response_success),
+            "received_pdu_per_second": self._rate(
+                self.total_received, self.first_received_monotonic, self.last_received_monotonic
+            ),
+            "response_pdu_per_second": self._rate(
+                self.responses, self.first_response_monotonic, self.last_response_monotonic
+            ),
+            "response_delay_seconds": self.response_delay_seconds,
+            "binds": int(self.binds),
+            "active_binds": int(self.active_binds),
+            "max_active_binds": int(self.max_active_binds),
+            "per_bind": [
+                {
+                    **stats,
+                    "active_seconds": (
+                        round(
+                            max(0.0, float(stats["closed_at_monotonic"] or time.monotonic())
+                                  - float(stats["bound_at_monotonic"])),
+                            6,
+                        )
+                        if stats.get("bound_at_monotonic") is not None else None
+                    ),
+                    "received_pdu_per_second": self._rate(
+                        int(stats["received"]),
+                        stats.get("first_received_monotonic"),
+                        stats.get("last_received_monotonic"),
+                    ),
+                    "response_pdu_per_second": self._rate(
+                        int(stats["responses"]),
+                        stats.get("first_response_monotonic"),
+                        stats.get("last_response_monotonic"),
+                    ),
+                }
+                for stats in sorted(self._connection_stats.values(), key=lambda item: item["connection_id"])
+            ],
+        }
 
 
 async def _drain_transport_responses(worker, *, timeout: float = 60.0) -> None:
@@ -344,8 +805,10 @@ def _worker_process(
         prefetch_per_partition=64,
         profiler=profiler,
     )
+    last_transport_snapshots: list[dict] = []
 
     async def loop() -> None:
+        nonlocal last_transport_snapshots
         while True:
             # Each pass may become idle while another worker still owns the
             # bounded physical bind pool.  Release the leases at the pass
@@ -354,6 +817,9 @@ def _worker_process(
             # same bounded lifecycle; this is not a quota bypass.
             await worker.run_until_idle(close_transports=False)
             await _drain_transport_responses(worker)
+            last_transport_snapshots = [
+                dict(item) for item in worker.snapshot().get("transports", [])
+            ]
             await worker.close_transports()
             _release_completed_worker_caches(spool, worker)
             # The feeder/worker idle loop must not rebuild every segment index.
@@ -362,8 +828,14 @@ def _worker_process(
             if stop_event.is_set() and int(status.get("pending_records", 0) or 0) == 0:
                 break
             await asyncio.sleep(0.02)
+        # Capture the final transport snapshot before close_transports() clears
+        # the live bind objects.  The result is acceptance evidence, not a
+        # live handle, so retaining this immutable snapshot does not change
+        # the worker lifecycle or production dispatch semantics.
+        result = worker.snapshot()
+        result["transports"] = last_transport_snapshots
         await worker.close_transports()
-        return worker.snapshot()
+        return result
 
     result = asyncio.run(loop())
     profiler.publish(force=True)
@@ -377,13 +849,28 @@ def _worker_process(
 def _sample(
     *, run_root: Path, process_roots: list[int], application_roots: list[int] | None = None,
     process_roles: dict | None = None, spool, projection, smsc, started: float,
-    profile_root: Path | None = None,
+    profile_root: Path | None = None, sampler_state: dict | None = None,
 ) -> dict:
     application_roots = list(application_roots or process_roots)
-    harness_cpu, harness_rss_kib, harness_process_count = _process_tree_metrics(process_roots)
-    application_cpu, application_rss_kib, application_process_count = _process_tree_metrics(
-        application_roots
+    diagnostic_path = run_root / "resource-sampler-diagnostics.jsonl"
+    harness_metrics = _process_tree_metrics(
+        process_roots,
+        sampler_state=sampler_state,
+        label="harness",
+        diagnostic_path=diagnostic_path,
     )
+    application_metrics = _process_tree_metrics(
+        application_roots,
+        sampler_state=sampler_state,
+        label="application",
+        diagnostic_path=diagnostic_path,
+    )
+    sampler_ok = bool(harness_metrics["sampler_ok"] and application_metrics["sampler_ok"])
+    sampler_errors = [
+        str(item["sampler_error"])
+        for item in (harness_metrics, application_metrics)
+        if item.get("sampler_error")
+    ]
     try:
         projection_status = projection.snapshot()
     except Exception as exc:  # pragma: no cover - diagnostic path
@@ -393,15 +880,25 @@ def _sample(
         "at_seconds": round(time.monotonic() - started, 3),
         # Backward-compatible aliases retain the historical harness-inclusive
         # values; the explicit fields are used for production profile gates.
-        "cpu_percent_sum": harness_cpu,
-        "rss_kib_sum": harness_rss_kib,
-        "process_count": harness_process_count,
-        "harness_cpu_percent": harness_cpu,
-        "harness_rss_kib": harness_rss_kib,
-        "harness_process_count": harness_process_count,
-        "application_cpu_percent": application_cpu,
-        "application_rss_kib": application_rss_kib,
-        "application_process_count": application_process_count,
+        "cpu_percent_sum": harness_metrics["cpu_percent"],
+        "rss_kib_sum": harness_metrics["rss_kib"],
+        "process_count": harness_metrics["sampled_pid_count"],
+        "harness_cpu_percent": harness_metrics["cpu_percent"],
+        "harness_rss_kib": harness_metrics["rss_kib"],
+        "harness_process_count": harness_metrics["sampled_pid_count"],
+        "application_cpu_percent": application_metrics["cpu_percent"],
+        "application_rss_kib": application_metrics["rss_kib"],
+        "application_process_count": application_metrics["sampled_pid_count"],
+        "sampler_ok": sampler_ok,
+        "sampler_error": "; ".join(sampler_errors) or None,
+        "sampled_pid_count": harness_metrics["sampled_pid_count"],
+        "sampling_source": (
+            harness_metrics["sampling_source"]
+            if harness_metrics["sampling_source"] == application_metrics["sampling_source"]
+            else f"{harness_metrics['sampling_source']}+{application_metrics['sampling_source']}"
+        ),
+        "harness_sampler": harness_metrics,
+        "application_sampler": application_metrics,
         "process_roles": process_roles or {},
         "run_bytes": _directory_bytes(run_root),
         "disk_free_bytes": shutil.disk_usage(run_root).free,
@@ -522,6 +1019,108 @@ def _write_critical_path_samples(run_root: Path, samples: list[dict]) -> str:
         for sample in samples:
             writer.writerow(_profile_sample_row(sample))
     return str(path)
+
+
+def _safe_rate(count: int | float, seconds: float | None) -> float | None:
+    if seconds is None or float(seconds) <= 0:
+        return None
+    return round(float(count) / float(seconds), 3)
+
+
+def _throughput_observability(
+    *, route_config: dict, feed_stats: Counter, smsc: CountingLoopbackSMSC,
+    worker_results: list[dict], critical_path: dict,
+) -> dict:
+    """Build route/bind/worker/loopback evidence without changing dispatch."""
+
+    workers = []
+    binds = []
+    credit_totals = Counter()
+    for worker in worker_results:
+        counters = worker.get("counters") or {}
+        credit = worker.get("route_credits") or {}
+        for key in (
+            "reservations", "credit_refills", "file_credit_refills", "credit_wait_count",
+            "credit_granted_units", "credit_consumed_units", "credit_remaining_units",
+            "credit_wasted_units", "credit_wait_seconds", "credit_refill_cost_seconds",
+            "bind_acquires",
+        ):
+            if key in {"credit_wait_seconds", "credit_refill_cost_seconds"}:
+                credit_totals[key] += float(credit.get(key, 0.0) or 0.0)
+            else:
+                credit_totals[key] += int(credit.get(key, 0) or 0)
+        worker_socket_written = int(
+            counters.get("socket_written_pdu", counters.get("socket_written", 0)) or 0
+        )
+        worker_responses = int(
+            counters.get("response_pdus_received", counters.get("response_success", 0)) or 0
+        )
+        worker_row = {
+            "worker_id": worker.get("worker_id"),
+            "task_taken": int(counters.get("task_taken", counters.get("taken", 0)) or 0),
+            "socket_written_pdu": worker_socket_written,
+            "response_pdus_received": worker_responses,
+            "journal_events_durable": int(counters.get("journal_events_durable", 0) or 0),
+            "route_credits": credit,
+            "transports": [],
+        }
+        for transport in worker.get("transports") or []:
+            bind = dict(transport)
+            bind["socket_pdu_per_bind_active_second"] = _safe_rate(
+                bind.get("socket_written_parts", 0), bind.get("bind_active_seconds")
+            )
+            bind["response_pdu_per_bind_active_second"] = _safe_rate(
+                bind.get("response_success", 0), bind.get("bind_active_seconds")
+            )
+            bind["worker_id"] = worker.get("worker_id")
+            binds.append(bind)
+            worker_row["transports"].append(bind)
+        workers.append(worker_row)
+    durations = critical_path.get("durations") or {}
+    counters = critical_path.get("counters") or {}
+    return {
+        "configured": {
+            "route_id": route_config.get("route_id"),
+            "configured_tps_scope": route_config.get("tps_scope"),
+            "configured_tps_per_bind": route_config.get("tps")
+            if route_config.get("tps_scope") == "per_bind" else None,
+            "configured_tps_route_shared": route_config.get("tps")
+            if route_config.get("tps_scope") == "route_shared" else None,
+            "configured_tps_total_ceiling": (
+                float(route_config.get("tps", 0.0)) * int(route_config.get("pool_size", 1))
+                if route_config.get("tps_scope") == "per_bind"
+                else float(route_config.get("tps", 0.0))
+            ),
+            "pool_size": int(route_config.get("pool_size", 1)),
+            "window_size": int(route_config.get("window_size", 0)),
+        },
+        "producer": {
+            "accepted_tasks": int(sum(
+                value for key, value in feed_stats.items() if str(key).endswith("_accepted")
+            )),
+            "batches": int(feed_stats.get("batches", 0) or 0),
+            "backpressure_waits": int(feed_stats.get("backpressure_waits", 0) or 0),
+        },
+        "credits": dict(credit_totals),
+        "binds": binds,
+        "workers": workers,
+        "window": {
+            "configured_size": int(route_config.get("window_size", 0)),
+            "wait_count": int(counters.get("response_window_wait_count", 0) or 0),
+            "wait_p50_ms": (durations.get("response_window_wait") or {}).get("p50_ms_max"),
+            "wait_p95_ms": (durations.get("response_window_wait") or {}).get("p95_ms_max"),
+            "wait_p99_ms": (durations.get("response_window_wait") or {}).get("p99_ms_max"),
+        },
+        "loopback": smsc.snapshot(),
+        "writer": {
+            "socket_written_pdu": int(counters.get("socket_written_pdu", 0) or 0),
+            "response_pdus_received": int(counters.get("response_pdus_received", 0) or 0),
+            "journal_events_durable": int(counters.get("journal_events_durable", 0) or 0),
+            "projection_commits": int(counters.get("projection_commits", 0) or 0),
+            "tps_credit_wait_p95_ms": (durations.get("tps_credit_wait") or {}).get("p95_ms_max"),
+            "response_callback_p95_ms": (durations.get("response_callback") or {}).get("p95_ms_max"),
+        },
+    }
 
 
 async def run(args: argparse.Namespace) -> dict:
@@ -665,6 +1264,15 @@ async def run(args: argparse.Namespace) -> dict:
     smpp_drained_at = None
     projection_caught_up_at = None
     projection_drain_deadline = None
+    completion_detection_lag_ms = None
+    completion_status_age_ms = None
+    completion_evidence = {
+        "state": "INCOMPLETE",
+        "complete": False,
+        "status_age_ms": None,
+        "durable": None,
+    }
+    sampler_state: dict = {}
 
     async def feed() -> None:
         while (
@@ -747,10 +1355,14 @@ async def run(args: argparse.Namespace) -> dict:
                     smsc=smsc,
                     started=started,
                     profile_root=profile_root,
+                    sampler_state=sampler_state,
                 )
                 sample["critical_path"] = _aggregate_critical_path_profiles(profile_root)
                 samples.append(sample)
                 next_sample += max(0.1, args.sample_interval)
+                if not sample["sampler_ok"]:
+                    guard_reason = "resource_sampler_error"
+                    break
                 if sample["run_bytes"] > args.max_run_bytes:
                     guard_reason = "run_disk_guard_exceeded"
                     break
@@ -777,9 +1389,20 @@ async def run(args: argparse.Namespace) -> dict:
                         and smsc.response_success == smsc.total_received
                     ):
                         smpp_drained_at = time.monotonic()
-                    if _projection_caught_up(projection, journal_paths):
+                    completion_evidence = _projection_completion_evidence(
+                        projection, journal_paths,
+                        max_status_age_seconds=max(2.0, args.sample_interval * 3.0),
+                    )
+                    if completion_evidence.get("complete"):
                         if projection_caught_up_at is None:
                             projection_caught_up_at = time.monotonic()
+                            completion_status_age_ms = completion_evidence.get("status_age_ms")
+                            durable_mtime = completion_evidence.get("durable_offset_mtime_epoch")
+                            if durable_mtime is not None:
+                                completion_detection_lag_ms = round(
+                                    max(0.0, time.time() - float(durable_mtime)) * 1000.0,
+                                    3,
+                                )
                         elif time.monotonic() - projection_caught_up_at >= 0.5:
                             break
                     else:
@@ -865,6 +1488,20 @@ async def run(args: argparse.Namespace) -> dict:
         and (time.monotonic() - started) >= float(args.steady_seconds)
         and generated_tasks > 0
     )
+    resource_sampler_valid = bool(samples) and all(
+        bool(item.get("sampler_ok")) for item in samples
+    )
+    resource_gate = "PASS" if resource_sampler_valid else "NOT_VERIFIED"
+    if guard_reason == "resource_sampler_error":
+        completion_state = "SAMPLER_ERROR"
+    elif projection_caught_up_at is not None:
+        completion_state = "COMPLETED"
+    elif completion_evidence.get("state") == "STALE_STATUS":
+        completion_state = "STALE_STATUS"
+    elif guard_reason == "projection_drain_timeout":
+        completion_state = "TIMEOUT"
+    else:
+        completion_state = str(completion_evidence.get("state") or "INCOMPLETE")
     failure_reason = guard_reason or (smsc.errors[0] if smsc.errors else "")
     if not failure_reason and write_failed_events:
         failure_reason = "task_write_failed"
@@ -872,6 +1509,7 @@ async def run(args: argparse.Namespace) -> dict:
         failure_reason = "response_event_count_mismatch"
     passed = (
         not guard_reason
+        and resource_gate == "PASS"
         and not smsc.errors
         and (finite_complete or steady_complete)
         and len(task_events) == generated_tasks
@@ -885,30 +1523,41 @@ async def run(args: argparse.Namespace) -> dict:
         and smsc.max_active_binds <= args.pool_size
         and not spool_status.get("pending_records")
         and int(projection_status.get("applied", 0) or 0) == len(progress)
+        and projection_caught_up_at is not None
         and all(item["socket_written_tasks"] == item["tasks"] for item in expected_campaigns.values())
     )
     samples_sorted = sorted(samples, key=lambda item: float(item.get("at_seconds", 0.0)))
     critical_path = _aggregate_critical_path_profiles(profile_root)
+    throughput_observability = _throughput_observability(
+        route_config=route_config,
+        feed_stats=feed_stats,
+        smsc=smsc,
+        worker_results=worker_results,
+        critical_path=critical_path,
+    )
     critical_path_samples_path = (
         _write_critical_path_samples(run_root, samples) if profile_root else None
     )
 
-    def _peak(key: str) -> int:
-        return max((int(item.get(key, 0) or 0) for item in samples_sorted), default=0)
+    def _peak(key: str) -> int | None:
+        values = [item.get(key) for item in samples_sorted if item.get(key) is not None]
+        return max((int(value) for value in values), default=None)
 
-    def _slope_last_180(key: str) -> float:
-        if not samples_sorted:
-            return 0.0
-        end = samples_sorted[-1]
+    def _slope_last_180(key: str) -> float | None:
+        valid_samples = [item for item in samples_sorted if item.get(key) is not None]
+        if not valid_samples:
+            return None
+        end = valid_samples[-1]
         start = next(
             (item for item in reversed(samples_sorted)
-             if float(end.get("at_seconds", 0.0)) - float(item.get("at_seconds", 0.0)) >= 180.0),
-            samples_sorted[0],
+             if item.get(key) is not None
+             and float(end.get("at_seconds", 0.0)) - float(item.get("at_seconds", 0.0)) >= 180.0),
+            valid_samples[0],
         )
         seconds = float(end.get("at_seconds", 0.0)) - float(start.get("at_seconds", 0.0))
         if seconds <= 0:
-            return 0.0
-        return round((float(end.get(key, 0) or 0) - float(start.get(key, 0) or 0)) / seconds, 3)
+            return None
+        return round((float(end[key]) - float(start[key])) / seconds, 3)
 
     def _counter_value(sample: dict, name: str) -> int:
         return int(((sample.get("critical_path") or {}).get("counters") or {}).get(name, 0) or 0)
@@ -978,6 +1627,11 @@ async def run(args: argparse.Namespace) -> dict:
     return {
         "status": "PASS" if passed else "FAIL",
         "failure_reason": failure_reason,
+        "resource_gate": resource_gate,
+        "completion_state": completion_state,
+        "completion_detection_lag_ms": completion_detection_lag_ms,
+        "status_age_ms": completion_status_age_ms,
+        "completion_evidence": completion_evidence,
         "source_root": str(Path(args.source_root).resolve()),
         "run_root": str(run_root),
         "started_epoch": time.time() - (time.monotonic() - started),
@@ -1082,7 +1736,9 @@ async def run(args: argparse.Namespace) -> dict:
             "duplicate_destination_pdu_count": duplicate_destination_pdu_count,
             "destination_tracking_truncated": bool(smsc.destination_tracking_truncated),
             "errors": smsc.errors,
+            "observability": smsc.snapshot(),
         },
+        "throughput_observability": throughput_observability,
         "campaigns": expected_campaigns,
         "projection": projection_status,
         "worker_results": worker_results,
@@ -1206,6 +1862,10 @@ def main() -> int:
         "projection_events_applied": result["projection_events_applied"],
         "max_active_binds": result["smpp"]["max_active_binds"],
         "failure_reason": result["failure_reason"],
+        "resource_gate": result["resource_gate"],
+        "completion_state": result["completion_state"],
+        "completion_detection_lag_ms": result["completion_detection_lag_ms"],
+        "status_age_ms": result["status_age_ms"],
     }, sort_keys=True))
     return 0 if result["status"] == "PASS" else 2
 

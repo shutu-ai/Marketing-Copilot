@@ -76,6 +76,11 @@ class RouteCreditBroker:
         self._credit_refills = 0
         self._file_credit_refills = 0
         self._credit_wait_seconds = 0.0
+        self._credit_wait_count = 0
+        self._credit_granted_units = 0
+        self._credit_consumed_units = 0
+        self._credit_wasted_units = 0
+        self._credit_refill_cost_seconds = 0.0
         self._bind_acquires = 0
 
     @staticmethod
@@ -169,6 +174,9 @@ class RouteCreditBroker:
         async with self._lock:
             lease = self._leases.get(key)
             if not lease or float(lease["rate"]) != rate or int(lease["remaining"]) <= 0:
+                if lease:
+                    self._credit_wasted_units += max(0, int(lease.get("remaining", 0) or 0))
+                refill_started = time.perf_counter()
                 if self.root:
                     async with self._file_lock:
                         start_at, interval = await asyncio.to_thread(
@@ -181,7 +189,9 @@ class RouteCreditBroker:
                     start_at = max(now, previous)
                     interval = 1.0 / max(0.0001, rate)
                     self._next_at[key] = start_at + interval * self.CREDIT_LEASE_SIZE
+                self._credit_refill_cost_seconds += max(0.0, time.perf_counter() - refill_started)
                 self._credit_refills += 1
+                self._credit_granted_units += self.CREDIT_LEASE_SIZE
                 lease = {
                     "rate": rate,
                     "interval": interval,
@@ -198,10 +208,12 @@ class RouteCreditBroker:
             self._next_at[key] = float(lease["next_at"])
             self._rates[key] = rate
             self._reservations += 1
+            self._credit_consumed_units += 1
         if delay:
             wait_started = time.monotonic()
             await asyncio.sleep(delay)
             self._credit_wait_seconds += max(0.0, time.monotonic() - wait_started)
+            self._credit_wait_count += 1
         return delay
 
     @staticmethod
@@ -320,5 +332,17 @@ class RouteCreditBroker:
             "credit_refills": int(self._credit_refills),
             "file_credit_refills": int(self._file_credit_refills),
             "credit_wait_seconds": round(float(self._credit_wait_seconds), 6),
+            "credit_wait_count": int(self._credit_wait_count),
+            "credit_granted_units": int(self._credit_granted_units),
+            "credit_consumed_units": int(self._credit_consumed_units),
+            "credit_remaining_units": int(sum(
+                max(0, int(item.get("remaining", 0) or 0))
+                for item in self._leases.values()
+            )),
+            "credit_wasted_units": int(
+                self._credit_wasted_units
+                + sum(max(0, int(item.get("remaining", 0) or 0)) for item in self._leases.values())
+            ),
+            "credit_refill_cost_seconds": round(float(self._credit_refill_cost_seconds), 6),
             "bind_acquires": int(self._bind_acquires),
         }

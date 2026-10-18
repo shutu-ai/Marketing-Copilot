@@ -169,6 +169,11 @@ class AsyncSmppTransport:
         self._closing = False
         self._bind_lease: RouteBindLease | None = None
         self.bind_slot: int | None = None
+        self._bind_started_monotonic: float | None = None
+        self._bind_active_seconds = 0.0
+        self.bind_acquired_count = 0
+        self.bind_released_count = 0
+        self.last_bind_slot: int | None = None
         self._reconnect_failures = 0
         self._reconnect_not_before = 0.0
         self.socket_written_parts = 0
@@ -177,6 +182,11 @@ class AsyncSmppTransport:
         self.unknown_parts = 0
         self.write_failures = 0
         self.last_error = ""
+        self.window_inflight_peak = 0
+        self.first_socket_write_monotonic: float | None = None
+        self.last_socket_write_monotonic: float | None = None
+        self.first_response_monotonic: float | None = None
+        self.last_response_monotonic: float | None = None
 
     def set_response_sink(self, callback: Callable[[dict], Awaitable[None] | None] | None) -> None:
         """Attach the current worker's durable response sink."""
@@ -250,6 +260,9 @@ class AsyncSmppTransport:
                     timeout=max(self.timeout, self.reconnect_max_seconds, 30.0),
                 )
                 self.bind_slot = self._bind_lease.slot
+                self.last_bind_slot = self.bind_slot
+                self.bind_acquired_count += 1
+                self._bind_started_monotonic = time.monotonic()
                 self.reader, self.writer = await asyncio.wait_for(
                     asyncio.open_connection(self.host, self.port), timeout=self.timeout
                 )
@@ -290,6 +303,9 @@ class AsyncSmppTransport:
                 command_id, status, sequence, body = await read_pdu(self.reader)
                 if command_id == (SUBMIT_SM | RESPONSE_MASK):
                     response_received_at = time.monotonic()
+                    if self.first_response_monotonic is None:
+                        self.first_response_monotonic = response_received_at
+                    self.last_response_monotonic = response_received_at
                     if self.profiler:
                         self.profiler.inc("response_pdus_received")
                         self.profiler.mark("last_smpp_response_received_monotonic", response_received_at)
@@ -358,11 +374,7 @@ class AsyncSmppTransport:
                     stale_writer.close()
                 self.reader = None
                 self.writer = None
-                lease = self._bind_lease
-                self._bind_lease = None
-                self.bind_slot = None
-                if lease is not None:
-                    lease.release()
+                self._release_bind_lease()
 
     async def _mark_pending_unknown(self, outstanding: list[_Pending], reason: str) -> None:
         """Release timed-out window slots without authorizing a resend."""
@@ -458,6 +470,7 @@ class AsyncSmppTransport:
                 sequence, time.monotonic(), self.route_id,
                 dict(progress_context or {}),
             )
+            self.window_inflight_peak = max(self.window_inflight_peak, len(self._pending))
             try:
                 assert self.writer is not None
                 async with self._write_lock:
@@ -481,6 +494,10 @@ class AsyncSmppTransport:
                             )
                 self.socket_written_parts += 1
                 written += 1
+                now_monotonic = time.monotonic()
+                if self.first_socket_write_monotonic is None:
+                    self.first_socket_write_monotonic = now_monotonic
+                self.last_socket_write_monotonic = now_monotonic
                 if self.profiler:
                     self.profiler.inc("socket_written_pdu")
                     self.profiler.mark("last_socket_write_monotonic")
@@ -528,12 +545,19 @@ class AsyncSmppTransport:
         await self._mark_pending_unknown(pending, "transport closed before response drain")
         self.reader = None
         self.writer = None
+        self._release_bind_lease()
+        self._closing = False
+
+    def _release_bind_lease(self) -> None:
         lease = self._bind_lease
         self._bind_lease = None
         self.bind_slot = None
+        if self._bind_started_monotonic is not None:
+            self._bind_active_seconds += max(0.0, time.monotonic() - self._bind_started_monotonic)
+            self._bind_started_monotonic = None
         if lease is not None:
+            self.bind_released_count += 1
             lease.release()
-        self._closing = False
 
     def snapshot(self) -> dict:
         return {
@@ -551,6 +575,7 @@ class AsyncSmppTransport:
             "enquire_interval": self.enquire_interval,
             "reconnect_max_seconds": self.reconnect_max_seconds,
             "window_inflight": len(self._pending),
+            "window_inflight_peak": self.window_inflight_peak,
             "socket_written_parts": self.socket_written_parts,
             "response_success": self.response_success,
             "response_error": self.response_error,
@@ -560,5 +585,18 @@ class AsyncSmppTransport:
             "reconnect_backoff_seconds": round(
                 max(0.0, self._reconnect_not_before - time.monotonic()), 3
             ),
+            "bind_acquired_count": self.bind_acquired_count,
+            "bind_released_count": self.bind_released_count,
+            "bind_slot_last": self.last_bind_slot,
+            "bind_active_seconds": round(
+                self._bind_active_seconds
+                + (max(0.0, time.monotonic() - self._bind_started_monotonic)
+                   if self._bind_started_monotonic is not None else 0.0),
+                6,
+            ),
+            "first_socket_write_monotonic": self.first_socket_write_monotonic,
+            "last_socket_write_monotonic": self.last_socket_write_monotonic,
+            "first_response_monotonic": self.first_response_monotonic,
+            "last_response_monotonic": self.last_response_monotonic,
             "last_error": self.last_error,
         }
