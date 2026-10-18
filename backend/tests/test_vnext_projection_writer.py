@@ -116,9 +116,18 @@ def test_vectorized_staging_matches_executemany_and_reports_stage_metrics(tmp_pa
             assert metrics["events_new"] == len(values)
             assert metrics["events_replayed"] == 0
             assert metrics["rows_prepare_ns"] >= 0
+            assert metrics["staging_prepare_rows_ns"] == metrics["rows_prepare_ns"]
+            assert metrics["staging_clear_table_ns"] >= 0
+            assert metrics["staging_transpose_ns"] >= 0
+            assert metrics["staging_bind_execute_ns"] >= 0
             assert metrics["staging_load_ns"] >= 0
+            assert metrics["staging_total_ns"] == metrics["staging_load_ns"]
+            assert metrics["staging_batch_count"] == 1
+            assert metrics["staging_event_count"] == len(values)
             assert metrics["db_commit_ns"] >= 0
             assert metrics["batch_size_p50"] == len(values)
+            assert metrics["staging_batch_ms_p50"] >= 0
+            assert metrics["staging_event_us_p95"] >= 0
         finally:
             writer.stop()
     assert summaries["vectorized"] == summaries["executemany"] == (128, 128, 1)

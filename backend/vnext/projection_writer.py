@@ -349,7 +349,16 @@ class ProjectionWriter:
             "journal_read_ns": 0,
             "json_decode_ns": 0,
             "rows_prepare_ns": 0,
+            "staging_prepare_rows_ns": 0,
+            "staging_clear_table_ns": 0,
+            "staging_transpose_ns": 0,
+            "staging_bind_execute_ns": 0,
+            "staging_relation_create_ns": 0,
+            "staging_relation_insert_ns": 0,
             "staging_load_ns": 0,
+            "staging_total_ns": 0,
+            "staging_batch_count": 0,
+            "staging_event_count": 0,
             "new_event_dedupe_ns": 0,
             "events_insert_ns": 0,
             "aggregate_upsert_ns": 0,
@@ -370,6 +379,8 @@ class ProjectionWriter:
             "projection_events_applied": 0,
         }
         self._batch_sizes: deque[int] = deque(maxlen=4096)
+        self._staging_batch_durations_ns: deque[int] = deque(maxlen=4096)
+        self._staging_event_durations_ns: deque[int] = deque(maxlen=4096)
         self._metrics_last_published = 0.0
         self._published_metrics: dict = {}
         self._batch_table_created = False
@@ -502,6 +513,88 @@ class ProjectionWriter:
             int(event.get("response_error", state == "submit_sm_resp_error")),
         )
 
+    def _clear_staging(self, execute, batch_table_sql: str) -> None:
+        """Clear/reuse the staging tables without changing transaction scope.
+
+        The method is intentionally small so isolated benchmark adapters can
+        vary only the cleanup order while retaining the production DML path.
+        """
+
+        if self.reuse_staging:
+            if not self._batch_table_created:
+                execute("DROP TABLE IF EXISTS _vnext_projection_batch")
+                execute(batch_table_sql)
+                self._batch_table_created = True
+            execute("DELETE FROM _vnext_projection_batch")
+            execute("DROP TABLE IF EXISTS _vnext_projection_new")
+        else:
+            execute("DROP TABLE IF EXISTS _vnext_projection_batch")
+            execute("DROP TABLE IF EXISTS _vnext_projection_new")
+            execute(batch_table_sql)
+
+    def _stage_rows(self, rows: list[tuple], execute, executemany) -> None:
+        """Insert prepared rows into the staging table using the configured A0 path."""
+
+        if not rows:
+            return
+        if self.staging_mode == "vectorized":
+            if any(len(row) != 25 for row in rows):
+                raise ValueError("projection staging columns must have equal lengths")
+            transpose_started_ns = time.perf_counter_ns()
+            columns = [list(column) for column in zip(*rows)]
+            transpose_elapsed_ns = time.perf_counter_ns() - transpose_started_ns
+            self._metrics["staging_transpose_ns"] += transpose_elapsed_ns
+            if self.profiler:
+                self.profiler.observe_ns("staging_transpose", transpose_elapsed_ns)
+
+            types = (
+                "VARCHAR", "INTEGER", "BIGINT", "VARCHAR", "BIGINT", "BIGINT",
+                "VARCHAR", "VARCHAR", "INTEGER", "INTEGER", "VARCHAR", "VARCHAR",
+                "DOUBLE", "VARCHAR", "DOUBLE", "BIGINT", "BIGINT", "BIGINT",
+                "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT",
+            )
+            bind_started_ns = time.perf_counter_ns()
+            select_columns = ", ".join(
+                f"(u.value)[{index}]::{column_type}"
+                for index, column_type in enumerate(types, start=1)
+            )
+            parameters = ", ".join(f"?::{column_type}[]" for column_type in types)
+            self._metrics["vectorized_staging_calls"] += 1
+            execute(
+                "INSERT INTO _vnext_projection_batch SELECT "
+                f"{select_columns} FROM UNNEST(list_zip({parameters})) AS u(value)",
+                columns,
+            )
+            bind_elapsed_ns = time.perf_counter_ns() - bind_started_ns
+        else:
+            bind_started_ns = time.perf_counter_ns()
+            executemany(
+                "INSERT INTO _vnext_projection_batch VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+            bind_elapsed_ns = time.perf_counter_ns() - bind_started_ns
+        self._metrics["staging_bind_execute_ns"] += bind_elapsed_ns
+        if self.profiler:
+            self.profiler.observe_ns("staging_bind_execute", bind_elapsed_ns)
+
+    def _record_staging_batch(self, elapsed_ns: int, event_count: int) -> None:
+        elapsed_ns = max(0, int(elapsed_ns))
+        event_count = max(0, int(event_count))
+        self._metrics["staging_load_ns"] += elapsed_ns
+        self._metrics["staging_total_ns"] += elapsed_ns
+        self._metrics["staging_batch_count"] += 1
+        self._metrics["staging_event_count"] += event_count
+        self._staging_batch_durations_ns.append(elapsed_ns)
+        if event_count:
+            per_event_ns = elapsed_ns // event_count
+            self._staging_event_durations_ns.extend(
+                [per_event_ns] * min(event_count, self._staging_event_durations_ns.maxlen)
+            )
+        if self.profiler:
+            self.profiler.observe_ns("staging_total", elapsed_ns)
+            self.profiler.inc("staging_batch_count")
+            self.profiler.inc("staging_event_count", event_count)
+
     def _apply_batch(self, batch: list[dict]) -> int:
         """Apply one bounded batch with set-based event and aggregate DML."""
 
@@ -544,48 +637,22 @@ class ProjectionWriter:
             )
         """
         staging_started_ns = time.perf_counter_ns()
-        if self.reuse_staging:
-            if not self._batch_table_created:
-                execute("DROP TABLE IF EXISTS _vnext_projection_batch")
-                execute(batch_table_sql)
-                self._batch_table_created = True
-            execute("DELETE FROM _vnext_projection_batch")
-            execute("DROP TABLE IF EXISTS _vnext_projection_new")
-        else:
-            execute("DROP TABLE IF EXISTS _vnext_projection_batch")
-            execute("DROP TABLE IF EXISTS _vnext_projection_new")
-            execute(batch_table_sql)
+        clear_started_ns = time.perf_counter_ns()
+        self._clear_staging(execute, batch_table_sql)
+        clear_elapsed_ns = time.perf_counter_ns() - clear_started_ns
+        self._metrics["staging_clear_table_ns"] += clear_elapsed_ns
+        if self.profiler:
+            self.profiler.observe_ns("staging_clear_table", clear_elapsed_ns)
+
         rows_prepare_started_ns = time.perf_counter_ns()
         rows = [self._event_row(event) for event in unique.values()]
-        self._metrics["rows_prepare_ns"] += time.perf_counter_ns() - rows_prepare_started_ns
-        if rows:
-            if self.staging_mode == "vectorized":
-                if any(len(row) != 25 for row in rows):
-                    raise ValueError("projection staging columns must have equal lengths")
-                columns = [list(column) for column in zip(*rows)]
-                types = (
-                    "VARCHAR", "INTEGER", "BIGINT", "VARCHAR", "BIGINT", "BIGINT",
-                    "VARCHAR", "VARCHAR", "INTEGER", "INTEGER", "VARCHAR", "VARCHAR",
-                    "DOUBLE", "VARCHAR", "DOUBLE", "BIGINT", "BIGINT", "BIGINT",
-                    "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT",
-                )
-                select_columns = ", ".join(
-                    f"(u.value)[{index}]::{column_type}"
-                    for index, column_type in enumerate(types, start=1)
-                )
-                parameters = ", ".join(f"?::{column_type}[]" for column_type in types)
-                self._metrics["vectorized_staging_calls"] += 1
-                execute(
-                    "INSERT INTO _vnext_projection_batch SELECT "
-                    f"{select_columns} FROM UNNEST(list_zip({parameters})) AS u(value)",
-                    columns,
-                )
-            else:
-                executemany(
-                    "INSERT INTO _vnext_projection_batch VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    rows,
-                )
-        self._metrics["staging_load_ns"] += time.perf_counter_ns() - staging_started_ns
+        rows_prepare_elapsed_ns = time.perf_counter_ns() - rows_prepare_started_ns
+        self._metrics["rows_prepare_ns"] += rows_prepare_elapsed_ns
+        self._metrics["staging_prepare_rows_ns"] += rows_prepare_elapsed_ns
+        if self.profiler:
+            self.profiler.observe_ns("staging_prepare_rows", rows_prepare_elapsed_ns)
+        self._stage_rows(rows, execute, executemany)
+        self._record_staging_batch(time.perf_counter_ns() - staging_started_ns, len(rows))
 
         dedupe_started_ns = time.perf_counter_ns()
         execute("""
@@ -748,6 +815,18 @@ class ProjectionWriter:
         values.update({
             "batch_size_p50": self._percentile(self._batch_sizes, 0.50),
             "batch_size_p95": self._percentile(self._batch_sizes, 0.95),
+            "staging_batch_ms_p50": round(
+                self._percentile(self._staging_batch_durations_ns, 0.50) / 1_000_000, 3
+            ),
+            "staging_batch_ms_p95": round(
+                self._percentile(self._staging_batch_durations_ns, 0.95) / 1_000_000, 3
+            ),
+            "staging_event_us_p50": round(
+                self._percentile(self._staging_event_durations_ns, 0.50) / 1_000, 3
+            ),
+            "staging_event_us_p95": round(
+                self._percentile(self._staging_event_durations_ns, 0.95) / 1_000, 3
+            ),
             "staging_mode": self.staging_mode,
             "reuse_staging": self.reuse_staging,
             "applied_scope": "process_local",

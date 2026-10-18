@@ -1,0 +1,168 @@
+{
+  "schema": "vnext-bulk-staging-evidence-v1",
+  "task_id": "MC-VNEXT-STAGING-BULK-INGEST-OPTIMIZATION-20261018",
+  "date": "2026-10-18",
+  "source_identity": {
+    "head_sha": "c8505017e8526a21a41aabb6e9bcdaaece2f6216",
+    "origin_main_sha": "75aa2ddc58ede3b140d7538f02edf1b8f417832e",
+    "working_tree_preexisting_dirty": true,
+    "preexisting_status_line_count": 42,
+    "relevant_files": {
+      "backend/vnext/projection_writer.py": "e204693343a99a36cdc04097a839b418cea505dd",
+      "backend/tools/vnext_single_writer_benchmark.py": "361b42ee89d24ff97255ab217d40df5faada604b",
+      "backend/tests/test_vnext_projection_writer.py": "9db67ab6cf4e59b868d1ee02a2c3dd33660ca60a",
+      "backend/tests/test_vnext_staging_benchmark.py": "d9d70fa96c87f0d5ecd91c25b423a1fdba7aa3f0",
+      "backend/vnext/critical_path_profiler.py": "aeadcb924889202f03b2737507b955d5a1c9fefa"
+    },
+    "commit_push": "NOT_REQUESTED"
+  },
+  "environment": {
+    "workspace": "/tmp/mc-vnext-staging-20261018.MSdK4g",
+    "distribution": "AlmaLinux-8 on WSL2",
+    "filesystem": "ext4",
+    "df_type": "ext4",
+    "df_record": "/dev/sdd 1055762868 blocks, 879043164 available at final capture",
+    "python": "3.11.13",
+    "duckdb": "1.2.0",
+    "pandas": "2.3.2",
+    "numpy": "2.2.6",
+    "pyarrow": "NOT_INSTALLED",
+    "dependency_freeze": [
+      "duckdb==1.2.0",
+      "numpy==2.2.6",
+      "pandas==2.3.2",
+      "python-dateutil==2.9.0.post0",
+      "pytz==2026.3.post1",
+      "six==1.17.0",
+      "tzdata==2026.3"
+    ],
+    "cpu_affinity": [0, 1, 2, 3],
+    "nice": 10,
+    "ionice": "requested idle class; system reported class data ignored",
+    "target_euleros_connection": "NOT_ATTEMPTED; separate authorization/VPN not established"
+  },
+  "implementation": {
+    "production_ingest_mode_changed": false,
+    "production_default": "unchanged vectorized A0",
+    "projection_writer_contract_changed": false,
+    "new_metrics": [
+      "staging_prepare_rows_ns",
+      "staging_clear_table_ns",
+      "staging_transpose_ns",
+      "staging_bind_execute_ns",
+      "staging_relation_create_ns",
+      "staging_relation_insert_ns",
+      "staging_total_ns",
+      "staging_batch_ms_p50/p95",
+      "staging_event_us_p50/p95"
+    ],
+    "candidate_code_scope": "isolated benchmark subclass and adapters only",
+    "dependencies_added": false
+  },
+  "r1_internal_rca": {
+    "status": "PASS",
+    "workload": {
+      "events": 11000,
+      "campaigns": 4,
+      "business_days": 2,
+      "events_per_sms": 2,
+      "duplicate_fraction_requested": 0.1,
+      "batch_sizes": [256, 512, 1024, 2048]
+    },
+    "a0_sweep": [
+      {"batch_size": 256, "wall_seconds": 1.566303, "batch_end_to_end_seconds": 1.498211, "staging_seconds": 0.554312457, "staging_share_percent": 36.998, "batches": 43, "prepared_rows": 9918},
+      {"batch_size": 512, "wall_seconds": 1.232341, "batch_end_to_end_seconds": 1.156841, "staging_seconds": 0.518325494, "staging_share_percent": 44.805, "batches": 22, "prepared_rows": 9910},
+      {"batch_size": 1024, "wall_seconds": 0.794978, "batch_end_to_end_seconds": 0.729917, "staging_seconds": 0.388043336, "staging_share_percent": 53.163, "batches": 11, "prepared_rows": 9906},
+      {"batch_size": 2048, "wall_seconds": 0.693803, "batch_end_to_end_seconds": 0.627417, "staging_seconds": 0.396670093, "staging_share_percent": 63.223, "batches": 6, "prepared_rows": 9904}
+    ],
+    "profiler_overhead_100k": {
+      "off_seconds": 12.011486,
+      "on_seconds": 12.096638,
+      "overhead_percent": 0.709,
+      "digest_equal": true,
+      "profile_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/profiler-100k-on/"
+    }
+  },
+  "r2_adapter_ab": {
+    "status": "NO_CHANGE_WITH_EVIDENCE",
+    "quick_screen_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/r2a-final.json",
+    "a3_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/r2a-a3-final.json",
+    "paired_100k_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/r2b-final.json",
+    "a2_status": "SKIPPED",
+    "a2_reason": "PyArrow is absent and no matching offline wheel was available",
+    "correctness_digest": "4f4d316bf81280560d3878ce5d4d01460afd0a49ee31a99cae4d1edb5464f6f6",
+    "paired_100k": {
+      "batch_512": {
+        "a0_median_wall_seconds": 11.686108,
+        "a1_median_wall_seconds": 11.49156,
+        "wall_change_percent": -1.7,
+        "a0_median_staging_seconds": 4.421086,
+        "a1_median_staging_seconds": 4.238013,
+        "staging_change_percent": -4.1,
+        "rounds": 3
+      },
+      "batch_1024": {
+        "a0_median_wall_seconds": 8.125283,
+        "a1_median_wall_seconds": 7.000101,
+        "wall_change_percent": -13.9,
+        "a0_median_staging_seconds": 3.753418,
+        "a1_median_staging_seconds": 2.55636,
+        "staging_change_percent": -31.9,
+        "rounds": 3
+      }
+    },
+    "selection": "NO_CHANGE; no production candidate selected"
+  },
+  "e2e_and_recovery": {
+    "local_ext4_smoke": {
+      "status": "PASS",
+      "evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/e2e-smoke.json",
+      "tasks": 400,
+      "pdu": 400,
+      "responses": 400,
+      "journal_events": 800,
+      "projection_events": 800,
+      "unknown_responses": 0
+    },
+    "local_ext4_multipart": {
+      "status": "PASS",
+      "evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/e2e-multipart-smoke.json",
+      "tasks": 80,
+      "pdu": 120,
+      "responses": 120,
+      "journal_events": 200,
+      "projection_events": 200,
+      "unknown_responses": 0
+    },
+    "t7_recovery_matrix": {
+      "status": "PASS",
+      "evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/t7-native.json",
+      "scenarios_passed": 6
+    },
+    "backend_pytest_windows": "422 passed, 5 skipped, 4 warnings",
+    "t3_50k_paired": "NOT_VERIFIED; no candidate selected",
+    "euleros_600s_800pdu": "BLOCKED_ENV"
+  },
+  "gates": {
+    "SOURCE_AND_ENV_IDENTITY": "PASS",
+    "STAGING_INTERNAL_RCA": "PASS",
+    "A0_A4_CORRECTNESS": "NOT_VERIFIED",
+    "STAGING_AB_BENEFIT": "NO_CHANGE",
+    "PRODUCT_CANDIDATE_CORRECTNESS": "NOT_APPLICABLE",
+    "T3_50K_PAIRED": "NOT_VERIFIED",
+    "MULTIPART_AND_RECOVERY": "NOT_VERIFIED",
+    "EULEROS_600S_800PDU": "BLOCKED_ENV",
+    "PROD_8G_CAPACITY": "NOT_VERIFIED",
+    "PROD_16G_CAPACITY": "NOT_VERIFIED",
+    "SINGLE_WRITER_CAPACITY_ESTIMATE": "MEASURED",
+    "CANARY_READY": "NO"
+  },
+  "safety": {
+    "real_smsc_used": false,
+    "production_database_used": false,
+    "production_api_used": false,
+    "deployment_performed": false,
+    "credentials_included": false,
+    "raw_runtime_runs_committed": false
+  }
+}
