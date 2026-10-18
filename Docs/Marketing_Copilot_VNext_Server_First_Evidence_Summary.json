@@ -1,0 +1,112 @@
+{
+  "schema": "mc-vnext-server-first-evidence-summary-v1",
+  "task_id": "MC-VNEXT-SERVER-FIRST-PERFORMANCE-MICROBATCH-20261018",
+  "generated_at": "2026-10-18",
+  "BASELINE_HEAD": "450e84d82cca2b8ef5d4d34efe0f2ced604e3c2e",
+  "TARGET_DEPLOYMENT_OS": "SLES 12 SP5",
+  "TEST_SERVER_HOST_OS_KERNEL": "SUSE Linux Enterprise Server 12 SP5; 4.12.14-122.307-default; x86_64",
+  "SERVER_REPRESENTATIVE": "PARTIAL: deployment OS matches; host is 80 CPU / approximately 375 GiB shared capacity, not 8/16 GiB hardware equivalent",
+  "SERVER_AUTHORIZED": "YES: user-provided test-server access over VPN; credentials omitted",
+  "RESOURCE_ENVELOPE_CPU_MEM_IO": {
+    "cpu": "Intel Xeon Gold 6230N; 80 logical CPUs; affinity 0-79; nice 0",
+    "memory": "375 GiB RAM; 8 GiB swap; host load observed approximately 9-13",
+    "filesystem": "/dev/sda1 ext4; approximately 20,465,232 KiB total, 16,267,100 KiB used, 3,133,224 KiB available",
+    "cgroup": "sshd.service cgroup observed; no effective CPU/memory hard quota verified",
+    "application_guard": "PROD_8G profile; application RSS guard 6,291,456 KiB",
+    "resource_sampling": "E2E harness RSS samples were zero on SLES and are treated as NOT_CAPTURED"
+  },
+  "SOURCE_AND_DEPENDENCY_FREEZE": {
+    "source_head": "450e84d82cca2b8ef5d4d34efe0f2ced604e3c2e",
+    "source_archive_sha256": "53b6f61f7c004e1b430cbcf9b97de3243ddceda1328d2ae95221da2a7eacac6d",
+    "site_packages_archive_sha256": "0c464ddce0fee4c1ddde2452bdd2b2f4ff9ead76adf33b4ae4b3d0264fcca303",
+    "python": "3.11.4",
+    "duckdb": "1.2.0",
+    "freeze_sha256": "502422a5a1be6e2cea2e0ae206c01940b3104c6d906545d8219cdbda72a04227",
+    "freeze": [
+      "duckdb==1.2.0",
+      "numpy==1.26.4",
+      "pandas==2.3.2",
+      "pyarrow==12.0.1",
+      "python-dateutil==2.9.0.post0",
+      "pytz==2026.5",
+      "six==1.17.0",
+      "tzdata==2026.5"
+    ]
+  },
+  "SERVER_C0_50K_WALL": "94.671 s",
+  "SERVER_C0_PDU_PER_SEC": {
+    "wall_average": 528.2,
+    "producer_phase": 687.2,
+    "sampled_socket_p50": 622.852,
+    "sampled_socket_p95": 873.661
+  },
+  "SERVER_C0_PROJECTION_EVENTS_PER_SEC": {
+    "wall_average": 1056.3,
+    "feed_phase": 1374.4,
+    "sampled_committed_p50": 1233.641,
+    "sampled_committed_p95": 1533.124
+  },
+  "SERVER_C0_BATCH_P50_P95": {
+    "configured": 512,
+    "actual_p50": 58,
+    "actual_p95": 188,
+    "commits": 1397,
+    "events": 100000
+  },
+  "PRODUCER_LIMITED": "NO: producer backpressure waits 0",
+  "SMPP_WINDOW_LIMITED": "YES: TPS credit wait and response-window wait dominate worker-side feed",
+  "WRITER_UNDERFILL_IS_BOTTLENECK": "NO: underfill is observed but not the E2E limiting stage",
+  "WINNING_ARM": "NONE",
+  "PAIRED_50K_MEDIAN_E2E_DELTA": "NOT_RUN: R2 trigger not met",
+  "PROJECTION_POST_RESPONSE_TAIL_DELTA": {
+    "response_journal_durable_to_db_commit": "46.584 ms",
+    "response_journal_durable_to_offset_durable": "58.512 ms"
+  },
+  "COMMIT_COUNT_AND_BATCH_DELTA": "Baseline 1,397 commits; actual batch p50/p95 58/188; candidate delta N/A",
+  "JOURNAL_BACKLOG_END_AND_TREND": "0 bytes/events at end; projection lag 0; no growing backlog",
+  "SMPP_AND_RESPONSE_RECONCILIATION": "50,000 accepted/socket-written/submit_sm_resp/response; unknown 0; write_failed 0",
+  "UNKNOWN_OR_DUPLICATE_PDU": "E2E unknown 0; pure Writer intentional replay 9,998/166,666 in 100K/500K tests and correct dedupe",
+  "OFFSET_AND_CRASH_RECOVERY": "T6 PASS; T7 current matrix 6/6 PASS",
+  "T6_CROSS_DAY": "PASS: old/new 8 each; old after cutoff 0; restart redispatch 0; stats contamination 0; pending 0",
+  "T7_CURRENT_6_OF_6": {
+    "status": "PASS",
+    "scenarios": ["T7-4", "T7-5", "T7-6", "T7-7", "T7-8", "T7-9"],
+    "not_claimed": ["T7-1", "T7-2", "T7-3"]
+  },
+  "APP_RSS_PEAK_AND_SLOPE": "E2E NOT_CAPTURED due SLES harness sampler returning zero; pure Writer peak 171,716 KiB at 100K and 207,628 KiB at 500K; slope not captured",
+  "HARDWARE_EQUIVALENCE": "NO",
+  "SUSTAINED_600S_800_PDU": "NOT_RUN: R2 candidate and Producer/SMPP feed prerequisites absent",
+  "PRODUCTION_DEFAULT_CHANGED": "NO",
+  "FINAL_DECISION": "UPSTREAM_OR_HARNESS_LIMITED",
+  "CANARY_READY": "NO-GO",
+  "COMMIT_PUSH": "NOT_REQUESTED",
+  "r2": {
+    "trigger": "NOT_MET",
+    "B0": "PASS",
+    "B1_A0_512_10ms": "NOT_RUN",
+    "B2_A0_512_25ms": "NOT_RUN",
+    "B3_A0_512_50ms": "NOT_RUN",
+    "B4_A0_1024": "NOT_RUN",
+    "reason": "E2E is upstream/SMPP-window limited; Writer underfill is not primary"
+  },
+  "recovery": {
+    "T6": "PASS",
+    "T7_current": "6/6 PASS",
+    "source_scope": "Current source exposes T7-4..T7-9 only"
+  },
+  "harness_observation": {
+    "5k_default_status_interval": "FAIL projection_drain_timeout after 308.136 s, while final raw counts/backlog were complete",
+    "5k_status_interval_0_1": "PASS in 12.657 s with complete counts and caught-before-stop true",
+    "interpretation": "status freshness/stop-condition observation, not data-loss evidence"
+  },
+  "evidence_files": [
+    {"file": "1k-c0.json", "sha256": "F0F481528B7A1BE90A4556508FCB1AFBC68A799D171D716277329CF2E1687DBC"},
+    {"file": "5k-c0.json", "sha256": "2FBDACDA506AE8429A832656295708A35F40EED31A7F6449B230E1351E04EB7F"},
+    {"file": "5k-c0-status01.json", "sha256": "33E62CE3EC5BE7B71A5923C7992910F44E684E70BF6FAABE9C051111119ACE7B"},
+    {"file": "50k-c0.json", "sha256": "ECB304B80FE91E5B55AFBBC31AA802271A291875938FA0AFFC2D8BB79678BE55"},
+    {"file": "writer-100k-c0.json", "sha256": "5F93CF035E15D464B1052442AC9A6F3DAF6BA0050B99907ACA976622FE1D93FF"},
+    {"file": "writer-500k-c0.json", "sha256": "55ACC3B974FF35613B484052D0156FCF0A294D51BF324308847D82691FBD2982"},
+    {"file": "t6-daily-result.json", "sha256": "4BFD594A7C724A5D479532772975CE3AC0DB74ABCE14E96F94B3FFDC5C43C7DF"},
+    {"file": "t7.json", "sha256": "304489ACBC58D3D70C9D495D1F26FBD8A964A47E008301EB5530B2764A70D12E"}
+  ]
+}
