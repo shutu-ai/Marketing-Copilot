@@ -1,7 +1,7 @@
 # Marketing Copilot VNext — Bulk Staging Adapter A/B
 
 Task: `MC-VNEXT-STAGING-BULK-INGEST-OPTIMIZATION-20261018`
-Decision: `STAGING_CANDIDATE=NO_CHANGE_WITH_EVIDENCE`.
+Decision: `STAGING_CANDIDATE=NO_CHANGE_WITH_EVIDENCE`; A2 remains benchmark-only pending R3/R4 gates.
 
 ## Adapter contract
 
@@ -11,7 +11,7 @@ The benchmark uses a separate `BenchmarkProjectionWriter` subclass only for expe
 |---|---|---|
 | A0 | Current `LIST + list_zip + UNNEST`, staging-table reuse | PASS; control |
 | A1 | pandas DataFrame with nullable/string/integer/float dtypes, connection-local relation, `INSERT ... SELECT` | PASS; tested |
-| A2 | PyArrow Table/relation, `INSERT ... SELECT` | SKIPPED; PyArrow absent from the offline environment and wheelhouses |
+| A2 | PyArrow Table/relation, `INSERT ... SELECT` | PASS; isolated native-ext4 run with PyArrow 12.0.1 and NumPy 1.26.4 |
 | A3 | NDJSON write + flush + `fsync` + DuckDB `read_json_auto` + delete, all included in elapsed time | PASS; smoke/11K screened |
 | A4 | Same A0 input and SQL, only the reuse cleanup order reversed | PASS; control isolation |
 
@@ -19,41 +19,52 @@ A1/A3/A4 all produced the same digest as A0 in the evaluated runs. The staged ta
 
 ## R2a quick screen
 
-Workload: 11,000 events, four campaigns, two business days, two events per SMS, 10% requested duplicates, randomized arm order, CPU affinity `0-3`, `nice=10`, DuckDB `1.2.0`.
+Workload: 11,000 events, four campaigns, two business days, two events per SMS, 10% requested duplicates, randomized arm order, CPU affinity `0-3`, `nice=10`, DuckDB `1.2.0`. The final valid run used CPython 3.11.13, pandas 2.3.2, NumPy 1.26.4, and PyArrow 12.0.1 on native ext4.
 
-| batch | A0 wall / staging (s) | A1 wall / staging (s) | A4 wall / staging (s) | A2 |
-|---:|---:|---:|---:|---|
-| 256 | 1.566303 / 0.554312 | 1.927340 / 0.819115 | 1.730472 / 0.615770 | SKIPPED |
-| 512 | 1.232341 / 0.518325 | 1.133166 / 0.476498 | 1.201240 / 0.517114 | SKIPPED |
-| 1024 | 0.794978 / 0.388043 | 0.633012 / 0.260987 | 0.824525 / 0.419141 | SKIPPED |
-| 2048 | 0.693803 / 0.396670 | 0.470495 / 0.188889 | 0.676180 / 0.393664 | SKIPPED |
+| batch | A0 wall / staging (s) | A1 wall / staging (s) | A2 wall / staging (s) | A3 wall / staging (s) | A4 wall / staging (s) |
+|---:|---:|---:|---:|---:|
+| 256 | 1.972362 / 0.684315 | 1.935207 / 0.828515 | 2.047142 / 0.597249 | 2.024936 / 0.706491 | 2.068402 / 0.727129 |
+| 512 | 1.484356 / 0.631804 | 1.066215 / 0.457120 | 0.917792 / 0.266722 | 1.088738 / 0.441579 | 1.282835 / 0.538362 |
+| 1024 | 0.818254 / 0.409380 | 0.676868 / 0.279994 | 0.546901 / 0.155799 | 0.820537 / 0.361404 | 0.815359 / 0.409214 |
+| 2048 | 0.648154 / 0.368485 | 0.491681 / 0.198829 | 0.443493 / 0.118245 | 0.584848 / 0.286366 | 0.701571 / 0.395941 |
 
-The apparent A1 improvement grows with batch size, but it is not a stable default-512 win and does not approach the requested strong staging improvement threshold. A3 screening at 11K was correct, with wall times 1.582698/1.134843/0.866014 s for batches 256/512/1024; its file create/write/fsync and relation-read costs were material and it was not a production candidate.
+A2 was the fastest arm from batch 512 onward in this screen, while all five arms preserved the same digest and 25-column schema. A3 file create/write/fsync and relation-read costs remained material and it was not a production candidate.
 
 ## R2b paired expansion
 
-The only plausible candidate, A1, was compared with A0 for three rounds at 100,000 events. Every arm had one digest across its three rounds, and A0/A1 digests matched. Unique event rows were 90,002 and aggregate rows were 8.
+The two strongest arms, A1 and A2, were compared with A0 for three rounds at 100,000 events. Every arm had one digest across its three rounds, and all A0/A1/A2 digests matched. Unique event rows were 90,002 and aggregate rows were 8.
 
-| batch | A0 median wall (s) | A1 median wall (s) | wall change | A0 median staging (s) | A1 median staging (s) | staging change |
-|---:|---:|---:|---:|---:|---:|---:|
-| 512 | 11.686108 | 11.491560 | -1.7% | 4.421086 | 4.238013 | -4.1% |
-| 1024 | 8.125283 | 7.000101 | -13.9% | 3.753418 | 2.556360 | -31.9% |
+| batch | A0 median wall (s) | A1 median wall (s) | A2 median wall (s) | A1 wall change | A2 wall change | A0 median staging (s) | A1 median staging (s) | A2 median staging (s) | A1 staging change | A2 staging change |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 12.191240 | 11.765172 | 9.587405 | -3.5% | -21.4% | 4.647704 | 4.392319 | 2.382979 | -5.5% | -48.7% |
+| 1024 | 8.600536 | 7.174149 | 5.849494 | -16.6% | -32.0% | 3.962810 | 2.648162 | 1.435465 | -33.2% | -63.8% |
 
-The batch-1024 result is directionally useful, but the production comparison is batch 512 and the gain is within the range where host scheduling and DuckDB variability matter. No candidate reached the required evidence level for a production mode switch. No 500K/30%-duplicate expansion was started because the candidate had already failed the selection gate.
+The 100K result makes A2 the strongest experimental arm, but the default production comparison is batch 512 and R2 is not a production authorization. A1 had one 21.5-second batch-1024 outlier; medians are reported. The A2 run used a temporary test-only dependency environment and did not change the application dependency contract.
+
+## R2c 500K stress screen
+
+One paired 500,000-event / 30%-duplicate screen was run for A0 and A2 on the same native-ext4 guard. The digest matched, with 333,334 unique event rows and 8 aggregate rows.
+
+| batch | A0 wall / staging (s) | A2 wall / staging (s) | wall change | staging change |
+|---:|---:|---:|---:|---:|
+| 512 | 72.029992 / 19.729794 | 69.588518 / 13.708721 | -3.4% | -30.5% |
+| 1024 | 50.036760 / 17.323214 | 40.902258 / 8.089067 | -18.3% | -53.3% |
+
+The 500K default-batch result does not establish a strong end-to-end production win, despite the meaningful staging reduction. A2 is retained as the best benchmark arm, but it is not promoted into R3/R4 without target-environment dependency approval and candidate-specific end-to-end gates.
 
 ## Memory, dependency, and correctness
 
 - The 11K sequential benchmark process high-water samples were approximately 125–142 MiB; the 100K sequential cases were approximately 173–187 MiB. These are benchmark-process measurements, not an 8 GiB/16 GiB capacity claim.
 - pandas `2.3.2` is already present in the SLES12SP5-compatible offline wheelhouse and was usable with CPython 3.11/DuckDB 1.2.0.
-- PyArrow was not installed and no matching wheel was found in the three inspected offline archives. It was explicitly recorded as `SKIPPED`, not installed online.
-- A0/A1/A3/A4 had identical event/projection digests, 25-column staging schemas, complete duplicate accounting, and no loss of response rows in the adapter benchmark.
+- PyArrow `12.0.1` was downloaded only into a temporary native-ext4 test venv; its `manylinux_2_17_x86_64.manylinux2014_x86_64` wheel loaded with NumPy `1.26.4`. No production dependency or deployment package was changed.
+- A0/A1/A2/A3/A4 had identical event/projection digests, 25-column staging schemas, complete duplicate accounting, and no loss of response rows in the adapter benchmark.
 
 ## Decision
 
-`STAGING_AB_BENEFIT=NO_CHANGE`. The current product implementation remains the safe default. The only source changes are internal timing counters, benchmark adapters, and tests; no `ProjectionWriterProcess` production configuration or upstream Worker/SMPP/Journal behavior was changed.
+`STAGING_AB_BENEFIT=NO_CHANGE`. A2 is the best isolated benchmark arm, but the 500K default-batch result is not a strong enough end-to-end basis for R3/R4 promotion. The current product implementation remains the safe default. No `ProjectionWriterProcess` production configuration or upstream Worker/SMPP/Journal behavior was changed.
 
 Raw JSON results:
 
-- `/tmp/mc-vnext-staging-20261018.MSdK4g/r2a-final.json`
-- `/tmp/mc-vnext-staging-20261018.MSdK4g/r2a-a3-final.json`
-- `/tmp/mc-vnext-staging-20261018.MSdK4g/r2b-final.json`
+- `/tmp/mc-vnext-staging-20261018-pyarrow-r2a-np1/r2a-final.json`
+- `/tmp/mc-vnext-staging-20261018-pyarrow-r2b/r2b-final.json`
+- `/tmp/mc-vnext-staging-20261018-pyarrow-r2c/r2c-final.json`

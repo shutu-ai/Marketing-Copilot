@@ -3,8 +3,8 @@
   "task_id": "MC-VNEXT-STAGING-BULK-INGEST-OPTIMIZATION-20261018",
   "date": "2026-10-18",
   "source_identity": {
-    "head_sha": "c8505017e8526a21a41aabb6e9bcdaaece2f6216",
-    "origin_main_sha": "75aa2ddc58ede3b140d7538f02edf1b8f417832e",
+    "head_sha": "9c46b5c396029134cec1f57a46829007b4a0e5bf",
+    "origin_main_sha": "9c46b5c396029134cec1f57a46829007b4a0e5bf",
     "working_tree_preexisting_dirty": true,
     "preexisting_status_line_count": 42,
     "relevant_files": {
@@ -14,23 +14,24 @@
       "backend/tests/test_vnext_staging_benchmark.py": "d9d70fa96c87f0d5ecd91c25b423a1fdba7aa3f0",
       "backend/vnext/critical_path_profiler.py": "aeadcb924889202f03b2737507b955d5a1c9fefa"
     },
-    "commit_push": "NOT_REQUESTED"
+    "commit_push": "9c46b5c3 implementation/evidence commit already pushed; follow-up evidence update pending"
   },
   "environment": {
-    "workspace": "/tmp/mc-vnext-staging-20261018.MSdK4g",
+    "workspace": "/tmp/mc-vnext-staging-20261018-pyarrow-r2a-np1; /tmp/mc-vnext-staging-20261018-pyarrow-r2b; /tmp/mc-vnext-staging-20261018-pyarrow-r2c",
     "distribution": "AlmaLinux-8 on WSL2",
     "filesystem": "ext4",
     "df_type": "ext4",
-    "df_record": "/dev/sdd 1055762868 blocks, 879043164 available at final capture",
+    "df_record": "/dev/sdd 1055762868 blocks, 878177628 available at 500K capture",
     "python": "3.11.13",
     "duckdb": "1.2.0",
     "pandas": "2.3.2",
-    "numpy": "2.2.6",
-    "pyarrow": "NOT_INSTALLED",
+    "numpy": "1.26.4",
+    "pyarrow": "12.0.1",
     "dependency_freeze": [
       "duckdb==1.2.0",
-      "numpy==2.2.6",
+      "numpy==1.26.4",
       "pandas==2.3.2",
+      "pyarrow==12.0.1",
       "python-dateutil==2.9.0.post0",
       "pytz==2026.3.post1",
       "six==1.17.0",
@@ -39,7 +40,7 @@
     "cpu_affinity": [0, 1, 2, 3],
     "nice": 10,
     "ionice": "requested idle class; system reported class data ignored",
-    "target_euleros_connection": "NOT_ATTEMPTED; separate authorization/VPN not established"
+    "target_euleros_connection": "NOT_ATTEMPTED; separate target-server authorization was not established"
   },
   "implementation": {
     "production_ingest_mode_changed": false,
@@ -57,7 +58,11 @@
       "staging_event_us_p50/p95"
     ],
     "candidate_code_scope": "isolated benchmark subclass and adapters only",
-    "dependencies_added": false
+    "dependencies_added": false,
+    "test_only_dependencies_downloaded": [
+      "pyarrow==12.0.1",
+      "numpy==1.26.4"
+    ]
   },
   "r1_internal_rca": {
     "status": "PASS",
@@ -85,33 +90,76 @@
   },
   "r2_adapter_ab": {
     "status": "NO_CHANGE_WITH_EVIDENCE",
-    "quick_screen_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/r2a-final.json",
-    "a3_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/r2a-a3-final.json",
-    "paired_100k_evidence": "/tmp/mc-vnext-staging-20261018.MSdK4g/r2b-final.json",
-    "a2_status": "SKIPPED",
-    "a2_reason": "PyArrow is absent and no matching offline wheel was available",
+    "experimental_best_arm": "A2",
+    "quick_screen_evidence": "/tmp/mc-vnext-staging-20261018-pyarrow-r2a-np1/r2a-final.json",
+    "paired_100k_evidence": "/tmp/mc-vnext-staging-20261018-pyarrow-r2b/r2b-final.json",
+    "stress_500k_evidence": "/tmp/mc-vnext-staging-20261018-pyarrow-r2c/r2c-final.json",
+    "a2_status": "PASS",
+    "a2_environment": "pyarrow==12.0.1, numpy==1.26.4 in temporary native-ext4 venv",
     "correctness_digest": "4f4d316bf81280560d3878ce5d4d01460afd0a49ee31a99cae4d1edb5464f6f6",
+    "correctness_digests": {
+      "r2a_11k": "4f4d316bf81280560d3878ce5d4d01460afd0a49ee31a99cae4d1edb5464f6f6",
+      "r2b_100k": "83efd2d088ac9d3f887bf73d8f068676e2d9059761a14f023e206659e0cdb859",
+      "r2c_500k": "12d81497b148e294a966016ad350d1e05010fbdae39e64bb61fce28843c6fd3a"
+    },
+    "quick_screen_11k": {
+      "all_arms": ["A0", "A1", "A2", "A3", "A4"],
+      "all_pass": true,
+      "schema_columns": 25,
+      "digest_equal": true
+    },
     "paired_100k": {
       "batch_512": {
-        "a0_median_wall_seconds": 11.686108,
-        "a1_median_wall_seconds": 11.49156,
-        "wall_change_percent": -1.7,
-        "a0_median_staging_seconds": 4.421086,
-        "a1_median_staging_seconds": 4.238013,
-        "staging_change_percent": -4.1,
+        "a0_median_wall_seconds": 12.19124,
+        "a1_median_wall_seconds": 11.765172,
+        "a2_median_wall_seconds": 9.587405,
+        "a1_wall_change_percent": -3.5,
+        "a2_wall_change_percent": -21.4,
+        "a0_median_staging_seconds": 4.647704,
+        "a1_median_staging_seconds": 4.392319,
+        "a2_median_staging_seconds": 2.382979,
+        "a1_staging_change_percent": -5.5,
+        "a2_staging_change_percent": -48.7,
         "rounds": 3
       },
       "batch_1024": {
-        "a0_median_wall_seconds": 8.125283,
-        "a1_median_wall_seconds": 7.000101,
-        "wall_change_percent": -13.9,
-        "a0_median_staging_seconds": 3.753418,
-        "a1_median_staging_seconds": 2.55636,
-        "staging_change_percent": -31.9,
+        "a0_median_wall_seconds": 8.600536,
+        "a1_median_wall_seconds": 7.174149,
+        "a2_median_wall_seconds": 5.849494,
+        "a1_wall_change_percent": -16.6,
+        "a2_wall_change_percent": -32.0,
+        "a0_median_staging_seconds": 3.96281,
+        "a1_median_staging_seconds": 2.648162,
+        "a2_median_staging_seconds": 1.435465,
+        "a1_staging_change_percent": -33.2,
+        "a2_staging_change_percent": -63.8,
         "rounds": 3
       }
     },
-    "selection": "NO_CHANGE; no production candidate selected"
+    "paired_500k": {
+      "duplicate_fraction": 0.3,
+      "unique_event_rows": 333334,
+      "aggregate_rows": 8,
+      "batch_512": {
+        "a0_wall_seconds": 72.029992,
+        "a2_wall_seconds": 69.588518,
+        "wall_change_percent": -3.4,
+        "a0_staging_seconds": 19.729794,
+        "a2_staging_seconds": 13.708721,
+        "staging_change_percent": -30.5
+      },
+      "batch_1024": {
+        "a0_wall_seconds": 50.03676,
+        "a2_wall_seconds": 40.902258,
+        "wall_change_percent": -18.3,
+        "a0_staging_seconds": 17.323214,
+        "a2_staging_seconds": 8.089067,
+        "staging_change_percent": -53.3
+      },
+      "digest_equal": true,
+      "rounds": 1
+    },
+    "selection": "NO_CHANGE; A2 is the best experimental arm, but no production candidate selected"
   },
   "e2e_and_recovery": {
     "local_ext4_smoke": {
@@ -140,15 +188,15 @@
       "scenarios_passed": 6
     },
     "backend_pytest_windows": "422 passed, 5 skipped, 4 warnings",
-    "t3_50k_paired": "NOT_VERIFIED; no candidate selected",
+    "t3_50k_paired": "NOT_VERIFIED; A2 remained benchmark-only",
     "euleros_600s_800pdu": "BLOCKED_ENV"
   },
   "gates": {
     "SOURCE_AND_ENV_IDENTITY": "PASS",
     "STAGING_INTERNAL_RCA": "PASS",
-    "A0_A4_CORRECTNESS": "NOT_VERIFIED",
+    "A0_A4_CORRECTNESS": "PASS",
     "STAGING_AB_BENEFIT": "NO_CHANGE",
-    "PRODUCT_CANDIDATE_CORRECTNESS": "NOT_APPLICABLE",
+    "PRODUCT_CANDIDATE_CORRECTNESS": "NOT_VERIFIED",
     "T3_50K_PAIRED": "NOT_VERIFIED",
     "MULTIPART_AND_RECOVERY": "NOT_VERIFIED",
     "EULEROS_600S_800PDU": "BLOCKED_ENV",

@@ -5,7 +5,7 @@ Final decision: `CANARY_READY=NO`.
 
 ## Scope decision
 
-R2 did not select a staging candidate. Therefore the production ingest path was not switched and the expensive candidate-specific R4a/R4c gates were not started. The unchanged baseline was still exercised through local loopback and recovery checks to make sure the instrumentation/refactoring did not alter correctness contracts.
+R2 verified A2 as the strongest isolated benchmark arm, but the 500K default-batch result did not establish a strong enough end-to-end production win for R3/R4 promotion. Therefore the production ingest path was not switched and the expensive candidate-specific R4a/R4c gates were not started. The unchanged baseline was still exercised through local loopback and recovery checks to make sure the instrumentation/refactoring did not alter correctness contracts.
 
 No connection was made to the supplied remote server. The task explicitly requires separate authorization and VPN for EulerOS synthetic-loopback testing; server credentials are not copied into this report or any artifact.
 
@@ -29,9 +29,9 @@ These local checks are regression evidence only. They are not a claim about Eule
 ```text
 SOURCE_AND_ENV_IDENTITY=PASS
 STAGING_INTERNAL_RCA=PASS
-A0_A4_CORRECTNESS=NOT_VERIFIED
+A0_A4_CORRECTNESS=PASS
 STAGING_AB_BENEFIT=NO_CHANGE
-PRODUCT_CANDIDATE_CORRECTNESS=NOT_APPLICABLE
+PRODUCT_CANDIDATE_CORRECTNESS=NOT_VERIFIED
 T3_50K_PAIRED=NOT_VERIFIED
 MULTIPART_AND_RECOVERY=NOT_VERIFIED
 EULEROS_600S_800PDU=BLOCKED_ENV
@@ -41,10 +41,10 @@ SINGLE_WRITER_CAPACITY_ESTIMATE=MEASURED
 CANARY_READY=NO
 ```
 
-`A0_A4_CORRECTNESS` is intentionally `NOT_VERIFIED` rather than `PASS` because A2 was skipped for a missing PyArrow dependency. The evaluated A0/A1/A3/A4 arms were correct. `MULTIPART_AND_RECOVERY` is not signed as a candidate gate because no candidate entered R3; unchanged baseline checks passed as listed above.
+`A0_A4_CORRECTNESS=PASS` covers the isolated adapter contract only. `PRODUCT_CANDIDATE_CORRECTNESS` and `MULTIPART_AND_RECOVERY` are not signed as candidate gates because A2 did not enter R3; unchanged baseline checks passed as listed above.
 
 ## Why the canary remains NO-GO
 
-The local adapter evidence did not show a strong, default-batch production win. The 100K A1 improvement at batch 1024 is not sufficient to authorize a production mode switch, and the actual EulerOS 600-second / approximately 800-PDU/s gate was not authorized or run. No assertion is made for 8 GiB or 16 GiB production capacity.
+The local adapter evidence identified A2 as the strongest experimental arm, but its 500K default-batch wall improvement was only 3.4%; this is not sufficient to authorize a production mode switch. The actual EulerOS 600-second / approximately 800-PDU/s gate was not authorized or run. No assertion is made for 8 GiB or 16 GiB production capacity.
 
-The safe follow-up is to obtain explicit target-environment authorization, install/verify only an approved columnar dependency if one is available offline, and rerun the same paired correctness and sustained-drain gates before considering any production mode change.
+The safe follow-up is to obtain explicit target-environment authorization, approve/package the columnar dependency if it is acceptable for the target, integrate A2 behind a controlled mode switch, and rerun the same paired correctness and sustained-drain gates before considering any production mode change.
