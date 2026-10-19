@@ -1,0 +1,273 @@
+{
+  "TASK_ID": "MC-VNEXT-WORKER-LIFECYCLE-CLEAN-EXIT-20261018",
+  "SOURCE_HEAD": "a25726d47d5963df85b7da754733029591345539",
+  "ORIGIN_MAIN": "a25726d47d5963df85b7da754733029591345539",
+  "SOURCE_SHA256": {
+    "frozen_source_archive_provenance": "805bec45f8e7ec6576a729704eccb405ba8c5cb7b0b145d82474fc2832f4b551",
+    "source_root": "/home/paas/mc-vnext-worker-scaling-20261018-01/source/source-b-3e73ab80"
+  },
+  "HARNESS_SHA256": "6c559cf8c2809e6e5c23e19a0d12c5759f4678eeb27b585b74fbb7bc3257217b",
+  "PRODUCT_DIFF": {
+    "production_backend_vnext_changed": false,
+    "changed_files": [
+      "backend/tools/vnext_streaming_acceptance.py",
+      "backend/tests/test_vnext_streaming_acceptance.py",
+      "backend/tests/test_vnext_worker.py"
+    ],
+    "production_paths_changed": []
+  },
+  "SERVER_OS_NATIVE_EXT4": {
+    "host": "paas-core01",
+    "os": "SUSE Linux Enterprise Server 12 SP5",
+    "kernel": "4.12.14-122.307-default",
+    "filesystem": "ext4",
+    "device": "/dev/sda1",
+    "formal_workspace": "/home/paas/mc-vnext-worker-scaling-20261018-01",
+    "synthetic_smsc": "127.0.0.1"
+  },
+  "PYTHON_DUCKDB_FREEZE": {
+    "python": "3.11.4",
+    "duckdb": "1.2.0",
+    "pip_freeze_sha256": "502422a5a1be6e2cea2e0ae206c01940b3104c6d906545d8219cdbda72a04227"
+  },
+  "HOST_RESOURCE_PREFLIGHT": {
+    "cpu_count": 80,
+    "memory_total": "375G",
+    "ulimit_n": 1000000,
+    "ulimit_u": 16000,
+    "disk_available_before_1k": "3.7G",
+    "disk_available_before_5k": "3.6G",
+    "disk_available_after_5k": "3.5G",
+    "df_type": "ext4",
+    "load_average_observed_before_1k": "10.45 10.95 11.23",
+    "residual_harness_processes_after_matrix": 0,
+    "residual_bind_leases_after_matrix": 0
+  },
+  "FROZEN_CONFIG": {
+    "pool_size": 4,
+    "route_tps": 200,
+    "tps_scope": "per_bind",
+    "configured_total_tps_ceiling": 800,
+    "window_size": 50,
+    "smoke_counts": [250, 250, 250, 250],
+    "formal_5k_counts": [1250, 1250, 1250, 1250],
+    "batch_size": 250,
+    "projection_batch_size": 512,
+    "projection_staging_mode": "vectorized",
+    "projection_status_interval_seconds": 0.1,
+    "instrumentation": "on",
+    "profile_interval_seconds": 1.0,
+    "response_delay_ms": 0,
+    "resource_profile": "PROD_8G",
+    "rss_guard_scope": "application",
+    "worker_join_timeout_seconds": 120,
+    "lifecycle_stall_diagnostic_seconds": 15
+  },
+  "FAILURE_SIGNATURE": "GLOBAL_DONE_LOCAL_STOP_UNWIRED_SPOOL_SNAPSHOT_POLL_LOOP",
+  "FAILED_WORKER_IDS": {
+    "legacy_smoke_12": [5],
+    "controlled_diagnostic_lifecycle_12_r1": [2, 5, 6, 9],
+    "legacy_smoke_24": [11, 13, 17],
+    "legacy_smoke_24_r2": [18]
+  },
+  "STUCK_PHASE": {
+    "worker_2": "RUN_UNTIL_IDLE_ENTER",
+    "worker_5": "RUN_UNTIL_IDLE_ENTER",
+    "worker_6": "SPOOL_SNAPSHOT_ENTER",
+    "worker_9": "RUN_UNTIL_IDLE_ENTER",
+    "diagnostic_run": "lifecycle-12-r1"
+  },
+  "LAST_PROGRESS_TIMESTAMP": {
+    "worker_2": "2026-10-18T20:36:46.761Z",
+    "worker_5": "2026-10-18T20:36:46.689Z",
+    "worker_6": "2026-10-18T20:36:46.816Z",
+    "worker_9": "2026-10-18T20:36:46.808Z",
+    "note": "Final heartbeat timestamp in the failed controlled run; no later phase progress was observed."
+  },
+  "STOP_EVENT_SET_AT": {
+    "diagnostic_run": "lifecycle-12-r1",
+    "utc": "2026-10-18T20:34:46.680Z",
+    "monotonic": 8974201.580127236,
+    "feeder_done": true,
+    "lightweight_pending_at_parent_signal": 0
+  },
+  "PER_WORKER_STOP_OBSERVED_AT": {
+    "measurement": "parent STOP_SIGNAL_SET to final worker PROCESS_EXIT phase_entered_monotonic; parent also verified exitcode=0",
+    "one_k_runs": {
+      "lifecycle-w8-a": {"worker_count": 8, "p50_s": 0.303, "p95_s": 0.357, "max_s": 0.358},
+      "lifecycle-12-r2": {"worker_count": 12, "p50_s": 0.278, "p95_s": 0.341, "max_s": 0.361},
+      "lifecycle-w16-a": {"worker_count": 16, "p50_s": 0.317, "p95_s": 0.375, "max_s": 0.379},
+      "lifecycle-w24-a": {"worker_count": 24, "p50_s": 0.285, "p95_s": 0.338, "max_s": 0.389},
+      "lifecycle-w24-b": {"worker_count": 24, "p50_s": 0.300, "p95_s": 0.417, "max_s": 0.516},
+      "lifecycle-w16-b": {"worker_count": 16, "p50_s": 0.285, "p95_s": 0.341, "max_s": 0.344},
+      "lifecycle-w12-b": {"worker_count": 12, "p50_s": 0.286, "p95_s": 0.329, "max_s": 0.329},
+      "lifecycle-w8-b": {"worker_count": 8, "p50_s": 0.282, "p95_s": 0.304, "max_s": 0.363}
+    },
+    "five_k_runs": {
+      "lifecycle-5k-w8-a": {"worker_count": 8, "p50_s": 0.891, "p95_s": 1.179, "max_s": 1.366},
+      "lifecycle-5k-w12-a": {"worker_count": 12, "p50_s": 1.162, "p95_s": 1.265, "max_s": 1.274},
+      "lifecycle-5k-w16-a": {"worker_count": 16, "p50_s": 1.004, "p95_s": 1.545, "max_s": 1.650},
+      "lifecycle-5k-w24-a": {"worker_count": 24, "p50_s": 1.243, "p95_s": 1.699, "max_s": 1.774},
+      "lifecycle-5k-w24-b": {"worker_count": 24, "p50_s": 1.001, "p95_s": 1.164, "max_s": 1.333},
+      "lifecycle-5k-w16-b": {"worker_count": 16, "p50_s": 0.984, "p95_s": 1.237, "max_s": 1.276},
+      "lifecycle-5k-w12-b": {"worker_count": 12, "p50_s": 1.099, "p95_s": 1.242, "max_s": 1.242},
+      "lifecycle-5k-w8-b": {"worker_count": 8, "p50_s": 0.770, "p95_s": 0.803, "max_s": 0.839}
+    }
+  },
+  "WORKER_EXITCODE": {
+    "legacy_smoke_12_worker_5": -15,
+    "controlled_diagnostic_after_join_timeout": "terminated_after_forensics",
+    "all_fixed_1k_runs": 0,
+    "all_formal_5k_runs": 0
+  },
+  "RESULT_FILE_PRESENT": {
+    "legacy_smoke_12": {"present": 11, "expected": 12, "missing": [5]},
+    "controlled_diagnostic_lifecycle_12_r1": {"present": 8, "expected": 12, "missing": [2, 5, 6, 9]},
+    "all_fixed_1k_runs": "requested workers == result files",
+    "all_formal_5k_runs": "requested workers == result files"
+  },
+  "STACK_TRACE_PATH_AND_SHA256": {
+    "failed_run_worker_9": {
+      "path": "/home/paas/mc-vnext-worker-scaling-20261018-01/runs/lifecycle-12-r1/lifecycle/worker-9-stacks.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "status": "NOT_CAPTURED"
+    },
+    "failed_run_forensics": {
+      "path": "/home/paas/mc-vnext-worker-scaling-20261018-01/runs/lifecycle-12-r1/lifecycle/join-timeout-forensics.json",
+      "sha256": "74bca220cab8b1d3a1b0c975fb993128084c98cbd50a314e57a99ec3e8671496",
+      "status": "CAPTURED"
+    },
+    "successful_runs": "faulthandler files remained zero bytes because no stall was detected"
+  },
+  "ASYNCIO_TASKS_SUMMARY": {
+    "failed_controlled_run": "NOT_CAPTURED; asyncio task dump files had zero lines",
+    "successful_runs": "no dump expected; all workers reached PROCESS_EXIT",
+    "diagnostic_gap": "No claim is made about a specific await/executor stack."
+  },
+  "THREAD_WCHAN_CPU_SAMPLES": {
+    "worker_id": 9,
+    "pid": 37073,
+    "state": "R (running)",
+    "wchan": "0",
+    "cpu_ticks": 11122,
+    "fd_count": 12,
+    "threads": [
+      {"tid": 37073, "state": "R", "wchan": "0", "cpu_ticks": 11102},
+      {"tid": 37410, "state": "S", "wchan": "futex_wait_queue_me", "cpu_ticks": 7},
+      {"tid": 41433, "state": "S", "wchan": "futex_wait_queue_me", "cpu_ticks": 11}
+    ],
+    "interpretation": "High-CPU main thread in repeated lifecycle polling; not a blocked Bind wait."
+  },
+  "BIND_SLOTS_OWNED_AND_WAITERS": {
+    "failed_controlled_run": {"bind_leases": [], "active_bind_evidence": "none at capture", "waiters": "NOT_OBSERVED"},
+    "fixed_runs": {"max_active_binds": 4, "residual_leases": 0, "configured_pool_size": 4}
+  },
+  "SPOOL_LOCAL_GLOBAL_PENDING": {
+    "failed_controlled_run": {
+      "worker_2": {"global_pending": 1, "local_pending_observed": 1},
+      "worker_5": {"global_pending": 1, "local_pending_observed": 1},
+      "worker_6": {"global_pending": 1, "local_pending_observed": 1},
+      "worker_9": {"global_pending": 1, "local_pending_observed": 1},
+      "independent_fresh_full_status_pending": 0,
+      "recovery_issues": []
+    },
+    "fixed_runs": "all final worker global_pending.records == 0"
+  },
+  "JOURNAL_DURABLE_OFFSETS": {
+    "one_k": {"journal_events": 2000, "projection_applied": 2000, "unique_rows": 2000, "backlog_bytes": 0, "offset": "EOF"},
+    "five_k": {"journal_events": 10000, "projection_applied": 10000, "unique_rows": 10000, "backlog_bytes": 0, "offset": "EOF"}
+  },
+  "ROOT_CAUSE_CONFIDENCE": {
+    "lifecycle_stop_signal_not_wired": "HIGH",
+    "transient_lightweight_snapshot_observation_as_loop_trigger": "MEDIUM-HIGH",
+    "Bind_contention_as_primary_cause": "LOW; no lease at failure capture",
+    "specific_asyncio_await_or_executor_frame": "INCONCLUSIVE; stack artifact was NOT_CAPTURED"
+  },
+  "PATCH_REASON": {
+    "chosen_fix": "Wire external stop_event to ShardWorker.stop(), use full spool.status() at shutdown, add lifecycle diagnostics, and use a global join deadline.",
+    "why_minimal": "All changes are confined to acceptance harness lifecycle/observability; no production backend/vnext path changed.",
+    "why_not_join_only": "The failed child was actively spinning for the full join window; a longer join would only delay SIGTERM and would not make the missing result file valid."
+  },
+  "SEMANTIC_INVARIANTS": [
+    "4 physical Bind slots and 200 TPS per Bind remain unchanged.",
+    "window=50 remains unchanged.",
+    "Journal durability/fsync and Projection single-writer ownership remain unchanged.",
+    "TaskSpool cursor/taken/checkpoint is never cleared or advanced by the fix.",
+    "Already-dispatched work is drained; unknown responses are not automatically redispatched.",
+    "A result file and exitcode=0 are independent required gates."
+  ],
+  "SMOKE_W8_W12_W16_W24_TWO_RUNS": {
+    "all_pass": true,
+    "workload": [250, 250, 250, 250],
+    "runs": [
+      {"id": "lifecycle-w8-a", "workers": 8, "status": "PASS", "duration_s": 14.430, "result_files": 8, "clean_exit": 8, "result_sha256": "1103c8af5460d2e38c488e7daa9550bb720ac7d04bdda8ea5881d7a133cde7b4"},
+      {"id": "lifecycle-12-r2", "workers": 12, "status": "PASS", "duration_s": 17.013, "result_files": 12, "clean_exit": 12, "result_sha256": "413f7b1d8c345df034409d6a1ec36da32d22333d5d7181d00436e590c0f70786"},
+      {"id": "lifecycle-w16-a", "workers": 16, "status": "PASS", "duration_s": 18.832, "result_files": 16, "clean_exit": 16, "result_sha256": "f50b9ec4536eea815f2768d9159d071d976d59a0d8039865213cf577e67e0d48"},
+      {"id": "lifecycle-w24-a", "workers": 24, "status": "PASS", "duration_s": 20.383, "result_files": 24, "clean_exit": 24, "result_sha256": "c63e0f14c0550be46d609b45ab6311e07335969ba12d162da499b5cfd5f3df5a"},
+      {"id": "lifecycle-w24-b", "workers": 24, "status": "PASS", "duration_s": 20.259, "result_files": 24, "clean_exit": 24, "result_sha256": "0d9e9938a76829427379f5e98429d72d9ce473b10204fb248e0c371834f4984a"},
+      {"id": "lifecycle-w16-b", "workers": 16, "status": "PASS", "duration_s": 18.868, "result_files": 16, "clean_exit": 16, "result_sha256": "22f37aaea05a972888f9252f43a99965e66a6d6a80636271b719959eea708e46"},
+      {"id": "lifecycle-w12-b", "workers": 12, "status": "PASS", "duration_s": 17.621, "result_files": 12, "clean_exit": 12, "result_sha256": "4fe0ea559bbd6db5553f33c97195d85adb44d4aa96abaec84ff81e2018a0e436"},
+      {"id": "lifecycle-w8-b", "workers": 8, "status": "PASS", "duration_s": 14.612, "result_files": 8, "clean_exit": 8, "result_sha256": "85fd316a4985341956b68a31b867aee8f1741011ceb27275c6a5e22f289509c7"}
+    ]
+  },
+  "PER_WORKER_CLEAN_EXIT": {
+    "one_k": "all successful runs: every worker final phase PROCESS_EXIT, exitcode=0, result file present",
+    "five_k": "all successful runs: every worker final phase PROCESS_EXIT, exitcode=0, result file present"
+  },
+  "SMSC_AND_DURABLE_COUNTS": {
+    "one_k": {"accepted": 1000, "socket_written_pdu": 1000, "loopback_received": 1000, "submit_sm_resp_success": 1000, "journal": 2000, "projection": 2000},
+    "five_k": {"accepted": 5000, "socket_written_pdu": 5000, "loopback_received": 5000, "submit_sm_resp_success": 5000, "journal": 10000, "projection": 10000}
+  },
+  "5K_AB_BA_STATUS_AND_RATES_OR_NOT_RUN": {
+    "status": "PASS",
+    "order_ab": ["lifecycle-5k-w8-a", "lifecycle-5k-w12-a", "lifecycle-5k-w16-a", "lifecycle-5k-w24-a"],
+    "order_ba": ["lifecycle-5k-w24-b", "lifecycle-5k-w16-b", "lifecycle-5k-w12-b", "lifecycle-5k-w8-b"],
+    "rate_definition": "stage_sampled is 5000 divided by first-to-last nonzero socket-write sample span; feed_window is producer active window; e2e is 5000 divided by result wall duration.",
+    "runs": [
+      {"id": "lifecycle-5k-w8-a", "workers": 8, "duration_s": 46.502, "stage_sampled_pdu_s": 147.52, "feed_window_pdu_s": 170.14, "e2e_pdu_s": 107.52, "app_rss_kib": 308072, "harness_rss_kib": 585580, "max_active_binds": 4, "result_sha256": "2ef68ec0dfc28954dd8580c61ccad4ae3c8346e4ef0380e3bfb1bda9d8a4e387"},
+      {"id": "lifecycle-5k-w12-a", "workers": 12, "duration_s": 45.895, "stage_sampled_pdu_s": 149.85, "feed_window_pdu_s": 172.22, "e2e_pdu_s": 108.94, "app_rss_kib": 462464, "harness_rss_kib": 732152, "max_active_binds": 4, "result_sha256": "6645ede4b6cc45ab692d6378992acb0df18e9664bbee22cc314ede697bb818df"},
+      {"id": "lifecycle-5k-w16-a", "workers": 16, "duration_s": 50.480, "stage_sampled_pdu_s": 133.02, "feed_window_pdu_s": 172.62, "e2e_pdu_s": 99.05, "app_rss_kib": 615216, "harness_rss_kib": 896312, "max_active_binds": 4, "result_sha256": "25e51e59bd25a56d6356d5b95f6d2919cf0b32370fb3ad3b348eb5f2530175e1"},
+      {"id": "lifecycle-5k-w24-a", "workers": 24, "duration_s": 54.867, "stage_sampled_pdu_s": 127.56, "feed_window_pdu_s": 172.92, "e2e_pdu_s": 91.13, "app_rss_kib": 915080, "harness_rss_kib": 1191656, "max_active_binds": 4, "result_sha256": "d4aa9695cfdb5289bcb33606336f86c6cb0bbd4db3ccd4033773691e78942fa1"},
+      {"id": "lifecycle-5k-w24-b", "workers": 24, "duration_s": 55.661, "stage_sampled_pdu_s": 116.23, "feed_window_pdu_s": 173.79, "e2e_pdu_s": 89.83, "app_rss_kib": 917532, "harness_rss_kib": 1183632, "max_active_binds": 4, "result_sha256": "ced289c2019726e2b77b8bd681c59a3200f5004ea96449039ab05d648e20495f"},
+      {"id": "lifecycle-5k-w16-b", "workers": 16, "duration_s": 50.933, "stage_sampled_pdu_s": 130.15, "feed_window_pdu_s": 173.47, "e2e_pdu_s": 98.17, "app_rss_kib": 617156, "harness_rss_kib": 892840, "max_active_binds": 4, "result_sha256": "f0a45c671c72c1081fc8288dc59aca06513e5badb52394fa59c750e14aa2ba01"},
+      {"id": "lifecycle-5k-w12-b", "workers": 12, "duration_s": 45.998, "stage_sampled_pdu_s": 149.48, "feed_window_pdu_s": 172.11, "e2e_pdu_s": 108.70, "app_rss_kib": 461608, "harness_rss_kib": 738692, "max_active_binds": 4, "result_sha256": "f996df70f15aa387681d2ae77174e03c2a9690a21962c1a17de4dc660be70b7f"},
+      {"id": "lifecycle-5k-w8-b", "workers": 8, "duration_s": 44.189, "stage_sampled_pdu_s": 158.61, "feed_window_pdu_s": 163.77, "e2e_pdu_s": 113.15, "app_rss_kib": 307828, "harness_rss_kib": 579908, "max_active_binds": 4, "result_sha256": "bb06b61c304af794a272b57d24ab2f7d5e94f81a8c69308d12ffd8f797616d62"}
+    ],
+    "two_run_medians": {
+      "8": {"stage_sampled_pdu_s": 153.07, "feed_window_pdu_s": 166.96, "e2e_pdu_s": 110.34},
+      "12": {"stage_sampled_pdu_s": 149.67, "feed_window_pdu_s": 172.17, "e2e_pdu_s": 108.82},
+      "16": {"stage_sampled_pdu_s": 131.59, "feed_window_pdu_s": 173.05, "e2e_pdu_s": 98.61},
+      "24": {"stage_sampled_pdu_s": 121.90, "feed_window_pdu_s": 173.36, "e2e_pdu_s": 90.48}
+    },
+    "24_vs_8_median_delta_percent": {
+      "stage_sampled_pdu_s": -20.4,
+      "feed_window_pdu_s": 3.8,
+      "e2e_pdu_s": -18.0
+    }
+  },
+  "50K_STATUS_OR_NOT_RUN": "NOT_RUN; optional follow-on capacity test, not required after no scaling benefit and no production authorization.",
+  "DUPLICATE_UNKNOWN_REDISPATCH": {
+    "one_k": {"duplicate": 0, "unknown": 0, "write_failed": 0, "redispatch": 0},
+    "five_k": {"duplicate": 0, "unknown": 0, "write_failed": 0, "redispatch": 0}
+  },
+  "T6": "No T6 production-path change; existing backend regression suite passed.",
+  "T7_CURRENT_6_OF_6": "No T7 production-path change; existing backend regression suite passed; this task did not invent or claim additional T7 cases.",
+  "TEST_RESULTS": {
+    "targeted_lifecycle_worker_transport": "35 passed in 3.40s",
+    "backend_tests": "447 passed, 5 skipped, 4 warnings",
+    "py_compile": "PASS",
+    "git_diff_check": "PASS",
+    "json_validation": "PASS"
+  },
+  "PRODUCTION_DEFAULT_CHANGED": false,
+  "PRODUCT_CODE_CHANGED": false,
+  "COMMIT_PUSH": "NOT_REQUESTED",
+  "FINAL_DECISION": "WORKER_LIFECYCLE_FIXED_NO_SCALING_BENEFIT",
+  "CANARY_READY": "NO",
+  "REPORT_PATHS": [
+    "Docs/Marketing_Copilot_VNext_Worker_Shutdown_Lifecycle_RCA.md",
+    "Docs/Marketing_Copilot_VNext_Worker_Clean_Exit_and_Scaling_Decision.md",
+    "Docs/Marketing_Copilot_VNext_Worker_Lifecycle_Closure_Evidence.json"
+  ]
+}

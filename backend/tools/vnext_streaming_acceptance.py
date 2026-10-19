@@ -11,15 +11,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import faulthandler
 import json
 import multiprocessing
 import os
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
+import traceback
 
 
 RESOURCE_PROFILE_RSS_KIB = {
@@ -34,6 +39,8 @@ RESOURCE_PROFILE_RSS_KIB = {
 SUPPORTED_WORKER_COUNTS = (8, 12, 16, 24)
 MAX_WORKERS = max(SUPPORTED_WORKER_COUNTS)
 WORKER_JOIN_TIMEOUT_SECONDS = 120.0
+LIFECYCLE_HEARTBEAT_SECONDS = 1.0
+LIFECYCLE_STALL_DIAGNOSTIC_SECONDS = 15.0
 
 
 def _validate_worker_count(value: object) -> int:
@@ -65,6 +72,297 @@ def _worker_bind_target(pool_size: int, worker_count: int) -> int:
 
     workers = max(1, int(worker_count))
     return max(1, (int(pool_size) + workers - 1) // workers)
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _pid_start_time(pid: int | None = None) -> int | float | None:
+    """Return a process start marker suitable for same-run PID correlation."""
+
+    observed = int(pid or os.getpid())
+    proc_stat = Path(f"/proc/{observed}/stat")
+    try:
+        text = proc_stat.read_text(encoding="ascii")
+        closing = text.rfind(")")
+        fields = text[closing + 2:].split()
+        if len(fields) > 19:
+            return int(fields[19])
+    except (OSError, UnicodeError, ValueError, IndexError):
+        pass
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.Process(observed).create_time())
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _atomic_json_write(path: Path, value: dict) -> None:
+    """Write bounded diagnostics without adding fsync to the hot path."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _append_jsonl(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        handle.write("\n")
+        handle.flush()
+
+
+class _WorkerLifecycle:
+    """Low-overhead worker heartbeat and bounded stall evidence.
+
+    This is intentionally local to the acceptance harness.  It records phase
+    transitions and a once-per-second heartbeat without changing spool,
+    journal, bind, or response semantics.  A watchdog thread can still dump
+    Python frames when the event loop is stuck in an await or executor call.
+    """
+
+    def __init__(self, worker_id: int, partitions: tuple[int, ...], root: str):
+        self.worker_id = int(worker_id)
+        self.partitions = tuple(int(item) for item in partitions)
+        self.root = Path(root).resolve() if root else None
+        self.path = self.root / f"worker-{self.worker_id}.json" if self.root else None
+        self.stack_path = self.root / f"worker-{self.worker_id}-stacks.log" if self.root else None
+        self.asyncio_path = self.root / f"worker-{self.worker_id}-asyncio.jsonl" if self.root else None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._loop = None
+        self._stop_event = None
+        self._feeder_done = None
+        self._fault_handle = None
+        self._watchdog: threading.Thread | None = None
+        self._last_stall_dump = 0.0
+        self._last_snapshot_progress: tuple | None = None
+        self._state = {
+            "schema_version": 1,
+            "worker_id": self.worker_id,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "pid_start_time": _pid_start_time(),
+            "phase": "BOOT",
+            "phase_entered_monotonic": time.monotonic(),
+            "last_progress_monotonic": time.monotonic(),
+            "loop_pass_count": 0,
+            "stop_event_is_set": False,
+            "feeder_done_is_set": False,
+            "partitions": list(self.partitions),
+            "local_processed": {},
+            "local_inflight": 0,
+            "global_pending": {"scope": "all_workers", "records": None},
+            "active_bind_leases": 0,
+            "response_pending": 0,
+            "journal_durable_count": 0,
+            "updated_utc": _utc_timestamp(),
+            "updated_monotonic": time.monotonic(),
+            "last_progress_detail": "BOOT",
+        }
+        if self.root:
+            self.root.mkdir(parents=True, exist_ok=True)
+            try:
+                handle = self.stack_path.open("w", encoding="utf-8")
+                faulthandler.enable(handle, all_threads=True)
+                self._fault_handle = handle
+                self._state["faulthandler_path"] = str(self.stack_path)
+                self._state["faulthandler_enabled"] = bool(faulthandler.is_enabled())
+            except (OSError, ValueError):
+                self._state["faulthandler_path"] = ""
+                self._state["faulthandler_enabled"] = False
+            self._write()
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop,
+                name=f"mc-vnext-lifecycle-{self.worker_id}",
+                daemon=True,
+            )
+            self._watchdog.start()
+
+    def attach_loop(self, loop) -> None:
+        self._loop = loop
+
+    def attach_events(self, *, stop_event, feeder_done) -> None:
+        self._stop_event = stop_event
+        self._feeder_done = feeder_done
+
+    def _write(self) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            value = dict(self._state)
+        try:
+            _atomic_json_write(self.path, value)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def update(self, phase: str | None = None, *, progress: bool = True, detail: str = "", **fields) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if phase and phase != self._state.get("phase"):
+                self._state["phase"] = str(phase)
+                self._state["phase_entered_monotonic"] = now
+            if progress:
+                self._state["last_progress_monotonic"] = now
+                self._last_stall_dump = 0.0
+            if detail:
+                self._state["last_progress_detail"] = str(detail)
+            self._state.update(fields)
+            self._state["stop_event_is_set"] = bool(self._state.get("stop_event_is_set", False))
+            self._state["updated_utc"] = _utc_timestamp()
+            self._state["updated_monotonic"] = now
+        if phase or progress or fields:
+            self._write()
+
+    def set_events(self, *, stop_event, feeder_done) -> None:
+        self.update(
+            progress=False,
+            stop_event_is_set=bool(stop_event.is_set()),
+            feeder_done_is_set=bool(feeder_done.is_set()),
+        )
+
+    def record_worker_snapshot(self, worker, *, global_pending: int | None = None) -> None:
+        try:
+            snapshot = worker.snapshot()
+            counters = dict(snapshot.get("counters") or {})
+            transports = list(snapshot.get("transports") or [])
+            active_binds = sum(1 for item in transports if item.get("bind_slot") is not None)
+            response_pending = sum(int(item.get("window_inflight", 0) or 0) for item in transports)
+            snapshot_progress = (
+                int(counters.get("task_taken", 0) or 0),
+                int(counters.get("socket_written", 0) or 0),
+                int(counters.get("response_success", 0) or 0),
+                int(counters.get("write_failed", 0) or 0),
+                int(snapshot.get("inflight", 0) or 0),
+                response_pending,
+            )
+            changed = snapshot_progress != self._last_snapshot_progress
+            self._last_snapshot_progress = snapshot_progress
+            self.update(
+                progress=changed,
+                local_processed={
+                    "task_taken": int(counters.get("task_taken", 0) or 0),
+                    "socket_written": int(counters.get("socket_written", 0) or 0),
+                    "response_success": int(counters.get("response_success", 0) or 0),
+                    "write_failed": int(counters.get("write_failed", 0) or 0),
+                },
+                local_inflight=int(snapshot.get("inflight", 0) or 0),
+                active_bind_leases=active_binds,
+                response_pending=response_pending,
+                journal_durable_count=int(counters.get("journal_events_durable", 0) or 0),
+                **({"global_pending": {"scope": "all_workers", "records": int(global_pending)}}
+                   if global_pending is not None else {}),
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            self.update(progress=False, detail=f"snapshot_error:{type(exc).__name__}:{exc}")
+
+    def _capture_asyncio_tasks(self) -> None:
+        if self.asyncio_path is None:
+            return
+        tasks = []
+        try:
+            loop = asyncio.get_running_loop()
+            for task in sorted(asyncio.all_tasks(loop), key=lambda item: str(item.get_name())):
+                frames = []
+                for frame in task.get_stack(limit=12):
+                    frames.append({
+                        "file": str(frame.f_code.co_filename),
+                        "line": int(frame.f_lineno),
+                        "function": str(frame.f_code.co_name),
+                    })
+                tasks.append({
+                    "name": str(task.get_name()),
+                    "done": bool(task.done()),
+                    "cancelled": bool(task.cancelled()),
+                    "coro": repr(task.get_coro()),
+                    "stack": frames,
+                })
+            _append_jsonl(self.asyncio_path, {
+                "captured_utc": _utc_timestamp(),
+                "captured_monotonic": time.monotonic(),
+                "worker_id": self.worker_id,
+                "tasks": tasks,
+            })
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+
+    def _dump_stall(self, phase: str, stalled_seconds: float) -> None:
+        now = time.monotonic()
+        if now - self._last_stall_dump < LIFECYCLE_STALL_DIAGNOSTIC_SECONDS:
+            return
+        self._last_stall_dump = now
+        if self.stack_path is not None:
+            try:
+                with self.stack_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"\n--- lifecycle stall phase={phase} seconds={stalled_seconds:.3f} "
+                        f"utc={_utc_timestamp()} ---\n"
+                    )
+                    faulthandler.dump_traceback(file=handle, all_threads=True)
+                    frames = sys._current_frames()
+                    for thread in threading.enumerate():
+                        frame = frames.get(thread.ident)
+                        handle.write(f"THREAD name={thread.name!r} ident={thread.ident!r} daemon={thread.daemon!r}\n")
+                        if frame is not None:
+                            handle.write("".join(traceback.format_stack(frame)))
+            except (OSError, ValueError):
+                pass
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._capture_asyncio_tasks)
+            except RuntimeError:
+                pass
+        self.update(
+            progress=False,
+            detail=f"stall_diagnostic:{phase}:{stalled_seconds:.3f}s",
+            last_stall_diagnostic_utc=_utc_timestamp(),
+            last_stall_diagnostic_monotonic=now,
+        )
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop.wait(LIFECYCLE_HEARTBEAT_SECONDS):
+            with self._lock:
+                phase = str(self._state.get("phase") or "")
+                last_progress = float(self._state.get("last_progress_monotonic") or 0.0)
+                stalled = max(0.0, time.monotonic() - last_progress)
+                if self._stop_event is not None:
+                    self._state["stop_event_is_set"] = bool(self._stop_event.is_set())
+                if self._feeder_done is not None:
+                    self._state["feeder_done_is_set"] = bool(self._feeder_done.is_set())
+                self._state["updated_utc"] = _utc_timestamp()
+                self._state["updated_monotonic"] = time.monotonic()
+            self._write()
+            if phase and stalled >= LIFECYCLE_STALL_DIAGNOSTIC_SECONDS:
+                self._dump_stall(phase, stalled)
+
+    def close(self, *, phase: str = "PROCESS_EXIT") -> None:
+        self.update(phase, progress=True)
+        self._stop.set()
+        if self._watchdog and self._watchdog is not threading.current_thread():
+            self._watchdog.join(timeout=2.0)
+        if self._fault_handle is not None:
+            try:
+                faulthandler.disable()
+                self._fault_handle.flush()
+                self._fault_handle.close()
+            except (OSError, ValueError):
+                pass
+            self._fault_handle = None
+        self._write()
 
 
 def _partition_assignment_evidence(partition_map, worker_count: int) -> dict:
@@ -256,6 +554,148 @@ def _read_proc_rows() -> tuple[dict[int, dict], dict]:
         "status_rss_mismatches": status_mismatches,
         "read_errors": read_errors,
     }
+
+
+def _read_proc_details(pids: list[int]) -> list[dict]:
+    """Capture bounded OS wait evidence for a suspected stuck process tree."""
+
+    details = []
+    for raw_pid in sorted({int(pid) for pid in pids if int(pid) > 0}):
+        root = Path(f"/proc/{raw_pid}")
+        item = {"pid": raw_pid}
+        try:
+            stat_text = (root / "stat").read_text(encoding="ascii")
+            closing = stat_text.rfind(")")
+            fields = stat_text[closing + 2:].split()
+            item.update({
+                "state": str(fields[0]),
+                "ppid": int(fields[1]),
+                "cpu_ticks": int(fields[11]) + int(fields[12]),
+                "pid_start_time": int(fields[19]),
+            })
+        except (OSError, UnicodeError, ValueError, IndexError):
+            item["stat_error"] = True
+        try:
+            item["wchan"] = (root / "wchan").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            item["wchan"] = "NOT_CAPTURED"
+        try:
+            status = (root / "status").read_text(encoding="ascii")
+            for line in status.splitlines():
+                if line.startswith(("Name:", "State:", "Threads:", "VmRSS:")):
+                    key, _, value = line.partition(":")
+                    item[key.lower()] = value.strip()
+        except (OSError, UnicodeError):
+            item["status_error"] = True
+        try:
+            item["fd_count"] = len(list((root / "fd").iterdir()))
+        except OSError:
+            item["fd_count"] = None
+        threads = []
+        try:
+            thread_root = root / "task"
+            for thread_path in sorted(thread_root.iterdir(), key=lambda value: value.name)[:256]:
+                thread_item = {"tid": int(thread_path.name)}
+                try:
+                    thread_stat = (thread_path / "stat").read_text(encoding="ascii")
+                    closing = thread_stat.rfind(")")
+                    fields = thread_stat[closing + 2:].split()
+                    thread_item.update({
+                        "state": str(fields[0]),
+                        "cpu_ticks": int(fields[11]) + int(fields[12]),
+                    })
+                except (OSError, UnicodeError, ValueError, IndexError):
+                    thread_item["stat_error"] = True
+                try:
+                    thread_item["wchan"] = (thread_path / "wchan").read_text(encoding="ascii").strip()
+                except (OSError, UnicodeError):
+                    thread_item["wchan"] = "NOT_CAPTURED"
+                threads.append(thread_item)
+        except OSError:
+            pass
+        item["threads"] = threads
+        details.append(item)
+    return details
+
+
+def _bind_lease_evidence(root: Path) -> list[dict]:
+    """Read bind lease metadata while redacting the lease token."""
+
+    values = []
+    if not root.exists():
+        return values
+    for path in sorted(root.glob("route-*-bind-*.lease")):
+        value = {"path": str(path), "exists": True}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            value.update({
+                "route_id": str(payload.get("route_id", "")),
+                "slot": int(payload.get("slot", 0) or 0),
+                "pid": int(payload.get("pid", 0) or 0),
+                "created_at": float(payload.get("created_at", 0.0) or 0.0),
+                "age_seconds": round(max(0.0, time.time() - float(payload.get("created_at", time.time()))), 3),
+            })
+        except (OSError, ValueError, TypeError):
+            value["read_error"] = True
+        values.append(value)
+    return values
+
+
+def _parent_lifecycle_event(path: Path | None, event: str, **fields) -> None:
+    if path is None:
+        return
+    payload = {
+        "schema_version": 1,
+        "event": str(event),
+        "utc": _utc_timestamp(),
+        "monotonic": time.monotonic(),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+    }
+    payload.update(fields)
+    try:
+        _append_jsonl(path, payload)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _capture_join_forensics(
+    *, run_root: Path, lifecycle_root: Path, credits_root: Path,
+    processes: list[multiprocessing.Process], reason: str,
+) -> Path | None:
+    """Persist same-run child state, OS wait data, and bind leases."""
+
+    pids = [int(process.pid or 0) for process in processes if process.is_alive()]
+    states = []
+    for process in processes:
+        path = lifecycle_root / f"worker-{processes.index(process)}.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            value = {"path": str(path), "state_missing": True}
+        value.update({
+            "worker_id": processes.index(process),
+            "parent_pid": os.getpid(),
+            "exitcode_at_capture": process.exitcode,
+            "alive_at_capture": bool(process.is_alive()),
+        })
+        states.append(value)
+    evidence = {
+        "schema_version": 1,
+        "captured_utc": _utc_timestamp(),
+        "captured_monotonic": time.monotonic(),
+        "reason": str(reason),
+        "run_root": str(run_root),
+        "processes": states,
+        "proc_details": _read_proc_details(pids),
+        "bind_leases": _bind_lease_evidence(credits_root),
+    }
+    path = lifecycle_root / "join-timeout-forensics.json"
+    try:
+        _atomic_json_write(path, evidence)
+        return path
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _read_ps_rows(pids: list[int] | None = None) -> tuple[dict[int, dict], dict]:
@@ -851,76 +1291,170 @@ def _worker_process(
     stop_event,
     profile_root: str = "",
     profile_interval_seconds: float = 1.0,
+    lifecycle_root: str = "",
 ) -> None:
-    _install_source(source_root)
-    from vnext.critical_path_profiler import CriticalPathProfiler
-    from vnext.projection_writer import ProgressJournal
-    from vnext.route_credits import RouteCreditBroker
-    from vnext.spool import TaskSpool
-    from vnext.worker import ShardWorker
+    lifecycle = _WorkerLifecycle(worker_id, tuple(partitions), lifecycle_root)
+    lifecycle.attach_events(stop_event=stop_event, feeder_done=feeder_done)
+    worker = None
+    profiler = None
+    result = None
+    try:
+        lifecycle.update(
+            "BOOT",
+            detail="worker_process_started",
+            stop_event_is_set=bool(stop_event.is_set()),
+            feeder_done_is_set=bool(feeder_done.is_set()),
+        )
+        _install_source(source_root)
+        from vnext.critical_path_profiler import CriticalPathProfiler
+        from vnext.projection_writer import ProgressJournal
+        from vnext.route_credits import RouteCreditBroker
+        from vnext.spool import TaskSpool
+        from vnext.worker import ShardWorker
 
-    spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
-    credits = RouteCreditBroker(credits_root)
-    profiler = CriticalPathProfiler(
-        profile_root,
-        f"worker-{int(worker_id)}",
-        interval_seconds=profile_interval_seconds,
-    )
-    journal = ProgressJournal(journal_path, profiler=profiler)
-    worker_route_config = dict(route_config)
-    worker_route_config["_worker_bind_target"] = _worker_bind_target(
-        route_config.get("pool_size", 1), worker_count
-    )
-    worker = ShardWorker(
-        worker_id,
-        tuple(partitions),
-        spool,
-        {str(route_config["route_id"]): worker_route_config},
-        credits=credits,
-        progress_sink=journal.append,
-        max_inflight=128,
-        prefetch_per_partition=64,
-        profiler=profiler,
-    )
-    last_transport_snapshots: list[dict] = []
+        lifecycle.update("SPOOL_INIT", detail="imports_ready")
+        spool = TaskSpool(spool_root, virtual_partition_count=256, max_bytes=512 * 1024 * 1024)
+        credits = RouteCreditBroker(credits_root)
+        profiler = CriticalPathProfiler(
+            profile_root,
+            f"worker-{int(worker_id)}",
+            interval_seconds=profile_interval_seconds,
+        )
+        journal = ProgressJournal(journal_path, profiler=profiler)
+        worker_route_config = dict(route_config)
+        worker_route_config["_worker_bind_target"] = _worker_bind_target(
+            route_config.get("pool_size", 1), worker_count
+        )
+        worker = ShardWorker(
+            worker_id,
+            tuple(partitions),
+            spool,
+            {str(route_config["route_id"]): worker_route_config},
+            credits=credits,
+            progress_sink=journal.append,
+            max_inflight=128,
+            prefetch_per_partition=64,
+            profiler=profiler,
+        )
+        lifecycle.update("SPOOL_INIT", detail="worker_ready", local_inflight=0)
+        last_transport_snapshots: list[dict] = []
 
-    async def loop() -> None:
-        nonlocal last_transport_snapshots
-        while True:
-            # Each pass may become idle while another worker still owns the
-            # bounded physical bind pool.  Release the leases at the pass
-            # boundary so a worker with newly admitted partitions cannot be
-            # starved behind an idle worker.  The production runtime uses the
-            # same bounded lifecycle; this is not a quota bypass.
-            await worker.run_until_idle(close_transports=False)
-            await _drain_transport_responses(worker)
-            last_transport_snapshots = [
-                dict(item) for item in worker.snapshot().get("transports", [])
-            ]
-            await worker.close_transports()
-            _release_completed_worker_caches(spool, worker)
-            # The feeder/worker idle loop must not rebuild every segment index.
-            # Full status is reserved for the final reconciliation boundary.
-            status = spool.lightweight_snapshot()
-            if stop_event.is_set() and int(status.get("pending_records", 0) or 0) == 0:
-                break
-            await asyncio.sleep(0.02)
-        # Capture the final transport snapshot before close_transports() clears
-        # the live bind objects.  The result is acceptance evidence, not a
-        # live handle, so retaining this immutable snapshot does not change
-        # the worker lifecycle or production dispatch semantics.
-        result = worker.snapshot()
-        result["transports"] = last_transport_snapshots
-        await worker.close_transports()
-        return result
+        async def loop() -> dict:
+            nonlocal last_transport_snapshots
+            lifecycle.attach_loop(asyncio.get_running_loop())
+            loop_pass_count = 0
+            stop_requested = False
+            while True:
+                loop_pass_count += 1
+                if stop_event.is_set() and not stop_requested:
+                    # The parent sets this only after producer, SMPP response,
+                    # Journal EOF, and Projection catch-up are complete.  Wire
+                    # the external lifecycle signal into the worker's own
+                    # cancellation boundary so a stale lightweight spool
+                    # observation cannot make run_until_idle spin forever.
+                    worker.stop()
+                    stop_requested = True
+                    lifecycle.update("STOP_EVENT_OBSERVED", progress=False, detail="worker_stop_requested")
+                lifecycle.update(
+                    "RUN_UNTIL_IDLE_ENTER",
+                    progress=False,
+                    detail=f"pass={loop_pass_count}",
+                    loop_pass_count=loop_pass_count,
+                    stop_event_is_set=bool(stop_event.is_set()),
+                    feeder_done_is_set=bool(feeder_done.is_set()),
+                )
+                lifecycle.record_worker_snapshot(worker)
+                # Each pass may become idle while another worker still owns
+                # the bounded physical bind pool.  Release the leases at the
+                # pass boundary so a worker with newly admitted partitions
+                # cannot be starved behind an idle worker.
+                await worker.run_until_idle(close_transports=False)
+                lifecycle.update("RUN_UNTIL_IDLE_EXIT", progress=False, detail=f"pass={loop_pass_count}")
+                lifecycle.record_worker_snapshot(worker)
+                lifecycle.update("DRAIN_RESPONSES_ENTER", progress=False)
+                await _drain_transport_responses(worker)
+                lifecycle.update("DRAIN_RESPONSES_EXIT", progress=False)
+                lifecycle.record_worker_snapshot(worker)
+                last_transport_snapshots = [
+                    dict(item) for item in worker.snapshot().get("transports", [])
+                ]
+                lifecycle.update("CLOSE_TRANSPORT_ENTER", progress=False)
+                await worker.close_transports()
+                lifecycle.update("CLOSE_TRANSPORT_EXIT", progress=False)
+                _release_completed_worker_caches(spool, worker)
+                lifecycle.update("SPOOL_SNAPSHOT_ENTER", progress=False)
+                # A final shutdown check must reload all cursor/taken files.
+                # The lightweight path is deliberately retained for the hot
+                # feeder loop, but it is not authoritative at the lifecycle
+                # boundary when another process may have just atomically
+                # replaced a cursor file.
+                status = spool.status() if stop_event.is_set() else spool.lightweight_snapshot()
+                lifecycle.update(
+                    "SPOOL_SNAPSHOT_EXIT",
+                    progress=False,
+                    pending_records=int(status.get("pending_records", 0) or 0),
+                    global_pending={
+                        "scope": "all_workers",
+                        "records": int(status.get("pending_records", 0) or 0),
+                    },
+                    pending_by_partition={
+                        str(key): int(value)
+                        for key, value in (status.get("pending_by_partition") or {}).items()
+                        if int(value or 0) != 0
+                    },
+                )
+                lifecycle.set_events(stop_event=stop_event, feeder_done=feeder_done)
+                if stop_event.is_set():
+                    lifecycle.update("STOP_EVENT_OBSERVED", progress=False, detail="parent_stop_event_set")
+                if stop_event.is_set() and int(status.get("pending_records", 0) or 0) == 0:
+                    break
+                if stop_requested and int(status.get("pending_records", 0) or 0) > 0:
+                    lifecycle.update(
+                        "SHUTDOWN_BLOCKED",
+                        progress=False,
+                        detail="durable spool still has pending records after stop",
+                    )
+                await asyncio.sleep(0.02)
+            lifecycle.update("FINAL_SNAPSHOT", detail="all_worker_work_and_responses_drained")
+            result = worker.snapshot()
+            result["transports"] = last_transport_snapshots
+            lifecycle.record_worker_snapshot(worker)
+            return result
 
-    result = asyncio.run(loop())
-    profiler.publish(force=True)
-    result["process_pid"] = os.getpid()
-    result["process_role"] = "stream-worker"
-    if profiler.enabled:
-        result["critical_path"] = profiler.snapshot()
-    Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+        result = asyncio.run(loop())
+        lifecycle.update("ASYNCIO_RUN_RETURNED")
+    except Exception as exc:  # pragma: no cover - exercised by integration runs
+        lifecycle.update(
+            "WORKER_EXCEPTION",
+            detail=f"{type(exc).__name__}:{exc}",
+            worker_exception=f"{type(exc).__name__}: {exc}",
+        )
+        result = {
+            "worker_id": int(worker_id),
+            "partitions": list(partitions),
+            "process_pid": os.getpid(),
+            "process_role": "stream-worker",
+            "worker_exception": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if profiler is not None:
+            profiler.publish(force=True)
+            if result is not None and profiler.enabled:
+                result["critical_path"] = profiler.snapshot()
+        if result is not None:
+            result["process_pid"] = os.getpid()
+            result["process_role"] = "stream-worker"
+            try:
+                lifecycle.update("RESULT_FILE_WRITING", detail="atomic_result_write_start")
+                Path(result_path).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+                lifecycle.update("RESULT_FILE_WRITTEN", detail="result_file_write_complete")
+            except (OSError, TypeError, ValueError) as exc:
+                lifecycle.update(
+                    "RESULT_FILE_WRITE_FAILED",
+                    detail=f"{type(exc).__name__}:{exc}",
+                    result_file_error=f"{type(exc).__name__}: {exc}",
+                )
+        lifecycle.close()
 
 
 def _sample(
@@ -1240,6 +1774,16 @@ async def run(args: argparse.Namespace) -> dict:
 
     run_root = Path(args.run_root).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
+    lifecycle_root = run_root / "lifecycle"
+    lifecycle_root.mkdir(parents=True, exist_ok=True)
+    parent_lifecycle_path = lifecycle_root / "parent.jsonl"
+    _parent_lifecycle_event(
+        parent_lifecycle_path,
+        "PARENT_START",
+        source_root=str(Path(args.source_root).resolve()),
+        requested_workers=int(args.workers),
+        worker_join_timeout_seconds=WORKER_JOIN_TIMEOUT_SECONDS,
+    )
     profile_root = Path(args.profile_root).resolve() if args.profile_root else None
     if profile_root:
         profile_root.mkdir(parents=True, exist_ok=True)
@@ -1330,6 +1874,7 @@ async def run(args: argparse.Namespace) -> dict:
                 stop_event,
                 str(args.profile_root) if args.profile_root else "",
                 args.profile_interval,
+                str(lifecycle_root),
             ),
             name=f"mc-vnext-stream-worker-{worker_id}",
             daemon=True,
@@ -1356,6 +1901,11 @@ async def run(args: argparse.Namespace) -> dict:
     projection_drain_deadline = None
     completion_detection_lag_ms = None
     completion_status_age_ms = None
+    producer_done_recorded = False
+    all_pdus_responded_recorded = False
+    journal_eof_recorded = False
+    projection_caught_up_recorded = False
+    join_forensics_path = None
     completion_evidence = {
         "state": "INCOMPLETE",
         "complete": False,
@@ -1471,6 +2021,15 @@ async def run(args: argparse.Namespace) -> dict:
                 await feed_task
                 if feed_stopped_at is None:
                     feed_stopped_at = time.monotonic()
+                    if not producer_done_recorded:
+                        _parent_lifecycle_event(
+                            parent_lifecycle_path,
+                            "PRODUCER_DONE",
+                            feeder_done=bool(feeder_done.is_set()),
+                            generated_tasks=sum(int(value) for value in feed_stats.values()
+                                                if isinstance(value, int)),
+                        )
+                        producer_done_recorded = True
                     projection_drain_deadline = (
                         feed_stopped_at + max(1.0, float(args.projection_drain_timeout))
                     )
@@ -1482,10 +2041,26 @@ async def run(args: argparse.Namespace) -> dict:
                         and smsc.response_success == smsc.total_received
                     ):
                         smpp_drained_at = time.monotonic()
+                        if not all_pdus_responded_recorded:
+                            _parent_lifecycle_event(
+                                parent_lifecycle_path,
+                                "ALL_PDUS_RESPONDED",
+                                smpp_received=int(smsc.total_received),
+                                response_success=int(smsc.response_success),
+                            )
+                            all_pdus_responded_recorded = True
                     completion_evidence = _projection_completion_evidence(
                         projection, journal_paths,
                         max_status_age_seconds=max(2.0, args.sample_interval * 3.0),
                     )
+                    if completion_evidence.get("durable") and not journal_eof_recorded:
+                        _parent_lifecycle_event(
+                            parent_lifecycle_path,
+                            "JOURNAL_EOF",
+                            journal_paths_count=len(journal_paths),
+                            completion_evidence=dict(completion_evidence),
+                        )
+                        journal_eof_recorded = True
                     if completion_evidence.get("complete"):
                         if projection_caught_up_at is None:
                             projection_caught_up_at = time.monotonic()
@@ -1496,6 +2071,13 @@ async def run(args: argparse.Namespace) -> dict:
                                     max(0.0, time.time() - float(durable_mtime)) * 1000.0,
                                     3,
                                 )
+                            if not projection_caught_up_recorded:
+                                _parent_lifecycle_event(
+                                    parent_lifecycle_path,
+                                    "PROJECTION_CAUGHT_UP",
+                                    completion_evidence=dict(completion_evidence),
+                                )
+                                projection_caught_up_recorded = True
                         elif time.monotonic() - projection_caught_up_at >= 0.5:
                             break
                     else:
@@ -1513,14 +2095,66 @@ async def run(args: argparse.Namespace) -> dict:
         if not feed_task.done():
             feed_task.cancel()
             feeder_done.set()
-        if guard_reason:
-            stop_event.set()
-        else:
-            stop_event.set()
-        for process in processes:
-            await asyncio.to_thread(process.join, WORKER_JOIN_TIMEOUT_SECONDS)
+        stop_event.set()
+        _parent_lifecycle_event(
+            parent_lifecycle_path,
+            "STOP_SIGNAL_SET",
+            guard_reason=str(guard_reason),
+            feeder_done=bool(feeder_done.is_set()),
+            pending_records=int(spool.lightweight_snapshot().get("pending_records", 0) or 0),
+        )
+        join_deadline = time.monotonic() + WORKER_JOIN_TIMEOUT_SECONDS
+        join_started = {int(process.pid or 0): time.monotonic() for process in processes}
+        for index, process in enumerate(processes):
+            _parent_lifecycle_event(
+                parent_lifecycle_path,
+                "JOIN_START",
+                worker_id=index,
+                pid=int(process.pid or 0),
+                pid_start_time=_pid_start_time(process.pid),
+            )
+        next_join_sample = 0.0
+        while any(process.is_alive() for process in processes) and time.monotonic() < join_deadline:
+            now = time.monotonic()
+            if now >= next_join_sample:
+                alive = [process for process in processes if process.is_alive()]
+                _parent_lifecycle_event(
+                    parent_lifecycle_path,
+                    "JOIN_HEARTBEAT",
+                    alive_worker_ids=[index for index, process in enumerate(processes) if process.is_alive()],
+                    elapsed_seconds=round(now - min(join_started.values(), default=now), 3),
+                )
+                next_join_sample = now + LIFECYCLE_HEARTBEAT_SECONDS
+            for process in processes:
+                process.join(timeout=0)
+            await asyncio.sleep(0.2)
+        for index, process in enumerate(processes):
+            process.join(timeout=0)
+            _parent_lifecycle_event(
+                parent_lifecycle_path,
+                "JOIN_END",
+                worker_id=index,
+                pid=int(process.pid or 0),
+                exitcode=process.exitcode,
+                alive=bool(process.is_alive()),
+                elapsed_seconds=round(max(0.0, time.monotonic() - join_started.get(int(process.pid or 0), time.monotonic())), 3),
+            )
         for process in processes:
             if process.is_alive():
+                join_forensics_path = _capture_join_forensics(
+                    run_root=run_root,
+                    lifecycle_root=lifecycle_root,
+                    credits_root=credits_root,
+                    processes=processes,
+                    reason="worker_join_deadline_exceeded",
+                )
+                _parent_lifecycle_event(
+                    parent_lifecycle_path,
+                    "TERMINATE_REQUESTED",
+                    worker_id=processes.index(process),
+                    pid=int(process.pid or 0),
+                    pid_start_time=_pid_start_time(process.pid),
+                )
                 process.terminate()
                 await asyncio.to_thread(process.join, 5)
         workers_alive_peak = max(
@@ -1529,6 +2163,13 @@ async def run(args: argparse.Namespace) -> dict:
         )
         await smsc.stop()
         projection.stop(timeout=300)
+        _parent_lifecycle_event(
+            parent_lifecycle_path,
+            "PARENT_CLEANUP_COMPLETE",
+            worker_exitcodes=[process.exitcode for process in processes],
+            alive_worker_ids=[index for index, process in enumerate(processes) if process.is_alive()],
+            join_forensics_path=str(join_forensics_path) if join_forensics_path else "",
+        )
 
     progress = []
     for journal_path in journal_paths:
@@ -1765,6 +2406,15 @@ async def run(args: argparse.Namespace) -> dict:
         "workers_alive_peak": workers_alive_peak,
         "workers_exited_cleanly_count": workers_exited_cleanly_count,
         "worker_join_timeout_seconds": WORKER_JOIN_TIMEOUT_SECONDS,
+        "lifecycle_diagnostics": {
+            "enabled": True,
+            "root": str(lifecycle_root),
+            "parent_events": str(parent_lifecycle_path),
+            "worker_state_files": [str(lifecycle_root / f"worker-{index}.json") for index in range(args.workers)],
+            "faulthandler_files": [str(lifecycle_root / f"worker-{index}-stacks.log") for index in range(args.workers)],
+            "asyncio_task_files": [str(lifecycle_root / f"worker-{index}-asyncio.jsonl") for index in range(args.workers)],
+            "join_forensics": str(join_forensics_path) if join_forensics_path else "",
+        },
         "worker_processes": worker_processes,
         "partition_owner_distribution": partition_evidence["owner_distribution"],
         "partition_assignment_evidence": partition_evidence,

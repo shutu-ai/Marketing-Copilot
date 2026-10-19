@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -59,6 +60,46 @@ def test_worker_scaling_does_not_expand_shared_physical_bind_target():
         acceptance._worker_bind_target(4, workers)
         for workers in (8, 12, 16, 24)
     ] == [1, 1, 1, 1]
+
+
+def test_worker_lifecycle_heartbeat_records_shutdown_contract(tmp_path: Path):
+    stop_event = threading.Event()
+    feeder_done = threading.Event()
+    lifecycle = acceptance._WorkerLifecycle(5, (5, 17), str(tmp_path / "lifecycle"))
+    lifecycle.attach_events(stop_event=stop_event, feeder_done=feeder_done)
+    lifecycle.update(
+        "DRAIN_RESPONSES_ENTER",
+        detail="diagnostic-test",
+        local_inflight=2,
+        response_pending=3,
+        global_pending={"scope": "all_workers", "records": 0},
+    )
+    feeder_done.set()
+    stop_event.set()
+    lifecycle.set_events(stop_event=stop_event, feeder_done=feeder_done)
+    lifecycle.close()
+
+    payload = json.loads((tmp_path / "lifecycle" / "worker-5.json").read_text(encoding="utf-8"))
+    assert payload["worker_id"] == 5
+    assert payload["pid"] == os.getpid()
+    assert "pid_start_time" in payload
+    assert payload["phase"] == "PROCESS_EXIT"
+    assert payload["partitions"] == [5, 17]
+    assert payload["stop_event_is_set"] is True
+    assert payload["feeder_done_is_set"] is True
+    assert payload["global_pending"]["scope"] == "all_workers"
+    assert payload["response_pending"] == 3
+    assert payload["faulthandler_enabled"] is True
+
+
+def test_worker_lifecycle_stall_dump_writes_thread_evidence(tmp_path: Path):
+    lifecycle = acceptance._WorkerLifecycle(2, (2,), str(tmp_path / "lifecycle"))
+    lifecycle._dump_stall("RUN_UNTIL_IDLE_ENTER", 16.0)
+    lifecycle.close()
+
+    stack_text = (tmp_path / "lifecycle" / "worker-2-stacks.log").read_text(encoding="utf-8")
+    assert "lifecycle stall phase=RUN_UNTIL_IDLE_ENTER" in stack_text
+    assert "THREAD name=" in stack_text
 
 
 def test_process_rows_accepts_sles_ps_and_ignores_headers_or_short_lines():

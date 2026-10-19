@@ -98,3 +98,24 @@ async def _test_worker_bind_target_can_use_multiple_physical_transports(tmp_path
     assert len(created) == 2
     assert len(snapshot["transports"]) == 2
     await worker.close_transports()
+
+
+def test_worker_stop_prevents_new_dispatch_at_shutdown_boundary(tmp_path):
+    return asyncio.run(_test_worker_stop_prevents_new_dispatch_at_shutdown_boundary(tmp_path))
+
+
+async def _test_worker_stop_prevents_new_dispatch_at_shutdown_boundary(tmp_path):
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000)
+    spool.append_many([_record("not-dispatched", 1, 1, 1, 0)])
+    worker = ShardWorker(
+        0, (0,), spool, {1: {"route_id": 1}},
+        transport_factory=lambda config, credits: FakeTransport(config, credits, []),
+    )
+
+    worker.stop()
+    snapshot = await worker.run_until_idle(close_transports=False)
+
+    assert snapshot["counters"].get("task_taken", 0) == 0
+    assert snapshot["counters"].get("socket_written", 0) == 0
+    assert spool.status()["pending_records"] == 1
+    await worker.close_transports()
