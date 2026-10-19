@@ -153,16 +153,6 @@
       :close-on-click-modal="false"
       @close="dialogVisible = false"
     >
-      <div class="editor-intro">
-        <div>
-          <strong>{{ editForm.id ? $t('common.edit') : $t('campaign.addCampaign') }}</strong>
-          <span>{{ inProgressEdit ? $t('campaign.inProgressSmppOnly') : $t('campaign.editorBasicsHint') }}</span>
-        </div>
-        <el-tag v-if="editForm.id" size="small" effect="plain" type="info">
-          {{ $t('campaign.status_' + editForm.status) }}
-        </el-tag>
-      </div>
-
       <el-form :model="editForm" label-position="top" size="small" class="campaign-editor-form">
         <el-tabs v-model="activeEditorTab" class="campaign-editor-tabs" stretch>
           <el-tab-pane v-if="!inProgressEdit" name="basics" :label="$t('campaign.basicInfo')">
@@ -327,10 +317,6 @@
       </el-form>
       <template #footer>
         <div class="editor-footer">
-          <div class="editor-footer__status">
-            <span>{{ activeEditorTabLabel }}</span>
-            <el-tag v-if="editForm.watch_source === 'sftp' && !inProgressEdit" size="small" type="warning" effect="plain">SSH / SFTP</el-tag>
-          </div>
           <div class="editor-footer__actions">
             <el-button v-if="!inProgressEdit && activeEditorTab !== 'basics'" @click="goPrevious">{{ $t('common.back') }}</el-button>
             <el-button v-if="!inProgressEdit && activeEditorTab !== 'delivery'" @click="goNext">{{ $t('common.next') }}</el-button>
@@ -591,12 +577,6 @@ function showDialog(row: Campaign | null) {
  activeEditorTab.value = inProgressEdit.value ? 'delivery' : 'basics'
  dialogVisible.value = true
 }
-
-const activeEditorTabLabel = computed(() => {
-  if (activeEditorTab.value === 'source') return t('campaign.watchSource')
-  if (activeEditorTab.value === 'delivery') return t('campaign.editorDelivery')
-  return t('campaign.basicInfo')
-})
 
 function goNext() {
   if (activeEditorTab.value === 'basics') activeEditorTab.value = 'source'
@@ -1031,17 +1011,11 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 8px 18px;
 }
-.editor-footer__status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--mc-text-tertiary);
-  font-size: 12px;
-}
 .editor-footer__actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-left: auto;
 }
 .form-tip {
   font-size: 12px;

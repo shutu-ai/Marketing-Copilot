@@ -24,3 +24,18 @@ def test_runtime_starts_projection_and_worker_supervisor_then_stops(tmp_path):
     finally:
         runtime.stop()
     assert runtime.status()["started"] is False
+
+
+def test_runtime_capacity_snapshot_avoids_full_spool_reconciliation(tmp_path):
+    runtime = VNextRuntime(
+        tmp_path / "capacity-runtime", {1: {"route_id": 1, "host": "127.0.0.1", "port": 1}},
+        worker_count=1, virtual_partition_count=8,
+    )
+    runtime.spool.status = lambda: (_ for _ in ()).throw(
+        AssertionError("capacity snapshot must not call the full spool status")
+    )
+
+    snapshot = runtime.capacity_snapshot()
+
+    assert snapshot["snapshot_mode"] == "capacity_lightweight"
+    assert snapshot["spool"]["snapshot_mode"] == "lightweight"

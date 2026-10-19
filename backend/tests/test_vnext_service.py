@@ -354,6 +354,41 @@ def test_smpp_stats_direct_runtime_snapshot_includes_configured_routes(tmp_path,
     assert [item["config_id"] for item in stats["items"]] == [7]
 
 
+def test_smpp_stats_uses_lightweight_capacity_snapshot_and_exposes_rejections(
+    tmp_path, monkeypatch
+):
+    fake = _FakeRuntime(tmp_path)
+    business_day = fake.spool.current_business_day
+    fake.status = lambda: (_ for _ in ()).throw(
+        AssertionError("capacity stats must not use the full runtime status")
+    )
+    fake.capacity_snapshot = lambda: {
+        "worker_progress": [],
+        "projection": {
+            "projection_lag_seconds": 0.7,
+            "daily_totals": [{
+                "business_day": business_day,
+                "socket_written": 12,
+                "response_success": 10,
+                "response_error": 2,
+                "unknown": 1,
+                "write_failed": 3,
+            }],
+        },
+        "spool": {"pending_records": 4},
+        "daily_epoch": {"business_day": business_day},
+    }
+    monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
+
+    stats = vnext_service.smpp_stats()
+
+    assert stats["summary"]["today_socket_written"] == 12
+    assert stats["summary"]["today_smsc_accepted"] == 10
+    assert stats["summary"]["today_smsc_rejected"] == 2
+    assert stats["summary"]["projection_lag_seconds"] == 0.7
+    assert stats["summary"]["queue_size"] == 4
+
+
 def test_vnext_dashboard_does_not_scan_legacy_send_table(monkeypatch):
     statements = []
 

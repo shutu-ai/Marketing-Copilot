@@ -702,6 +702,32 @@ class VNextRuntime:
                 continue
         return values
 
+    def capacity_snapshot(self) -> dict:
+        """Return the bounded read-only snapshot needed by capacity monitoring.
+
+        Capacity polling must not enter ``status()``, which intentionally
+        performs a full reconciliation and scans retained journal segments.
+        The lightweight spool snapshot uses maintained manifest and cursor
+        metadata instead of walking every in-memory spool record.
+        """
+
+        spool = self.spool.lightweight_snapshot()
+        return {
+            "started": self._started,
+            "run_id": self.run_id,
+            "start_method": self.start_method,
+            "spool": spool,
+            "supervisor": self.supervisor.status() if self.supervisor else None,
+            "projection": self.projection.snapshot(),
+            "worker_progress": self._worker_progress(),
+            "daily_epoch": {
+                "business_day": spool.get("business_day") or self.spool.current_business_day,
+                "business_epoch": int(spool.get("business_epoch") or self.spool.business_epoch),
+                "timezone": self.clock.timezone_name,
+            },
+            "snapshot_mode": "capacity_lightweight",
+        }
+
     def campaign_counter_snapshot(self) -> dict:
         """Return durable per-campaign counters without replaying journals.
 

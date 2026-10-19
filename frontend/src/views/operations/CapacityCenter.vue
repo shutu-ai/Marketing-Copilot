@@ -32,10 +32,13 @@
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.spoolPending')" :value="stats.summary.queue_size || 0" /></el-card></el-col>
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.socketWritten1m')" :value="stats.summary.socket_written_parts_1m || 0" /></el-card></el-col>
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.smscAccepted1m')" :value="stats.summary.submit_sm_resp_success_1m || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.smscRejected1m')" :value="stats.summary.submit_sm_resp_failed_1m || 0" /></el-card></el-col>
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todaySocketWritten')" :value="stats.summary.today_socket_written || 0" /></el-card></el-col>
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todaySmscAccepted')" :value="stats.summary.today_smsc_accepted || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todaySmscRejected')" :value="stats.summary.today_smsc_rejected || 0" /></el-card></el-col>
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todayUnknown')" :value="stats.summary.today_unknown || 0" /></el-card></el-col>
           <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todayWriteFailed')" :value="stats.summary.today_write_failed || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.projectionLag')" :value="stats.summary.projection_lag_seconds || 0" :precision="1"><template #suffix>s</template></el-statistic></el-card></el-col>
         </template>
         <template v-else>
           <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.x58f7d86e')" :value="stats.summary.queue_size || 0" /></el-card></el-col>
@@ -62,6 +65,7 @@
         </el-table-column>
         <el-table-column :label="$t('capacity.socketWritten1m')" min-width="130"><template #default="{ row }">{{ row.socket_written_parts_1m || 0 }} / {{ row.observed_parts_tps || 0 }} TPS</template></el-table-column>
         <el-table-column :label="$t('capacity.smscAccepted1m')" min-width="130"><template #default="{ row }">{{ row.submit_sm_resp_success_1m || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.smscRejected1m')" min-width="130"><template #default="{ row }">{{ row.submit_sm_resp_failed_1m || 0 }}</template></el-table-column>
         <el-table-column :label="$t('capacity.unknown')" width="110"><template #default="{ row }">{{ row.unknown_parts_1m || 0 }}</template></el-table-column>
         <el-table-column :label="$t('capacity.limit')" width="150"><template #default="{ row }">{{ row.effective_total_limit_tps || 0 }} TPS</template></el-table-column>
         <el-table-column :label="$t('legacy.xa2b83df0')" min-width="150">
@@ -144,11 +148,18 @@ async function load(){
   loading.value=true
   try{
     status.value=(await getCapacityStatus()).data
-    try{
-      stats.value=(await getSmppStats()).data
+    if(status.value.smpp?.pipeline === 'vnext'){
+      // The capacity endpoint already includes the same lightweight SMPP
+      // snapshot. Reuse it to avoid a second runtime status read per poll.
+      stats.value=status.value.smpp
       statsError.value=''
-    }catch{
-      statsError.value=i18n.global.t('legacy.xe9c8033e')
+    }else{
+      try{
+        stats.value=(await getSmppStats()).data
+        statsError.value=''
+      }catch{
+        statsError.value=i18n.global.t('legacy.xe9c8033e')
+      }
     }
     if(isVnext.value){
       // Campaign fairness is a legacy task-table view and is hidden for

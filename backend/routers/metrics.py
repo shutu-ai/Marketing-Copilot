@@ -51,12 +51,15 @@ def prometheus_metrics():
 
 
 @router.get('/api/metrics/status')
-def capacity_status():
+def capacity_status(view: str = Query(default="full")):
     vnext_pipeline = None
     try:
         from services import vnext_service
         if vnext_service.is_active():
-            vnext_pipeline = vnext_service.status()
+            vnext_pipeline = (
+                vnext_service.capacity_snapshot()
+                if view == "capacity" else vnext_service.status()
+            )
             supervisor = vnext_pipeline.get("supervisor") or {}
             worker_rows = supervisor.get("workers") or []
             workers = {

@@ -66,6 +66,8 @@ test('realtime campaign editor keeps SSH/SFTP setup compact and navigable', asyn
   await page.getByRole('button', { name: 'Add Campaign' }).click()
   const dialog = page.getByRole('dialog')
   await expect(dialog).toBeVisible()
+  await expect(dialog.locator('.editor-intro')).toHaveCount(0)
+  await expect(dialog.locator('.editor-footer__status')).toHaveCount(0)
   await expect(page.getByRole('tab', { name: 'Basic Info' })).toBeVisible()
   await expect(page.getByRole('tab', { name: 'Watch Source' })).toBeVisible()
   await expect(page.getByRole('tab', { name: 'Sending settings' })).toBeVisible()

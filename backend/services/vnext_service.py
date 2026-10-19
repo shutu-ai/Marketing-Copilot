@@ -962,16 +962,16 @@ def smpp_stats(status_value: dict | None = None) -> dict:
     runtime_value = None
     if status_value is None:
         runtime_value = runtime()
-        state = dict(runtime_value.status())
+        snapshot = getattr(runtime_value, "capacity_snapshot", None)
+        state = dict(snapshot() if snapshot else runtime_value.status())
     else:
         state = dict(status_value)
     route_rows = state.get("routes") or []
-    # ``VNextRuntime.status()`` is intentionally a lightweight raw snapshot
-    # and does not decorate it with control-plane route definitions. The
-    # direct /api/smpp/stats path must still expose configured routes without
-    # calling the heavier application status() endpoint (which scans journal
-    # progress). Loading these in-memory configs keeps stats read-only and
-    # out of the send path.
+    # The capacity snapshot intentionally does not decorate itself with
+    # control-plane route definitions. The direct /api/smpp/stats path must
+    # still expose configured routes without calling the heavier application
+    # status() endpoint (which scans journal progress). Loading these
+    # in-memory configs keeps stats read-only and out of the send path.
     if not route_rows:
         if runtime_value is None:
             runtime_value = runtime()
@@ -1110,6 +1110,7 @@ def smpp_stats(status_value: dict | None = None) -> dict:
         "submit_sm_resp_failed_1m": sum(item["submit_sm_resp_failed_1m"] for item in items),
         "today_socket_written": int(today.get("socket_written") or 0),
         "today_smsc_accepted": int(today.get("response_success") or 0),
+        "today_smsc_rejected": int(today.get("response_error") or 0),
         "today_unknown": int(today.get("unknown") or 0),
         "today_write_failed": int(today.get("write_failed") or 0),
         "durable_socket_written_pdus": int(durable["socket_written_pdus"]),
@@ -1129,6 +1130,18 @@ def smpp_stats(status_value: dict | None = None) -> dict:
         "summary": summary,
         "items": items,
     }
+
+
+def capacity_snapshot() -> dict:
+    """Return the lightweight runtime state used by capacity polling."""
+
+    value = runtime()
+    snapshot = getattr(value, "capacity_snapshot", None)
+    result = dict(snapshot() if snapshot else value.status())
+    result["pipeline"] = "vnext"
+    result["run_root"] = str(value.root)
+    result["metric_contract"] = dict(VNEXT_METRIC_CONTRACT)
+    return result
 
 
 def status() -> dict:
