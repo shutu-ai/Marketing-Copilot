@@ -12,6 +12,7 @@ from tools.vnext_stats import _RateTracker, _build_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_PATH = REPO_ROOT / "backend" / "tools" / "vnext_stats.py"
+MCCTL_PATH = REPO_ROOT / "backend" / "tools" / "mcctl.py"
 
 
 def _write(path: Path, value: dict) -> None:
@@ -225,6 +226,18 @@ def _run_cli(*args: str):
     )
 
 
+def _run_mcctl(*args: str, env=None):
+    return subprocess.run(
+        [sys.executable, str(MCCTL_PATH), *args],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        env=env,
+    )
+
+
 def test_stats_cli_json_snapshot(tmp_path):
     root = _fake_runtime_root(tmp_path)
     result = _run_cli("--root", str(root), "--once", "--json")
@@ -254,6 +267,93 @@ def test_stats_cli_json_snapshot(tmp_path):
         row["campaign_id"]: row["state"] for row in value["campaigns"]
     }
     assert states == {101: "paused", 102: "running"}
+
+
+def test_stats_cli_deduplicates_route_pool_across_workers(tmp_path):
+    root = _fake_runtime_root(tmp_path)
+    first_status_path = root / "progress" / "worker-0.status.json"
+    first_status = json.loads(first_status_path.read_text(encoding="utf-8"))
+    second_status = json.loads(json.dumps(first_status))
+    second_status["worker_id"] = 1
+    second_snapshot = second_status["snapshot"]
+    second_snapshot["counters"] = {}
+    second_snapshot["progress"] = {}
+    second_snapshot["campaign_counters"] = []
+    second_snapshot["transports"] = []
+    _write(root / "progress" / "worker-1.status.json", second_status)
+
+    value = _build_snapshot(root, interval=2.0)
+
+    assert value["smpp"]["binds_configured"] == 2
+
+
+def test_stats_cli_counts_route_shared_tps_once(tmp_path):
+    root = _fake_runtime_root(tmp_path)
+    first_status_path = root / "progress" / "worker-0.status.json"
+    first_status = json.loads(first_status_path.read_text(encoding="utf-8"))
+    first_transport = first_status["snapshot"]["transports"][0]
+    first_transport.update({
+        "tps": 200,
+        "tps_scope": "route_shared",
+        "effective_total_limit_tps": 200,
+        "pool_size": 4,
+    })
+    _write(first_status_path, first_status)
+    second_status = json.loads(json.dumps(first_status))
+    second_status["worker_id"] = 1
+    second_status["snapshot"]["transports"] = [dict(first_transport)]
+    _write(root / "progress" / "worker-1.status.json", second_status)
+
+    value = _build_snapshot(root, interval=2.0)
+
+    assert value["smpp"]["tps_limit"] == 200
+
+
+def test_mcctl_stats_subcommand_delegates_to_read_only_observer(tmp_path):
+    root = _fake_runtime_root(tmp_path)
+    env = os.environ.copy()
+    env.pop("MC_VNEXT_RUN_ROOT", None)
+    result = _run_mcctl(
+        "stats", "--root", str(root), "--once", "--json", env=env
+    )
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["run_id"] == "pilot-1"
+    assert value["health"] == "OK"
+
+
+def test_mcctl_stats_uses_default_state_dir_when_root_is_omitted(tmp_path):
+    root = _fake_runtime_root(tmp_path)
+    default_root = root.parent / "vnext"
+    root.rename(default_root)
+
+    env = os.environ.copy()
+    env.pop("MC_VNEXT_RUN_ROOT", None)
+    env.pop("MC_ENV_FILE", None)
+    env["MC_STATE_DIR"] = str(default_root.parent)
+    result = _run_mcctl("stats", "--json", env=env)
+
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["run_id"] == "pilot-1"
+    assert value["health"] == "OK"
+
+
+def test_mcctl_stats_falls_back_from_missing_configured_root(tmp_path):
+    root = _fake_runtime_root(tmp_path)
+    default_root = root.parent / "vnext"
+    root.rename(default_root)
+
+    env = os.environ.copy()
+    env.pop("MC_ENV_FILE", None)
+    env["MC_STATE_DIR"] = str(default_root.parent)
+    env["MC_VNEXT_RUN_ROOT"] = str(default_root / "pilot-001")
+    result = _run_mcctl("stats", "--json", env=env)
+
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["run_id"] == "pilot-1"
+    assert "using default" in result.stderr
 
 
 def test_stats_cli_campaign_filter_and_plain_output(tmp_path):

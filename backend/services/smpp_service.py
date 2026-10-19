@@ -12,20 +12,19 @@ _STATS_CACHE = None
 _STATS_CACHE_AT = 0.0
 _STATS_CACHE_TTL = 2.0
 _STATS_CACHE_LOCK = threading.Lock()
+_HOT_APPLY_FIELDS = frozenset({"tps", "tps_scope"})
 
 
 def _validate_tps_scope(scope: str | None) -> None:
-    value = str(scope or "route_shared").strip().lower()
-    if value == "per_bind":
-        from services import vnext_service
-        if vnext_service.pipeline_mode() in {"legacy", "test"}:
-            raise ValueError(
-                "tps_scope=per_bind is supported only by the VNext pipeline; "
-                "use route_shared for legacy/test mode"
-            )
+    if scope is None:
+        return
+    value = str(scope).strip().lower()
+    if value != "per_bind":
+        raise ValueError("tps_scope is fixed to per_bind")
 
 
-def _invalidate_gateway_config_cache() -> None:
+def _invalidate_gateway_config_cache(*, mark_restart: bool = True,
+                                      reason: str = "SMPP configuration changed") -> None:
     try:
         from services.smpp_gateway import gateway
         gateway.invalidate_config_cache()
@@ -33,7 +32,8 @@ def _invalidate_gateway_config_cache() -> None:
         logger.debug("Unable to invalidate SMPP gateway config cache", exc_info=True)
     try:
         from services import vnext_service
-        vnext_service.mark_config_change()
+        if mark_restart:
+            vnext_service.mark_config_change(reason)
     except Exception:
         logger.debug("Unable to mark VNext config restart requirement", exc_info=True)
 
@@ -53,13 +53,16 @@ def _masked(row) -> dict:
 
 def _config_response(row: dict) -> dict:
     result = _masked(row)
+    # The application-level contract is permanently per physical bind.  This
+    # also keeps responses consistent while an older database is being
+    # normalized during startup.
+    result["tps_scope"] = "per_bind"
     try:
         from services import vnext_service
-        active = vnext_service.is_active()
+        result.update(vnext_service.config_state())
     except Exception:
-        active = False
-    result["restart_required"] = bool(active)
-    result["effective_state"] = "pending_restart" if active else "next_start"
+        result["restart_required"] = False
+        result["effective_state"] = "next_start"
     return result
 
 
@@ -118,6 +121,7 @@ def create_config(data: SmppConfigCreate) -> dict:
 def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     _validate_tps_scope(data.tps_scope)
     fields = {}
+    changed_fields = set()
     for field in ["name", "host", "port", "system_id", "password", "source_addr",
                    "bind_type", "address_ton", "address_npi", "data_coding",
                    "pool_size", "window_size", "enquire_interval", "timeout", "tps", "priority",
@@ -130,9 +134,17 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
             fields[field] = val
 
     def write(conn):
+        nonlocal changed_fields
         existing = conn.execute("SELECT * FROM smpp_configs WHERE id=?", (config_id,)).fetchone()
         if not existing:
             return None
+        # Normalize rows created by releases that still allowed route_shared.
+        if str(existing["tps_scope"] or "").strip().lower() != "per_bind":
+            fields["tps_scope"] = "per_bind"
+        changed_fields = {
+            key for key, value in fields.items()
+            if existing[key] != value
+        }
         if not fields:
             return dict(existing)
 
@@ -147,8 +159,37 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     row = write_transaction(write, operation="smpp.config.update")
     if row is None:
         return None
-    _invalidate_gateway_config_cache()
-    return _config_response(row)
+    if not changed_fields:
+        return _config_response(row)
+
+    hot_apply = (
+        changed_fields.issubset(_HOT_APPLY_FIELDS)
+        and int(row.get("enabled", 0) or 0) == 1
+    )
+    _invalidate_gateway_config_cache(mark_restart=not hot_apply)
+    hot_applied = False
+    if hot_apply:
+        try:
+            from services import vnext_service
+            result = vnext_service.apply_route_rates()
+            hot_applied = bool(result.get("ok"))
+            if vnext_service.is_active() and not hot_applied:
+                vnext_service.mark_config_change(
+                    "SMPP rate hot-apply failed; safe restart required"
+                )
+        except Exception:
+            logger.exception("Unable to hot-apply SMPP rate configuration")
+            try:
+                from services import vnext_service
+                if vnext_service.is_active():
+                    vnext_service.mark_config_change(
+                        "SMPP rate hot-apply failed; safe restart required"
+                    )
+            except Exception:
+                logger.debug("Unable to mark failed SMPP rate hot-apply", exc_info=True)
+    response = _config_response(row)
+    response["hot_applied"] = hot_applied
+    return response
 
 
 def delete_config(config_id: int) -> bool:
@@ -245,7 +286,7 @@ def _get_config_stats() -> dict:
         stats = []
         for cfg in configs:
             cfg_id = cfg["id"]
-            tps_scope = str(cfg.get("tps_scope") or "route_shared")
+            tps_scope = "per_bind"
             configured_tps = float(cfg.get("tps") or 0) if cfg.get("enabled") else 0.0
             pool_size = max(1, int(cfg.get("pool_size") or 1))
             where, params = _where(cfg_id)
@@ -286,11 +327,9 @@ def _get_config_stats() -> dict:
                 "tps": cfg.get("tps", 0),
                 "pool_size": pool_size,
                 "window_size": cfg.get("window_size", 10),
-                "configured_route_tps": configured_tps if tps_scope == "route_shared" else 0.0,
-                "configured_per_bind_tps": configured_tps if tps_scope == "per_bind" else None,
-                "effective_total_limit_tps": (
-                    configured_tps * pool_size if tps_scope == "per_bind" else configured_tps
-                ),
+                "configured_route_tps": 0.0,
+                "configured_per_bind_tps": configured_tps,
+                "effective_total_limit_tps": configured_tps * pool_size,
                 "tps_scope": tps_scope,
                 "tps_unit": "submit_sm_parts/s",
                 "queue_size": _count(where, params, "status IN ('queued','retrying')"),
@@ -348,10 +387,10 @@ def _get_config_stats() -> dict:
             "submitted_parts_1m": sum(item["submitted_parts_1m"] for item in stats),
             "submitted_parts_5m": sum(item["submitted_parts_5m"] for item in stats),
             "submitted_parts_60m": sum(item["submitted_parts_60m"] for item in stats),
-            "configured_route_tps": sum(item["configured_route_tps"] for item in stats),
-            "configured_per_bind_tps": None,
+            "configured_route_tps": 0.0,
+            "configured_per_bind_tps": sum(item["configured_per_bind_tps"] for item in stats),
             "effective_total_limit_tps": sum(item["effective_total_limit_tps"] for item in stats),
-            "tps_scope": "route_shared",
+            "tps_scope": "per_bind",
             "tps_unit": "submit_sm_parts/s",
             "submit_sm_tps_1m": round(sum(item["submitted_parts_1m"] for item in stats) / 60.0, 2),
             "send_message_1m": sum(item["send_message_1m"] for item in stats),

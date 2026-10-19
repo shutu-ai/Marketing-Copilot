@@ -17,6 +17,7 @@ from .business_day import BusinessClock, ensure_clock, normalize_business_day
 
 
 SPOOL_SCHEMA_VERSION = 1
+DEFAULT_MAX_SPOOL_BYTES = 4 * 1024 * 1024 * 1024
 
 
 class SpoolError(RuntimeError):
@@ -58,6 +59,7 @@ class SpoolRecord:
     # New admissions are normalized by TaskSpool before they are persisted.
     business_day: str = ""
     expires_at: float = 0.0
+    language: str = ""
 
     def unsigned_dict(self) -> dict:
         value = {
@@ -87,6 +89,8 @@ class SpoolRecord:
             value["business_day"] = normalize_business_day(self.business_day)
         if self.expires_at:
             value["expires_at"] = float(self.expires_at)
+        if self.language:
+            value["language"] = str(self.language)
         return value
 
     def is_expired(self, now: float | None = None) -> bool:
@@ -136,6 +140,7 @@ class SpoolRecord:
             source_addr=str(value.get("source_addr", "")),
             business_day=str(value.get("business_day", "") or ""),
             expires_at=float(value.get("expires_at", 0.0) or 0.0),
+            language=str(value.get("language", "") or ""),
         )
         if item.schema_version != SPOOL_SCHEMA_VERSION:
             raise SpoolCorruptionError(f"unsupported spool schema: {item.schema_version}")
@@ -184,7 +189,7 @@ class TaskSpool:
 
     def __init__(self, root: str | os.PathLike[str], *, virtual_partition_count: int = 256,
                  segment_max_records: int = 1000, segment_max_bytes: int = 4 * 1024 * 1024,
-                 max_bytes: int = 512 * 1024 * 1024, fsync: bool = True,
+                 max_bytes: int = DEFAULT_MAX_SPOOL_BYTES, fsync: bool = True,
                  clock: BusinessClock | object | None = None,
                  business_timezone: str | object | None = None):
         self.root = Path(root).resolve()
@@ -499,7 +504,7 @@ class TaskSpool:
         except OSError as exc:
             self._add_recovery_issue(f"cannot read segment {path.name}: {exc}")
 
-    def refresh(self, partition_id: int | None = None) -> None:
+    def refresh(self, partition_id: int | None = None, *, scan_segments: bool = True) -> None:
         """Refresh append-only state written by another process.
 
         Long-lived workers keep a ``TaskSpool`` instance, while ingress owns
@@ -519,18 +524,19 @@ class TaskSpool:
                 if loaded is not None:
                     self._manifest = loaded
                     self._refresh_current_day_locked()
-                    for value in range(self.virtual_partition_count):
-                        entries = self._manifest["segments"].get(str(value), [])
-                        for entry in entries:
-                            path = self._segment_path(value, str(entry["filename"]))
-                            if not path.exists():
-                                self._add_recovery_issue(f"missing segment: {path.name}")
-                                continue
-                            previous = self._segment_offsets.get(path, 0)
-                            size = int(path.stat().st_size)
-                            self._scan_segment(path, start=previous if previous <= size else 0)
-                    self._manifest["total_records"] = len(self._event_index)
-                    self._manifest["total_bytes"] = self._disk_bytes()
+                    if scan_segments:
+                        for value in range(self.virtual_partition_count):
+                            entries = self._manifest["segments"].get(str(value), [])
+                            for entry in entries:
+                                path = self._segment_path(value, str(entry["filename"]))
+                                if not path.exists():
+                                    self._add_recovery_issue(f"missing segment: {path.name}")
+                                    continue
+                                previous = self._segment_offsets.get(path, 0)
+                                size = int(path.stat().st_size)
+                                self._scan_segment(path, start=previous if previous <= size else 0)
+                        self._manifest["total_records"] = len(self._event_index)
+                        self._manifest["total_bytes"] = self._disk_bytes()
                     self._manifest_signature = signature
 
             if partition_id is None:
@@ -557,9 +563,9 @@ class TaskSpool:
         """Drop decoded record indexes after a pass with no live iterators.
 
         The append-only segment files and cursor/manifest files remain the
-        authority.  Marking the manifest stale makes the next reader rebuild
-        the cache from durable files instead of retaining every historical
-        record for the lifetime of a worker process.
+        authority.  The next dispatch reader loads only manifest/cursor state
+        first; a detailed status/recovery boundary can still rebuild the
+        decoded index when it explicitly calls :meth:`refresh`.
         """
 
         with self._lock:
@@ -836,10 +842,38 @@ class TaskSpool:
                 self.refresh()
                 if today != self.current_business_day:
                     self._rollover_locked(today)
-        self.refresh(partition)
+        # Dispatch only needs the durable manifest and cursor.  Decoding all
+        # segment rows here defeats release_reader_cache() and makes an idle
+        # worker CPU-bound on historical spool data.
+        self.refresh(partition, scan_segments=False)
         current_day = self.current_business_day
+        # The durable cursor is authoritative.  Callers normally pass it in,
+        # but taking the maximum also prevents a stale reader from reopening
+        # already checkpointed records after a cache release.
+        try:
+            effective_cursor = max(int(cursor), self.cursor(partition))
+        except (TypeError, ValueError):
+            effective_cursor = self.cursor(partition)
+        taken_pending = self._taken_pending.get(str(partition), set())
         entries = list(self._manifest["segments"].get(str(partition), []))
         for entry in entries:
+            entry_day = str(entry.get("business_day") or "")
+            # The worker can only dispatch the current business day.  Skip
+            # closed-day segments before opening them; the daily reclamation
+            # path remains responsible for deleting them after the fence.
+            if entry_day and entry_day != current_day:
+                continue
+            # Segment metadata is maintained by append/recovery.  A complete
+            # segment whose last ordinal is at or before the cursor cannot
+            # contain a dispatchable record, so do not decode its JSONL rows
+            # on every idle polling pass.  Missing/invalid metadata is scanned
+            # fail-closed for legacy compatibility.
+            try:
+                last_ordinal = int(entry.get("last_ordinal", 0) or 0)
+            except (TypeError, ValueError):
+                last_ordinal = 0
+            if last_ordinal > 0 and last_ordinal <= effective_cursor:
+                continue
             path = self._segment_path(partition, str(entry["filename"]))
             if not path.exists():
                 continue
@@ -854,8 +888,8 @@ class TaskSpool:
                     # A missing business day is deliberately fail-closed: it
                     # may be inspected for recovery, but it is never sent.
                     if (record.business_day == current_day
-                            and record.ordinal > int(cursor)
-                            and record.ordinal not in self._taken_pending.get(str(partition), set())):
+                            and record.ordinal > effective_cursor
+                            and record.ordinal not in taken_pending):
                         yield record
 
     def checkpoint(self, partition_id: int, ordinal: int) -> None:

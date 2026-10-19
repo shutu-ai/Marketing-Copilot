@@ -14,9 +14,9 @@ VNext 的有效容量契约现在固定为：
 | Bind | `smpp_configs.pool_size`，默认 1，限制 1–20 | 一个 route 允许的物理 SMPP bind 上限；bind 生命周期持有 lease | `AsyncSmppTransport`、`RouteCreditBroker.acquire_bind` | 否 |
 | Window | `smpp_configs.window_size`，默认 10，限制 1–100 | 每个物理 bind 的 `submit_sm` 在途 PDU 上限 | `AsyncSmppTransport._window` | 否 |
 | TPS | `smpp_configs.tps`，默认 20，单位 `submit_sm_parts/s` | PDU part 发送节奏 | `RouteCreditBroker.acquire` | 否 |
-| TPS scope | `smpp_configs.tps_scope`，默认 `route_shared` | `route_shared`: 一个 route 共用 TPS；`per_bind`: 每个实际 bind 独立 TPS | `RouteCreditBroker`、状态 API/UI | 否 |
+| TPS scope | `smpp_configs.tps_scope`，固定 `per_bind` | 每个实际 bind 独立 TPS；Web/API 不再允许选择 `route_shared` | `RouteCreditBroker`、状态 API/UI | 否 |
 
-有效总 TPS：`route_shared=tps`；`per_bind=tps × 实际物理 bind 数`，最多不超过 `pool_size`。Worker 数不会再把 TPS 或 Bind 数隐式放大。有效 PDU 在途上限：`实际物理 bind 数 × window_size`。
+有效总 TPS：`per_bind=tps × 实际物理 bind 数`，最多不超过 `pool_size`。Worker 数不会再把 TPS 或 Bind 数隐式放大。有效 PDU 在途上限：`实际物理 bind 数 × window_size`。
 
 ## 2. SMPP 配置字段全量去向
 
@@ -36,25 +36,25 @@ VNext 的有效容量契约现在固定为：
 | `enquire_interval` | 30 秒，0–300 | DB → transport heartbeat | `ENQUIRE_LINK`；0 可关闭 | 连接保活 |
 | `timeout` | 10 秒，1–120 | DB → socket/connect/window 等待 | 连接及响应等待上限 | 稳定性 |
 | `tps` | 20，0–10000 | DB → RouteCreditBroker | 单位固定为 `submit_sm_parts/s` | 性能/限流 |
-| `tps_scope` | `route_shared` | DB → credit key | `route_shared` 用 `route-id`；`per_bind` 用 `route-id:bind:slot` | 契约 |
+| `tps_scope` | `per_bind`（固定） | DB → credit key | 使用 `route-id:bind:slot`，不再提供 route-shared 选项 | 契约 |
 | `priority` | 100，1–10000 | DB → route load / default route | 默认路由按 `(priority,id)`，不再按最小 id 偶然选择 | 路由正确性 |
 | `reconnect_max_seconds` | 60 秒，0–300 | DB → bounded reconnect backoff | 连接失败退避；0 表示不退避 | 稳定性 |
 | `delivery_receipt_mode` | `optional` | DB → `registered_delivery` | required 请求 DLR；optional/disabled 不强制请求 | 协议/业务 |
 | `enabled` | 1 | DB → `_load_routes` | 仅启用 route 进入 VNext；修改须重启生效 | 控制面 |
 | `created_at`,`updated_at` | DB 元数据 | DB/API | 审计与 UI 排序 | 元数据 |
 
-新增 DB 字段：`smpp_configs.tps_scope TEXT NOT NULL DEFAULT 'route_shared'`，并在初始化迁移中将空值/非法值回填为 `route_shared`。旧数据库只在应用 `init_db()` 正常启动时迁移；本次没有直接改写工作区原始数据库。
+新增 DB 字段：`smpp_configs.tps_scope TEXT NOT NULL DEFAULT 'per_bind'`，并在初始化迁移中将空值、旧 `route_shared` 和非法值统一回填为 `per_bind`。旧数据库只在应用 `init_db()` 正常启动时迁移；本次没有直接改写工作区原始数据库。
 
 ## 3. VNext 环境配置
 
 | Key | 默认/边界 | 读取路径 | 语义 |
 |---|---|---|---|
-| `MC_PIPELINE_MODE` | `vnext`；`legacy/test` 不启动 VNext | `services/vnext_service.pipeline_mode` | 总开关；`per_bind` 在 legacy/test 被拒绝 |
+| `MC_PIPELINE_MODE` | `vnext`；`legacy/test` 不启动 VNext | `services/vnext_service.pipeline_mode` | 总开关；VNext 的 SMPP 配置固定使用 `per_bind` |
 | `MC_VNEXT_RUN_ROOT` | `$MC_STATE_DIR/vnext` | `vnext_service.run_root` | spool、credits、progress、projection 根目录 |
 | `MC_STATE_DIR` | `backend/data` | `run_root`、auth、update | 状态根；不是 Worker 数 |
 | `MC_VNEXT_WORKERS` | 4，1–8（Runtime 上限 32） | `vnext_service.start` | 业务分片并发 |
 | `MC_VNEXT_PARTITIONS` | 256，16–4096 | `vnext_service.start` | 稳定 MSISDN 逻辑分片数 |
-| `MC_VNEXT_MAX_SPOOL_BYTES` | 512 MiB，至少 16 MiB | `vnext_service.start` | spool 硬容量 |
+| `MC_VNEXT_MAX_SPOOL_BYTES` | 默认 4 GiB，最小 4 GiB；可配置 16/32 GiB 等更大值 | `vnext_service.start` | spool 硬容量 |
 | `MC_VNEXT_PROJECTION_QUEUE` | 8192，128–100000 | `vnext_service.start` | 投影 IPC 有界队列 |
 | `MC_VNEXT_MAX_INFLIGHT` | 128，1–2048 | `vnext_service.start` | 每 Worker 业务 task 并发，不改变 route TPS |
 | `MC_VNEXT_PREFETCH_PER_PARTITION` | 64，1–512 | `vnext_service.start` | 每分片预取，不是 PDU window |
@@ -62,7 +62,7 @@ VNext 的有效容量契约现在固定为：
 | `MC_RUN_ID` | run root 名称 | `VNextRuntime` | 诊断标识 |
 | `MC_VNEXT_CANARY_MODE` | 0 | VNext API canary router | 仅 canary API 门控 |
 
-运行时状态 API 现在返回 `config_contract`、每 route 的 `pool_size/window_size/tps/tps_scope`、`active_bind_count/slots`、effective TPS、`tps_unit` 和 `restart_required`。配置 CRUD 在运行时变更后返回 `effective_state=pending_restart`；安全重启后才清除 pending 状态。
+运行时状态 API 现在返回 `config_contract`、每 route 的 `pool_size/window_size/tps/tps_scope`、`active_bind_count/slots`、effective TPS、`tps_unit` 和 `restart_required`。Web/API 修改 `tps` 时可热应用；修改 `window_size`、`pool_size` 等结构字段后返回 `effective_state=pending_restart`，安全重启后才清除 pending 状态。
 
 ## 4. 旧/并行配置的边界
 

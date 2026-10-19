@@ -49,6 +49,57 @@ def test_projection_writer_batches_idempotently_and_replays_journal(tmp_path):
         conn.close()
 
 
+def test_projection_snapshot_publishes_day_level_metric_contract(tmp_path):
+    writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=10)
+    writer.start()
+    try:
+        first = event("day-a")
+        first["business_day"] = "2026-10-19"
+        second = event("day-b", state="submit_sm_resp_success", ordinal=2)
+        second.update({
+            "business_day": "2026-10-19",
+            "response_success": 1,
+            "socket_written": 0,
+        })
+        writer.submit(first)
+        writer.submit(second)
+        assert writer.flush() == 2
+        daily = writer.snapshot()["daily_totals"]
+        assert daily == [{
+            "business_day": "2026-10-19",
+            "queued": 0,
+            "taken": 2,
+            "socket_written": 1,
+            "socket_written_pdus": 1,
+            "write_failed": 0,
+            "unknown": 0,
+            "cancelled": 0,
+            "accepted": 0,
+            "expired": 0,
+            "response_success": 1,
+            "response_error": 0,
+        }]
+        campaign_daily = writer.snapshot()["campaign_daily_totals"]
+        assert campaign_daily == [{
+            "business_day": "2026-10-19",
+            "campaign_type": "batch",
+            "campaign_id": 10,
+            "queued": 0,
+            "taken": 2,
+            "socket_written": 1,
+            "socket_written_pdus": 1,
+            "write_failed": 0,
+            "unknown": 0,
+            "cancelled": 0,
+            "expired": 0,
+            "accepted": 0,
+            "response_success": 1,
+            "response_error": 0,
+        }]
+    finally:
+        writer.stop()
+
+
 def test_projection_pause_is_local_and_catches_up_after_resume(tmp_path):
     writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=10)
     writer.start()

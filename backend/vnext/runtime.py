@@ -21,7 +21,7 @@ from .projection_writer import ProjectionWriterProcess, ProgressJournal
 from .progress import ProgressPersistence
 from .pressure import StageCredit
 from .route_credits import RouteCreditBroker
-from .spool import TaskSpool
+from .spool import DEFAULT_MAX_SPOOL_BYTES, TaskSpool
 from .supervisor import WorkerSupervisor
 from .worker import ShardWorker
 
@@ -201,12 +201,44 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     status_interval = max(
         0.2, float(context.get("status_interval_seconds", 1.0))
     )
+    # An idle worker still needs to notice newly appended spool records, but
+    # it must not rescan the entire manifest ten times per second.
+    idle_poll_interval = max(
+        0.1, float(context.get("idle_poll_interval_seconds", 0.5))
+    )
 
     def status_heartbeat() -> None:
         while not status_stop.wait(status_interval):
             publish_status(bool(status_state.get("active")))
 
     async def run() -> None:
+        stop_requested = False
+
+        def handle_control() -> bool:
+            nonlocal stop_requested
+            while control.poll():
+                message = control.recv()
+                if message == "stop":
+                    stop_requested = True
+                    worker.stop()
+                    return True
+                if (
+                    isinstance(message, dict)
+                    and message.get("type") == "reload_route_rates"
+                ):
+                    result = worker.apply_route_rates(message.get("routes") or {})
+                    diagnostic(
+                        phase="smpp_rate_reload",
+                        status="running",
+                        progress={
+                            "updated_routes": len(result.get("updated_routes") or []),
+                            "updated_transports": int(
+                                result.get("updated_transports", 0) or 0
+                            ),
+                        },
+                    )
+            return stop_requested
+
         heartbeat = threading.Thread(
             target=status_heartbeat,
             name=f"mc-vnext-worker-status-{int(worker_id)}",
@@ -214,19 +246,38 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         )
         heartbeat.start()
         try:
+            prewarm_route_ids = tuple(context.get("prewarm_route_ids") or ())
+            if prewarm_route_ids:
+                for result in await worker.prewarm_transports(
+                    prewarm_route_ids,
+                    worker_count=worker_count,
+                ):
+                    if not result.get("connected"):
+                        diagnostic(
+                            phase="smpp_prewarm_failed",
+                            status="degraded",
+                            extra={
+                                "route_id": result.get("route_id"),
+                                "last_error": result.get("error", ""),
+                            },
+                        )
             while True:
-                if control.poll():
-                    message = control.recv()
-                    if message == "stop":
-                        return
+                if handle_control():
+                    return
                 worker.refresh_campaign_states(force=True)
+                # A long-lived bind must recover even while the spool is
+                # empty; otherwise a dropped idle socket would remain absent
+                # until the next business record happened to arrive.
+                await worker.maintain_transports()
                 before = worker.snapshot()["counters"].get("taken", 0)
                 status_state["active"] = True
                 publish_status(True)
-                # Bind slots are a shared per-route resource.  Releasing an
-                # idle worker's connections lets another business worker take
-                # the same bounded pool without creating one bind per worker.
-                await worker.run_until_idle(close_transports=False)
+                await worker.run_until_idle(
+                    close_transports=False,
+                    control_handler=handle_control,
+                )
+                if stop_requested:
+                    return
                 drain = await worker.drain_transports()
                 if not drain.get("drained"):
                     diagnostic(
@@ -239,7 +290,8 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                             ),
                         },
                     )
-                await worker.close_transports()
+                if not bool(context.get("keep_smpp_binds", True)):
+                    await worker.close_transports()
                 status_state["draining"] = True
                 progress_drain = await worker.drain_progress(timeout=30.0)
                 status_state["draining"] = False
@@ -261,7 +313,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 publish_status(False)
                 after = worker.snapshot()["counters"].get("taken", 0)
                 if after == before:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(idle_poll_interval)
         finally:
             status_state["active"] = False
             await worker.close_transports()
@@ -296,7 +348,7 @@ class VNextRuntime:
 
     def __init__(self, root: str | os.PathLike[str], route_configs: dict[int | str, dict], *,
                  worker_count: int = 4, virtual_partition_count: int = 256,
-                 max_spool_bytes: int = 512 * 1024 * 1024, projection_queue_size: int = 8192,
+                 max_spool_bytes: int = DEFAULT_MAX_SPOOL_BYTES, projection_queue_size: int = 8192,
                  max_inflight: int = 128, prefetch_per_partition: int = 64,
                  projection_batch_size: int = 512,
                  start_method: str = "spawn", projection_flush_interval_seconds: float | None = None,
@@ -309,8 +361,11 @@ class VNextRuntime:
                   progress_flush_interval_seconds: float = 0.05,
                   progress_aggregate_interval_seconds: float = 1.0,
                   status_interval_seconds: float = 1.0,
+                  idle_poll_interval_seconds: float = 0.5,
                   profile_root: str | os.PathLike[str] | None = None,
-                  profile_interval_seconds: float = 1.0):
+                  profile_interval_seconds: float = 1.0,
+                  keep_smpp_binds: bool = True,
+                  prewarm_smpp_binds: bool = False):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.spool_root = self.root / "spool"
@@ -344,7 +399,19 @@ class VNextRuntime:
         )
         self.ingress = IngressRouter(self.spool, ingress_credit=self.ingress_credit)
         self.route_configs = {str(key): dict(value) for key, value in route_configs.items()}
+        self._route_config_lock = threading.RLock()
         self.worker_count = max(1, min(32, int(worker_count)))
+        self.keep_smpp_binds = bool(keep_smpp_binds)
+        self.prewarm_smpp_binds = bool(prewarm_smpp_binds)
+        self.prewarm_route_ids = tuple(
+            key for key, _config in sorted(
+                self.route_configs.items(),
+                key=lambda item: (
+                    int(item[1].get("priority", 100) or 100),
+                    int(item[1].get("route_id", item[0]) or 0),
+                ),
+            )
+        ) if self.prewarm_smpp_binds else ()
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
         self.projection_batch_size = max(1, min(4096, int(projection_batch_size)))
@@ -358,6 +425,9 @@ class VNextRuntime:
             0.1, float(progress_aggregate_interval_seconds)
         )
         self.status_interval_seconds = max(0.2, float(status_interval_seconds))
+        self.idle_poll_interval_seconds = max(
+            0.1, float(idle_poll_interval_seconds)
+        )
         self._mp_context = multiprocessing.get_context(start_method or "spawn")
         self.start_method = self._mp_context.get_start_method()
         if projection_flush_interval_seconds is None:
@@ -523,6 +593,9 @@ class VNextRuntime:
                 self.progress_aggregate_interval_seconds
             ),
             "status_interval_seconds": self.status_interval_seconds,
+            "idle_poll_interval_seconds": self.idle_poll_interval_seconds,
+            "keep_smpp_binds": self.keep_smpp_binds,
+            "prewarm_route_ids": self.prewarm_route_ids,
         }
         self.supervisor = WorkerSupervisor(
             self.root, worker_count=self.worker_count,
@@ -554,6 +627,72 @@ class VNextRuntime:
         )
         self._daily_epoch_thread.start()
 
+    def reload_route_rates(self, route_configs: dict[int | str, dict]) -> dict:
+        """Apply only TPS settings to live workers without closing SMPP binds."""
+
+        with self._route_config_lock:
+            if not self._started or self.supervisor is None:
+                return {
+                    "ok": False,
+                    "reason": "runtime_inactive",
+                    "updated_routes": [],
+                }
+            updates: dict[str, dict] = {}
+            missing_routes: list[str] = []
+            for raw_route_id, values in (route_configs or {}).items():
+                key = str(raw_route_id)
+                current = self.route_configs.get(key)
+                if current is None:
+                    missing_routes.append(key)
+                    continue
+                if not isinstance(values, dict):
+                    missing_routes.append(key)
+                    continue
+                scope = str(values.get("tps_scope", current.get("tps_scope", "route_shared")))
+                scope = scope.strip().lower()
+                if scope not in {"route_shared", "per_bind"}:
+                    return {
+                        "ok": False,
+                        "reason": f"invalid_tps_scope:{scope}",
+                        "updated_routes": [],
+                    }
+                try:
+                    tps = max(0.0, float(values.get("tps", current.get("tps", 0.0)) or 0.0))
+                except (TypeError, ValueError):
+                    return {
+                        "ok": False,
+                        "reason": f"invalid_tps:{key}",
+                        "updated_routes": [],
+                    }
+                current["tps"] = tps
+                current["tps_scope"] = scope
+                updates[key] = {
+                    "route_id": int(current.get("route_id", key)),
+                    "tps": tps,
+                    "tps_scope": scope,
+                }
+            if missing_routes:
+                return {
+                    "ok": False,
+                    "reason": "route_not_active",
+                    "updated_routes": [],
+                    "missing_routes": sorted(set(missing_routes)),
+                }
+            if not updates:
+                return {"ok": False, "reason": "no_active_routes", "updated_routes": []}
+            broadcast = self.supervisor.broadcast({
+                "type": "reload_route_rates",
+                "routes": updates,
+            })
+            failed = broadcast.get("failed_worker_ids") or []
+            return {
+                "ok": not failed,
+                "reason": "worker_broadcast_failed" if failed else "applied",
+                "updated_routes": sorted(updates),
+                "sent_worker_ids": broadcast.get("sent_worker_ids") or [],
+                "failed_worker_ids": failed,
+            }
+
     def _worker_progress(self) -> list[dict]:
         values = []
         for path in sorted(self.progress_root.glob("worker-*.status.json")):
@@ -562,6 +701,58 @@ class VNextRuntime:
             except (OSError, ValueError, TypeError):
                 continue
         return values
+
+    def campaign_counter_snapshot(self) -> dict:
+        """Return durable per-campaign counters without replaying journals.
+
+        Worker status files already contain the counters maintained by each
+        worker's :class:`ProgressPersistence`.  The control plane can read
+        those small snapshots without opening DuckDB, scanning the spool, or
+        parsing the append-only progress journals.  This method is therefore
+        deliberately read-only and kept separate from the dispatch path.
+        """
+
+        counters_by_campaign: dict[tuple[str, int], dict[str, int]] = {}
+        workers = self._worker_progress()
+        counter_fields = {
+            "accepted_tasks", "tasks_taken", "socket_written_events",
+            "socket_written_pdus", "write_failed", "unknown",
+            "response_success", "response_error", "cancelled", "expired",
+            "durable_events",
+        }
+        for worker in workers:
+            snapshot = worker.get("snapshot") or {}
+            for item in snapshot.get("campaign_counters") or []:
+                try:
+                    campaign_type = str(item.get("campaign_type") or "")
+                    campaign_id = int(item.get("campaign_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                key = (campaign_type, campaign_id)
+                target = counters_by_campaign.setdefault(
+                    key,
+                    {field: 0 for field in counter_fields},
+                )
+                for field in counter_fields:
+                    value = item.get(field)
+                    if isinstance(value, (int, float)):
+                        target[field] += int(value)
+
+        campaigns = []
+        for (campaign_type, campaign_id), counters in sorted(counters_by_campaign.items()):
+            campaigns.append({
+                "campaign_type": campaign_type,
+                "campaign_id": campaign_id,
+                **counters,
+            })
+        expected = max(1, int(self.worker_count))
+        return {
+            "campaigns": campaigns,
+            "workers_seen": len(workers),
+            "workers_expected": expected,
+            "complete": len(workers) >= expected,
+            "source": "worker_status_aggregate",
+        }
 
     def stop(self) -> None:
         if self.supervisor:
@@ -657,6 +848,11 @@ class VNextRuntime:
             },
             "ingress_credit": self.ingress_credit.snapshot(),
             "route_credits": route_credits,
+            "smpp_lifecycle": {
+                "keep_binds": self.keep_smpp_binds,
+                "prewarm_binds": self.prewarm_smpp_binds,
+                "prewarm_route_ids": list(self.prewarm_route_ids),
+            },
             "control_version": int(self._control_version),
             "controls": [
                 {"campaign_type": key[0], "campaign_id": key[1], "state": value}

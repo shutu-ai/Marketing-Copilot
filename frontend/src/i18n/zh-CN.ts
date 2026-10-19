@@ -190,6 +190,9 @@ export default {
     taskCreatedUsers: '\u5df2\u521b\u5efa\u4efb\u52a1\u7528\u6237',
     acceptedUsers: '\u77ed\u4fe1\u4e2d\u5fc3\u5df2\u63a5\u53d7',
     deliveredUsers: '\u77ed\u4fe1\u5df2\u9001\u8fbe\u7528\u6237',
+    sentViaSocket: '\u5df2\u53d1\u9001\uff08SMPP Socket\uff09',
+    sentUsers: '\u5df2\u53d1\u9001\u7528\u6237\u6570',
+    writeFailed: '\u5199\u5165\u5931\u8d25',
     downloadTaskSnapshot: '\u4e0b\u8f7d\u4efb\u52a1\u5feb\u7167',
     receivedFiles: '接收文件数',
     currentWatchFiles: '监听目录当前文件',
@@ -338,7 +341,7 @@ export default {
     configSms: '配置短信',
     template: '短信模板',
   },
-  smsTasks: { title: '\u77ed\u4fe1\u4efb\u52a1', accepted: '\u77ed\u4fe1\u4e2d\u5fc3\u5df2\u63a5\u53d7', delivered: '\u77ed\u4fe1\u5df2\u9001\u8fbe', partial: '\u90e8\u5206\u63a5\u53d7', unknown: '\u7ed3\u679c\u672a\u77e5' },
+  smsTasks: { title: '\u77ed\u4fe1\u4efb\u52a1', accepted: '\u65e7\u6d41\u7a0b\u77ed\u4fe1\u4e2d\u5fc3\u5df2\u63a5\u53d7', delivered: '\u65e7\u6d41\u7a0b\u5df2\u9001\u8fbe', partial: '\u65e7\u6d41\u7a0b\u90e8\u5206\u63a5\u53d7', unknown: '\u7ed3\u679c\u672a\u77e5', socketWritten: '\u5df2\u53d1\u9001\uff08SMPP Socket\uff09', smscAccepted: '\u77ed\u4fe1\u4e2d\u5fc3\u5df2\u63a5\u53d7', smscRejected: '\u77ed\u4fe1\u4e2d\u5fc3\u62d2\u7edd', writeFailed: '\u5199\u5165 SMPP Socket \u5931\u8d25', cancelled: '\u5df2\u53d6\u6d88', expired: '\u5df2\u8fc7\u671f', vnextNotice: 'VNext\u53d1\u9001\u8bc1\u636e', vnextNoticeDescription: 'socket_written \u5728\u5199\u5165 SMPP Socket \u540e\u8ba1\u4e3a\u5df2\u53d1\u9001\uff1b\u77ed\u4fe1\u4e2d\u5fc3\u63a5\u53d7\u662f\u5355\u72ec\u7684\u54cd\u5e94\u6307\u6807\u3002\u5f53\u524d Projection \u5ef6\u8fdf：{lag}\u79d2\u3002' },
   operations: { title: '运营中心' },
   capacity: { title: '容量与高可用', campaignFairness: '活动公平调度与发送能力', campaign: '活动', route: 'SMPP路由', backlog: '排队 / 重试 / 发送中', outcomes: '部分成功 / 结果未知', weight: '调度权重', rateLimit: '分片TPS上限', socketRate: 'Socket发出/分钟', responseRate: '响应完成/分钟', schedulerEnabled: '公平调度已启用', schedulerDisabled: '公平调度未启用', campaignLoadFailed: '活动容量数据刷新失败' },
   rabbitmq: {
@@ -380,6 +383,8 @@ export default {
     sentAt: '发送时间',
   },
   dashboard: {
+    sentViaSocket: 'VNext：socket_written = 已写入 SMPP Socket',
+    vnextTrendDescription: '过去7天 VNext socket_written 已发送消息',
     title: '仪表盘',
     description: '活动、发送和异常的运营概览',
     stale: '当前显示上次成功获取的数据',

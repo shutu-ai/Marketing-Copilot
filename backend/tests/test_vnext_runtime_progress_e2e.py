@@ -133,6 +133,7 @@ def test_production_runtime_durably_records_two_campaigns(tmp_path):
         projection_batch_size=64,
         status_interval_seconds=0.25,
         progress_aggregate_interval_seconds=0.2,
+        prewarm_smpp_binds=True,
     )
     try:
         runtime.start()
@@ -240,6 +241,14 @@ def test_production_runtime_durably_records_two_campaigns(tmp_path):
         assert projection_status["journal_backlog_bytes"] == 0
         assert projection_status["journal_pending_events"] == 0
         assert projection_status["applied"] >= 8
+
+        transport_statuses = [
+            transport
+            for item in (status.get("worker_progress") or [])
+            for transport in (item.get("snapshot") or {}).get("transports", [])
+        ]
+        assert transport_statuses
+        assert all(transport["connected"] for transport in transport_statuses)
 
         worker_statuses = sorted(
             (tmp_path / "runtime" / "progress").glob("worker-*.status.json")

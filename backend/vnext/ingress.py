@@ -122,6 +122,7 @@ class IngressRouter:
                 source_addr=str(row.get("source_addr", source_addr) or ""),
                 business_day=business_day,
                 expires_at=record_expiry,
+                language=str(row.get("language", row.get("lang", "")) or ""),
             ))
         if not records:
             return result

@@ -47,17 +47,19 @@ def _route_contract(row: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         tps = float(row.get("tps") or 0)
     except (TypeError, ValueError):
         tps = -1.0
-    scope = str(row.get("tps_scope") or "route_shared").strip().lower()
+    scope = str(row.get("tps_scope") or "per_bind").strip().lower()
     bind_type = str(row.get("bind_type") or "transceiver").strip().lower()
     if bind_type not in {"receiver", "transmitter", "transceiver"}:
         errors.append(f"route {row.get('id')}: invalid bind_type={bind_type!r}")
-    if scope not in {"route_shared", "per_bind"}:
-        errors.append(f"route {row.get('id')}: invalid tps_scope={scope!r}")
+    if scope != "per_bind":
+        errors.append(
+            f"route {row.get('id')}: tps_scope must be fixed to 'per_bind', got {scope!r}"
+        )
     if tps < 0:
         errors.append(f"route {row.get('id')}: tps must be >= 0")
     if scope == "per_bind" and bind_type == "receiver":
         errors.append(f"route {row.get('id')}: receiver bind cannot be an outbound per_bind route")
-    effective_total = tps * pool_size if scope == "per_bind" else tps
+    effective_total = tps * pool_size
     item = {
         key: row.get(key) for key in SAFE_ROUTE_COLUMNS if key in row
     }
@@ -97,8 +99,7 @@ def audit_database(db_path: str | os.PathLike[str]) -> dict[str, Any]:
             "bind_semantics": "pool_size physical binds per route",
             "window_semantics": "window_size PDUs per physical bind",
             "tps_semantics": "tps submit_sm_parts/s",
-            "tps_scope_default": "route_shared",
-            "route_shared_effective_total": "tps",
+            "tps_scope_fixed": "per_bind",
             "per_bind_effective_total": "tps * pool_size",
         },
     }

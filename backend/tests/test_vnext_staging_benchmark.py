@@ -22,5 +22,5 @@ def test_isolated_staging_adapters_preserve_digest(tmp_path: Path):
     assert all(item["status"] == "PASS" for item in cases)
     assert all("matches_a0_result" not in item for item in cases)
     assert len({item["result_sha256"] for item in cases}) == 1
-    assert all(len(item["staging_schema"]) == 25 for item in cases)
+    assert all(len(item["staging_schema"]) == 26 for item in cases)
     assert all(item["metrics"]["staging_total_ns"] == item["metrics"]["staging_load_ns"] for item in cases)

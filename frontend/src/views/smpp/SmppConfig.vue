@@ -28,7 +28,6 @@
         <el-table-column prop="pool_size" :label="$t('remaining.x64cea34e')" width="80" />
         <el-table-column prop="window_size" :label="$t('smpp.windowSize')" width="100" />
         <el-table-column prop="tps" label="TPS" width="70" />
-        <el-table-column prop="tps_scope" :label="$t('smpp.tpsScope')" width="120" />
         <el-table-column :label="$t('common.status')" width="80">
           <template #default="{ row }">
             <StatusTag :status="row.enabled ? 'enabled' : 'disabled'" />
@@ -152,14 +151,6 @@
               <el-input-number v-model="form.window_size" :min="1" :max="100" style="width: 100%" />
             </el-form-item>
           </el-col>
-          <el-col :span="12">
-            <el-form-item :label="$t('smpp.tpsScope')">
-              <el-select v-model="form.tps_scope" style="width: 100%">
-                <el-option :label="$t('smpp.routeShared')" value="route_shared" />
-                <el-option :label="$t('smpp.perBind')" value="per_bind" />
-              </el-select>
-            </el-form-item>
-          </el-col>
         </el-row>
         <el-row :gutter="20" class="smpp-throughput-row">
           <el-col :span="12">
@@ -219,7 +210,7 @@ const defaultForm: SmppConfigForm = {
   name: '', host: '', port: 2775, system_id: '', password: '',
   source_addr: '', bind_type: 'transceiver', address_ton: 0, address_npi: 0,
   data_coding: 0, pool_size: 1, window_size: 10, enquire_interval: 30, timeout: 10,
-  tps: 20, tps_scope: 'route_shared', priority: 100, reconnect_max_seconds: 60, delivery_receipt_mode: 'optional',
+  tps: 20, priority: 100, reconnect_max_seconds: 60, delivery_receipt_mode: 'optional',
 }
 const form = ref<SmppConfigForm>({ ...defaultForm })
 const restartRequired = ref(false)
@@ -236,7 +227,7 @@ function openDialog(row?: SmppConfig) {
       address_ton: row.address_ton, address_npi: row.address_npi,
       data_coding: row.data_coding, pool_size: row.pool_size, window_size: row.window_size || 10,
       enquire_interval: row.enquire_interval, timeout: row.timeout,
-      tps: row.tps, tps_scope: row.tps_scope || 'route_shared', priority: row.priority, reconnect_max_seconds: row.reconnect_max_seconds,
+      tps: row.tps, priority: row.priority, reconnect_max_seconds: row.reconnect_max_seconds,
       delivery_receipt_mode: row.delivery_receipt_mode || 'optional',
     }
   } else {

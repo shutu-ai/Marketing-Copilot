@@ -203,6 +203,33 @@ class AsyncSmppTransport:
         self.last_socket_write_monotonic: float | None = None
         self.first_response_monotonic: float | None = None
         self.last_response_monotonic: float | None = None
+        self._rate_buckets = {
+            "socket_written_parts": deque(),
+            "response_success": deque(),
+            "response_error": deque(),
+            "unknown_parts": deque(),
+        }
+
+    def _record_rate(self, name: str, value: int = 1, now: float | None = None) -> None:
+        """Record a bounded one-minute counter without retaining per-PDU data."""
+
+        second = int(time.monotonic() if now is None else now)
+        bucket = self._rate_buckets[name]
+        if bucket and bucket[-1][0] == second:
+            bucket[-1][1] += int(value)
+        else:
+            bucket.append([second, int(value)])
+        cutoff = second - 60
+        while bucket and bucket[0][0] <= cutoff:
+            bucket.popleft()
+
+    def _rate_count(self, name: str, now: float | None = None) -> int:
+        second = int(time.monotonic() if now is None else now)
+        bucket = self._rate_buckets[name]
+        cutoff = second - 60
+        while bucket and bucket[0][0] <= cutoff:
+            bucket.popleft()
+        return sum(int(item[1]) for item in bucket)
 
     def set_response_sink(self, callback: Callable[[dict], Awaitable[None] | None] | None) -> None:
         """Attach the current worker's durable response sink."""
@@ -213,6 +240,29 @@ class AsyncSmppTransport:
         """Attach an optional process-local critical-path profiler."""
 
         self.profiler = profiler
+
+    def update_rate_limit(self, tps: float, tps_scope: str) -> dict:
+        """Apply the safe, connection-preserving route rate settings.
+
+        Credentials, endpoint and bind lifecycle settings deliberately remain
+        immutable for the lifetime of this transport.  Only the credit rate
+        and its scope are changed, so in-flight PDUs keep their existing
+        response/window state while the next admission uses the new bucket.
+        """
+
+        normalized_scope = str(tps_scope or "route_shared").strip().lower()
+        if normalized_scope not in {"route_shared", "per_bind"}:
+            raise ValueError(f"unsupported tps scope: {tps_scope}")
+        normalized_tps = max(0.0, float(tps or 0.0))
+        self.tps = normalized_tps
+        self.tps_scope = normalized_scope
+        self.config["tps"] = normalized_tps
+        self.config["tps_scope"] = normalized_scope
+        return {
+            "route_id": self.route_id,
+            "tps": self.tps,
+            "tps_scope": self.tps_scope,
+        }
 
     async def _admission_allowed(self, callback) -> bool:
         if callback is None:
@@ -328,6 +378,7 @@ class AsyncSmppTransport:
                     pending = self._pending.pop(sequence, None)
                     if pending is None:
                         self.unknown_parts += 1
+                        self._record_rate("unknown_parts")
                         self.unexpected_response_pdus += 1
                         self.response_observed_unknown += 1
                         if self.profiler:
@@ -336,9 +387,11 @@ class AsyncSmppTransport:
                         continue
                     if status == ESME_ROK:
                         self.response_success += 1
+                        self._record_rate("response_success")
                         self.response_observed_success += 1
                     else:
                         self.response_error += 1
+                        self._record_rate("response_error")
                         self.response_observed_error += 1
                     self._window.release()
                     latency = max(0.0, time.monotonic() - pending.sent_at)
@@ -566,6 +619,7 @@ class AsyncSmppTransport:
                                 "socket_write_drain", time.perf_counter_ns() - socket_started_ns
                             )
                 self.socket_written_parts += 1
+                self._record_rate("socket_written_parts")
                 written += 1
                 now_monotonic = time.monotonic()
                 if self.first_socket_write_monotonic is None:
@@ -662,9 +716,16 @@ class AsyncSmppTransport:
             "window_inflight": len(self._pending),
             "window_inflight_peak": self.window_inflight_peak,
             "socket_written_parts": self.socket_written_parts,
+            "socket_written_parts_1m": self._rate_count("socket_written_parts"),
+            "socket_written_tps_1m": round(
+                self._rate_count("socket_written_parts") / 60.0, 3
+            ),
             "response_success": self.response_success,
+            "response_success_1m": self._rate_count("response_success"),
             "response_error": self.response_error,
+            "response_error_1m": self._rate_count("response_error"),
             "unknown_parts": self.unknown_parts,
+            "unknown_parts_1m": self._rate_count("unknown_parts"),
             "response_observed_success": self.response_observed_success,
             "response_observed_error": self.response_observed_error,
             "response_observed_unknown": self.response_observed_unknown,

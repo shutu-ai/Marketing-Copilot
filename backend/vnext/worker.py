@@ -40,6 +40,7 @@ class WorkerProgress:
     message: str = ""
     business_day: str = ""
     expires_at: float = 0.0
+    language: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -58,6 +59,7 @@ class WorkerProgress:
             "message": self.message,
             "business_day": self.business_day,
             "expires_at": float(self.expires_at or 0.0),
+            "language": self.language,
         }
 
 
@@ -152,6 +154,40 @@ class ShardWorker:
             except (KeyError, TypeError, ValueError):
                 continue
 
+    def apply_route_rates(self, route_rates: dict) -> dict:
+        """Update safe route rate settings without recreating SMPP binds."""
+
+        updated_routes: list[str] = []
+        updated_transports = 0
+        for raw_route_id, values in (route_rates or {}).items():
+            key = str(raw_route_id)
+            config = self.route_configs.get(key)
+            if config is None or not isinstance(values, dict):
+                continue
+            scope = str(values.get("tps_scope", config.get("tps_scope", "route_shared")))
+            scope = scope.strip().lower()
+            if scope not in {"route_shared", "per_bind"}:
+                continue
+            try:
+                tps = max(0.0, float(values.get("tps", config.get("tps", 0.0)) or 0.0))
+            except (TypeError, ValueError):
+                continue
+            config["tps"] = tps
+            config["tps_scope"] = scope
+            updated_routes.append(key)
+            with self._transports_lock:
+                transports = list(self._transports.get(key, ()))
+            for transport in transports:
+                updater = getattr(transport, "update_rate_limit", None)
+                if updater is None:
+                    continue
+                updater(tps, scope)
+                updated_transports += 1
+        return {
+            "updated_routes": sorted(set(updated_routes)),
+            "updated_transports": int(updated_transports),
+        }
+
     def _eligible(self, record: SpoolRecord) -> bool:
         self.refresh_campaign_states()
         key = (record.campaign_type, record.campaign_id)
@@ -190,6 +226,88 @@ class ShardWorker:
             self._transport_cursor[key] = cursor + 1
             return value
 
+    async def prewarm_transports(
+        self, route_ids: list[int | str] | tuple[int | str, ...], *, worker_count: int
+    ) -> list[dict]:
+        """Establish the assigned SMPP binds before the first business record.
+
+        A route's physical pool is shared across worker processes.  Assigning
+        the first ``pool_size`` workers a prewarm slot prevents every worker
+        from racing for a single-bind backup route while still making the
+        configured pool visible and warm at service start.
+        """
+
+        count = max(1, int(worker_count))
+        results: list[dict] = []
+        for raw_route_id in route_ids:
+            key = str(raw_route_id)
+            config = self.route_configs.get(key)
+            if not config:
+                continue
+            pool_size = max(1, int(config.get("pool_size", 1) or 1))
+            if self.worker_id >= min(pool_size, count):
+                continue
+            target = max(1, (pool_size + count - 1) // count)
+            for _ in range(target):
+                transport = await self._transport(int(key))
+                if transport is None:
+                    continue
+                connect = getattr(transport, "connect", None)
+                if connect is None:
+                    continue
+                try:
+                    result = connect()
+                    if inspect.isawaitable(result):
+                        await result
+                    results.append({"route_id": int(key), "connected": True})
+                except Exception as exc:
+                    # Keep the worker alive.  The maintenance pass will retry
+                    # with the transport's bounded reconnect backoff, and a
+                    # later business record can still trigger an on-demand
+                    # connection if the SMSC is temporarily unavailable.
+                    results.append({
+                        "route_id": int(key),
+                        "connected": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+        return results
+
+    async def maintain_transports(self) -> list[dict]:
+        """Reconnect existing bind objects after an SMSC-side disconnect."""
+
+        with self._transports_lock:
+            transports = [
+                transport for values in self._transports.values() for transport in values
+            ]
+        results: list[dict] = []
+        for transport in transports:
+            connect = getattr(transport, "connect", None)
+            if connect is None:
+                continue
+            connected = getattr(transport, "connected", None)
+            if connected is None and hasattr(transport, "snapshot"):
+                try:
+                    connected = bool(transport.snapshot().get("connected"))
+                except Exception:
+                    connected = False
+            if connected:
+                continue
+            try:
+                result = connect()
+                if inspect.isawaitable(result):
+                    await result
+                results.append({
+                    "route_id": str(getattr(transport, "route_id", "")),
+                    "connected": True,
+                })
+            except Exception as exc:
+                results.append({
+                    "route_id": str(getattr(transport, "route_id", "")),
+                    "connected": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+        return results
+
     def _build_event(self, progress: WorkerProgress, **overrides) -> dict:
         event = progress.as_dict()
         event.update({
@@ -203,6 +321,10 @@ class ShardWorker:
             "accepted": int(not progress.state.startswith("submit_sm_resp_")),
         })
         event.update(overrides)
+        # ``created_at`` is the source-record timestamp.  Keep an explicit
+        # observation timestamp for rate windows and operational audit; these
+        # are different concepts and must not be conflated.
+        event["event_at"] = float(event.get("event_at") or time.time())
         event["error"] = str(event.get("error") or "")[:512]
         return event
 
@@ -351,6 +473,7 @@ class ShardWorker:
             created_at=float(context.get("created_at") or time.time()),
             business_day=str(context.get("business_day") or ""),
             expires_at=float(context.get("expires_at") or 0.0),
+            language=str(context.get("language") or ""),
         )
 
     def _response_event_nowait(self, response: dict) -> None:
@@ -398,6 +521,7 @@ class ShardWorker:
                 f"expiry checkpoint failed: {type(exc).__name__}: {exc}",
                 created_at=record.created_at, message=record.message,
                 business_day=record.business_day, expires_at=record.expires_at,
+                language=record.language,
             ), reservation=reservation)
             return
         await self._emit(WorkerProgress(
@@ -406,6 +530,7 @@ class ShardWorker:
             record.normalized_msisdn, "expired", 0, record.part_count_hint,
             reason, created_at=record.created_at, message=record.message,
             business_day=record.business_day, expires_at=record.expires_at,
+            language=record.language,
         ), reservation=reservation)
 
     @staticmethod
@@ -419,6 +544,7 @@ class ShardWorker:
             parts_total, parts_total, "x" * 512,
             created_at=record.created_at, message=record.message,
             business_day=record.business_day, expires_at=record.expires_at,
+            language=record.language,
         )
         response = WorkerProgress(
             f"{record.event_id}:resp:2147483647",
@@ -428,6 +554,7 @@ class ShardWorker:
             0, parts_total, "x" * 512,
             created_at=record.created_at, business_day=record.business_day,
             expires_at=record.expires_at,
+            language=record.language,
         )
         return send, response
 
@@ -513,6 +640,7 @@ class ShardWorker:
                     record.campaign_type, record.campaign_id, record.route_id,
                     record.normalized_msisdn, "cancelled", 0, parts_total,
                     "campaign cancelled", message=record.message,
+                    language=record.language,
                 ),
                 reservation=reservation,
             )
@@ -531,7 +659,7 @@ class ShardWorker:
                 record.campaign_type, record.campaign_id, record.route_id,
                 record.normalized_msisdn, "write_failed", 0, parts_total,
                 f"dispatch checkpoint failed: {type(exc).__name__}: {exc}",
-                message=record.message,
+                message=record.message, language=record.language,
             ), reservation=reservation)
             if reservation is not None:
                 reservation.release_unwritten(reservation.slots_open)
@@ -575,6 +703,7 @@ class ShardWorker:
                         "created_at": record.created_at,
                         "business_day": record.business_day,
                         "expires_at": record.expires_at,
+                        "language": record.language,
                     },
                 }
                 if reservation is not None:
@@ -616,6 +745,7 @@ class ShardWorker:
                 result.parts_total, result.error, created_at=record.created_at,
                 message=record.message, business_day=record.business_day,
                 expires_at=record.expires_at,
+                language=record.language,
             ), reservation=reservation)
             if not accepted and reservation is not None:
                 reservation.release_unwritten(reservation.slots_open)
@@ -740,7 +870,8 @@ class ShardWorker:
             await asyncio.sleep(0.01)
 
     async def run_until_idle(self, *, max_tasks: int | None = None,
-                             close_transports: bool = True) -> dict:
+                             close_transports: bool = True,
+                             control_handler: Callable[[], bool] | None = None) -> dict:
         iterators, buffers, counts, exhausted, group_order, fill = self._seed_buffers()
         pending: set[asyncio.Task] = set()
         blocked_partitions: set[int] = set()
@@ -748,6 +879,8 @@ class ShardWorker:
         fill()
         try:
             while not self._stop.is_set() and (group_order or pending) and (max_tasks is None or processed < int(max_tasks)):
+                if control_handler is not None and control_handler():
+                    break
                 for partition in blocked_partitions:
                     exhausted.add(partition)
                 fill()

@@ -12,13 +12,14 @@ import os
 import json
 import threading
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
 
 from database import read_transaction
 from vnext.ingress import IngressRouter
 from vnext.runtime import VNextRuntime
-from vnext.spool import SpoolCapacityError
+from vnext.spool import DEFAULT_MAX_SPOOL_BYTES, SpoolCapacityError
 
 
 _LOCK = threading.RLock()
@@ -26,6 +27,17 @@ _RUNTIME: VNextRuntime | None = None
 _CONFIG_RESTART_REQUIRED = False
 _CONFIG_CHANGE_AT = 0.0
 _CONFIG_CHANGE_REASON = ""
+
+
+VNEXT_METRIC_CONTRACT = {
+    "sent": "socket_written",
+    "sent_definition": "logical send event durably recorded after submit_sm was written to the SMPP socket",
+    "sent_unit": "message_event",
+    "smsc_accepted": "submit_sm_resp_success",
+    "smsc_accepted_definition": "SMSC returned a successful submit_sm response; this is not handset delivery",
+    "smsc_accepted_unit": "submit_sm_part",
+    "delivery_receipts_available": False,
+}
 
 
 def pipeline_mode() -> str:
@@ -36,6 +48,23 @@ def pipeline_mode() -> str:
 def is_active() -> bool:
     with _LOCK:
         return _RUNTIME is not None and bool(getattr(_RUNTIME, "_started", False))
+
+
+def config_state() -> dict:
+    """Return whether persisted SMPP settings are effective in this runtime."""
+
+    with _LOCK:
+        active = _RUNTIME is not None and bool(getattr(_RUNTIME, "_started", False))
+        pending = bool(_CONFIG_RESTART_REQUIRED)
+    if not active:
+        return {
+            "restart_required": False,
+            "effective_state": "next_start",
+        }
+    return {
+        "restart_required": pending,
+        "effective_state": "pending_restart" if pending else "applied",
+    }
 
 
 def runtime() -> VNextRuntime:
@@ -58,15 +87,24 @@ def _env_bytes(name: str, default: int) -> int:
         value = int(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         value = default
-    return max(16 * 1024 * 1024, value)
+    # Keep the production spool fail-safe at 4 GiB or more.  Larger values
+    # such as 16 GiB/32 GiB remain valid when the host has the capacity.
+    return max(16 * 1024 * 1024, int(default), value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = str(os.environ.get(name, "")).strip().lower()
+    if not value:
+        return bool(default)
+    return value not in {"0", "false", "no", "off"}
 
 
 def mark_config_change(reason: str = "SMPP configuration changed") -> None:
-    """Mark a control-plane change that takes effect on a safe restart.
+    """Mark a structural control-plane change for a safe restart.
 
-    VNext deliberately does not hot-swap sockets or route credentials while a
-    PDU may be in flight.  The API/UI can therefore report the pending state
-    instead of claiming that a stale worker snapshot is already effective.
+    Endpoint, credential, bind-pool, window and protocol settings remain
+    restart-bound.  The safe rate settings use ``apply_route_rates`` instead
+    and do not call this function.
     """
 
     global _CONFIG_RESTART_REQUIRED, _CONFIG_CHANGE_AT, _CONFIG_CHANGE_REASON
@@ -74,6 +112,21 @@ def mark_config_change(reason: str = "SMPP configuration changed") -> None:
         _CONFIG_RESTART_REQUIRED = True
         _CONFIG_CHANGE_AT = time.time()
         _CONFIG_CHANGE_REASON = str(reason or "SMPP configuration changed")
+
+
+def apply_route_rates(route_configs: dict | None = None) -> dict:
+    """Push persisted TPS settings to all live workers without reconnecting."""
+
+    with _LOCK:
+        value = _RUNTIME
+        if value is None or not getattr(value, "_started", False):
+            return {
+                "ok": False,
+                "reason": "runtime_inactive",
+                "updated_routes": [],
+            }
+        routes = route_configs if route_configs is not None else _load_routes()
+        return value.reload_route_rates(routes)
 
 
 def run_root() -> Path:
@@ -87,7 +140,7 @@ def run_root() -> Path:
 def _load_routes() -> dict[str, dict]:
     def read(conn):
         return conn.execute(
-            """SELECT id,host,port,system_id,password,source_addr,window_size,
+            """SELECT id,name,host,port,system_id,password,source_addr,window_size,
                       timeout,tps,tps_scope,pool_size,bind_type,enquire_interval,
                       reconnect_max_seconds,delivery_receipt_mode,priority,
                       address_ton,address_npi,data_coding,enabled
@@ -98,6 +151,7 @@ def _load_routes() -> dict[str, dict]:
     return {
         str(row["id"]): {
             "route_id": int(row["id"]),
+            "name": str(row["name"] or ""),
             "host": str(row["host"] or ""),
             "port": int(row["port"] or 0),
             "system_id": str(row["system_id"] or ""),
@@ -106,7 +160,8 @@ def _load_routes() -> dict[str, dict]:
             "window_size": int(row["window_size"] or 10),
             "timeout": float(row["timeout"] or 10),
             "tps": float(row["tps"] or 0),
-            "tps_scope": str(row["tps_scope"] or "route_shared"),
+            # VNext capacity is always accounted per physical bind.
+            "tps_scope": "per_bind",
             "pool_size": max(1, int(row["pool_size"] or 1)),
             "bind_type": str(row["bind_type"] or "transceiver"),
             "enquire_interval": float(row["enquire_interval"] or 30),
@@ -146,10 +201,12 @@ def start() -> VNextRuntime | None:
             run_root(), routes,
             worker_count=_env_int("MC_VNEXT_WORKERS", 4, 1, 8),
             virtual_partition_count=_env_int("MC_VNEXT_PARTITIONS", 256, 16, 4096),
-            max_spool_bytes=_env_bytes("MC_VNEXT_MAX_SPOOL_BYTES", 512 * 1024 * 1024),
+            max_spool_bytes=_env_bytes("MC_VNEXT_MAX_SPOOL_BYTES", DEFAULT_MAX_SPOOL_BYTES),
             projection_queue_size=_env_int("MC_VNEXT_PROJECTION_QUEUE", 8192, 128, 100000),
             max_inflight=_env_int("MC_VNEXT_MAX_INFLIGHT", 128, 1, 2048),
             prefetch_per_partition=_env_int("MC_VNEXT_PREFETCH_PER_PARTITION", 64, 1, 512),
+            keep_smpp_binds=_env_bool("MC_VNEXT_KEEP_SMPP_BINDS", True),
+            prewarm_smpp_binds=_env_bool("MC_VNEXT_PREWARM_SMPP_BINDS", True),
         )
         value.start()
         _RUNTIME = value
@@ -388,48 +445,690 @@ def _progress_events(business_day: str | None = None) -> list[dict]:
     return list(events.values())
 
 
+def _live_campaign_counter_snapshot(business_day: str | None = None) -> dict | None:
+    """Read the bounded worker counter snapshot for the current business day.
+
+    The worker status files are already maintained by ``ProgressPersistence``
+    and contain durable counters by campaign.  Reading them keeps API/UI
+    statistics off the journal replay path and, importantly, does not open
+    DuckDB or touch the send workers.  Historical-day queries still use the
+    journal fallback because the live snapshot only describes the active day.
+    """
+
+    try:
+        value = runtime()
+        current_day = str(getattr(value.spool, "current_business_day", ""))
+        if business_day is not None and str(business_day) != current_day:
+            return None
+        reader = getattr(value, "campaign_counter_snapshot", None)
+        if not callable(reader):
+            return None
+        snapshot = reader()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _counter_stats(counters: list[dict]) -> dict[str, int]:
+    fields = (
+        "accepted_tasks", "tasks_taken", "socket_written_events",
+        "socket_written_pdus", "response_success", "response_error",
+        "unknown", "write_failed", "cancelled", "expired", "durable_events",
+    )
+    result = {field: 0 for field in fields}
+    for item in counters:
+        for field in fields:
+            value = item.get(field)
+            if isinstance(value, (int, float)):
+                result[field] += int(value)
+    return result
+
+
+def _campaign_stats_from_counters(
+    campaign_type: str,
+    campaign_id: int,
+    counters: dict,
+    *,
+    complete: bool,
+    source: str,
+) -> dict:
+    return {
+        "pipeline": "vnext",
+        "campaign_type": str(campaign_type),
+        "campaign_id": int(campaign_id),
+        "metric_contract": dict(VNEXT_METRIC_CONTRACT),
+        "delivery_receipts_available": False,
+        "sent_count": int(counters.get("socket_written_events") or 0),
+        "sent_pdus": int(counters.get("socket_written_pdus") or 0),
+        "smsc_accepted_pdus": int(counters.get("response_success") or 0),
+        "smsc_rejected_pdus": int(counters.get("response_error") or 0),
+        "unknown_pdus": int(counters.get("unknown") or 0),
+        "write_failed": int(counters.get("write_failed") or 0),
+        "cancelled": int(counters.get("cancelled") or 0),
+        "expired": int(counters.get("expired") or 0),
+        "accepted_tasks": int(counters.get("accepted_tasks") or 0),
+        "tasks_taken": int(counters.get("tasks_taken") or 0),
+        "event_count": int(counters.get("durable_events") or 0),
+        "stats_complete": bool(complete),
+        "stats_source": str(source),
+    }
+
+
+def _projection_campaign_totals(
+    campaign_type: str,
+    campaign_id: int,
+    business_day: str | None = None,
+) -> dict | None:
+    """Read one campaign/day row from the bounded projection snapshot."""
+
+    try:
+        value = runtime()
+        selected_day = str(business_day or value.spool.current_business_day)
+        snapshot = value.projection.snapshot()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    for item in snapshot.get("campaign_daily_totals") or []:
+        if (
+            str(item.get("business_day") or "") == selected_day
+            and str(item.get("campaign_type") or "") == str(campaign_type)
+            and int(item.get("campaign_id") or 0) == int(campaign_id)
+        ):
+            return dict(item)
+    return None
+
+
+def _add_today_campaign_stats(stats: dict, daily: dict | None) -> dict:
+    """Attach today/day counters without changing the cumulative contract."""
+
+    daily = daily or {}
+    values = {
+        "today_sent_users": int(daily.get("socket_written") or 0),
+        "today_socket_written_events": int(daily.get("socket_written") or 0),
+        "today_sent_pdus": int(daily.get("socket_written_pdus") or 0),
+        "today_smsc_accepted_pdus": int(daily.get("response_success") or 0),
+        "today_smsc_rejected_pdus": int(daily.get("response_error") or 0),
+        "today_unknown_pdus": int(daily.get("unknown") or 0),
+        "today_write_failed": int(daily.get("write_failed") or 0),
+        "today_accepted_tasks": int(daily.get("accepted") or 0),
+        "today_tasks_taken": int(daily.get("taken") or 0),
+    }
+    values["today_sent_count"] = values["today_sent_users"]
+    values["today_socket_written"] = values["today_sent_users"]
+    values["today_event_count"] = sum(
+        int(daily.get(field) or 0)
+        for field in (
+            "queued", "taken", "accepted", "socket_written", "write_failed",
+            "unknown", "cancelled", "expired", "response_success", "response_error",
+        )
+    )
+    stats.update(values)
+    stats["sent_users"] = int(stats.get("sent_count") or 0)
+    return stats
+
+
+def _business_days(current_day: str, count: int = 7) -> list[str]:
+    try:
+        anchor = date.fromisoformat(str(current_day))
+    except (TypeError, ValueError):
+        anchor = date.today()
+    return [
+        (anchor - timedelta(days=offset)).isoformat()
+        for offset in range(max(1, int(count)) - 1, -1, -1)
+    ]
+
+
+def _daily_totals_by_day(snapshot: dict) -> dict[str, dict[str, int]]:
+    result: dict[str, dict[str, int]] = {}
+    for raw in snapshot.get("daily_totals") or []:
+        day = str(raw.get("business_day") or "")
+        if not day:
+            continue
+        result[day] = {
+            key: int(raw.get(key) or 0)
+            for key in (
+                "queued", "taken", "socket_written", "socket_written_pdus",
+                "write_failed", "unknown", "cancelled", "accepted", "expired",
+                "response_success", "response_error",
+            )
+        }
+    return result
+
+
+def dashboard_stats() -> dict:
+    """Return dashboard counters using the VNext projection contract."""
+
+    value = runtime()
+    projection = value.projection.snapshot()
+    current_day = str(value.spool.current_business_day)
+    totals = _daily_totals_by_day(projection)
+    days = _business_days(current_day)
+    today = totals.get(current_day, {})
+    trend = []
+    for day in days:
+        row = totals.get(day, {})
+        trend.append({
+            "stats_date": day,
+            # The dashboard's send count is intentionally socket_written,
+            # never legacy accepted/delivered task-table state.
+            "sent_count": int(row.get("socket_written", 0)),
+            "socket_written_count": int(row.get("socket_written", 0)),
+            "smsc_accepted_count": int(row.get("response_success", 0)),
+            "unknown_count": int(row.get("unknown", 0)),
+            "write_failed_count": int(row.get("write_failed", 0)),
+            "conversion_count": 0,
+        })
+    return {
+        "pipeline": "vnext",
+        "metric_contract": dict(VNEXT_METRIC_CONTRACT),
+        "sent_metric": "socket_written",
+        "sent_unit": "message_event",
+        "delivery_receipts_available": False,
+        "delivery_receipt_reason": (
+            "VNext records submit_sm socket and response evidence; handset DLR is not connected"
+        ),
+        "today_sent_count": int(today.get("socket_written", 0)),
+        "today_socket_written_count": int(today.get("socket_written", 0)),
+        "today_smsc_accepted_count": int(today.get("response_success", 0)),
+        "today_unknown_count": int(today.get("unknown", 0)),
+        "today_write_failed_count": int(today.get("write_failed", 0)),
+        "daily_trend": trend,
+        "projection_lag_seconds": float(projection.get("projection_lag_seconds") or 0.0),
+        "stats_source": "vnext_projection",
+    }
+
+
+def _task_item_from_event(row: dict, base: dict | None = None) -> dict:
+    """Adapt one progress event to the logical-task shape consumed by the UI.
+
+    Response events deliberately carry only transport evidence.  Their
+    logical task fields are filled from the corresponding base event so the
+    list never renders an empty number or message just because the selected
+    row happens to be a ``submit_sm_resp`` event.
+    """
+
+    base = base or {}
+    event_id = str(row.get("event_id") or "")
+    normalized_msisdn = str(
+        row.get("normalized_msisdn") or base.get("normalized_msisdn") or ""
+    )
+    language = str(row.get("language") or base.get("language") or "")
+    message = str(row.get("message") or base.get("message") or "")
+    campaign_type = str(row.get("campaign_type") or base.get("campaign_type") or "")
+    campaign_id = int(row.get("campaign_id") or base.get("campaign_id") or 0)
+    return {
+        "id": event_id,
+        "event_id": event_id,
+        "campaign_name": f"{campaign_type} #{campaign_id}",
+        "campaign_type": campaign_type,
+        "campaign_id": campaign_id,
+        "smpp_config_id": int(row.get("route_id") or base.get("route_id") or 0),
+        "msisdn": normalized_msisdn,
+        "normalized_msisdn": normalized_msisdn,
+        "language": language,
+        "content": message,
+        "status": str(row.get("state") or "unknown"),
+        "attempts": 0,
+        "error_msg": str(row.get("error") or ""),
+        "updated_at": row.get("created_at"),
+        "parts_written": int(row.get("parts_written") or 0),
+        "parts_total": int(row.get("parts_total") or 0),
+    }
+
+
+def _projection_task_page(
+    page: int, page_size: int, status: str, campaign_type: str,
+    smpp_config_id: int, business_day: str | None,
+) -> tuple[int, list[dict]] | None:
+    """Read only one task page from the bounded VNext projection database.
+
+    The projection writer remains the sole writer.  This connection is
+    read-only and is intentionally opened only for the API query, so the
+    send workers and their journal path are not involved.
+    """
+
+    try:
+        import duckdb
+
+        value = runtime()
+        snapshot = value.projection.snapshot()
+        db_path = snapshot.get("db_path")
+        if not db_path:
+            return None
+        selected_day = str(business_day or value.spool.current_business_day)
+        conditions = ["e.business_day=?"]
+        params: list[object] = [selected_day]
+        if status:
+            conditions.append("e.state=?")
+            params.append(str(status))
+        if campaign_type:
+            conditions.append("e.campaign_type=?")
+            params.append(str(campaign_type))
+        if int(smpp_config_id) >= 0:
+            conditions.append("e.route_id=?")
+            params.append(int(smpp_config_id))
+        where = " AND ".join(conditions)
+        offset = (max(1, int(page)) - 1) * max(1, int(page_size))
+        connection = duckdb.connect(str(db_path), read_only=True)
+        try:
+            total = int(connection.execute(
+                f"SELECT COUNT(*) FROM vnext_progress_events e WHERE {where}",
+                params,
+            ).fetchone()[0])
+            rows = connection.execute(
+                f"""
+                SELECT e.event_id, e.campaign_type, e.campaign_id, e.route_id,
+                       COALESCE(NULLIF(e.normalized_msisdn,''), base.normalized_msisdn, '')
+                           AS normalized_msisdn,
+                       COALESCE(NULLIF(e.language,''), base.language, '') AS language,
+                       COALESCE(NULLIF(e.message,''), base.message, '') AS message,
+                       e.state, e.parts_written, e.parts_total, e.error, e.created_at
+                  FROM vnext_progress_events e
+                  LEFT JOIN vnext_progress_events base
+                    ON base.event_id=split_part(e.event_id, ':resp:', 1)
+                   AND base.business_day=e.business_day
+                 WHERE {where}
+                 ORDER BY e.created_at DESC, e.ordinal DESC, e.event_id DESC
+                 LIMIT ? OFFSET ?
+                """,
+                params + [max(1, int(page_size)), offset],
+            ).fetchall()
+            columns = [str(item[0]) for item in connection.description]
+            return total, [dict(zip(columns, row)) for row in rows]
+        finally:
+            connection.close()
+    except Exception:
+        # A read-only diagnostic/list query must never make the API or send
+        # path fail.  The caller falls back to the compatibility journal view.
+        return None
+
+
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
                smpp_config_id: int = -1, cursor: Optional[int] = None,
                business_day: str | None = None) -> dict:
-    del cursor
     page = max(1, int(page))
+    # Keep the existing cursor-based API usable by acceptance tools and older
+    # clients.  VNext cursors are page tokens, while the legacy implementation
+    # used a task id; VNext is selected by the router, so interpreting the
+    # token here is unambiguous.  An explicit page remains authoritative.
+    if page <= 1 and cursor is not None and int(cursor) > 0:
+        page = int(cursor)
     page_size = max(1, min(200, int(page_size)))
-    offset = (page - 1) * page_size
+    projection_page = _projection_task_page(
+        page, page_size, status, campaign_type, smpp_config_id, business_day,
+    )
+    if projection_page is not None:
+        total, rows = projection_page
+        items = [_task_item_from_event(row) for row in rows]
+        has_more = page * page_size < total
+        return {
+            "pipeline": "vnext", "total": total, "page": page,
+            "page_size": page_size, "items": items,
+            "next_cursor": page + 1 if has_more else None, "has_more": has_more,
+            "stats_source": "vnext_projection_page",
+        }
+
+    # Compatibility fallback for a runtime whose projection database has not
+    # been initialized yet.  Normal production requests use the bounded SQL
+    # path above and do not replay the worker journals.
     events = [item for item in _progress_events(business_day)
               if (not status or str(item.get("state")) == str(status))
               and (not campaign_type or str(item.get("campaign_type")) == str(campaign_type))
               and (int(smpp_config_id) < 0 or int(item.get("route_id") or 0) == int(smpp_config_id))]
     events.sort(key=lambda item: (float(item.get("created_at") or 0), str(item.get("event_id"))), reverse=True)
     total = len(events)
+    by_id = {str(item.get("event_id") or ""): item for item in events}
+    offset = (page - 1) * page_size
     rows = events[offset:offset + page_size]
     items = []
     for row in rows:
-        item = dict(row)
-        item.update({
-            "id": item["event_id"], "campaign_name": f"{item['campaign_type']} #{item['campaign_id']}",
-            "smpp_config_id": item["route_id"], "content": item.pop("message", ""),
-            "status": item.pop("state"), "attempts": 0, "error_msg": item.pop("error", ""),
-            "updated_at": item.pop("created_at"),
-        })
-        items.append(item)
+        parent_id = str(row.get("event_id") or "").split(":resp:", 1)[0]
+        items.append(_task_item_from_event(row, by_id.get(parent_id)))
     has_more = offset + len(items) < total
-    return {"pipeline": "vnext", "total": total, "page": page, "page_size": page_size,
-            "items": items, "next_cursor": page + 1 if has_more else None, "has_more": has_more}
+    return {
+        "pipeline": "vnext", "total": total, "page": page,
+        "page_size": page_size, "items": items,
+        "next_cursor": page + 1 if has_more else None, "has_more": has_more,
+        "stats_source": "vnext_journal_fallback",
+    }
 
 
 def task_stats(business_day: str | None = None) -> dict:
-    events = _progress_events(business_day)
-    result: dict[str, int | float | str] = {}
+    value = runtime()
+    projection = value.projection.snapshot()
+    current_day = str(value.spool.current_business_day)
+    selected_day = str(business_day or current_day)
+    row = _daily_totals_by_day(projection).get(selected_day, {})
+
+    socket_written = int(row.get("socket_written") or 0)
+    socket_written_pdus = int(row.get("socket_written_pdus") or 0)
+    response_success = int(row.get("response_success") or 0)
+    response_error = int(row.get("response_error") or 0)
+    unknown = int(row.get("unknown") or 0)
+    write_failed = int(row.get("write_failed") or 0)
+    cancelled = int(row.get("cancelled") or 0)
+    expired = int(row.get("expired") or 0)
+
+    # Keep the task-statistics cards on the same projection snapshot as the
+    # dashboard. These aliases are intentionally current-business-day values
+    # for the VNext endpoint, so the UI does not fall back to a different
+    # worker-side source while rendering its "today" cards.
+    return {
+        "accepted_tasks": int(row.get("accepted") or 0),
+        "tasks_taken": int(row.get("taken") or 0),
+        "socket_written": socket_written,
+        "socket_written_events": socket_written,
+        "socket_written_pdus": socket_written_pdus,
+        "sent": socket_written,
+        "sent_pdus": socket_written_pdus,
+        "smsc_accepted": response_success,
+        "smsc_rejected": response_error,
+        "unknown": unknown,
+        "write_failed": write_failed,
+        "cancelled": cancelled,
+        "expired": expired,
+        "total": int(projection.get("projection_events_applied") or 0),
+        "today_socket_written": socket_written,
+        "today_socket_written_events": socket_written,
+        "today_socket_written_pdus": socket_written_pdus,
+        "today_sent_count": socket_written,
+        "today_submit_sm_resp_success": response_success,
+        "today_submit_sm_resp_error": response_error,
+        "today_write_failed": write_failed,
+        "today_unknown": unknown,
+        "today_cancelled": cancelled,
+        "today_expired": expired,
+        "delivery_receipts_available": False,
+        "metric_contract": dict(VNEXT_METRIC_CONTRACT),
+        "pipeline": "vnext",
+        "stats_complete": True,
+        "stats_source": "vnext_projection",
+        "projection_lag_seconds": float(projection.get("projection_lag_seconds") or 0.0),
+    }
+
+
+def campaign_stats(campaign_type: str, campaign_id: int,
+                   business_day: str | None = None) -> dict:
+    """Return bounded VNext counters for one campaign.
+
+    ``socket_written`` is a logical message event.  Response counters are
+    SMPP PDU events, so the API names them explicitly instead of presenting
+    them as handset/user delivery counts.  The live path reads worker status
+    aggregates; journal replay is retained only for historical-day queries or
+    runtimes that predate the aggregate snapshot API.
+    """
+
+    live_snapshot = _live_campaign_counter_snapshot(business_day)
+    if live_snapshot is not None:
+        counters = next(
+            (
+                item for item in live_snapshot.get("campaigns") or []
+                if str(item.get("campaign_type") or "") == str(campaign_type)
+                and int(item.get("campaign_id") or 0) == int(campaign_id)
+            ),
+            {},
+        )
+        stats = _campaign_stats_from_counters(
+            campaign_type,
+            campaign_id,
+            counters,
+            complete=bool(live_snapshot.get("complete")),
+            source=str(live_snapshot.get("source") or "worker_status_aggregate"),
+        )
+        return _add_today_campaign_stats(
+            stats, _projection_campaign_totals(campaign_type, campaign_id, business_day)
+        )
+
+    projection_totals = _projection_campaign_totals(
+        campaign_type, campaign_id, business_day
+    )
+    if projection_totals is not None:
+        stats = _campaign_stats_from_counters(
+            campaign_type,
+            campaign_id,
+            {
+                "accepted_tasks": projection_totals.get("accepted"),
+                "tasks_taken": projection_totals.get("taken"),
+                "socket_written_events": projection_totals.get("socket_written"),
+                "socket_written_pdus": projection_totals.get("socket_written_pdus"),
+                "response_success": projection_totals.get("response_success"),
+                "response_error": projection_totals.get("response_error"),
+                "unknown": projection_totals.get("unknown"),
+                "write_failed": projection_totals.get("write_failed"),
+                "cancelled": projection_totals.get("cancelled"),
+                "expired": projection_totals.get("expired"),
+                "durable_events": 0,
+            },
+            complete=True,
+            source="vnext_projection",
+        )
+        return _add_today_campaign_stats(stats, projection_totals)
+
+    events = [
+        item for item in _progress_events(business_day)
+        if str(item.get("campaign_type") or "") == str(campaign_type)
+        and int(item.get("campaign_id") or 0) == int(campaign_id)
+    ]
+    counters = {
+        "socket_written": 0,
+        "socket_written_pdus": 0,
+        "submit_sm_resp_success": 0,
+        "submit_sm_resp_error": 0,
+        "unknown": 0,
+        "write_failed": 0,
+        "cancelled": 0,
+        "expired": 0,
+    }
     for event in events:
         state = str(event.get("state") or "unknown")
-        result[state] = int(result.get(state, 0)) + 1
-    result["total"] = len(events)
-    latest = max((float(item.get("created_at") or 0) for item in events), default=0.0)
-    writer_status = runtime().projection.snapshot()
-    applied_at = float(writer_status.get("last_applied_at") or 0.0)
-    result["projection_lag_seconds"] = max(0.0, latest - applied_at) if applied_at else 0.0
-    result["pipeline"] = "vnext"
-    return result
+        if state in counters:
+            counters[state] += 1
+        if state == "socket_written":
+            counters["socket_written_pdus"] += max(
+                0, int(event.get("parts_written", 0) or 0)
+            )
+    stats = _campaign_stats_from_counters(
+        campaign_type,
+        campaign_id,
+        {
+            "socket_written_events": counters["socket_written"],
+            "socket_written_pdus": counters["socket_written_pdus"],
+            "response_success": counters["submit_sm_resp_success"],
+            "response_error": counters["submit_sm_resp_error"],
+            "unknown": counters["unknown"],
+            "write_failed": counters["write_failed"],
+            "cancelled": counters["cancelled"],
+            "expired": counters["expired"],
+            "durable_events": len(events),
+        },
+        complete=True,
+        source="journal_replay",
+    )
+    return _add_today_campaign_stats(
+        stats,
+        {
+            "socket_written": counters["socket_written"],
+            "socket_written_pdus": counters["socket_written_pdus"],
+            "response_success": counters["submit_sm_resp_success"],
+            "response_error": counters["submit_sm_resp_error"],
+            "unknown": counters["unknown"],
+            "write_failed": counters["write_failed"],
+        },
+    )
+
+
+def smpp_stats(status_value: dict | None = None) -> dict:
+    """Expose live VNext bind/rate counters using the UI metric contract."""
+
+    runtime_value = None
+    if status_value is None:
+        runtime_value = runtime()
+        state = dict(runtime_value.status())
+    else:
+        state = dict(status_value)
+    route_rows = state.get("routes") or []
+    # ``VNextRuntime.status()`` is intentionally a lightweight raw snapshot
+    # and does not decorate it with control-plane route definitions. The
+    # direct /api/smpp/stats path must still expose configured routes without
+    # calling the heavier application status() endpoint (which scans journal
+    # progress). Loading these in-memory configs keeps stats read-only and
+    # out of the send path.
+    if not route_rows:
+        if runtime_value is None:
+            runtime_value = runtime()
+        route_rows = []
+        for config in runtime_value.route_configs.values():
+            route_rows.append({
+                key: config.get(key) for key in (
+                    "route_id", "name", "host", "port", "pool_size", "window_size",
+                    "tps", "tps_scope", "priority", "effective_total_limit_tps",
+                )
+            })
+    aggregates: dict[int, dict] = {}
+    for route in route_rows:
+        route_id = int(route.get("route_id") or 0)
+        aggregates[route_id] = {
+            "connected_count": 0,
+            "connections": [],
+            "socket_written_parts": 0,
+            "socket_written_parts_1m": 0,
+            "socket_written_tps_1m": 0.0,
+            "response_success": 0,
+            "response_success_1m": 0,
+            "response_error": 0,
+            "response_error_1m": 0,
+            "unknown_parts": 0,
+            "unknown_parts_1m": 0,
+            "write_failures": 0,
+        }
+    for worker in state.get("worker_progress") or []:
+        snapshot = worker.get("snapshot") or {}
+        for transport in snapshot.get("transports") or []:
+            route_id = int(transport.get("route_id") or 0)
+            aggregate = aggregates.setdefault(route_id, {
+                "connected_count": 0, "connections": [],
+                "socket_written_parts": 0, "socket_written_parts_1m": 0,
+                "socket_written_tps_1m": 0.0, "response_success": 0,
+                "response_success_1m": 0, "response_error": 0,
+                "response_error_1m": 0, "unknown_parts": 0,
+                "unknown_parts_1m": 0, "write_failures": 0,
+            })
+            connected = bool(transport.get("connected"))
+            aggregate["connected_count"] += int(connected)
+            aggregate["socket_written_parts"] += int(transport.get("socket_written_parts") or 0)
+            aggregate["socket_written_parts_1m"] += int(transport.get("socket_written_parts_1m") or 0)
+            aggregate["socket_written_tps_1m"] += float(transport.get("socket_written_tps_1m") or 0.0)
+            aggregate["response_success"] += int(transport.get("response_success") or 0)
+            aggregate["response_success_1m"] += int(transport.get("response_success_1m") or 0)
+            aggregate["response_error"] += int(transport.get("response_error") or 0)
+            aggregate["response_error_1m"] += int(transport.get("response_error_1m") or 0)
+            aggregate["unknown_parts"] += int(transport.get("unknown_parts") or 0)
+            aggregate["unknown_parts_1m"] += int(transport.get("unknown_parts_1m") or 0)
+            aggregate["write_failures"] += int(transport.get("write_failures") or 0)
+            aggregate["connections"].append({
+                "bind_slot": transport.get("bind_slot"),
+                "connected": connected,
+                "window_inflight": int(transport.get("window_inflight") or 0),
+                "last_error": str(transport.get("last_error") or ""),
+            })
+
+    durable = {
+        "socket_written_pdus": 0,
+        "socket_written_events": 0,
+        "response_success": 0,
+        "response_error": 0,
+        "unknown": 0,
+        "write_failed": 0,
+    }
+    for worker in state.get("worker_progress") or []:
+        progress = (worker.get("snapshot") or {}).get("progress") or {}
+        for target, source in (
+            ("socket_written_pdus", "durable_socket_written_pdus"),
+            ("socket_written_events", "durable_socket_written_events"),
+            ("response_success", "durable_response_success"),
+            ("response_error", "durable_response_error"),
+            ("unknown", "durable_unknown"),
+            ("write_failed", "durable_write_failed"),
+        ):
+            durable[target] += int(progress.get(source) or 0)
+
+    projection = state.get("projection") or {}
+    days = _daily_totals_by_day(projection)
+    current_day = str((state.get("daily_epoch") or {}).get("business_day") or "")
+    today = days.get(current_day, {})
+    items = []
+    for route in route_rows:
+        route_id = int(route.get("route_id") or 0)
+        aggregate = aggregates.get(route_id, {})
+        pool_size = max(1, int(route.get("pool_size") or 1))
+        connected_count = int(aggregate.get("connected_count") or 0)
+        items.append({
+            "config_id": route_id,
+            "name": str(route.get("name") or f"Route #{route_id}"),
+            "host": route.get("host", ""),
+            "port": route.get("port", 0),
+            "enabled": 1,
+            "priority": route.get("priority", 100),
+            "tps": route.get("tps", 0),
+            "pool_size": pool_size,
+            "window_size": route.get("window_size", 0),
+            "configured_route_tps": 0.0,
+            "configured_per_bind_tps": float(route.get("tps") or 0.0),
+            "effective_total_limit_tps": float(route.get("effective_total_limit_tps") or 0.0),
+            "tps_scope": "per_bind",
+            "tps_unit": "submit_sm_parts/s",
+            "pipeline": "vnext",
+            "healthy": connected_count > 0 and not any(
+                item.get("last_error") for item in aggregate.get("connections", [])
+            ),
+            "connected_count": connected_count,
+            "desired_pool_size": pool_size,
+            "connections": aggregate.get("connections", []),
+            "queue_size": 0,
+            "socket_written_parts": int(aggregate.get("socket_written_parts") or 0),
+            "socket_written_parts_1m": int(aggregate.get("socket_written_parts_1m") or 0),
+            "observed_parts_tps": round(float(aggregate.get("socket_written_tps_1m") or 0.0), 3),
+            "submit_sm_resp_success": int(aggregate.get("response_success") or 0),
+            "submit_sm_resp_success_1m": int(aggregate.get("response_success_1m") or 0),
+            "submit_sm_resp_failed": int(aggregate.get("response_error") or 0),
+            "submit_sm_resp_failed_1m": int(aggregate.get("response_error_1m") or 0),
+            "unknown_parts": int(aggregate.get("unknown_parts") or 0),
+            "unknown_parts_1m": int(aggregate.get("unknown_parts_1m") or 0),
+            "write_failures": int(aggregate.get("write_failures") or 0),
+            "last_error": "; ".join(
+                str(item.get("last_error") or "")
+                for item in aggregate.get("connections", [])
+                if item.get("last_error")
+            )[:500],
+        })
+
+    summary = {
+        "pipeline": "vnext",
+        "queue_size": int((state.get("spool") or {}).get("pending_records") or 0),
+        "socket_written_parts_1m": sum(item["socket_written_parts_1m"] for item in items),
+        "socket_written_tps_1m": round(sum(item["observed_parts_tps"] for item in items), 3),
+        "submit_sm_resp_success_1m": sum(item["submit_sm_resp_success_1m"] for item in items),
+        "submit_sm_resp_failed_1m": sum(item["submit_sm_resp_failed_1m"] for item in items),
+        "today_socket_written": int(today.get("socket_written") or 0),
+        "today_smsc_accepted": int(today.get("response_success") or 0),
+        "today_unknown": int(today.get("unknown") or 0),
+        "today_write_failed": int(today.get("write_failed") or 0),
+        "durable_socket_written_pdus": int(durable["socket_written_pdus"]),
+        "durable_socket_written_events": int(durable["socket_written_events"]),
+        "durable_smsc_accepted_pdus": int(durable["response_success"]),
+        "effective_total_limit_tps": sum(item["effective_total_limit_tps"] for item in items),
+        "configured_per_bind_tps": sum(item["configured_per_bind_tps"] for item in items),
+        "configured_route_tps": 0.0,
+        "tps_scope": "per_bind",
+        "tps_unit": "submit_sm_parts/s",
+        "delivery_receipts_available": False,
+        "projection_lag_seconds": float(projection.get("projection_lag_seconds") or 0.0),
+    }
+    return {
+        "pipeline": "vnext",
+        "metric_contract": dict(VNEXT_METRIC_CONTRACT),
+        "summary": summary,
+        "items": items,
+    }
 
 
 def status() -> dict:
@@ -449,10 +1148,10 @@ def status() -> dict:
     for config in value.route_configs.values():
         route_key = str(config.get("route_id"))
         tps = float(config.get("tps") or 0)
-        scope = str(config.get("tps_scope") or "route_shared")
+        scope = "per_bind"
         result["routes"].append({
             key: config.get(key) for key in (
-                "route_id", "host", "port", "source_addr", "bind_type", "pool_size",
+                "route_id", "name", "host", "port", "source_addr", "bind_type", "pool_size",
                 "window_size", "tps", "tps_scope", "priority", "delivery_receipt_mode",
                 "enquire_interval", "reconnect_max_seconds", "address_ton", "address_npi",
                 "data_coding",
@@ -479,6 +1178,7 @@ def status() -> dict:
         "window_semantics": "submit_sm_pdu_inflight_per_physical_bind",
         "tps_semantics": "submit_sm_parts_per_second",
     }
+    result["metric_contract"] = dict(VNEXT_METRIC_CONTRACT)
     result["task_stats"] = task_stats()
     return result
 

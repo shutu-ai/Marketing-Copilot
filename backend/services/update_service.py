@@ -249,6 +249,8 @@ def _safe_extract(archive: Path, dest: Path) -> int:
                 raise ValueError(f"unsupported archive entry: {member.name} (type {member.type})")
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
+                if member.mode:
+                    os.chmod(target, member.mode & 0o777)
                 continue
             if not member.isfile():
                 raise ValueError(f"unsupported archive entry: {member.name} (type {member.type})")
@@ -259,6 +261,8 @@ def _safe_extract(archive: Path, dest: Path) -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             with open(target, "wb") as out:
                 shutil.copyfileobj(source, out)
+            if member.mode:
+                os.chmod(target, member.mode & 0o777)
             count += 1
     return count
 

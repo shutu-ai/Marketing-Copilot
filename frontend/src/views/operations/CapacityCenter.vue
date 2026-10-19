@@ -10,16 +10,16 @@
     </div>
     <el-alert v-if="error" type="warning" :closable="false" show-icon :title="$t('legacy.x27f373e5')" class="state-alert" />
     <el-row :gutter="16" class="summary">
-      <el-col :span="8"><el-card><el-statistic :title="$t('legacy.x6a5cb947')" :value="status.workers?.running || 0"><template #suffix>/ {{ status.workers?.configured || 0 }}</template></el-statistic></el-card></el-col>
-      <el-col :span="8"><el-card><el-statistic :title="$t('legacy.xf66a3536')" :value="status.smpp?.enabled_configs || 0" /></el-card></el-col>
-      <el-col :span="8"><el-card><el-statistic :title="$t('legacy.xfea90f61')" :value="status.smpp?.active_config_id || 0" /></el-card></el-col>
+      <el-col :span="8"><el-card><el-statistic :title="$t(isVnext ? 'capacity.workerProcesses' : 'legacy.x6a5cb947')" :value="status.workers?.running || 0"><template #suffix>/ {{ status.workers?.configured || 0 }}</template></el-statistic></el-card></el-col>
+      <el-col :span="8"><el-card><el-statistic :title="$t(isVnext ? 'capacity.connectedBinds' : 'legacy.xf66a3536')" :value="isVnext ? connectedBinds : (status.smpp?.enabled_configs || 0)" /></el-card></el-col>
+      <el-col :span="8"><el-card><el-statistic :title="$t(isVnext ? 'capacity.effectiveTps' : 'legacy.xfea90f61')" :value="isVnext ? (stats.summary.effective_total_limit_tps || 0) : (status.smpp?.active_config_id || 0)" /></el-card></el-col>
     </el-row>
     <el-card shadow="never" :header="$t('legacy.xfcd3cef4')">
-      <el-table :data="status.smpp?.pools || []" stripe>
+      <el-table :data="smppRows" stripe>
         <el-table-column prop="priority" :label="$t('legacy.xee8ecb9e')" width="90" />
         <el-table-column prop="name" label="SMSC" />
         <el-table-column prop="desired_pool_size" :label="$t('legacy.x03803fe7')" width="100" />
-        <el-table-column :label="$t('legacy.x66e87429')" width="100"><template #default="{ row }">{{ row.connections.filter((c:any) => c.connected).length }}</template></el-table-column>
+        <el-table-column :label="$t('legacy.x66e87429')" width="100"><template #default="{ row }">{{ (row.connections || []).filter((c:any) => c.connected).length || row.connected_count || 0 }}</template></el-table-column>
         <el-table-column :label="$t('common.status')" width="100"><template #default="{ row }"><el-tag :type="statusOf(row).type">{{ statusOf(row).label }}</el-tag></template></el-table-column>
         <el-table-column prop="cooldown_seconds" :label="$t('legacy.x178fa288')" width="110" />
         <el-table-column :label="$t('legacy.xa2b83df0')"><template #default="{ row }">{{ errorText(row) }}</template></el-table-column>
@@ -28,15 +28,26 @@
     <el-card shadow="never" :header="$t('legacy.x3db9a78c')" class="stats">
       <el-alert v-if="statsError" type="warning" :closable="false" show-icon :title="$t('legacy.xc4d3ad34')" :description="statsError" class="state-alert" />
       <el-row :gutter="16" class="summary">
-        <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.x58f7d86e')" :value="stats.summary.queue_size || 0" /></el-card></el-col>
-        <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.xbd3716f8')" :value="stats.summary.submitted_1m || 0" /></el-card></el-col>
-        <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.xa1b4c69e')" :value="stats.summary.submitted_60m || 0" /></el-card></el-col>
-        <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.xdefc7fea')" :value="stats.summary.today_submitted || 0" /></el-card></el-col>
-        <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.x9e1761f4')" :value="stats.summary.today_delivered || 0" /></el-card></el-col>
-        <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.x1efcaa09')" :value="stats.summary.today_failed || 0" /></el-card></el-col>
-        <el-col v-if="stats.summary.unassigned" :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.x745c726d')" :value="stats.summary.unassigned" /></el-card></el-col>
+        <template v-if="isVnext">
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.spoolPending')" :value="stats.summary.queue_size || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.socketWritten1m')" :value="stats.summary.socket_written_parts_1m || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.smscAccepted1m')" :value="stats.summary.submit_sm_resp_success_1m || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todaySocketWritten')" :value="stats.summary.today_socket_written || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todaySmscAccepted')" :value="stats.summary.today_smsc_accepted || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todayUnknown')" :value="stats.summary.today_unknown || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('capacity.todayWriteFailed')" :value="stats.summary.today_write_failed || 0" /></el-card></el-col>
+        </template>
+        <template v-else>
+          <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.x58f7d86e')" :value="stats.summary.queue_size || 0" /></el-card></el-col>
+          <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.xbd3716f8')" :value="stats.summary.submitted_1m || 0" /></el-card></el-col>
+          <el-col :span="8"><el-card shadow="never"><el-statistic :title="$t('legacy.xa1b4c69e')" :value="stats.summary.submitted_60m || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.xdefc7fea')" :value="stats.summary.today_submitted || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.x9e1761f4')" :value="stats.summary.today_delivered || 0" /></el-card></el-col>
+          <el-col :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.x1efcaa09')" :value="stats.summary.today_failed || 0" /></el-card></el-col>
+          <el-col v-if="stats.summary.unassigned" :span="6"><el-card shadow="never"><el-statistic :title="$t('legacy.x745c726d')" :value="stats.summary.unassigned" /></el-card></el-col>
+        </template>
       </el-row>
-      <el-table :data="stats.items || []" stripe>
+      <el-table v-if="isVnext" :data="stats.items || []" stripe>
         <el-table-column :label="$t('legacy.xb2db9f1c')" min-width="170">
           <template #default="{ row }">
             <div>{{ row.name }}</div>
@@ -49,27 +60,27 @@
         <el-table-column :label="$t('legacy.x30f7dd4e')" width="90">
           <template #default="{ row }">{{ row.connected_count || 0 }} / {{ row.desired_pool_size || 0 }}</template>
         </el-table-column>
-        <el-table-column prop="queue_size" :label="$t('legacy.xd2da477c')" width="90" />
-        <el-table-column prop="sending" :label="$t('legacy.x702513ff')" width="80" />
-        <el-table-column prop="submitted" :label="$t('legacy.x39130199')" width="80" />
-        <el-table-column :label="$t('legacy.xd94af3d4')" min-width="150">
-          <template #default="{ row }">{{ row.submitted_1m || 0 }} / {{ row.submitted_5m || 0 }} / {{ row.submitted_60m || 0 }}</template>
-        </el-table-column>
-        <el-table-column :label="$t('legacy.x26074df2')" min-width="150">
-          <template #default="{ row }">{{ row.today_submitted || 0 }} / {{ row.today_delivered || 0 }} / {{ row.today_failed || 0 }}</template>
-        </el-table-column>
-        <el-table-column :label="$t('legacy.x89e1cf1b')" width="110">
-          <template #default="{ row }">{{ pct(row.failure_rate_60m) }}</template>
-        </el-table-column>
-        <el-table-column :label="$t('legacy.xc7e8969c') + ' (' + (stats.summary.tps_unit || 'submit_sm_parts/s') + ') '" width="170">
-          <template #default="{ row }">{{ row.observed_parts_tps || 0 }} / {{ row.effective_total_limit_tps || 0 }}</template>
-        </el-table-column>
+        <el-table-column :label="$t('capacity.socketWritten1m')" min-width="130"><template #default="{ row }">{{ row.socket_written_parts_1m || 0 }} / {{ row.observed_parts_tps || 0 }} TPS</template></el-table-column>
+        <el-table-column :label="$t('capacity.smscAccepted1m')" min-width="130"><template #default="{ row }">{{ row.submit_sm_resp_success_1m || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.unknown')" width="110"><template #default="{ row }">{{ row.unknown_parts_1m || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('capacity.limit')" width="150"><template #default="{ row }">{{ row.effective_total_limit_tps || 0 }} TPS</template></el-table-column>
         <el-table-column :label="$t('legacy.xa2b83df0')" min-width="150">
           <template #default="{ row }">{{ errorText(row) }}</template>
         </el-table-column>
       </el-table>
+      <el-table v-else :data="stats.items || []" stripe>
+        <el-table-column :label="$t('legacy.xb2db9f1c')" min-width="170"><template #default="{ row }"><div>{{ row.name }}</div><small class="muted">{{ row.host }}:{{ row.port }}</small></template></el-table-column>
+        <el-table-column :label="$t('common.status')" width="90"><template #default="{ row }"><el-tag :type="statusOf(row).type">{{ statusOf(row).label }}</el-tag></template></el-table-column>
+        <el-table-column :label="$t('legacy.x30f7dd4e')" width="90"><template #default="{ row }">{{ row.connected_count || 0 }} / {{ row.desired_pool_size || 0 }}</template></el-table-column>
+        <el-table-column prop="queue_size" :label="$t('legacy.xd2da477c')" width="90" /><el-table-column prop="sending" :label="$t('legacy.x702513ff')" width="80" /><el-table-column prop="submitted" :label="$t('legacy.x39130199')" width="80" />
+        <el-table-column :label="$t('legacy.xd94af3d4')" min-width="150"><template #default="{ row }">{{ row.submitted_1m || 0 }} / {{ row.submitted_5m || 0 }} / {{ row.submitted_60m || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('legacy.x26074df2')" min-width="150"><template #default="{ row }">{{ row.today_submitted || 0 }} / {{ row.today_delivered || 0 }} / {{ row.today_failed || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('legacy.x89e1cf1b')" width="110"><template #default="{ row }">{{ pct(row.failure_rate_60m) }}</template></el-table-column>
+        <el-table-column :label="$t('legacy.xc7e8969c') + ' (' + (stats.summary.tps_unit || 'submit_sm_parts/s') + ') '" width="170"><template #default="{ row }">{{ row.observed_parts_tps || 0 }} / {{ row.effective_total_limit_tps || 0 }}</template></el-table-column>
+        <el-table-column :label="$t('legacy.xa2b83df0')" min-width="150"><template #default="{ row }">{{ errorText(row) }}</template></el-table-column>
+      </el-table>
     </el-card>
-    <el-card shadow="never" :header="$t('capacity.campaignFairness')" class="stats">
+    <el-card v-if="!isVnext" shadow="never" :header="$t('capacity.campaignFairness')" class="stats">
       <el-alert v-if="campaignCapacityError" type="warning" :closable="false" show-icon :title="$t('capacity.campaignLoadFailed')" :description="campaignCapacityError" class="state-alert" />
       <div class="scheduler-state">
         <el-tag :type="campaignCapacity.scheduler?.enabled ? 'success' : 'warning'">
@@ -90,7 +101,7 @@
         <el-table-column :label="$t('capacity.responseRate')" width="130"><template #default="{ row }">{{ Math.round((row.transport?.submit_sm_resp_success_1m || 0) + (row.transport?.submit_sm_resp_failure_1m || 0)) }}</template></el-table-column>
       </el-table>
     </el-card>
-    <el-card shadow="never" :header="$t('legacy.x44b54a85')" class="metrics">
+    <el-card v-if="!isVnext" shadow="never" :header="$t('legacy.x44b54a85')" class="metrics">
       <el-table :data="metricRows" stripe><el-table-column prop="name" :label="$t('legacy.x7e687515')" /><el-table-column prop="labels" :label="$t('legacy.x14d34236')" /><el-table-column prop="value" :label="$t('legacy.xfe7509e0')" width="140" /></el-table>
     </el-card>
   </div>
@@ -106,6 +117,9 @@ withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 const authStore = useAuthStore()
 const canEvaluate = computed(() => ['admin', 'marketing'].includes(authStore.role))
 const loading=ref(false),status=ref<any>({}),stats=ref<any>({ summary: {}, items: [] }),campaignCapacity=ref<any>({ scheduler: {}, items: [] }),statsError=ref(''),campaignCapacityError=ref(''),error=ref(''),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale');let timer=0,inFlight=false
+const isVnext = computed(() => stats.value.pipeline === 'vnext' || status.value.smpp?.pipeline === 'vnext')
+const smppRows = computed(() => isVnext.value ? (stats.value.items || []) : (status.value.smpp?.pools || []))
+const connectedBinds = computed(() => smppRows.value.reduce((total:number, row:any) => total + (row.connected_count || (row.connections || []).filter((item:any) => item.connected).length || 0), 0))
 const metricRows = computed(() => [...(status.value.metrics?.gauges || []), ...(status.value.metrics?.counters || [])].map((m:any) => ({ ...m, labels: Object.entries(m.labels || {}).map(([k,v]) => `${k}=${v}`).join(', ') || '—' })))
 function pct(value:number|undefined){return value == null ? '—' : `${(value * 100).toFixed(1)}%`}
 function statusOf(row:any): { type: 'success'|'danger'|'info'|'warning'; label: string } {
@@ -136,11 +150,18 @@ async function load(){
     }catch{
       statsError.value=i18n.global.t('legacy.xe9c8033e')
     }
-    try{
-      campaignCapacity.value=(await getCampaignCapacity()).data
+    if(isVnext.value){
+      // Campaign fairness is a legacy task-table view and is hidden for
+      // VNext; do not spend a request loading an incompatible data source.
+      campaignCapacity.value={ scheduler: {}, items: [] }
       campaignCapacityError.value=''
-    }catch(e:any){
-      campaignCapacityError.value=e.response?.data?.detail||i18n.global.t('capacity.campaignLoadFailed')
+    }else{
+      try{
+        campaignCapacity.value=(await getCampaignCapacity()).data
+        campaignCapacityError.value=''
+      }catch(e:any){
+        campaignCapacityError.value=e.response?.data?.detail||i18n.global.t('capacity.campaignLoadFailed')
+      }
     }
     lastUpdated.value=new Date();pollState.value='live';error.value=''
   }catch(e:any){error.value=e.response?.data?.detail||i18n.global.t('common.connectionFailed');pollState.value=lastUpdated.value?'stale':'offline'}

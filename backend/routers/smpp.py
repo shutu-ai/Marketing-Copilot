@@ -44,13 +44,12 @@ def delete_config(config_id: int):
         raise HTTPException(status_code=404, detail="配置不存在")
     try:
         from services import vnext_service
-        restart_required = vnext_service.is_active()
+        state = vnext_service.config_state()
     except Exception:
-        restart_required = False
+        state = {"restart_required": False, "effective_state": "next_start"}
     return {
         "message": "删除成功",
-        "restart_required": restart_required,
-        "effective_state": "pending_restart" if restart_required else "next_start",
+        **state,
     }
 
 
@@ -61,12 +60,18 @@ async def test_connection(data: SmppTestRequest):
 
 @router.get("/status")
 def connection_status():
+    from services import vnext_service
+    if vnext_service.is_active():
+        return vnext_service.status()
     return gateway.status()
 
 
 @router.get("/stats")
 def config_stats():
     """Per-SMSC processing statistics merged with live connection health."""
+    from services import vnext_service
+    if vnext_service.is_active():
+        return vnext_service.smpp_stats()
     result = smpp_service.get_config_stats()
     pool_map = {pool["config_id"]: pool for pool in gateway.status().get("pools", [])}
     for item in result["items"]:
@@ -80,33 +85,31 @@ def config_stats():
         item["last_error"] = "; ".join(
             str(conn.get("last_error") or "") for conn in connections if conn.get("last_error")
         )[:500]
-        scope = str(item.get("tps_scope") or "route_shared")
+        scope = "per_bind"
         configured_tps = float(item.get("tps") or 0) if item.get("enabled") else 0.0
         pool_size = max(1, int(item.get("pool_size") or 1))
-        item["configured_route_tps"] = configured_tps if scope == "route_shared" else 0.0
-        item["configured_per_bind_tps"] = configured_tps if scope == "per_bind" else None
+        item["configured_route_tps"] = 0.0
+        item["configured_per_bind_tps"] = configured_tps
         live_limits = [
             float(conn.get("effective_total_limit_tps") or 0)
             for conn in connections if conn.get("effective_total_limit_tps") is not None
         ]
         item["effective_total_limit_tps"] = (
-            live_limits[0] if live_limits else (
-                configured_tps * pool_size if scope == "per_bind" else configured_tps
-            )
+            live_limits[0] if live_limits else configured_tps * pool_size
         )
         item["tps_scope"] = scope
         item["tps_unit"] = "submit_sm_parts/s"
         item["observed_parts_tps"] = item.get("submit_sm_tps_1m", 0.0)
         item["configured_tps"] = item["configured_route_tps"]
         item["connected_tps"] = item["effective_total_limit_tps"] if connected_count else 0.0
-    result["summary"]["configured_route_tps"] = sum(
-        item.get("configured_route_tps", 0.0) for item in result["items"]
+    result["summary"]["configured_route_tps"] = 0.0
+    result["summary"]["configured_per_bind_tps"] = sum(
+        item.get("configured_per_bind_tps", 0.0) for item in result["items"]
     )
     result["summary"]["effective_total_limit_tps"] = sum(
         item.get("effective_total_limit_tps", 0.0) for item in result["items"]
     )
-    scopes = {str(item.get("tps_scope") or "route_shared") for item in result["items"]}
-    result["summary"]["tps_scope"] = next(iter(scopes)) if len(scopes) == 1 else "mixed"
+    result["summary"]["tps_scope"] = "per_bind"
     result["summary"]["tps_unit"] = "submit_sm_parts/s"
     result["summary"]["observed_parts_tps"] = result["summary"].get("submit_sm_tps_1m", 0.0)
     return result

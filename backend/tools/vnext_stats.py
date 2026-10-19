@@ -571,6 +571,21 @@ def _build_snapshot(
         for snapshot in worker_snapshots
         for transport in snapshot.get("transports", [])
     ]
+    route_tps_limits: dict[str, float] = {}
+    for index, transport in enumerate(transport_values):
+        route_id = transport.get("route_id")
+        key = f"route:{route_id}" if route_id is not None else f"transport:{index}"
+        if key in route_tps_limits:
+            # A route_shared limiter is represented once per physical bind in
+            # worker snapshots, but the configured route budget is shared.
+            continue
+        configured = _float_or_none(transport.get("effective_total_limit_tps"))
+        if configured is None:
+            tps = _float_or_none(transport.get("tps")) or 0.0
+            pool_size = max(1, _int(transport.get("pool_size", 1)))
+            scope = str(transport.get("tps_scope") or "route_shared").strip().lower()
+            configured = tps * pool_size if scope == "per_bind" else tps
+        route_tps_limits[key] = float(configured)
     counters = _sum_dicts(
         [snapshot.get("counters") or {} for snapshot in worker_snapshots],
         (
@@ -641,10 +656,7 @@ def _build_snapshot(
             ]
             or [0.0]
         ) or None,
-        "tps_limit": sum(
-            _float_or_none(item.get("effective_total_limit_tps")) or 0.0
-            for item in transport_values
-        ) or None,
+        "tps_limit": sum(route_tps_limits.values()) or None,
     }
     socket_counter, socket_identity, socket_rate_reasons = _transport_counter(
         workers, "socket_written_parts"
@@ -728,9 +740,12 @@ def _build_snapshot(
         },
         "status_age_seconds": snapshot_age,
     }
-    configured_binds = sum(
-        _int(snapshot.get("route_pool_size", 0))
-        for snapshot in worker_snapshots
+    # route_pool_size is the physical route-wide pool repeated in every
+    # worker snapshot, not a per-worker allocation.  Summing it inflated the
+    # CLI value (for example, 5 physical binds appeared as 20 with 4 workers).
+    configured_binds = max(
+        (_int(snapshot.get("route_pool_size", 0)) for snapshot in worker_snapshots),
+        default=0,
     )
     smpp_section = {
         "binds_active": transport_totals["binds_active"],

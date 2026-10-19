@@ -130,6 +130,8 @@ async def _test_async_transport_reports_socket_written_without_waiting_for_respo
         await asyncio.sleep(0.1)
         assert len(received) == 100
         assert transport.response_success == 100
+        assert transport.snapshot()["socket_written_parts_1m"] == 100
+        assert transport.snapshot()["response_success_1m"] == 100
         assert transport.snapshot()["window_inflight"] == 0
     finally:
         await transport.close()

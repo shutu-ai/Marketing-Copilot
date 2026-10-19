@@ -955,6 +955,16 @@ _REALTIME_TASK_STATUS_KEYS = (
 )
 
 
+def _vnext_pipeline_active() -> bool:
+    """Return whether read-only VNext projections are the active pipeline."""
+
+    try:
+        from services import vnext_service
+        return bool(vnext_service.is_active())
+    except (AttributeError, ImportError, OSError, RuntimeError):
+        return False
+
+
 def _realtime_task_status_counts(conn, campaign_id: int, date_value: Optional[str] = None) -> dict:
     """Return one consistent task-state view for realtime campaign metrics.
 
@@ -983,14 +993,31 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     campaign = get_one(campaign_id)
     if not campaign:
         return None
-    task_counts = read_transaction(
-        lambda conn: _realtime_task_status_counts(conn, campaign_id),
-        operation="realtime_campaign.detail_stats",
-    )
-    campaign["reached_users"] = task_counts["delivered"]
-    campaign["task_created_users"] = task_counts["task_created"]
-    campaign["accepted_users"] = task_counts["accepted"]
-    campaign["delivered_users"] = task_counts["delivered"]
+    if _vnext_pipeline_active():
+        # VNext has no business reason to rescan the legacy sms_tasks table.
+        # The UI hides these legacy fields, while the worker aggregate keeps
+        # the compatible values available for older API clients.
+        try:
+            from services import vnext_service
+
+            vnext = vnext_service.campaign_stats("realtime", campaign_id)
+        except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+            vnext = {}
+        campaign["pipeline"] = "vnext"
+        campaign["task_created_users"] = int(vnext.get("accepted_tasks") or 0)
+        campaign["accepted_users"] = int(vnext.get("smsc_accepted_pdus") or 0)
+        campaign["delivered_users"] = 0
+        campaign["reached_users"] = 0
+        campaign["stats_complete"] = bool(vnext.get("stats_complete", False))
+    else:
+        task_counts = read_transaction(
+            lambda conn: _realtime_task_status_counts(conn, campaign_id),
+            operation="realtime_campaign.detail_stats",
+        )
+        campaign["reached_users"] = task_counts["delivered"]
+        campaign["task_created_users"] = task_counts["task_created"]
+        campaign["accepted_users"] = task_counts["accepted"]
+        campaign["delivered_users"] = task_counts["delivered"]
     campaign["whitelist_index"] = realtime_whitelist_service.get_index_status(campaign)
     return campaign
 
@@ -1808,6 +1835,8 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
 
 
 def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
+    vnext_active = _vnext_pipeline_active()
+
     def read(conn):
         total = conn.execute(
             "SELECT COUNT(*) cnt FROM realtime_campaign_files WHERE campaign_id=?",
@@ -1821,7 +1850,7 @@ def get_realtime_files(campaign_id: int, page: int = 1, page_size: int = 50) -> 
         ).fetchall()
         filenames = [str(row["filename"] or "") for row in rows if row["filename"]]
         task_counts = {}
-        if filenames:
+        if filenames and not vnext_active:
             placeholders = ",".join("?" for _ in filenames)
             task_rows = conn.execute(
                 f"""SELECT source_file, status, COUNT(*) AS count
@@ -2054,6 +2083,18 @@ def get_realtime_watch_files(
 
 
 def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
+    if _vnext_pipeline_active():
+        # VNext deliberately does not maintain the legacy sms_tasks delivery
+        # report.  Avoid replaying that table if an older browser still calls
+        # this hidden endpoint during a rolling frontend update.
+        return {
+            "pipeline": "vnext",
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "items": [],
+        }
+
     campaign = get_one(campaign_id)
     if not campaign:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
@@ -2115,7 +2156,114 @@ def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 
     }
 
 
+def _get_vnext_realtime_stats(campaign_id: int) -> dict:
+    """Return current VNext activity stats without touching ``sms_tasks``.
+
+    ``realtime_campaign_files`` is the bounded ingestion metadata table.  The
+    send-side counters already live in the worker status snapshots, so the
+    VNext path must not fall back to the legacy task table just to render the
+    activity page.  This function intentionally keeps the old response keys
+    (with zero values where the legacy state model no longer applies) so old
+    clients remain compatible while the new metric fields carry the actual
+    send evidence.
+    """
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    def read(conn):
+        row = conn.execute(
+            """SELECT COUNT(*) AS file_count,
+                      COALESCE(SUM(total_msisdn), 0) AS total_msisdn_sum,
+                      COALESCE(SUM(matched_count), 0) AS total_matched
+               FROM realtime_campaign_files
+               WHERE campaign_id=?""",
+            (campaign_id,),
+        ).fetchone()
+        today_row = conn.execute(
+            """SELECT COUNT(*) AS file_count,
+                      COALESCE(SUM(total_msisdn), 0) AS total_msisdn_sum,
+                      COALESCE(SUM(matched_count), 0) AS total_matched
+               FROM realtime_campaign_files
+               WHERE campaign_id=? AND CAST(created_at AS DATE)=CAST(? AS DATE)""",
+            (campaign_id, today),
+        ).fetchone()
+        return row, today_row
+
+    row, today_row = read_transaction(
+        read, operation="realtime_campaign.stats.vnext"
+    )
+    result = dict(row) if row else {
+        "file_count": 0,
+        "total_msisdn_sum": 0,
+        "total_matched": 0,
+    }
+    today_result = dict(today_row) if today_row else {
+        "file_count": 0,
+        "total_msisdn_sum": 0,
+        "total_matched": 0,
+    }
+    result.update({
+        "today_file_count": int(today_result.get("file_count") or 0),
+        "today_msisdn_sum": int(today_result.get("total_msisdn_sum") or 0),
+        "today_matched": int(today_result.get("total_matched") or 0),
+    })
+
+    # These fields belong to the legacy sms_tasks state machine.  Keep them
+    # present for compatibility, but do not imply that VNext has delivery
+    # receipts or legacy accepted/delivered states.
+    for key in _REALTIME_TASK_STATUS_KEYS:
+        result[f"{key}_users"] = 0
+        result[f"today_{key}_users"] = 0
+    result.update({
+        "today_reached_users": 0,
+        "today_users": 0,
+        "reached_users": 0,
+    })
+
+    try:
+        from services import vnext_service
+
+        vnext = vnext_service.campaign_stats("realtime", campaign_id)
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        # Keep the endpoint lightweight and explicit if the worker snapshot is
+        # temporarily unavailable.  Do not re-enter the seven-million-row
+        # legacy table as an error fallback.
+        vnext = {}
+    result.update({
+        "pipeline": "vnext",
+        "metric_contract": dict(vnext.get("metric_contract") or {}),
+        "delivery_receipts_available": False,
+        "sent_count": int(vnext.get("sent_count") or 0),
+        "sent_users": int(vnext.get("sent_users") or vnext.get("sent_count") or 0),
+        "today_sent_count": int(vnext.get("today_sent_count") or 0),
+        "today_sent_users": int(vnext.get("today_sent_users") or 0),
+        "socket_written_events": int(vnext.get("sent_count") or 0),
+        "today_socket_written_events": int(vnext.get("today_socket_written_events") or 0),
+        "sent_pdus": int(vnext.get("sent_pdus") or 0),
+        "today_sent_pdus": int(vnext.get("today_sent_pdus") or 0),
+        "smsc_accepted_pdus": int(vnext.get("smsc_accepted_pdus") or 0),
+        "today_smsc_accepted_pdus": int(vnext.get("today_smsc_accepted_pdus") or 0),
+        "smsc_rejected_pdus": int(vnext.get("smsc_rejected_pdus") or 0),
+        "today_smsc_rejected_pdus": int(vnext.get("today_smsc_rejected_pdus") or 0),
+        "unknown_pdus": int(vnext.get("unknown_pdus") or 0),
+        "today_unknown_pdus": int(vnext.get("today_unknown_pdus") or 0),
+        "write_failed": int(vnext.get("write_failed") or 0),
+        "today_write_failed": int(vnext.get("today_write_failed") or 0),
+        "cancelled": int(vnext.get("cancelled") or 0),
+        "expired": int(vnext.get("expired") or 0),
+        "accepted_tasks": int(vnext.get("accepted_tasks") or 0),
+        "tasks_taken": int(vnext.get("tasks_taken") or 0),
+        "event_count": int(vnext.get("event_count") or 0),
+        "stats_complete": bool(vnext.get("stats_complete", False)),
+        "stats_source": str(vnext.get("stats_source") or "worker_status_aggregate"),
+    })
+    return result
+
+
 def get_realtime_stats(campaign_id: int) -> dict:
+    if _vnext_pipeline_active():
+        return _get_vnext_realtime_stats(campaign_id)
+
     today = datetime.now().strftime("%Y-%m-%d")
     def read(conn):
         campaign = conn.execute(
@@ -2160,6 +2308,24 @@ def get_realtime_stats(campaign_id: int) -> dict:
     result["today_reached_users"] = today_task_counts["delivered"]
     result["today_users"] = today_task_counts["delivered"]
     result["reached_users"] = task_counts["delivered"]
+    try:
+        from services import vnext_service
+        if vnext_service.is_active():
+            vnext = vnext_service.campaign_stats("realtime", campaign_id)
+            result.update({
+                "pipeline": "vnext",
+                "delivery_receipts_available": False,
+                "sent_count": int(vnext.get("sent_count") or 0),
+                "sent_pdus": int(vnext.get("sent_pdus") or 0),
+                "smsc_accepted_pdus": int(vnext.get("smsc_accepted_pdus") or 0),
+                "smsc_rejected_pdus": int(vnext.get("smsc_rejected_pdus") or 0),
+                "unknown_pdus": int(vnext.get("unknown_pdus") or 0),
+                "write_failed": int(vnext.get("write_failed") or 0),
+            })
+        else:
+            result["pipeline"] = "legacy"
+    except (RuntimeError, OSError, ValueError, TypeError):
+        result.setdefault("pipeline", "legacy")
     return result
 
 

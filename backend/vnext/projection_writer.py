@@ -430,6 +430,10 @@ class ProjectionWriter:
         self._metrics_last_published = 0.0
         self._published_metrics: dict = {}
         self._batch_table_created = False
+        self._daily_totals_cached_at = 0.0
+        self._daily_totals_cache: list[dict] = []
+        self._campaign_daily_totals_cached_at = 0.0
+        self._campaign_daily_totals_cache: list[dict] = []
 
     def _table_columns(self, table: str) -> set[str]:
         try:
@@ -459,6 +463,7 @@ class ProjectionWriter:
                 campaign_id BIGINT NOT NULL,
                 route_id BIGINT NOT NULL,
                 normalized_msisdn VARCHAR NOT NULL,
+                language VARCHAR NOT NULL DEFAULT '',
                 state VARCHAR NOT NULL,
                 parts_written INTEGER NOT NULL,
                 parts_total INTEGER NOT NULL,
@@ -473,10 +478,21 @@ class ProjectionWriter:
             "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS message VARCHAR DEFAULT ''"
         )
         self._conn.execute(
+            "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS language VARCHAR DEFAULT ''"
+        )
+        self._conn.execute(
             "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS business_day VARCHAR DEFAULT ''"
         )
         self._conn.execute(
             "ALTER TABLE vnext_progress_events ADD COLUMN IF NOT EXISTS expires_at DOUBLE DEFAULT 0"
+        )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_vnext_progress_day_order
+               ON vnext_progress_events(business_day, created_at, ordinal, event_id)"""
+        )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_vnext_progress_day_state_order
+               ON vnext_progress_events(business_day, state, created_at, ordinal, event_id)"""
         )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS vnext_projection (
@@ -488,6 +504,7 @@ class ProjectionWriter:
                 queued BIGINT NOT NULL DEFAULT 0,
                 taken BIGINT NOT NULL DEFAULT 0,
                 socket_written BIGINT NOT NULL DEFAULT 0,
+                socket_written_pdus BIGINT NOT NULL DEFAULT 0,
                 write_failed BIGINT NOT NULL DEFAULT 0,
                 unknown BIGINT NOT NULL DEFAULT 0,
                 cancelled BIGINT NOT NULL DEFAULT 0,
@@ -504,6 +521,9 @@ class ProjectionWriter:
             "ALTER TABLE vnext_projection ADD COLUMN IF NOT EXISTS cancelled BIGINT DEFAULT 0"
         )
         self._conn.execute(
+            "ALTER TABLE vnext_projection ADD COLUMN IF NOT EXISTS socket_written_pdus BIGINT DEFAULT 0"
+        )
+        self._conn.execute(
             "ALTER TABLE vnext_projection ADD COLUMN IF NOT EXISTS accepted BIGINT DEFAULT 0"
         )
         self._conn.execute(
@@ -515,10 +535,10 @@ class ProjectionWriter:
                 self._conn.execute(
                     """INSERT INTO vnext_projection(
                         business_day,campaign_type,campaign_id,partition_id,route_id,
-                        queued,taken,socket_written,write_failed,unknown,cancelled,
+                        queued,taken,socket_written,socket_written_pdus,write_failed,unknown,cancelled,
                         accepted,expired,response_success,response_error,last_ordinal,updated_at
                     ) SELECT '',campaign_type,campaign_id,partition_id,route_id,
-                        queued,taken,socket_written,write_failed,unknown,cancelled,
+                        queued,taken,socket_written,0,write_failed,unknown,cancelled,
                         0,0,response_success,response_error,last_ordinal,updated_at
                     FROM vnext_projection_legacy"""
                 )
@@ -543,7 +563,8 @@ class ProjectionWriter:
         return (
             str(event["event_id"]), int(event["partition_id"]), int(event["ordinal"]),
             str(event["campaign_type"]), int(event["campaign_id"]), int(event["route_id"]),
-            str(event.get("normalized_msisdn") or ""), state,
+            str(event.get("normalized_msisdn") or ""),
+            str(event.get("language") or ""), state,
             int(event.get("parts_written", 0)), int(event.get("parts_total", 0)),
             str(event.get("message") or ""), str(event.get("error") or ""),
             float(event.get("created_at") or time.time()),
@@ -584,7 +605,7 @@ class ProjectionWriter:
         if not rows:
             return
         if self.staging_mode == "vectorized":
-            if any(len(row) != 25 for row in rows):
+            if any(len(row) != 26 for row in rows):
                 raise ValueError("projection staging columns must have equal lengths")
             transpose_started_ns = time.perf_counter_ns()
             columns = [list(column) for column in zip(*rows)]
@@ -595,7 +616,7 @@ class ProjectionWriter:
 
             types = (
                 "VARCHAR", "INTEGER", "BIGINT", "VARCHAR", "BIGINT", "BIGINT",
-                "VARCHAR", "VARCHAR", "INTEGER", "INTEGER", "VARCHAR", "VARCHAR",
+                "VARCHAR", "VARCHAR", "VARCHAR", "INTEGER", "INTEGER", "VARCHAR", "VARCHAR",
                 "DOUBLE", "VARCHAR", "DOUBLE", "BIGINT", "BIGINT", "BIGINT",
                 "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT",
             )
@@ -615,7 +636,7 @@ class ProjectionWriter:
         else:
             bind_started_ns = time.perf_counter_ns()
             executemany(
-                "INSERT INTO _vnext_projection_batch VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO _vnext_projection_batch VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
             bind_elapsed_ns = time.perf_counter_ns() - bind_started_ns
@@ -674,7 +695,7 @@ class ProjectionWriter:
             CREATE TEMPORARY TABLE _vnext_projection_batch (
                 event_id VARCHAR, partition_id INTEGER, ordinal BIGINT,
                 campaign_type VARCHAR, campaign_id BIGINT, route_id BIGINT,
-                normalized_msisdn VARCHAR, state VARCHAR, parts_written INTEGER,
+                normalized_msisdn VARCHAR, language VARCHAR, state VARCHAR, parts_written INTEGER,
                 parts_total INTEGER, message VARCHAR, error VARCHAR, created_at DOUBLE,
                 business_day VARCHAR, expires_at DOUBLE, queued BIGINT, taken BIGINT,
                 accepted BIGINT, socket_written BIGINT, write_failed BIGINT,
@@ -717,10 +738,10 @@ class ProjectionWriter:
         execute("""
             INSERT INTO vnext_progress_events(
                 event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
-                normalized_msisdn,state,parts_written,parts_total,message,error,created_at,
+                normalized_msisdn,language,state,parts_written,parts_total,message,error,created_at,
                 business_day,expires_at
             ) SELECT event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
-                normalized_msisdn,state,parts_written,parts_total,message,error,created_at,
+                normalized_msisdn,language,state,parts_written,parts_total,message,error,created_at,
                 business_day,expires_at
             FROM _vnext_projection_new
         """)
@@ -730,10 +751,12 @@ class ProjectionWriter:
         execute("""
             INSERT INTO vnext_projection(
                 business_day,campaign_type,campaign_id,partition_id,route_id,
-                queued,taken,socket_written,write_failed,unknown,cancelled,
+                queued,taken,socket_written,socket_written_pdus,write_failed,unknown,cancelled,
                 accepted,expired,response_success,response_error,last_ordinal,updated_at
             ) SELECT business_day,campaign_type,campaign_id,partition_id,route_id,
-                SUM(queued),SUM(taken),SUM(socket_written),SUM(write_failed),SUM(unknown),
+                SUM(queued),SUM(taken),SUM(socket_written),
+                SUM(CASE WHEN state='socket_written' THEN parts_written ELSE 0 END),
+                SUM(write_failed),SUM(unknown),
                 SUM(cancelled),SUM(accepted),SUM(expired),SUM(response_success),SUM(response_error),
                 MAX(ordinal),MAX(created_at)
             FROM _vnext_projection_new
@@ -743,6 +766,7 @@ class ProjectionWriter:
                 queued=vnext_projection.queued+excluded.queued,
                 taken=vnext_projection.taken+excluded.taken,
                 socket_written=vnext_projection.socket_written+excluded.socket_written,
+                socket_written_pdus=vnext_projection.socket_written_pdus+excluded.socket_written_pdus,
                 write_failed=vnext_projection.write_failed+excluded.write_failed,
                 unknown=vnext_projection.unknown+excluded.unknown,
                 cancelled=vnext_projection.cancelled+excluded.cancelled,
@@ -842,6 +866,91 @@ class ProjectionWriter:
         columns = [str(item[0]) for item in self._conn.description]
         return [dict(zip(columns, row)) for row in rows]
 
+    def _daily_totals(self) -> list[dict]:
+        """Return bounded day-level counters for read-only API snapshots.
+
+        The projection process is the sole owner of this DuckDB.  Publishing
+        the small aggregate in its status file lets the application/UI consume
+        VNext counters without opening a second connection to the writer DB.
+        ``socket_written`` is an event/message count here; the corresponding
+        PDU-part count is included for the same read-only statistics contract.
+        """
+
+        now = time.monotonic()
+        # Dashboard refreshes are coarse-grained; keep this reconciliation
+        # query out of the projection writer's per-event path.
+        if now - self._daily_totals_cached_at < 5.0:
+            return [dict(item) for item in self._daily_totals_cache]
+        if self._conn is None:
+            return []
+        try:
+            rows = self._conn.execute(
+                """SELECT business_day,
+                          COALESCE(SUM(queued),0) AS queued,
+                          COALESCE(SUM(taken),0) AS taken,
+                          COALESCE(SUM(socket_written),0) AS socket_written,
+                          COALESCE(SUM(socket_written_pdus),0) AS socket_written_pdus,
+                          COALESCE(SUM(write_failed),0) AS write_failed,
+                          COALESCE(SUM(unknown),0) AS unknown,
+                          COALESCE(SUM(cancelled),0) AS cancelled,
+                          COALESCE(SUM(accepted),0) AS accepted,
+                          COALESCE(SUM(expired),0) AS expired,
+                          COALESCE(SUM(response_success),0) AS response_success,
+                          COALESCE(SUM(response_error),0) AS response_error
+                   FROM vnext_projection
+                   GROUP BY business_day
+                   ORDER BY business_day DESC
+                   LIMIT 31"""
+            ).fetchall()
+            columns = [str(item[0]) for item in self._conn.description]
+            self._daily_totals_cache = [dict(zip(columns, row)) for row in rows]
+        except Exception:
+            # Status publication is diagnostic/read-only.  A transient schema
+            # or connection issue must never affect the writer loop.
+            self._daily_totals_cache = []
+        self._daily_totals_cached_at = now
+        return [dict(item) for item in self._daily_totals_cache]
+
+    def _campaign_daily_totals(self) -> list[dict]:
+        """Publish bounded per-campaign day aggregates for the UI.
+
+        This reads the already-aggregated projection table at the same coarse
+        status cadence as ``_daily_totals``. It never scans progress JSONL or
+        the legacy ``sms_tasks`` table and is outside the event/send path.
+        """
+
+        now = time.monotonic()
+        if now - self._campaign_daily_totals_cached_at < 5.0:
+            return [dict(item) for item in self._campaign_daily_totals_cache]
+        if self._conn is None:
+            return []
+        try:
+            rows = self._conn.execute(
+                """SELECT business_day, campaign_type, campaign_id,
+                          COALESCE(SUM(queued),0) AS queued,
+                          COALESCE(SUM(taken),0) AS taken,
+                          COALESCE(SUM(socket_written),0) AS socket_written,
+                          COALESCE(SUM(socket_written_pdus),0) AS socket_written_pdus,
+                          COALESCE(SUM(write_failed),0) AS write_failed,
+                          COALESCE(SUM(unknown),0) AS unknown,
+                          COALESCE(SUM(cancelled),0) AS cancelled,
+                          COALESCE(SUM(expired),0) AS expired,
+                          COALESCE(SUM(accepted),0) AS accepted,
+                          COALESCE(SUM(response_success),0) AS response_success,
+                          COALESCE(SUM(response_error),0) AS response_error
+                   FROM vnext_projection
+                   GROUP BY business_day, campaign_type, campaign_id
+                   ORDER BY business_day DESC, campaign_type, campaign_id
+                   LIMIT 8192"""
+            ).fetchall()
+            columns = [str(item[0]) for item in self._conn.description]
+            self._campaign_daily_totals_cache = [dict(zip(columns, row)) for row in rows]
+        except Exception:
+            # A diagnostic snapshot must never interrupt projection writes.
+            self._campaign_daily_totals_cache = []
+        self._campaign_daily_totals_cached_at = now
+        return [dict(item) for item in self._campaign_daily_totals_cache]
+
     @staticmethod
     def _percentile(values: deque[int], percentile: float) -> int:
         if not values:
@@ -901,6 +1010,8 @@ class ProjectionWriter:
             "projection_lag_seconds": max(0.0, self._last_event_at - self._last_applied_at) if self._last_applied_at else 0.0,
             "last_applied_at": self._last_applied_at,
             "projection_events_applied": self._applied,
+            "daily_totals": self._daily_totals(),
+            "campaign_daily_totals": self._campaign_daily_totals(),
             "metrics": metrics,
         }
 

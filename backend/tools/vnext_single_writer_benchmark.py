@@ -1,6 +1,6 @@
 """Isolated A0-A4 staging benchmark for the single VNext projection writer.
 
-The benchmark intentionally uses the same 25-field event shape, event-id
+The benchmark intentionally uses the same 26-field event shape, event-id
 dedupe, aggregate upsert, DuckDB transaction and bounded batch path as the
 production writer.  Each case owns a separate database under ``--run-root``;
 no runtime database, journal or spool is read or modified.
@@ -33,14 +33,14 @@ from vnext.projection_writer import ProjectionWriter
 
 STAGING_COLUMNS = (
     "event_id", "partition_id", "ordinal", "campaign_type", "campaign_id",
-    "route_id", "normalized_msisdn", "state", "parts_written", "parts_total",
+    "route_id", "normalized_msisdn", "language", "state", "parts_written", "parts_total",
     "message", "error", "created_at", "business_day", "expires_at", "queued",
     "taken", "accepted", "socket_written", "write_failed", "unknown", "cancelled",
     "expired", "response_success", "response_error",
 )
 STAGING_TYPES = (
     "VARCHAR", "INTEGER", "BIGINT", "VARCHAR", "BIGINT", "BIGINT", "VARCHAR",
-    "VARCHAR", "INTEGER", "INTEGER", "VARCHAR", "VARCHAR", "DOUBLE", "VARCHAR",
+    "VARCHAR", "VARCHAR", "INTEGER", "INTEGER", "VARCHAR", "VARCHAR", "DOUBLE", "VARCHAR",
     "DOUBLE", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT", "BIGINT",
     "BIGINT", "BIGINT", "BIGINT",
 )

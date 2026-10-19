@@ -90,21 +90,28 @@
                 <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_matched }}</div>
               </div>
             </div>
-            <div class="summary-card">
+            <div v-if="isVnext" class="summary-card">
+              <div class="summary-label">{{ $t('campaign.sentUsers') }}</div>
+              <div class="summary-value primary">
+                <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.sent_users }}</div>
+                <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_sent_users }}</div>
+              </div>
+            </div>
+            <div v-if="!isVnext" class="summary-card">
               <div class="summary-label">{{ $t('campaign.taskCreatedUsers') }}</div>
               <div class="summary-value warning">
                 <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.task_created_users }}</div>
                 <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_task_created_users }}</div>
               </div>
             </div>
-            <div class="summary-card">
+            <div v-if="!isVnext" class="summary-card">
               <div class="summary-label">{{ $t('campaign.acceptedUsers') }}</div>
               <div class="summary-value primary">
                 <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.accepted_users }}</div>
                 <div class="summary-today"><span class="summary-period">{{ $t('campaign.today') }}</span>{{ stats.today_accepted_users }}</div>
               </div>
             </div>
-            <div class="summary-card">
+            <div v-if="!isVnext" class="summary-card">
               <div class="summary-label">{{ $t('campaign.deliveredUsers') }}</div>
               <div class="summary-value success">
                 <div><span class="summary-period">{{ $t('campaign.cumulative') }}</span>{{ stats.delivered_users }}</div>
@@ -117,8 +124,8 @@
             <el-table-column prop="filename" :label="$t('campaign.filename')" min-width="200" />
             <el-table-column prop="total_msisdn" :label="$t('campaign.receiveFileTotal')" width="140" />
             <el-table-column prop="matched_count" :label="$t('campaign.receiveFileMatched')" width="140" />
-            <el-table-column prop="task_count" :label="$t('campaign.taskCreatedUsers')" width="140" />
-            <el-table-column prop="delivered_count" :label="$t('campaign.deliveredUsers')" width="120" />
+            <el-table-column v-if="!isVnext" prop="task_count" :label="$t('campaign.taskCreatedUsers')" width="140" />
+            <el-table-column v-if="!isVnext" prop="delivered_count" :label="$t('campaign.deliveredUsers')" width="120" />
             <el-table-column prop="created_at" :label="$t('common.created_at')" width="180" />
           </el-table>
           <div class="received-pagination">
@@ -133,7 +140,7 @@
             />
           </div>
         </el-tab-pane>
-        <el-tab-pane :label="$t('legacy.xe7502eb1')" name="sent">
+        <el-tab-pane v-if="!isVnext" :label="$t('legacy.xe7502eb1')" name="sent">
           <el-table :data="sentRecords" stripe style="width: 100%" v-loading="sentRecordsLoading">
             <el-table-column prop="date" :label="$t('campaign.date')" width="140" />
             <el-table-column prop="filename" :label="$t('legacy.x29139c2a')" min-width="220" />
@@ -237,7 +244,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import StatusTag from '@/components/StatusTag.vue'
 import * as api from '@/api/realtime-campaign'
@@ -261,6 +268,7 @@ const watchFilesError = ref(false)
 let watchFilesRequestId = 0
 const activeTab = ref('received')
 const stats = reactive({
+  pipeline: 'legacy',
   file_count: 0,
   total_msisdn_sum: 0,
   total_matched: 0,
@@ -274,7 +282,13 @@ const stats = reactive({
   today_accepted_users: 0,
   today_delivered_users: 0,
   today_reached_users: 0,
+  sent_count: 0,
+  sent_users: 0,
+  today_sent_count: 0,
+  today_sent_users: 0,
+  today_socket_written_events: 0,
 })
+const isVnext = computed(() => stats.pipeline === 'vnext')
 const smppOptions = ref<any[]>([])
 
 function smppName(configId: number | null) {
@@ -450,7 +464,9 @@ async function loadDetail() {
   await loadCampaignDetail()
   await loadSmppOptions()
   await loadReceivedData(true)
-  await loadSentRecords(true)
+  // VNext has no legacy sent-record endpoint; avoid the extra request and
+  // keep the detail page on the received/projection flow.
+  if (!isVnext.value) await loadSentRecords(true)
   await loadWatchFiles(true)
 }
 
@@ -469,6 +485,9 @@ onMounted(loadDetail)
 watch(activeTab, (tab) => {
   if (tab === 'sent') void loadSentRecords(true)
   if (tab === 'watch-files') void loadWatchFiles(true)
+})
+watch(isVnext, (enabled) => {
+  if (enabled && activeTab.value === 'sent') activeTab.value = 'received'
 })
 </script>
 

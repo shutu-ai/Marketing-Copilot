@@ -343,6 +343,30 @@ class WorkerSupervisor:
         with self._handles_lock:
             self._handles[int(worker_id)].control.send(message)
 
+    def broadcast(self, message: object) -> dict:
+        """Send a control message to every live worker.
+
+        A worker may exit between the handle snapshot and the pipe send; the
+        supervisor's normal monitor loop will replace it.  Report that worker
+        explicitly so callers never mistake a partial broadcast for a full
+        configuration activation.
+        """
+
+        with self._handles_lock:
+            handles = list(self._handles.values())
+        sent: list[int] = []
+        failed: list[int] = []
+        for handle in handles:
+            try:
+                handle.control.send(message)
+                sent.append(int(handle.worker_id))
+            except (EOFError, OSError, BrokenPipeError):
+                failed.append(int(handle.worker_id))
+        return {
+            "sent_worker_ids": sorted(sent),
+            "failed_worker_ids": sorted(failed),
+        }
+
     def status(self) -> dict:
         with self._handles_lock:
             handles = list(self._handles.values())

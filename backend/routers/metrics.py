@@ -52,7 +52,24 @@ def prometheus_metrics():
 
 @router.get('/api/metrics/status')
 def capacity_status():
-    workers = worker_status()
+    vnext_pipeline = None
+    try:
+        from services import vnext_service
+        if vnext_service.is_active():
+            vnext_pipeline = vnext_service.status()
+            supervisor = vnext_pipeline.get("supervisor") or {}
+            worker_rows = supervisor.get("workers") or []
+            workers = {
+                "configured": int(supervisor.get("worker_count") or len(worker_rows)),
+                "running": sum(1 for item in worker_rows if item.get("alive")),
+                "workers": worker_rows,
+                "dispatch": {"mode": "vnext"},
+                "pipeline": "vnext",
+            }
+        else:
+            workers = worker_status()
+    except Exception:
+        workers = worker_status()
     try:
         metrics_service.observe_runtime_state(workers['running'], allow_cached=True)
     except Exception as exc:
@@ -84,7 +101,10 @@ def capacity_status():
             "error": "DATABASE_READ_UNAVAILABLE",
         }
     try:
-        smpp = gateway.status()
+        if vnext_pipeline is not None:
+            smpp = vnext_service.smpp_stats(vnext_pipeline)
+        else:
+            smpp = gateway.status()
     except Exception as exc:
         if not is_database_read_error(exc):
             raise

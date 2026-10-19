@@ -71,3 +71,21 @@ def test_spool_rejects_complete_crc_corruption_and_hard_capacity(tmp_path):
     segment.write_text(json.dumps(value) + "\n", encoding="utf-8")
     with pytest.raises(SpoolCorruptionError):
         list(TaskSpool(other_root, virtual_partition_count=4, max_bytes=20_000).iter_from(0))
+
+
+def test_spool_idle_reader_skips_fully_checkpointed_segments(tmp_path, monkeypatch):
+    spool = TaskSpool(
+        tmp_path / "spool", virtual_partition_count=1,
+        segment_max_records=2, segment_max_bytes=20_000, max_bytes=100_000,
+    )
+    appended, _ = spool.append_many([
+        record("a", partition=0), record("b", partition=0),
+    ])
+    for item in appended:
+        spool.checkpoint(0, item.ordinal)
+
+    def fail_if_decoded(_value):
+        raise AssertionError("an idle reader decoded a fully consumed segment")
+
+    monkeypatch.setattr(SpoolRecord, "from_dict", staticmethod(fail_if_decoded))
+    assert list(spool.iter_from(0, spool.cursor(0))) == []

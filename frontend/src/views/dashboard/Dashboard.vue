@@ -10,7 +10,7 @@
       </section>
       <section class="dashboard-grid">
         <article class="panel trend-panel">
-          <div class="panel__header"><div><h3>{{ $t('dashboard.trendTitle') }}</h3><p>{{ $t('dashboard.trendDescription') }}</p></div><strong>{{ trendTotal.toLocaleString() }}</strong></div>
+          <div class="panel__header"><div><h3>{{ $t('dashboard.trendTitle') }}</h3><p>{{ $t(stats.pipeline === 'vnext' ? 'dashboard.vnextTrendDescription' : 'dashboard.trendDescription') }}</p></div><strong>{{ trendTotal.toLocaleString() }}</strong></div>
           <div class="bar-chart" role="img" :aria-label="$t('dashboard.chartLabel')">
             <div v-for="point in stats.daily_trend" :key="point.stats_date" class="bar-chart__item">
               <span class="bar-chart__value">{{ point.sent_count }}</span><div class="bar-chart__track"><div class="bar-chart__bar" :style="{height: `${barHeight(point.sent_count)}%`}" /></div><span>{{ point.stats_date.slice(5) }}</span>
@@ -35,10 +35,10 @@ import { useI18n } from 'vue-i18n'
 import { getDashboardStats } from '@/api/dashboard'
 import PageHeader from '@/components/PageHeader.vue'
 import DataState from '@/components/DataState.vue'
-const stats=reactive({total_batch_campaigns:0,in_progress_campaigns:0,in_progress_batch_campaigns:0,in_progress_realtime_campaigns:0,ended_campaigns:0,today_sent_count:0,total_sms_campaigns:0,realtime_campaigns:0,today_realtime_files:0,today_realtime_event_users:0,today_realtime_matched_users:0,daily_trend:[] as Array<{stats_date:string;sent_count:number;conversion_count:number}>,today_open_exception_count:0,today_recent_exceptions:[] as any[]})
+const stats=reactive({pipeline:'legacy',total_batch_campaigns:0,in_progress_campaigns:0,in_progress_batch_campaigns:0,in_progress_realtime_campaigns:0,ended_campaigns:0,today_sent_count:0,total_sms_campaigns:0,realtime_campaigns:0,today_realtime_files:0,today_realtime_event_users:0,today_realtime_matched_users:0,daily_trend:[] as Array<{stats_date:string;sent_count:number;conversion_count:number}>,today_open_exception_count:0,today_recent_exceptions:[] as any[]})
 const loading=ref(false),loaded=ref(false),error=ref('')
 const { t } = useI18n()
-const kpis=computed(()=>[{label:t('dashboard.todaySent'),value:stats.today_sent_count,hint:t('dashboard.deliveredSms')},{label:t('dashboard.inProgress'),value:stats.in_progress_campaigns,hint:t('dashboard.batchRealtime',{batch:stats.in_progress_batch_campaigns,realtime:stats.in_progress_realtime_campaigns})},{label:t('dashboard.realtimeMatched'),value:stats.today_realtime_matched_users,hint:t('dashboard.fromFiles',{count:stats.today_realtime_files})},{label:t('dashboard.openExceptions'),value:stats.today_open_exception_count,hint:stats.today_open_exception_count?t('dashboard.handleSoon'):t('dashboard.healthy')}])
+const kpis=computed(()=>[{label:t('dashboard.todaySent'),value:stats.today_sent_count,hint:stats.pipeline==='vnext'?t('dashboard.sentViaSocket'):t('dashboard.deliveredSms')},{label:t('dashboard.inProgress'),value:stats.in_progress_campaigns,hint:t('dashboard.batchRealtime',{batch:stats.in_progress_batch_campaigns,realtime:stats.in_progress_realtime_campaigns})},{label:t('dashboard.realtimeMatched'),value:stats.today_realtime_matched_users,hint:t('dashboard.fromFiles',{count:stats.today_realtime_files})},{label:t('dashboard.openExceptions'),value:stats.today_open_exception_count,hint:stats.today_open_exception_count?t('dashboard.handleSoon'):t('dashboard.healthy')}])
 const trendTotal=computed(()=>stats.daily_trend.reduce((sum,item)=>sum+item.sent_count,0)),trendMax=computed(()=>Math.max(1,...stats.daily_trend.map(item=>item.sent_count)))
 const barHeight=(value:number)=>value?Math.max(8,Math.round(value/trendMax.value*100)):2
 async function load(){loading.value=true;error.value='';try{Object.assign(stats,(await getDashboardStats()).data);loaded.value=true}catch(e:any){error.value=e.response?.data?.detail||t('common.connectionFailed')}finally{loading.value=false}}

@@ -47,6 +47,49 @@ def _load_env_file() -> None:
         os.environ.setdefault(key, value)
 
 
+def _default_vnext_root() -> Path:
+    """Resolve the same default VNext runtime root used by the service."""
+    configured_state_dir = os.environ.get("MC_STATE_DIR", "").strip()
+    if configured_state_dir:
+        return (Path(configured_state_dir).expanduser() / "vnext").resolve()
+
+    app_root = project_root()
+    preferred = app_root / "data" / "vnext"
+    if preferred.is_dir():
+        return preferred.resolve()
+
+    # Older/manual deployments could fall back to backend/data when no state
+    # directory was exported. Keep that layout discoverable for read-only CLI
+    # inspection while retaining the current application-level default.
+    legacy = app_root / "backend" / "data" / "vnext"
+    if legacy.is_dir():
+        return legacy.resolve()
+    return preferred.resolve()
+
+
+def _stats_root(args) -> str:
+    explicit = str(args.root or "").strip()
+    if explicit:
+        return explicit
+
+    configured = str(os.environ.get("MC_VNEXT_RUN_ROOT", "") or "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.is_dir():
+            return str(configured_path)
+        fallback = _default_vnext_root()
+        if fallback.is_dir():
+            print(
+                "mcctl stats: configured MC_VNEXT_RUN_ROOT does not exist; "
+                f"using default {fallback}",
+                file=sys.stderr,
+            )
+            return str(fallback)
+        return str(configured_path)
+
+    return str(_default_vnext_root())
+
+
 def _service():
     _load_env_file()
     backend = str(project_root() / "backend")
@@ -189,10 +232,40 @@ def _rollback(args) -> int:
     return 0
 
 
+def _stats(args) -> int:
+    """Run the read-only VNext statistics observer from the local CLI."""
+    _load_env_file()
+    root = _stats_root(args)
+
+    tools_dir = project_root() / "backend" / "tools"
+    if str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
+    try:
+        from vnext_stats import main as vnext_stats_main
+    except ImportError as exc:
+        print(f"mcctl stats: vnext_stats.py is unavailable: {exc}", file=sys.stderr)
+        return 1
+
+    stats_args = ["--root", root]
+    if args.watch:
+        stats_args.append("--watch")
+    elif args.once:
+        stats_args.append("--once")
+    if args.interval is not None:
+        stats_args.extend(["--interval", str(args.interval)])
+    for campaign in args.campaign:
+        stats_args.extend(["--campaign", campaign])
+    if args.json:
+        stats_args.append("--json")
+    if args.no_color:
+        stats_args.append("--no-color")
+    return vnext_stats_main(stats_args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcctl",
-        description="Local Marketing Copilot version and update recovery commands",
+        description="Local Marketing Copilot maintenance and VNext statistics commands",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -216,6 +289,35 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--yes", action="store_true", help="confirm the rollback")
     rollback.add_argument("--operator", default="", help="operator name recorded in update state")
     rollback.set_defaults(handler=_rollback)
+
+    stats = subparsers.add_parser(
+        "stats",
+        help="show read-only VNext runtime statistics",
+    )
+    stats.add_argument(
+        "--root",
+        default="",
+        help="VNext runtime root (default: service-configured runtime root)",
+    )
+    stats_mode = stats.add_mutually_exclusive_group()
+    stats_mode.add_argument("--watch", action="store_true", help="refresh until Ctrl+C")
+    stats_mode.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    stats.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="refresh interval in seconds (default 2)",
+    )
+    stats.add_argument(
+        "--campaign",
+        action="append",
+        default=[],
+        metavar="TYPE:ID",
+        help="filter campaigns (repeatable; ID alone matches any type)",
+    )
+    stats.add_argument("--json", action="store_true", help="machine-readable JSON")
+    stats.add_argument("--no-color", action="store_true", help="disable ANSI output")
+    stats.set_defaults(handler=_stats)
     return parser
 
 

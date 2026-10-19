@@ -5,7 +5,7 @@ import duckdb
 from tools.vnext_config_contract_check import audit_database
 
 
-def _create_db(path, *, tps_scope: str = "route_shared", bind_type: str = "transceiver"):
+def _create_db(path, *, tps_scope: str = "per_bind", bind_type: str = "transceiver"):
     conn = duckdb.connect(str(path))
     try:
         conn.execute("""
@@ -53,3 +53,13 @@ def test_vnext_config_contract_rejects_receiver_outbound_route(tmp_path):
 
     assert result["status"] == "FAIL"
     assert any("receiver bind" in item for item in result["errors"])
+
+
+def test_vnext_config_contract_rejects_route_shared_scope(tmp_path):
+    path = tmp_path / "config.duckdb"
+    _create_db(path, tps_scope="route_shared")
+
+    result = audit_database(path)
+
+    assert result["status"] == "FAIL"
+    assert any("fixed to 'per_bind'" in item for item in result["errors"])

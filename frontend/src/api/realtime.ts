@@ -1,6 +1,7 @@
 import api from './index'
 
 export interface RealtimeStats {
+  pipeline: 'legacy' | 'vnext'
   file_count: number
   total_msisdn_sum: number
   total_matched: number
@@ -14,6 +15,10 @@ export interface RealtimeStats {
   today_accepted_users: number
   today_delivered_users: number
   today_reached_users: number
+  sent_count: number
+  sent_users: number
+  today_sent_count: number
+  today_sent_users: number
 }
 
 export function getRealtimeStats(campaignId: number) {

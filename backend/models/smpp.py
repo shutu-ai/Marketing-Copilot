@@ -18,7 +18,10 @@ class SmppConfigCreate(BaseModel):
     enquire_interval: int = Field(default=30, ge=0, le=300)
     timeout: int = Field(default=10, ge=1, le=120)
     tps: int = Field(default=20, ge=0, le=10000)
-    tps_scope: Literal['route_shared', 'per_bind'] = 'route_shared'
+    # VNext capacity is defined per physical SMPP bind.  Keep this field in
+    # the API contract for compatibility, but do not allow route-shared
+    # accounting to be configured through the application.
+    tps_scope: Literal['per_bind'] = 'per_bind'
     priority: int = Field(default=100, ge=1, le=10000)
     reconnect_max_seconds: int = Field(default=60, ge=0, le=300)
     delivery_receipt_mode: Literal['required', 'optional', 'disabled'] = 'optional'
@@ -41,7 +44,7 @@ class SmppConfigUpdate(BaseModel):
     enquire_interval: Optional[int] = Field(default=None, ge=0, le=300)
     timeout: Optional[int] = Field(default=None, ge=1, le=120)
     tps: Optional[int] = Field(default=None, ge=0, le=10000)
-    tps_scope: Optional[Literal['route_shared', 'per_bind']] = None
+    tps_scope: Optional[Literal['per_bind']] = None
     priority: Optional[int] = Field(default=None, ge=1, le=10000)
     reconnect_max_seconds: Optional[int] = Field(default=None, ge=0, le=300)
     delivery_receipt_mode: Optional[Literal['required', 'optional', 'disabled']] = None
@@ -64,7 +67,7 @@ class SmppConfigResponse(BaseModel):
     enquire_interval: int
     timeout: int
     tps: int
-    tps_scope: Literal['route_shared', 'per_bind']
+    tps_scope: Literal['per_bind']
     priority: int
     reconnect_max_seconds: int
     delivery_receipt_mode: Literal['required', 'optional', 'disabled']
@@ -72,7 +75,8 @@ class SmppConfigResponse(BaseModel):
     created_at: str
     updated_at: str
     restart_required: bool = False
-    effective_state: Literal['pending_restart', 'next_start'] = 'next_start'
+    effective_state: Literal['applied', 'pending_restart', 'next_start'] = 'next_start'
+    hot_applied: bool = False
 
 
 class SmppTestRequest(BaseModel):

@@ -69,7 +69,8 @@ normalize_text() { tr -d '\r' < "$1" > "$2"; }
 # of the runtime architecture, however: run.sh uses the systemd installer,
 # the online-update service starts apply_update.py, and the documented
 # maintenance workflow uses the backup, deployment-check, and reconciliation
-# commands.  Keep the set explicit so test/simulator tooling is not shipped.
+# commands, and the read-only VNext statistics observer.  Keep the set
+# explicit so test/simulator tooling is not shipped.
 PRODUCTION_TOOLS=(
   __init__.py
   apply_update.py
@@ -77,6 +78,7 @@ PRODUCTION_TOOLS=(
   deployment_check.py
   install_systemd_service.py
   reconcile_processed_files.py
+  vnext_stats.py
 )
 mkdir -p "$STAGE/backend/tools"
 for tool in "${PRODUCTION_TOOLS[@]}"; do

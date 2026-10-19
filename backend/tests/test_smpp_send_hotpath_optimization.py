@@ -68,7 +68,7 @@ def test_multipart_authorization_materializes_parts_in_one_durable_statement(
     conn.close()
 
 
-def test_smpp_stats_expose_route_shared_parts_per_second_limit(isolated_db):
+def test_smpp_stats_expose_fixed_per_bind_parts_per_second_limit(isolated_db):
     conn = database.get_connection()
     conn.execute(
         """INSERT INTO smpp_configs
@@ -81,10 +81,10 @@ def test_smpp_stats_expose_route_shared_parts_per_second_limit(isolated_db):
 
     item = smpp_service.get_config_stats()["items"][0]
 
-    assert item["configured_route_tps"] == 120.0
-    assert item["configured_per_bind_tps"] is None
-    assert item["effective_total_limit_tps"] == 120.0
-    assert item["tps_scope"] == "route_shared"
+    assert item["configured_route_tps"] == 0.0
+    assert item["configured_per_bind_tps"] == 120.0
+    assert item["effective_total_limit_tps"] == 480.0
+    assert item["tps_scope"] == "per_bind"
     assert item["tps_unit"] == "submit_sm_parts/s"
 
 

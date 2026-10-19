@@ -13,7 +13,7 @@ export interface SmppConfig {
   pool_size: number
   window_size: number
   tps: number
-  tps_scope: 'route_shared' | 'per_bind'
+  tps_scope: 'per_bind'
   priority: number
   reconnect_max_seconds: number
   delivery_receipt_mode: 'required' | 'optional' | 'disabled'
@@ -22,6 +22,9 @@ export interface SmppConfig {
   enabled: number
   created_at: string
   updated_at: string
+  restart_required?: boolean
+  effective_state?: 'applied' | 'pending_restart' | 'next_start'
+  hot_applied?: boolean
 }
 
 export interface SmppConfigForm {
@@ -38,7 +41,6 @@ export interface SmppConfigForm {
   pool_size: number
   window_size: number
   tps: number
-  tps_scope: 'route_shared' | 'per_bind'
   priority: number
   reconnect_max_seconds: number
   delivery_receipt_mode: 'required' | 'optional' | 'disabled'

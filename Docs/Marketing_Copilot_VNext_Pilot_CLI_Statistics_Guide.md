@@ -2,43 +2,52 @@
 
 适用对象：1–2 个真实 Campaign 的受控上线观察窗口。
 
-工具：`backend/tools/vnext_stats.py`（仅 Python 标准库）
+工具：`bin/marketing-copilot-cli stats`（底层为 `backend/tools/vnext_stats.py`，仅 Python 标准库）
 
 ## 1. 先决条件
 
 - 运行时通过现有 `marketing-copilot.service` 启动；不要为本 CLI 新建服务。
-- CLI 与运行时使用同一个 `MC_VNEXT_RUN_ROOT`。
+- CLI 与运行时使用同一个运行根目录：优先读取 `MC_VNEXT_RUN_ROOT`，未设置时使用
+  `MC_STATE_DIR/vnext`（标准部署通常为 `/opt/marketing-copilot/data/vnext`）。
 - CLI 只需要对运行目录的**读权限**，不需要数据库、API 或 SMSC 凭据。
 - 不要把 `MSISDN`、短信正文或 SMSC 密码写入统计文件或终端重定向文件。
 
-默认路径：
+标准部署默认路径：
 
 ```bash
-export MC_VNEXT_RUN_ROOT=/opt/marketing-copilot/data/vnext
+/opt/marketing-copilot/data/vnext
 ```
 
 ## 2. 命令
 
 ```bash
 # 单次快照，适合 SSH 排障
-python3 backend/tools/vnext_stats.py --root "$MC_VNEXT_RUN_ROOT" --once
+/opt/marketing-copilot/bin/marketing-copilot-cli \
+  stats
 
 # 默认每 2 秒刷新，Ctrl+C 退出
-python3 backend/tools/vnext_stats.py --root "$MC_VNEXT_RUN_ROOT" --watch
+/opt/marketing-copilot/bin/marketing-copilot-cli \
+  stats --watch
 
 # 只看两个 Campaign
-python3 backend/tools/vnext_stats.py \
-  --root "$MC_VNEXT_RUN_ROOT" --watch \
+/opt/marketing-copilot/bin/marketing-copilot-cli \
+  stats --watch \
   --campaign batch:101 --campaign batch:102
 
 # 机器可读（单次一条 JSON；watch 为 NDJSON，每行一条）
-python3 backend/tools/vnext_stats.py \
-  --root "$MC_VNEXT_RUN_ROOT" --once --json
+/opt/marketing-copilot/bin/marketing-copilot-cli \
+  stats --once --json
 
 # 自定义刷新频率 / 禁用 ANSI
-python3 backend/tools/vnext_stats.py \
-  --root "$MC_VNEXT_RUN_ROOT" --watch --interval 1 --no-color
+/opt/marketing-copilot/bin/marketing-copilot-cli \
+  stats --watch --interval 1 --no-color
 ```
+
+`--root` 通常不需要填写。CLI 会自动沿用服务的运行根目录；只有观察非默认目录或历史
+Pilot 目录时才需要显式指定。如果旧环境变量指向已不存在的目录，CLI 会自动回退到标准
+默认目录。直接执行
+`backend/tools/vnext_stats.py` 仍可用于源码目录排障，但部署包中的正式入口是
+`marketing-copilot-cli stats`。
 
 非 TTY 环境自动输出纯文本并保留历史滚动；TTY 下默认清屏。
 
