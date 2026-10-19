@@ -157,6 +157,43 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
     assert cursor_page["items"][0]["event_id"] == "task-1"
 
 
+def test_vnext_task_campaign_names_are_resolved_in_one_bounded_control_read(monkeypatch):
+    calls = []
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def execute(self, query, params):
+            calls.append((query, tuple(params)))
+            if "batch_campaigns" in query:
+                return Result([{"id": 11, "name": "批量活动 11"}])
+            return Result([{"id": 6, "name": "实时活动 6"}])
+
+    monkeypatch.setattr(
+        vnext_service,
+        "read_transaction",
+        lambda callback, **_kwargs: callback(Connection()),
+    )
+
+    names = vnext_service._campaign_names_for_rows([
+        {"campaign_type": "batch", "campaign_id": 11},
+        {"campaign_type": "realtime", "campaign_id": 6},
+        {"campaign_type": "realtime", "campaign_id": 6},
+    ])
+
+    assert names == {
+        ("batch", 11): "批量活动 11",
+        ("realtime", 6): "实时活动 6",
+    }
+    assert len(calls) == 2
+    assert {call[1] for call in calls} == {(11,), (6,)}
+
+
 def test_service_control_maps_campaign_states(tmp_path, monkeypatch):
     fake = _FakeRuntime(tmp_path)
     fake.set_campaign_state = lambda campaign_type, campaign_id, state: setattr(

@@ -637,7 +637,61 @@ def dashboard_stats() -> dict:
     }
 
 
-def _task_item_from_event(row: dict, base: dict | None = None) -> dict:
+def _campaign_names_for_rows(rows: Iterable[dict]) -> dict[tuple[str, int], str]:
+    """Resolve names for the bounded page of VNext task rows.
+
+    VNext projection rows intentionally keep only the compact campaign type
+    and id needed by the send path.  The task-list API can enrich one page at
+    a time from the control-plane database without adding campaign names to
+    journal/projection writes or the worker hot path.
+    """
+
+    ids_by_type = {"batch": set(), "realtime": set()}
+    for row in rows:
+        campaign_type = str(row.get("campaign_type") or "")
+        if campaign_type not in ids_by_type:
+            continue
+        try:
+            campaign_id = int(row.get("campaign_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if campaign_id > 0:
+            ids_by_type[campaign_type].add(campaign_id)
+    if not any(ids_by_type.values()):
+        return {}
+
+    tables = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}
+
+    def read(conn):
+        names = {}
+        for campaign_type, table in tables.items():
+            campaign_ids = sorted(ids_by_type[campaign_type])
+            if not campaign_ids:
+                continue
+            placeholders = ",".join("?" for _ in campaign_ids)
+            records = conn.execute(
+                f"SELECT id, name FROM {table} WHERE id IN ({placeholders})",
+                campaign_ids,
+            ).fetchall()
+            for record in records:
+                name = str(record["name"] or "").strip()
+                if name:
+                    names[(campaign_type, int(record["id"]))] = name
+        return names
+
+    try:
+        return read_transaction(read, operation="vnext.task_campaign_names")
+    except Exception:
+        # The list is diagnostic. A transient control-plane read failure must
+        # not make task listing fail or affect the sending data plane.
+        return {}
+
+
+def _task_item_from_event(
+    row: dict,
+    base: dict | None = None,
+    campaign_names: dict[tuple[str, int], str] | None = None,
+) -> dict:
     """Adapt one progress event to the logical-task shape consumed by the UI.
 
     Response events deliberately carry only transport evidence.  Their
@@ -655,10 +709,15 @@ def _task_item_from_event(row: dict, base: dict | None = None) -> dict:
     message = str(row.get("message") or base.get("message") or "")
     campaign_type = str(row.get("campaign_type") or base.get("campaign_type") or "")
     campaign_id = int(row.get("campaign_id") or base.get("campaign_id") or 0)
+    campaign_name = (
+        str(row.get("campaign_name") or base.get("campaign_name") or "").strip()
+        or (campaign_names or {}).get((campaign_type, campaign_id), "")
+        or f"{campaign_type} #{campaign_id}"
+    )
     return {
         "id": event_id,
         "event_id": event_id,
-        "campaign_name": f"{campaign_type} #{campaign_id}",
+        "campaign_name": campaign_name,
         "campaign_type": campaign_type,
         "campaign_id": campaign_id,
         "smpp_config_id": int(row.get("route_id") or base.get("route_id") or 0),
@@ -758,7 +817,11 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     )
     if projection_page is not None:
         total, rows = projection_page
-        items = [_task_item_from_event(row) for row in rows]
+        campaign_names = _campaign_names_for_rows(rows)
+        items = [
+            _task_item_from_event(row, campaign_names=campaign_names)
+            for row in rows
+        ]
         has_more = page * page_size < total
         return {
             "pipeline": "vnext", "total": total, "page": page,
@@ -779,10 +842,15 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     by_id = {str(item.get("event_id") or ""): item for item in events}
     offset = (page - 1) * page_size
     rows = events[offset:offset + page_size]
+    campaign_names = _campaign_names_for_rows(rows)
     items = []
     for row in rows:
         parent_id = str(row.get("event_id") or "").split(":resp:", 1)[0]
-        items.append(_task_item_from_event(row, by_id.get(parent_id)))
+        items.append(
+            _task_item_from_event(
+                row, by_id.get(parent_id), campaign_names=campaign_names
+            )
+        )
     has_more = offset + len(items) < total
     return {
         "pipeline": "vnext", "total": total, "page": page,
