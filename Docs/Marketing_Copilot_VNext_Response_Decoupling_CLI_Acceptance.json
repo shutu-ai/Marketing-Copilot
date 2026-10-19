@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "task_id": "MC-VNEXT-P0-RESPONSE-JOURNAL-DECOUPLING-CLI-20261019",
+  "implementation_date": "2026-10-19",
+  "source_head": "91257109f16158948d4e74f8b54ec13eab257fde",
+  "environment": {
+    "implementation": "Windows PowerShell",
+    "python": "3.13.15",
+    "pytest_venv": ".p0-test-venv",
+    "linux_target": "SLES12SP5 native ext4",
+    "linux_target_available": false
+  },
+  "product_changes": [
+    "Per-worker ProgressPersistence actor with one ordered writer thread and bounded queue",
+    "Non-blocking SMPP response callback; Reader releases protocol Window before enqueue",
+    "Pre-dispatch reservation for one task terminal event plus one response event per encoded SMS part",
+    "Socket-written and response progress events moved off the asyncio event loop",
+    "Durable per-Campaign aggregate checkpoint with restart/rollover/reclaim replay",
+    "Crash-time partial JSONL tail repair before the first append",
+    "Read-only vnext_stats CLI with --root/--watch/--once/--interval/--campaign/--json/--no-color",
+    "Low-frequency worker status heartbeat and explicit two-phase response/progress drain",
+    "Progress and transport observed/durable counters exposed in worker status",
+    "Thread-safe critical-path profiler counters for writer/heartbeat concurrency"
+  ],
+  "files": {
+    "new": [
+      "backend/vnext/progress.py",
+      "backend/tools/vnext_stats.py",
+      "backend/tests/test_vnext_progress_persistence.py",
+      "backend/tests/test_vnext_runtime_progress_e2e.py",
+      "backend/tests/test_vnext_stats_cli.py",
+      "Docs/Marketing_Copilot_VNext_Response_Journal_Decoupling_Implementation.md",
+      "Docs/Marketing_Copilot_VNext_Pilot_CLI_Statistics_Guide.md",
+      "Docs/Marketing_Copilot_VNext_Response_Decoupling_CLI_Acceptance.json"
+    ],
+    "updated": [
+      "backend/vnext/smpp_transport.py",
+      "backend/vnext/worker.py",
+      "backend/vnext/runtime.py",
+      "backend/vnext/projection_writer.py",
+      "backend/vnext/metrics.py",
+      "backend/vnext/critical_path_profiler.py",
+      "backend/tools/vnext_streaming_acceptance.py",
+      "backend/tests/test_vnext_smpp_transport.py"
+    ]
+  },
+  "acceptance": {
+    "RESPONSE_READER_JOURNAL_DECOUPLED": "PASS",
+    "SOCKET_WRITTEN_JOURNAL_IO_OFF_EVENT_LOOP": "PASS",
+    "PROGRESS_QUEUE_BOUNDED": "PASS",
+    "PREDISPATCH_RESERVATION": "PASS",
+    "JOURNAL_DURABILITY_AND_CRASH_GAP_HANDLED": "PASS",
+    "READER_AND_DURABLE_DRAIN": "PASS",
+    "STAGE_INDEPENDENCE_AND_AUTO_BACKPRESSURE": "PASS",
+    "CAMPAIGN_PAUSE_RESUME_CANCEL": "PASS",
+    "AT_MOST_ONCE_NO_REDISPATCH": "PASS",
+    "CLI_NO_WEB_DEPENDENCY": "PASS",
+    "CLI_CAMPAIGN_STATS": "PASS",
+    "CLI_OVERHEAD_PAIRED_PERCENT": "NOT_RUN",
+    "SLES_1K": "NOT_RUN_WINDOWS_WORKSPACE",
+    "SLES_5K_PAIRED": "NOT_RUN",
+    "STAGE_THROUGHPUT_OLD_NEW": "NOT_RUN_UNPAIRED",
+    "E2E_THROUGHPUT_OLD_NEW": "NOT_RUN_UNPAIRED",
+    "JOURNAL_AND_PROJECTION_RECONCILIATION": "PASS",
+    "BACKEND_TESTS": "469_PASSED_5_SKIPPED",
+    "50K": "NOT_RUN_UNLESS_AUTHORIZED",
+    "600S": "NOT_RUN",
+    "CANARY_READY": "NO_UNTIL_LIVE_SMSC_PILOT_APPROVED",
+    "FINAL_DECISION": "IMPLEMENTED_VALIDATED"
+  },
+  "test_evidence": {
+    "backend_full_suite": {
+      "command": ".p0-test-venv\\Scripts\\python.exe -m pytest backend/tests -q",
+      "result": "469 passed, 5 skipped, 4 warnings",
+      "duration_seconds": 144.66,
+      "baseline": "447 passed, 5 skipped",
+      "added_tests": 22
+    },
+    "focused_suites": [
+      {
+        "scope": "SMPP transport, worker, progress persistence, projection, runtime, E2E, CLI, static audit",
+        "result": "47 passed"
+      },
+      {
+        "scope": "progress persistence and projection writer",
+        "result": "17 passed"
+      },
+      {
+        "scope": "CLI unit and subprocess tests",
+        "result": "6 passed"
+      }
+    ],
+    "decoupling_proof": {
+      "test": "test_reader_observes_responses_while_journal_fsync_is_slow",
+      "injected_append_many_delay_ms": 600,
+      "responses_observed": 50,
+      "reader_blocked": false,
+      "observed_before_durable": true
+    },
+    "runtime_e2e": {
+      "test": "test_production_runtime_durably_records_two_campaigns",
+      "entry": "VNextRuntime",
+      "campaigns": [101, 102],
+      "loopback_smsc": "127.0.0.1",
+      "workers": 1,
+      "socket_written_events": 8,
+      "response_events": 8,
+      "journal_durable_events_min": 16,
+      "projection_caught_up": true,
+      "cli_live_read": "PASS"
+    }
+  },
+  "limitations": [
+    "SLES12SP5 native ext4 A/B (1K and paired 5K) was not available in this Windows workspace.",
+    "CLI OFF/ON paired overhead was not measured; only read-only and low-frequency properties were validated.",
+    "Per-Campaign projected counts are N/A and are reported in incomplete_metrics.",
+    "Durable campaign aggregates retain at most 256 campaigns; overflow evicts the oldest and marks statistics incomplete.",
+    "A process crash can still lose observed-but-not-fsynced events; these are reported as unresolved/crash gaps and never resent automatically.",
+    "50K, 600-second stability, real SMSC, production deployment and canary remain unauthorized/not run."
+  ],
+  "machine_summary": "SOURCE_HEAD=91257109f16158948d4e74f8b54ec13eab257fde\nPRODUCT_CHANGES=per-worker bounded progress actor; non-blocking SMPP reader callback; pre-dispatch reservation; batch fsync off event loop; durable campaign aggregate; read-only vnext_stats CLI; partial journal tail repair\nRESPONSE_READER_JOURNAL_DECOUPLED=PASS\nSOCKET_WRITTEN_JOURNAL_IO_OFF_EVENT_LOOP=PASS\nPROGRESS_QUEUE_BOUNDED=PASS\nPREDISPATCH_RESERVATION=PASS\nJOURNAL_DURABILITY_AND_CRASH_GAP_HANDLED=PASS\nREADER_AND_DURABLE_DRAIN=PASS\nSTAGE_INDEPENDENCE_AND_AUTO_BACKPRESSURE=PASS\nCAMPAIGN_PAUSE_RESUME_CANCEL=PASS\nAT_MOST_ONCE_NO_REDISPATCH=PASS\nCLI_NO_WEB_DEPENDENCY=PASS\nCLI_CAMPAIGN_STATS=PASS\nCLI_OVERHEAD_PAIRED_PERCENT=NOT_RUN\nSLES_1K=NOT_RUN_WINDOWS_WORKSPACE\nSLES_5K_PAIRED=NOT_RUN\nSTAGE_THROUGHPUT_OLD_NEW=NOT_RUN_UNPAIRED\nE2E_THROUGHPUT_OLD_NEW=NOT_RUN_UNPAIRED\nJOURNAL_AND_PROJECTION_RECONCILIATION=PASS\nBACKEND_TESTS=469_PASSED_5_SKIPPED\n50K=NOT_RUN_UNLESS_AUTHORIZED\n600S=NOT_RUN\nCANARY_READY=NO_UNTIL_LIVE_SMSC_PILOT_APPROVED\nFINAL_DECISION=IMPLEMENTED_VALIDATED"
+}

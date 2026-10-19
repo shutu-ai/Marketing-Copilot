@@ -46,6 +46,7 @@ class ProgressJournal:
         requested_segment_bytes = int(segment_bytes or min(self.max_bytes, 64 * 1024 * 1024))
         self.segment_bytes = max(self.max_event_bytes, min(self.max_bytes, requested_segment_bytes))
         self.profiler = profiler
+        self._tail_verified = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._read_metrics = {
             "journal_read_ns": 0,
@@ -119,6 +120,7 @@ class ProgressJournal:
         append_started_ns = time.perf_counter_ns()
         if not encoded:
             return
+        self.repair_partial_tail()
         if any(len(line) > self.max_event_bytes for line in encoded):
             raise ValueError("progress event exceeds bounded size")
         if self.size() + sum(len(line) for line in encoded) > self.max_bytes:
@@ -171,6 +173,50 @@ class ProgressJournal:
                     "journal_append", time.perf_counter_ns() - append_started_ns
                 )
                 self.profiler.publish_if_due()
+
+    def repair_partial_tail(self) -> None:
+        """Drop an unacknowledged partial JSONL tail left by a crash.
+
+        Only the active segment can contain a partial batch tail: the writer
+        closes and fsyncs a segment before rolling over to the next one.  The
+        repair is performed once per process before the first append, so a
+        restarted worker cannot append behind a broken line and block the
+        projection reader forever.
+        """
+
+        if self._tail_verified:
+            return
+        self._tail_verified = True
+        try:
+            active = self.active_path()
+            size = int(active.stat().st_size)
+        except OSError:
+            return
+        if size <= 0:
+            return
+        new_size = 0
+        try:
+            with active.open("rb") as handle:
+                position = size
+                while position > 0:
+                    start = max(0, position - 4096)
+                    handle.seek(start)
+                    chunk = handle.read(position - start)
+                    index = chunk.rfind(b"\n")
+                    if index >= 0:
+                        new_size = start + index + 1
+                        break
+                    position = start
+            if new_size == size:
+                return
+            with active.open("rb+") as handle:
+                handle.truncate(new_size)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if self.profiler:
+                self.profiler.inc("journal_partial_tail_repairs")
+        except OSError:
+            return
 
     def append(self, event: dict) -> None:
         started_ns = time.perf_counter_ns()

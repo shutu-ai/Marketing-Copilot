@@ -28,11 +28,13 @@ class VNextMetrics:
                 if event.get(key):
                     self._counters[key] += int(event[key])
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, include_samples: bool = True) -> dict:
         with self._lock:
-            return {
+            value = {
                 "started_at": self._started_at,
                 "counters": dict(self._counters),
                 "sample_count": len(self._samples),
-                "samples": list(self._samples),
             }
+            if include_samples:
+                value["samples"] = list(self._samples)
+            return value

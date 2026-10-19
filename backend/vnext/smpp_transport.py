@@ -7,6 +7,7 @@ import contextlib
 import inspect
 import struct
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -50,6 +51,13 @@ def _split_text(message: str) -> tuple[list[bytes], int]:
     if len(encoded) <= 140:
         return [encoded], 0
     return [encoded[index:index + 134] for index in range(0, len(encoded), 134)], 0
+
+
+def count_parts(message: str) -> int:
+    """Return the encoded submit_sm part count used by this transport."""
+
+    parts, _coding = _split_text(message)
+    return max(1, len(parts))
 
 
 def build_bind(sequence: int, system_id: str, password: str, system_type: str = "",
@@ -116,6 +124,7 @@ class _Pending:
     sent_at: float
     route_id: str
     context: dict | None = None
+    reservation: object | None = None
 
 
 class AsyncSmppTransport:
@@ -180,6 +189,13 @@ class AsyncSmppTransport:
         self.response_success = 0
         self.response_error = 0
         self.unknown_parts = 0
+        self.response_observed_success = 0
+        self.response_observed_error = 0
+        self.response_observed_unknown = 0
+        self.unexpected_response_pdus = 0
+        self.response_callback_errors = 0
+        self.response_callback_pending = 0
+        self.response_latency_samples = deque(maxlen=4096)
         self.write_failures = 0
         self.last_error = ""
         self.window_inflight_peak = 0
@@ -312,23 +328,30 @@ class AsyncSmppTransport:
                     pending = self._pending.pop(sequence, None)
                     if pending is None:
                         self.unknown_parts += 1
+                        self.unexpected_response_pdus += 1
+                        self.response_observed_unknown += 1
                         if self.profiler:
                             self.profiler.inc("unknown_response_pdus")
                             self.profiler.publish_if_due()
                         continue
                     if status == ESME_ROK:
                         self.response_success += 1
+                        self.response_observed_success += 1
                     else:
                         self.response_error += 1
+                        self.response_observed_error += 1
                     self._window.release()
+                    latency = max(0.0, time.monotonic() - pending.sent_at)
+                    self.response_latency_samples.append(latency)
                     event = {
                         "route_id": self.route_id,
                         "sequence": sequence,
                         "status": int(status),
                         "success": status == ESME_ROK,
-                        "latency_seconds": max(0.0, time.monotonic() - pending.sent_at),
+                        "latency_seconds": latency,
                         "body_length": len(body),
                         "context": dict(pending.context or {}),
+                        "progress_reservation": pending.reservation,
                     }
                     if self.profiler:
                         self.profiler.observe_ns(
@@ -337,11 +360,29 @@ class AsyncSmppTransport:
                         )
                     if self.response_callback:
                         callback_started_ns = time.perf_counter_ns()
+                        self.response_callback_pending += 1
                         try:
                             result = self.response_callback(event)
-                            if asyncio.iscoroutine(result):
+                            if inspect.isawaitable(result):
                                 await result
+                        except Exception as exc:
+                            # A failed progress callback must not stop the
+                            # reader from draining the protocol window.  Keep
+                            # processing responses and expose the gap.
+                            self.response_callback_errors += 1
+                            self.last_error = (
+                                f"response callback failed: {type(exc).__name__}: {exc}"
+                            )
+                            reservation = pending.reservation
+                            release_claim = getattr(
+                                reservation, "release_claim", None
+                            )
+                            if release_claim:
+                                release_claim()
                         finally:
+                            self.response_callback_pending = max(
+                                0, self.response_callback_pending - 1
+                            )
                             if self.profiler:
                                 self.profiler.observe_ns(
                                     "response_callback",
@@ -382,7 +423,11 @@ class AsyncSmppTransport:
         for pending in outstanding:
             self._window.release()
             self.unknown_parts += 1
+            self.response_observed_unknown += 1
             if not self.response_callback:
+                release_claim = getattr(pending.reservation, "release_claim", None)
+                if release_claim:
+                    release_claim()
                 continue
             event = {
                 "route_id": self.route_id,
@@ -394,18 +439,29 @@ class AsyncSmppTransport:
                 "body_length": 0,
                 "error": reason,
                 "context": dict(pending.context or {}),
+                "progress_reservation": pending.reservation,
             }
+            self.response_callback_pending += 1
             try:
                 result = self.response_callback(event)
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
+                self.response_callback_errors += 1
                 self.last_error = f"unknown response sink failed: {type(exc).__name__}: {exc}"
+                release_claim = getattr(pending.reservation, "release_claim", None)
+                if release_claim:
+                    release_claim()
+            finally:
+                self.response_callback_pending = max(
+                    0, self.response_callback_pending - 1
+                )
 
     async def send_task(self, *, destination_addr: str, message: str, flash_sms: bool = False,
                         reference: int = 1, source_addr: str | None = None,
                         before_write: Callable[[], bool | Awaitable[bool]] | None = None,
-                        progress_context: dict | None = None) -> SocketWriteResult:
+                        progress_context: dict | None = None,
+                        progress_reservation: object | None = None) -> SocketWriteResult:
         parts, _coding = _split_text(message)
         if not parts:
             return SocketWriteResult("write_failed", 0, 0, "empty message")
@@ -469,8 +525,20 @@ class AsyncSmppTransport:
             self._pending[sequence] = _Pending(
                 sequence, time.monotonic(), self.route_id,
                 dict(progress_context or {}),
+                progress_reservation,
             )
             self.window_inflight_peak = max(self.window_inflight_peak, len(self._pending))
+            if progress_reservation is not None:
+                claim_response_slot = getattr(
+                    progress_reservation, "claim_response_slot", None
+                )
+                if claim_response_slot is None or not claim_response_slot():
+                    self._pending.pop(sequence, None)
+                    self._window.release()
+                    self.write_failures += 1
+                    self.last_error = "progress reservation has no slot for this PDU"
+                    state = "unknown" if written else "write_failed"
+                    return SocketWriteResult(state, written, len(parts), self.last_error)
             try:
                 assert self.writer is not None
                 async with self._write_lock:
@@ -478,6 +546,11 @@ class AsyncSmppTransport:
                         if before_write is not None:
                             self._pending.pop(sequence, None)
                             self._window.release()
+                            release_claim = getattr(
+                                progress_reservation, "release_claim", None
+                            )
+                            if release_claim:
+                                release_claim()
                             state = "unknown" if written else "expired"
                             return SocketWriteResult(
                                 state, written, len(parts),
@@ -506,6 +579,9 @@ class AsyncSmppTransport:
             except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
                 self._pending.pop(sequence, None)
                 self._window.release()
+                release_claim = getattr(progress_reservation, "release_claim", None)
+                if release_claim:
+                    release_claim()
                 self.write_failures += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 if self.profiler:
@@ -560,6 +636,15 @@ class AsyncSmppTransport:
             lease.release()
 
     def snapshot(self) -> dict:
+        latencies = sorted(self.response_latency_samples)
+        def percentile(fraction: float) -> float | None:
+            if not latencies:
+                return None
+            index = min(
+                len(latencies) - 1,
+                max(0, int(round((len(latencies) - 1) * fraction))),
+            )
+            return round(latencies[index] * 1000.0, 3)
         return {
             "route_id": self.route_id,
             "connected": self.connected,
@@ -580,6 +665,23 @@ class AsyncSmppTransport:
             "response_success": self.response_success,
             "response_error": self.response_error,
             "unknown_parts": self.unknown_parts,
+            "response_observed_success": self.response_observed_success,
+            "response_observed_error": self.response_observed_error,
+            "response_observed_unknown": self.response_observed_unknown,
+            "response_observed_total": (
+                self.response_observed_success
+                + self.response_observed_error
+                + self.response_observed_unknown
+            ),
+            "unexpected_response_pdus": self.unexpected_response_pdus,
+            "response_callback_errors": self.response_callback_errors,
+            "response_callback_pending": self.response_callback_pending,
+            "response_latency_samples": len(latencies),
+            "response_latency_p50_ms": percentile(0.50),
+            "response_latency_p95_ms": percentile(0.95),
+            "bind_active": int(self.connected),
+            "bind_acquires": int(self.bind_acquired_count),
+            "reconnect_count": max(0, int(self.bind_acquired_count) - 1),
             "write_failures": self.write_failures,
             "reconnect_failures": self._reconnect_failures,
             "reconnect_backoff_seconds": round(
@@ -599,4 +701,14 @@ class AsyncSmppTransport:
             "first_response_monotonic": self.first_response_monotonic,
             "last_response_monotonic": self.last_response_monotonic,
             "last_error": self.last_error,
+        }
+
+    def inflight_snapshot(self) -> dict:
+        """Return only cheap protocol-boundary gauges for drain loops."""
+
+        return {
+            "route_id": self.route_id,
+            "connected": self.connected,
+            "window_inflight": len(self._pending),
+            "response_callback_pending": self.response_callback_pending,
         }

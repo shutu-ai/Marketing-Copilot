@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -43,6 +44,8 @@ class CriticalPathProfiler:
         self._gauges: dict[str, int | float | str | bool | None] = {}
         self._timestamps: dict[str, float] = {}
         self._durations: dict[str, deque[int]] = {}
+        self._lock = threading.RLock()
+        self._publish_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -51,28 +54,32 @@ class CriticalPathProfiler:
     def inc(self, name: str, value: int = 1) -> None:
         if not self.enabled:
             return
-        self._counters[str(name)] += int(value)
+        with self._lock:
+            self._counters[str(name)] += int(value)
 
     def gauge(self, name: str, value: Any) -> None:
         if not self.enabled:
             return
-        self._gauges[str(name)] = value
+        with self._lock:
+            self._gauges[str(name)] = value
 
     def mark(self, name: str, at_monotonic: float | None = None) -> None:
         if not self.enabled:
             return
-        self._timestamps[str(name)] = float(
-            time.monotonic() if at_monotonic is None else at_monotonic
-        )
+        with self._lock:
+            self._timestamps[str(name)] = float(
+                time.monotonic() if at_monotonic is None else at_monotonic
+            )
 
     def observe_ns(self, name: str, duration_ns: int) -> None:
         if not self.enabled:
             return
-        key = str(name)
-        values = self._durations.setdefault(key, deque(maxlen=self.sample_limit))
-        values.append(max(0, int(duration_ns)))
-        self._counters[f"{key}_count"] += 1
-        self._counters[f"{key}_total_ns"] += max(0, int(duration_ns))
+        with self._lock:
+            key = str(name)
+            values = self._durations.setdefault(key, deque(maxlen=self.sample_limit))
+            values.append(max(0, int(duration_ns)))
+            self._counters[f"{key}_count"] += 1
+            self._counters[f"{key}_total_ns"] += max(0, int(duration_ns))
 
     @staticmethod
     def _percentile(values: list[int], percentile: float) -> int:
@@ -86,39 +93,45 @@ class CriticalPathProfiler:
         return int(round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction))
 
     def snapshot(self) -> dict[str, Any]:
-        durations: dict[str, dict[str, int | float]] = {}
-        for name, values in self._durations.items():
-            ordered = list(values)
-            durations[name] = {
-                "count": len(ordered),
-                "sample_count": len(ordered),
-                "p50_ms": round(self._percentile(ordered, 0.50) / 1_000_000, 3),
-                "p95_ms": round(self._percentile(ordered, 0.95) / 1_000_000, 3),
-                "p99_ms": round(self._percentile(ordered, 0.99) / 1_000_000, 3),
-                "max_ms": round(max(ordered, default=0) / 1_000_000, 3),
-                "total_ns": int(sum(ordered)),
+        with self._lock:
+            durations: dict[str, dict[str, int | float]] = {}
+            for name, values in self._durations.items():
+                ordered = list(values)
+                durations[name] = {
+                    "count": len(ordered),
+                    "sample_count": len(ordered),
+                    "p50_ms": round(self._percentile(ordered, 0.50) / 1_000_000, 3),
+                    "p95_ms": round(self._percentile(ordered, 0.95) / 1_000_000, 3),
+                    "p99_ms": round(self._percentile(ordered, 0.99) / 1_000_000, 3),
+                    "max_ms": round(max(ordered, default=0) / 1_000_000, 3),
+                    "total_ns": int(sum(ordered)),
+                }
+            return {
+                "pid": self.pid,
+                "ppid": os.getppid(),
+                "role": self.role,
+                "enabled": self.enabled,
+                "interval_seconds": self.interval_seconds,
+                "started_monotonic": self.started_monotonic,
+                "updated_monotonic": time.monotonic(),
+                "counters": dict(sorted(self._counters.items())),
+                "gauges": dict(sorted(self._gauges.items())),
+                "timestamps": dict(sorted(self._timestamps.items())),
+                "durations": durations,
             }
-        return {
-            "pid": self.pid,
-            "ppid": os.getppid(),
-            "role": self.role,
-            "enabled": self.enabled,
-            "interval_seconds": self.interval_seconds,
-            "started_monotonic": self.started_monotonic,
-            "updated_monotonic": time.monotonic(),
-            "counters": dict(sorted(self._counters.items())),
-            "gauges": dict(sorted(self._gauges.items())),
-            "timestamps": dict(sorted(self._timestamps.items())),
-            "durations": durations,
-        }
 
     def publish(self, *, force: bool = False) -> None:
         if not self.enabled or self.root is None:
             return
-        now = time.monotonic()
-        if not force and now - self._last_published < self.interval_seconds:
-            return
-        self._last_published = now
+        with self._publish_lock:
+            now = time.monotonic()
+            if not force and now - self._last_published < self.interval_seconds:
+                return
+            self._last_published = now
+            self._publish_locked()
+
+    def _publish_locked(self) -> None:
+        assert self.root is not None
         directory = self.root / "profiles"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{self.role}-{self.pid}.json"

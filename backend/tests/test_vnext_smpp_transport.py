@@ -8,6 +8,7 @@ from vnext.smpp_transport import (
     BIND_RECEIVER,
     BIND_TRANSMITTER,
     BIND_TRANSCEIVER,
+    ENQUIRE_LINK,
     HEADER,
     RESPONSE_MASK,
     SUBMIT_SM,
@@ -43,6 +44,65 @@ async def _loopback_server():
 
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     return server, received
+
+
+async def _edge_case_loopback_server():
+    observed = {"enquire_response": None}
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            command, _status, sequence, _body = await read_pdu(reader)
+            assert command == BIND_TRANSCEIVER
+            writer.write(
+                HEADER.pack(22, BIND_TRANSCEIVER | RESPONSE_MASK, 0, sequence)
+                + b"LOCAL\x00"
+            )
+            await writer.drain()
+            writer.write(HEADER.pack(16, ENQUIRE_LINK, 0, 777))
+            await writer.drain()
+            sequences = []
+            responded = False
+            while len(sequences) < 2 or observed["enquire_response"] is None:
+                command, _status, sequence, _body = await read_pdu(reader)
+                if command == (ENQUIRE_LINK | RESPONSE_MASK):
+                    observed["enquire_response"] = (command, sequence)
+                    continue
+                assert command == SUBMIT_SM
+                sequences.append(sequence)
+                if len(sequences) < 2 or responded:
+                    continue
+                responded = True
+                for response_sequence in reversed(sequences):
+                    writer.write(
+                        HEADER.pack(
+                            19, SUBMIT_SM | RESPONSE_MASK, 0, response_sequence,
+                        )
+                        + b"id\x00"
+                    )
+                await writer.drain()
+                writer.write(
+                    HEADER.pack(
+                        19, SUBMIT_SM | RESPONSE_MASK, 0, sequences[0],
+                    )
+                    + b"id\x00"
+                )
+                writer.write(
+                    HEADER.pack(19, SUBMIT_SM | RESPONSE_MASK, 0, 999999)
+                    + b"id\x00"
+                )
+                await writer.drain()
+            while True:
+                command, _status, _sequence, _body = await read_pdu(reader)
+                if command != SUBMIT_SM:
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    return server, observed
 
 
 def test_async_transport_reports_socket_written_without_waiting_for_response():
@@ -177,3 +237,61 @@ async def _test_local_bind_pool_is_bounded_and_reusable():
     assert replacement.slot == first.slot
     second.release()
     replacement.release()
+
+
+def test_out_of_order_duplicate_and_unknown_responses_keep_window_consistent():
+    return asyncio.run(
+        _test_out_of_order_duplicate_and_unknown_responses_keep_window_consistent()
+    )
+
+
+async def _test_out_of_order_duplicate_and_unknown_responses_keep_window_consistent():
+    server, observed = await _edge_case_loopback_server()
+    port = server.sockets[0].getsockname()[1]
+    callback_events = []
+
+    def callback(event):
+        callback_events.append(event)
+
+    transport = AsyncSmppTransport(
+        {
+            "route_id": 1, "host": "127.0.0.1", "port": port,
+            "system_id": "test", "password": "test", "source_addr": "VNEXT",
+            "window_size": 2, "tps": 0, "timeout": 5, "enquire_interval": 0,
+        },
+        response_callback=callback,
+    )
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                transport.send_task(
+                    destination_addr="251900000001", message="one",
+                ),
+                transport.send_task(
+                    destination_addr="251900000002", message="two",
+                ),
+            ),
+            timeout=10,
+        )
+        assert [result.state for result in results] == [
+            "socket_written", "socket_written",
+        ]
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (
+            transport.unexpected_response_pdus < 2
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert observed["enquire_response"] == (
+            ENQUIRE_LINK | RESPONSE_MASK, 777,
+        )
+        assert len(callback_events) == 2
+        assert all(event["success"] for event in callback_events)
+        assert transport.response_success == 2
+        assert transport.unknown_parts == 2
+        assert transport.unexpected_response_pdus == 2
+        assert transport.snapshot()["window_inflight"] == 0
+    finally:
+        await transport.close()
+        server.close()
+        await server.wait_closed()

@@ -18,6 +18,7 @@ from .critical_path_profiler import CriticalPathProfiler
 from .ingress import IngressRouter
 from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
 from .projection_writer import ProjectionWriterProcess, ProgressJournal
+from .progress import ProgressPersistence
 from .pressure import StageCredit
 from .route_credits import RouteCreditBroker
 from .spool import TaskSpool
@@ -78,27 +79,62 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     )
     projection_queue = context.get("projection_queue")
     worker_status_path = Path(context["progress_root"]) / f"worker-{worker_id}.status.json"
+    progress_store = ProgressPersistence(
+        journal,
+        name=f"worker-{int(worker_id)}",
+        max_pending_items=int(context.get("progress_queue_items", 131_072)),
+        max_pending_bytes=int(
+            context.get("progress_queue_bytes", 64 * 1024 * 1024)
+        ),
+        batch_size=int(context.get("progress_batch_size", 256)),
+        flush_interval_seconds=float(
+            context.get("progress_flush_interval_seconds", 0.05)
+        ),
+        aggregate_path=(
+            Path(context["progress_root"])
+            / f"worker-{int(worker_id)}.progress-aggregate.json"
+        ),
+        aggregate_interval_seconds=float(
+            context.get("progress_aggregate_interval_seconds", 1.0)
+        ),
+        profiler=profiler,
+    )
     worker_ref = {"value": None}
+    status_state = {"active": False, "draining": False}
+    status_lock = threading.Lock()
+    status_stop = threading.Event()
 
     def publish_status(active: bool) -> None:
         current = worker_ref["value"]
+        snapshot = current.snapshot() if current is not None else {}
+        progress = snapshot.get("progress") or {}
+        busy = bool(int(snapshot.get("inflight", 0) or 0))
+        busy = busy or bool(status_state.get("draining"))
+        busy = busy or any(
+            int(transport.get("window_inflight", 0) or 0)
+            or int(transport.get("response_callback_pending", 0) or 0)
+            for transport in snapshot.get("transports", [])
+        )
+        busy = busy or int(progress.get("pending_durability", 0) or 0) > 0
         payload = {
             "worker_id": int(worker_id),
-            "active": bool(active),
+            # ``active`` describes real protocol/progress work, not the fact
+            # that the idle polling loop is currently running one pass.
+            "active": busy,
             "updated_at": time.time(),
-            "snapshot": current.snapshot() if current is not None else {},
+            "snapshot": snapshot,
         }
         temporary = worker_status_path.with_name(f".{worker_status_path.name}.{os.getpid()}.tmp")
         status_started_ns = time.perf_counter_ns()
         try:
-            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-            os.replace(temporary, worker_status_path)
+            with status_lock:
+                temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+                os.replace(temporary, worker_status_path)
         except OSError:
             pass
         profiler.observe_ns("worker_status_write", time.perf_counter_ns() - status_started_ns)
-        snapshot = current.snapshot() if current is not None else {}
         diagnostic(
-            phase="active" if active else "idle",
+            phase="active" if busy else "idle",
             status="running",
             progress={
                 "active": bool(active),
@@ -108,11 +144,13 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             },
         )
 
-    def emit(event: dict) -> None:
-        journal.append(event)
-        if projection_queue is not None:
+    def projection_hint(events: list[dict]) -> None:
+        if projection_queue is not None and events:
             try:
-                projection_queue.put_nowait(event)
+                # One wake-up hint is enough: the projection writer reads the
+                # durable journal, not the hint payload.  Sending one hint per
+                # batch keeps IPC overhead independent of the batch size.
+                projection_queue.put_nowait(events[-1])
                 profiler.inc("projection_hint_put")
             except queue.Full:
                 # The journal is the durable source of truth.  IPC is only a
@@ -121,26 +159,8 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 profiler.inc("projection_hint_queue_full")
         profiler.publish_if_due()
 
-    def journal_admission(record) -> bool:
-        # Conservative admission estimate: if the result fence cannot hold a
-        # full event with this message, stop before dispatch_taken/socket I/O.
-        estimated = {
-            "event_id": record.event_id,
-            "partition_id": record.partition_id,
-            "ordinal": record.ordinal,
-            "campaign_type": record.campaign_type,
-            "campaign_id": record.campaign_id,
-            "route_id": record.route_id,
-            "normalized_msisdn": record.normalized_msisdn,
-            "state": "socket_written",
-            "parts_written": record.part_count_hint,
-            "parts_total": record.part_count_hint,
-            "message": record.message,
-            "business_day": record.business_day,
-            "expires_at": record.expires_at,
-            "created_at": record.created_at,
-        }
-        return journal.can_append(estimated)
+    progress_store.add_durability_listener(projection_hint)
+    progress_store.start()
 
     control_signature = None
 
@@ -170,15 +190,29 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         route_configs[str(key)] = config
     worker = ShardWorker(
         worker_id, tuple(partitions), spool, route_configs, credits=credits,
-        progress_sink=emit, max_inflight=int(context["max_inflight"]),
+        max_inflight=int(context["max_inflight"]),
         prefetch_per_partition=int(context["prefetch_per_partition"]),
         control_loader=load_controls,
-        journal_admission=journal_admission,
+        progress_store=progress_store,
         profiler=profiler,
     )
     worker_ref["value"] = worker
 
+    status_interval = max(
+        0.2, float(context.get("status_interval_seconds", 1.0))
+    )
+
+    def status_heartbeat() -> None:
+        while not status_stop.wait(status_interval):
+            publish_status(bool(status_state.get("active")))
+
     async def run() -> None:
+        heartbeat = threading.Thread(
+            target=status_heartbeat,
+            name=f"mc-vnext-worker-status-{int(worker_id)}",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             while True:
                 if control.poll():
@@ -187,6 +221,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                         return
                 worker.refresh_campaign_states(force=True)
                 before = worker.snapshot()["counters"].get("taken", 0)
+                status_state["active"] = True
                 publish_status(True)
                 # Bind slots are a shared per-route resource.  Releasing an
                 # idle worker's connections lets another business worker take
@@ -197,16 +232,47 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                     diagnostic(
                         phase="response_drain_timeout",
                         status="degraded",
-                        extra={"pending": int(drain.get("pending", 0) or 0)},
+                        extra={
+                            "pending": int(drain.get("pending", 0) or 0),
+                            "callback_pending": int(
+                                drain.get("callback_pending", 0) or 0
+                            ),
+                        },
                     )
                 await worker.close_transports()
+                status_state["draining"] = True
+                progress_drain = await worker.drain_progress(timeout=30.0)
+                status_state["draining"] = False
+                if not progress_drain.get("drained"):
+                    diagnostic(
+                        phase="progress_drain_timeout",
+                        status="degraded",
+                        extra={
+                            "pending_events": int(
+                                progress_drain.get("pending_events", 0) or 0
+                            ),
+                            "unresolved_events": int(
+                                progress_drain.get("unresolved_events", 0) or 0
+                            ),
+                        },
+                    )
                 worker.release_reader_caches()
+                status_state["active"] = False
                 publish_status(False)
                 after = worker.snapshot()["counters"].get("taken", 0)
                 if after == before:
                     await asyncio.sleep(0.1)
         finally:
+            status_state["active"] = False
             await worker.close_transports()
+            status_state["draining"] = True
+            await worker.drain_progress(timeout=30.0)
+            await worker.close_progress(timeout=30.0)
+            status_state["draining"] = False
+            status_stop.set()
+            if heartbeat.is_alive() and heartbeat is not threading.current_thread():
+                heartbeat.join(timeout=2.0)
+            publish_status(False)
 
     try:
         diagnostic(phase="running", status="running")
@@ -237,6 +303,12 @@ class VNextRuntime:
                  run_id: str = "", clock: BusinessClock | object | None = None,
                  business_timezone: str | object | None = None,
                   max_journal_bytes: int | None = None,
+                  progress_queue_items: int = 131_072,
+                  progress_queue_bytes: int = 64 * 1024 * 1024,
+                  progress_batch_size: int = 256,
+                  progress_flush_interval_seconds: float = 0.05,
+                  progress_aggregate_interval_seconds: float = 1.0,
+                  status_interval_seconds: float = 1.0,
                   profile_root: str | os.PathLike[str] | None = None,
                   profile_interval_seconds: float = 1.0):
         self.root = Path(root).resolve()
@@ -276,6 +348,16 @@ class VNextRuntime:
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
         self.projection_batch_size = max(1, min(4096, int(projection_batch_size)))
+        self.progress_queue_items = max(16, int(progress_queue_items))
+        self.progress_queue_bytes = max(4096, int(progress_queue_bytes))
+        self.progress_batch_size = max(1, min(4096, int(progress_batch_size)))
+        self.progress_flush_interval_seconds = max(
+            0.01, float(progress_flush_interval_seconds)
+        )
+        self.progress_aggregate_interval_seconds = max(
+            0.1, float(progress_aggregate_interval_seconds)
+        )
+        self.status_interval_seconds = max(0.2, float(status_interval_seconds))
         self._mp_context = multiprocessing.get_context(start_method or "spawn")
         self.start_method = self._mp_context.get_start_method()
         if projection_flush_interval_seconds is None:
@@ -433,6 +515,14 @@ class VNextRuntime:
             "start_method": self.start_method,
             "profile_root": str(self.profile_root) if self.profile_root else "",
             "profile_interval_seconds": self.profile_interval_seconds,
+            "progress_queue_items": self.progress_queue_items,
+            "progress_queue_bytes": self.progress_queue_bytes,
+            "progress_batch_size": self.progress_batch_size,
+            "progress_flush_interval_seconds": self.progress_flush_interval_seconds,
+            "progress_aggregate_interval_seconds": (
+                self.progress_aggregate_interval_seconds
+            ),
+            "status_interval_seconds": self.status_interval_seconds,
         }
         self.supervisor = WorkerSupervisor(
             self.root, worker_count=self.worker_count,

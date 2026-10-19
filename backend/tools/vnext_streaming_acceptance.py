@@ -1292,11 +1292,13 @@ def _worker_process(
     profile_root: str = "",
     profile_interval_seconds: float = 1.0,
     lifecycle_root: str = "",
+    progress_mode: str = "decoupled",
 ) -> None:
     lifecycle = _WorkerLifecycle(worker_id, tuple(partitions), lifecycle_root)
     lifecycle.attach_events(stop_event=stop_event, feeder_done=feeder_done)
     worker = None
     profiler = None
+    progress_store = None
     result = None
     try:
         lifecycle.update(
@@ -1321,21 +1323,64 @@ def _worker_process(
             interval_seconds=profile_interval_seconds,
         )
         journal = ProgressJournal(journal_path, profiler=profiler)
+        progress_store = None
+        if progress_mode == "decoupled":
+            try:
+                from vnext.progress import ProgressPersistence
+
+                progress_store = ProgressPersistence(
+                    journal,
+                    name=f"worker-{int(worker_id)}",
+                    max_pending_items=131_072,
+                    max_pending_bytes=64 * 1024 * 1024,
+                    batch_size=256,
+                    flush_interval_seconds=0.05,
+                    aggregate_path=(
+                        Path(journal_path).with_name(
+                            f"{Path(journal_path).stem}.progress-aggregate.json"
+                        )
+                    ),
+                    profiler=profiler,
+                )
+                progress_store.start()
+            except (ImportError, TypeError, AttributeError):
+                # The harness can still run against an older source checkout.
+                progress_store = None
         worker_route_config = dict(route_config)
         worker_route_config["_worker_bind_target"] = _worker_bind_target(
             route_config.get("pool_size", 1), worker_count
         )
-        worker = ShardWorker(
-            worker_id,
-            tuple(partitions),
-            spool,
-            {str(route_config["route_id"]): worker_route_config},
-            credits=credits,
-            progress_sink=journal.append,
-            max_inflight=128,
-            prefetch_per_partition=64,
-            profiler=profiler,
-        )
+        try:
+            worker = ShardWorker(
+                worker_id,
+                tuple(partitions),
+                spool,
+                {str(route_config["route_id"]): worker_route_config},
+                credits=credits,
+                progress_sink=journal.append if progress_store is None else None,
+                progress_store=progress_store,
+                max_inflight=128,
+                prefetch_per_partition=64,
+                profiler=profiler,
+            )
+        except TypeError as exc:
+            # Old baseline source: no progress_store keyword.
+            if "progress_store" not in str(exc):
+                raise
+            if progress_store is not None:
+                progress_store.close(timeout=5.0)
+                progress_store = None
+            worker = ShardWorker(
+                worker_id,
+                tuple(partitions),
+                spool,
+                {str(route_config["route_id"]): worker_route_config},
+                credits=credits,
+                progress_sink=journal.append,
+                max_inflight=128,
+                prefetch_per_partition=64,
+                profiler=profiler,
+            )
         lifecycle.update("SPOOL_INIT", detail="worker_ready", local_inflight=0)
         last_transport_snapshots: list[dict] = []
 
@@ -1381,6 +1426,15 @@ def _worker_process(
                 lifecycle.update("CLOSE_TRANSPORT_ENTER", progress=False)
                 await worker.close_transports()
                 lifecycle.update("CLOSE_TRANSPORT_EXIT", progress=False)
+                if progress_store is not None:
+                    progress_drain = await worker.drain_progress(timeout=30.0)
+                    lifecycle.update(
+                        "PROGRESS_DRAIN_EXIT",
+                        progress=False,
+                        pending_events=int(
+                            progress_drain.get("pending_events", 0) or 0
+                        ),
+                    )
                 _release_completed_worker_caches(spool, worker)
                 lifecycle.update("SPOOL_SNAPSHOT_ENTER", progress=False)
                 # A final shutdown check must reload all cursor/taken files.
@@ -1418,6 +1472,9 @@ def _worker_process(
             lifecycle.update("FINAL_SNAPSHOT", detail="all_worker_work_and_responses_drained")
             result = worker.snapshot()
             result["transports"] = last_transport_snapshots
+            if progress_store is not None:
+                result["progress_final"] = progress_store.snapshot()
+                await worker.close_progress(timeout=30.0)
             lifecycle.record_worker_snapshot(worker)
             return result
 
@@ -1437,6 +1494,11 @@ def _worker_process(
             "worker_exception": f"{type(exc).__name__}: {exc}",
         }
     finally:
+        if progress_store is not None:
+            try:
+                progress_store.close(timeout=30.0)
+            except Exception:
+                pass
         if profiler is not None:
             profiler.publish(force=True)
             if result is not None and profiler.enabled:
@@ -1875,6 +1937,7 @@ async def run(args: argparse.Namespace) -> dict:
                 str(args.profile_root) if args.profile_root else "",
                 args.profile_interval,
                 str(lifecycle_root),
+                args.progress_mode,
             ),
             name=f"mc-vnext-stream-worker-{worker_id}",
             daemon=True,
@@ -2595,6 +2658,10 @@ def main() -> int:
                         help="status/diagnostic write interval in seconds")
     parser.add_argument("--instrumentation", choices=("off", "on"), default="off",
                         help="enable bounded critical-path profiles and per-second CSV")
+    parser.add_argument(
+        "--progress-mode", choices=("decoupled", "legacy"), default="decoupled",
+        help="worker progress journal path; legacy is only for explicit A/B",
+    )
     parser.add_argument("--profile-root", default="",
                         help="profile output root; defaults to <run-root>/critical-path when enabled")
     parser.add_argument("--profile-interval", type=float, default=1.0,
