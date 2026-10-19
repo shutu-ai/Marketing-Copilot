@@ -1,0 +1,210 @@
+{
+  "task_id": "MC-VNEXT-STAGE-INDEPENDENCE-BACKPRESSURE-SAFE-PERF-20261019",
+  "source_head": "86b1bee4a5fcbc005f43b4382c83dfe0781db14d",
+  "origin_main": "86b1bee4a5fcbc005f43b4382c83dfe0781db14d",
+  "target_server_os": "SLES12SP5",
+  "filesystem": "native_ext4",
+  "python": "3.11.4",
+  "duckdb": "1.2.0",
+  "dependency_freeze": [
+    "duckdb==1.2.0",
+    "numpy==1.26.4",
+    "pandas==2.3.2",
+    "pyarrow==12.0.1",
+    "python-dateutil==2.9.0.post0",
+    "pytz==2026.5",
+    "six==1.17.0",
+    "tzdata==2026.5"
+  ],
+  "workers": 8,
+  "physical_bind_limit": 4,
+  "tps_per_bind": 200,
+  "tps_scope": "per_bind",
+  "window": 50,
+  "production_defaults_changed": false,
+  "stage_independence_preserved": "PASS",
+  "backpressure_wiring_audited": "PASS_WITH_SCOPE_AND_EXISTING_WIRING_GAP",
+  "auto_backpressure_pause_resume": "PASS",
+  "manual_pause_resume_cancel": "PASS",
+  "durable_restart_at_most_once": "PASS",
+  "journal_projection_offsets_reconciled": "PASS",
+  "spool_workload_and_projection_critical_path": "EVIDENCE_RESPONSE_WINDOW_TAIL_NOT_SPOOL_OR_PROJECTION",
+  "paired_five_k": "NOT_RUN",
+  "fifty_k": "NOT_RUN_BY_GATE",
+  "six_hundred_seconds_800pdu": "NOT_RUN",
+  "canary_ready": "NO",
+  "product_code_changed": "NO",
+  "decision": "NO_CHANGE_WITH_EVIDENCE",
+  "commit_push": "NOT_REQUESTED",
+  "environment": {
+    "df_T_dot": "/dev/sda1 ext4, 80% used, native Linux filesystem",
+    "resource_profile": "PROD_8G",
+    "rss_guard_scope": "application",
+    "source_tree_tracked_backend_files": 190,
+    "synthetic_loopback_only": true
+  },
+  "frozen_flags": {
+    "workers": 8,
+    "pool_size": 4,
+    "route_tps": 200,
+    "tps_scope": "per_bind",
+    "window_size": 50,
+    "counts": [1250, 1250, 1250, 1250],
+    "batch_size": 250,
+    "projection_batch_size": 512,
+    "projection_staging_mode": "vectorized",
+    "projection_status_interval_requested": 0.1,
+    "instrumentation": "on",
+    "profile_interval": 1.0,
+    "response_delay_ms": 0,
+    "resource_profile": "PROD_8G",
+    "rss_guard_scope": "application"
+  },
+  "r1": {
+    "one_k": {
+      "run_id": "r1-1k-baseline",
+      "status": "PASS",
+      "duration_seconds": 14.976,
+      "accepted": 1000,
+      "socket_written": 1000,
+      "responses": 1000,
+      "journal_events": 2000,
+      "projection_events_applied": 2000,
+      "max_active_binds": 4,
+      "result_sha256": "9185b836e1f60070815c12d2a5f85db6d8e039e0710ff7a757deb167dccda5a2",
+      "result_path": "runs/r1-1k-baseline/result.json"
+    },
+    "five_k_baseline": {
+      "run_id": "r1-5k-baseline-a",
+      "status": "PASS",
+      "duration_seconds": 45.857,
+      "e2e_pdu_per_second": 109.035,
+      "producer_active_seconds": 29.534,
+      "producer_active_pdu_per_second": 169.296,
+      "smpp_drain_seconds": 12.903,
+      "projection_drain_seconds": 12.907,
+      "accepted": 5000,
+      "socket_written": 5000,
+      "loopback_received": 5000,
+      "responses": 5000,
+      "journal_durable_events": 10000,
+      "projection_events_applied": 10000,
+      "projection_unique_rows": 10000,
+      "unknown": 0,
+      "write_failed": 0,
+      "duplicates": 0,
+      "workers_clean_exit": 8,
+      "max_active_binds": 4,
+      "resource_gate": "PASS",
+      "application_rss_peak_kib": 308976,
+      "harness_rss_peak_kib": 587152,
+      "journal_backlog_bytes_sampled_max": 0,
+      "journal_backlog_events_sampled_max": 0,
+      "result_sha256": "bf059f7339eafd5c3d7d17f6c46d755125e2b10273568ba33e29487b9ca84a9b",
+      "result_path": "runs/r1-5k-baseline-a/result.json"
+    },
+    "critical_path": {
+      "primary_bottleneck": "SMPP response/window completion tail",
+      "root_cause_confidence": "MEDIUM",
+      "response_window_wait_total_concurrent_seconds": 3286.718,
+      "response_window_wait_p95_ms": 2371.399,
+      "smpp_response_latency_total_concurrent_seconds": 3652.242,
+      "response_drain_seconds": 12.903,
+      "projection_staging_total_seconds": 2.089,
+      "projection_staging_batches": 217,
+      "projection_staging_batch_p95_ms": 15.904,
+      "process_status_write_total_seconds": 4.396,
+      "process_status_write_count": 1700,
+      "concurrent_waits_not_summed_as_wall": true,
+      "worker_spool_subpath_breakdown": "NOT_VERIFIED_BY_CURRENT_HARNESS"
+    }
+  },
+  "r2": {
+    "BP-1": {
+      "status": "PASS",
+      "scope": "StageCredit high/low-water and async wake plus Spool hard capacity; synchronous ingress rejection remains a caller-retry boundary",
+      "tests": [
+        "backend/tests/test_vnext_ingress_pressure.py",
+        "backend/tests/test_vnext_spool.py"
+      ]
+    },
+    "BP-2": {
+      "status": "PASS",
+      "applied": 20,
+      "queue_depth_after_resume": 0,
+      "duplicates": 0,
+      "result_sha256": "37d29eac4e17e09f6fdea837f016021ee8ef8b748887061d1509b35f6e4206d0",
+      "result_path": "runs/bp2-writer-pause-evidence/result.json",
+      "t7_matrix_status": "PASS",
+      "t7_matrix_sha256": "d79cac0fcaa2b1cb3a7310aa0c95f2597d27fa64fe94ef2350e0d2211037d952",
+      "t7_matrix_path": "runs/bp-t7-matrix/t7-recovery-matrix.json"
+    },
+    "BP-3": {
+      "status": "PASS",
+      "same_day_pause_resume_sha256": "e174601515eaa316db35fc18bbf47aed3b6255f68932300175ed79fa257b2acf",
+      "same_day_pause_resume_path": "runs/bp3-two-campaign-2/manual-two-campaign.json",
+      "cancel_sha256": "2952dd125e527f1c96fee75f15f5303a9458b5018b8b595b2a28c146aa9c4763",
+      "cancel_path": "runs/bp3-cancel-evidence/cancel.json",
+      "paused_campaign_socket_writes": 0,
+      "other_campaign_socket_writes_while_paused": 3,
+      "cancelled_campaign_socket_writes": 0,
+      "pending_after_resume_or_cancel": 0
+    },
+    "BP-4": {
+      "status": "PASS",
+      "crashed_events": 5,
+      "recovered_events": 15,
+      "unique_events": 20,
+      "pending_after_recovery": 0,
+      "result_sha256": "dc2af86da8594df75c0e2d4cbd9f73918598df644bfe0d781bb0ab95be2211ba",
+      "result_path": "runs/bp4-restart-evidence/result.json",
+      "daily_rollover_restart_status": "PASS",
+      "daily_rollover_restart_sha256": "04dc386127ff6a4d7be2b2a09fc76b1c1d20ee68a78e50b87032b947a2187f26",
+      "daily_rollover_restart_path": "runs/bp-daily-rollover/daily-result.json"
+    },
+    "BP-5": {
+      "status": "PASS",
+      "max_active_binds": 4,
+      "per_bind_tps": 200,
+      "window": 50,
+      "workers": 8,
+      "clean_worker_exits": 8,
+      "residual_acceptance_or_fault_processes": 0
+    }
+  },
+  "existing_wiring_gaps": [
+    {
+      "id": "STATUS_INTERVAL_NOT_WIRED",
+      "source": "backend/tools/vnext_streaming_acceptance.py:1841-1852 and backend/vnext/projection_writer.py:1223-1231",
+      "effect": "The harness request for status_interval_seconds=0.1 falls back to historical per-loop status writes; the value is not claimed as effective."
+    },
+    {
+      "id": "R1_HARNESS_RUNTIME_SCOPE",
+      "source": "backend/tools/vnext_streaming_acceptance.py worker path",
+      "effect": "R1 scaling uses standalone ShardWorker/Journal sink; full VNextRuntime ingress and journal_admission wiring is covered by R2 component tests, not by the R1 E2E producer path."
+    }
+  ],
+  "validation": {
+    "targeted_backpressure_recovery_tests": "22 passed",
+    "full_backend_tests": "447 passed, 5 skipped, 4 warnings",
+    "product_code_changed": false,
+    "json_validation_required": true,
+    "sensitive_data_in_reports": false
+  },
+  "source_files_sha256": {
+    "backend/vnext/pressure.py": "df93f3fb856f6b3138a3578167fc9ae6e0286879bbacad6d32bce95e4d740384",
+    "backend/vnext/ingress.py": "d924e747e70b0043b3064c25e7e1369dd45ddc6128f931089c0e32ede30b9e39",
+    "backend/vnext/spool.py": "08a8ea54b1308b426686cec245cf28753f75b8c7afe7bf8bffdbb1fc37d95168",
+    "backend/vnext/worker.py": "955a37fbb606d92c3941f1bd64bfa819d5800b23a3812013e84f912a0a836010",
+    "backend/vnext/smpp_transport.py": "c715c21aa400ab6e1c5ca9a17b827ead546ed98f406c3c596d4d87aa12f32976",
+    "backend/vnext/route_credits.py": "c3694b016e89188835f61a34e05b8c8cf7f8deac5d1abfe68d90fef5f533da",
+    "backend/vnext/projection_writer.py": "b4ed17d3a3c6aab342eba9771ec8363406830172ad86ba026f9e80236f2e66ed",
+    "backend/vnext/runtime.py": "b9092e680c536e972b909e2c834992128735d40d1e896ce3ee89f3a8ac3985e2",
+    "backend/tools/vnext_streaming_acceptance.py": "6c559cf8c2809e6e5c23e19a0d12c5759f4678eeb27b585b74fbb7bc3257217b"
+  },
+  "reports": [
+    "Docs/Marketing_Copilot_VNext_Stage_Independence_and_Backpressure_Contract.md",
+    "Docs/Marketing_Copilot_VNext_8W_Spool_Projection_Targeted_Performance_RCA_and_AB.md",
+    "Docs/Marketing_Copilot_VNext_Backpressure_Safe_Performance_Evidence.json"
+  ]
+}
