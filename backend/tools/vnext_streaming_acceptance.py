@@ -1382,10 +1382,9 @@ def _worker_process(
                 profiler=profiler,
             )
         lifecycle.update("SPOOL_INIT", detail="worker_ready", local_inflight=0)
-        last_transport_snapshots: list[dict] = []
+        transport_snapshot_history: list[dict] = []
 
         async def loop() -> dict:
-            nonlocal last_transport_snapshots
             lifecycle.attach_loop(asyncio.get_running_loop())
             loop_pass_count = 0
             stop_requested = False
@@ -1420,9 +1419,11 @@ def _worker_process(
                 await _drain_transport_responses(worker)
                 lifecycle.update("DRAIN_RESPONSES_EXIT", progress=False)
                 lifecycle.record_worker_snapshot(worker)
-                last_transport_snapshots = [
+                current_transport_snapshots = [
                     dict(item) for item in worker.snapshot().get("transports", [])
                 ]
+                if current_transport_snapshots:
+                    transport_snapshot_history.extend(current_transport_snapshots)
                 lifecycle.update("CLOSE_TRANSPORT_ENTER", progress=False)
                 await worker.close_transports()
                 lifecycle.update("CLOSE_TRANSPORT_EXIT", progress=False)
@@ -1471,7 +1472,10 @@ def _worker_process(
                 await asyncio.sleep(0.02)
             lifecycle.update("FINAL_SNAPSHOT", detail="all_worker_work_and_responses_drained")
             result = worker.snapshot()
-            result["transports"] = last_transport_snapshots
+            # Keep every closed transport snapshot.  A later idle pass has no
+            # live transports and must not overwrite the evidence for the
+            # socket writes that happened in earlier passes.
+            result["transports"] = list(transport_snapshot_history)
             if progress_store is not None:
                 result["progress_final"] = progress_store.snapshot()
                 await worker.close_progress(timeout=30.0)
@@ -1969,6 +1973,7 @@ async def run(args: argparse.Namespace) -> dict:
     journal_eof_recorded = False
     projection_caught_up_recorded = False
     join_forensics_path = None
+    last_authoritative_spool_check = 0.0
     completion_evidence = {
         "state": "INCOMPLETE",
         "complete": False,
@@ -2097,6 +2102,19 @@ async def run(args: argparse.Namespace) -> dict:
                         feed_stopped_at + max(1.0, float(args.projection_drain_timeout))
                     )
                 status = spool.lightweight_snapshot()
+                if (
+                    feed_task.done()
+                    and int(status.get("pending_records", 0) or 0) > 0
+                    and time.monotonic() - last_authoritative_spool_check
+                    >= max(1.0, float(args.sample_interval))
+                ):
+                    # The completion boundary is low frequency and must not
+                    # trust a stale parent-side cursor cache.  Workers persist
+                    # cursor/taken files atomically; use the authoritative
+                    # recovery-aware status only while the feeder is done and
+                    # the lightweight snapshot still reports pending work.
+                    status = spool.status()
+                    last_authoritative_spool_check = time.monotonic()
                 if int(status.get("pending_records", 0) or 0) == 0:
                     if (
                         smpp_drained_at is None

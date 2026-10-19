@@ -51,7 +51,8 @@ VNEXT | run=<run_id> | HH:MM:SS | UPDATED <age> ago | state=RUNNING
 Ingress      accepted=...    rejected=...     paused-by-backpressure=NO
 Spool        pending=...     disk=... MB       source=lightweight-snapshot
 Workers      active=8/8      taken=...         inflight=...
-SMPP         binds=4/4       written=... PDU   rate(5s)=... PDU/s
+SMPP         binds=4/4       written=... PDU   observed_total=... PDU
+SMPP rates   socket_write=... PDU/s   journal_durable=... PDU/s
 Responses    observed=...    durable=...     unknown=...  pending_durable=...
 Journal      durable=...     backlog=...      oldest_undurable=... ms
 Projection   applied=...     lag=...          queue=...     caught_up=...
@@ -68,8 +69,19 @@ Campaign     Status    Accepted  SocketWritten  RespOK  RespErr  Unknown  Projec
 - `pending_durable`：已观察/已入队但尚未 fsync 的事件数；进程崩溃时这些事件可能丢失。
 - `unknown`：Reader 断开、超时或无法匹配的 PDU；**不等于 delivered**。
 - `Projected` / `projected`：当前版本未提供逐 Campaign Projection 计数，显示 `N/A`。
-- `rate(5s)`：同一持久 PDU 计数器的 5 秒差分；计数器回落时清空窗口并标记
-  `counter_reset`，不会出现负速率。
+- `socket_write_rate_pdu_per_second`：Worker/Transport 快照中 Socket 写出路径的
+  `socket_written_parts` 计数器 5 秒滚动差分；它表示发送侧实际观测，不表示
+  SMSC 接受成功或终端送达。
+- `journal_durable_rate_pdu_per_second`：Journal `append_many + fsync` 成功后的
+  `durable_socket_written_pdus` 计数器 5 秒滚动差分；它表示持久化进展，允许
+  短时落后于 Socket 写出。
+- `response_observed_rate_pdu_per_second`：Reader 观察到的
+  `submit_sm_resp` PDU 计数器 5 秒滚动差分。
+- `rate_pdu_per_second`：兼容旧脚本的别名，保持原 durable socket-written 语义；
+  新脚本应使用上面三个明确字段。
+- 计数器按 Run ID、Worker 进程 PID/代际和 Worker 实例识别重置；快照缺失、
+  stale 或代际切换时显示 `N/A`，并在 `rate_unavailable_reasons` 说明原因，
+  不把缺失数据填成 0。
 - `caught_up`：Projection 已提交到 Journal EOF 且无 pending 事件。
 - `STALE`：Worker/Projection 状态文件超过 `max(5s, 3×interval)` 未更新。
 - `OFFLINE`：Runtime 未运行或进程已停止；仍会显示 durable 聚合计数。
@@ -98,7 +110,17 @@ JSON 的 `workers.checkpoint_count` 与 `workers.control_counters.{pause,resume,
   "runtime": {"state": "RUNNING", "started": true},
   "spool": {"pending": 0, "disk_mb": 12.3},
   "workers": {"active": 8, "configured": 8, "inflight": 0},
-  "smpp": {"written_pdus": 1000, "rate_pdu_per_second": null},
+  "smpp": {
+    "written_pdus": 1000,
+    "socket_write_rate_pdu_per_second": null,
+    "journal_durable_rate_pdu_per_second": null,
+    "response_observed_rate_pdu_per_second": null
+  },
+  "socket_write_rate_pdu_per_second": null,
+  "journal_durable_rate_pdu_per_second": null,
+  "response_observed_rate_pdu_per_second": null,
+  "rate_pdu_per_second": null,
+  "rate_unavailable_reasons": ["first_sample"],
   "responses": {"observed_success": 1000, "durable_success": 1000},
   "journal": {"durable_events": 2000, "fsync_errors": 0},
   "projection": {"applied": 2000, "caught_up": true},

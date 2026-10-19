@@ -352,13 +352,22 @@ class _RateTracker:
         self.window_seconds = max(0.5, float(window_seconds))
         self.samples: deque[tuple[float, float]] = deque()
         self.counter_reset = False
+        self.identity = None
+        self.last_reset_reason = ""
 
-    def update(self, value: float | None, now: float) -> float | None:
+    def update(self, value: float | None, now: float, *, identity=None) -> float | None:
         if value is None:
             return None
+        if self.identity is not None and identity is not None and identity != self.identity:
+            self.samples.clear()
+            self.counter_reset = True
+            self.last_reset_reason = "counter_identity_changed"
+        if identity is not None:
+            self.identity = identity
         if self.samples and value < self.samples[-1][1]:
             self.samples.clear()
             self.counter_reset = True
+            self.last_reset_reason = "counter_decreased"
         self.samples.append((now, value))
         while (
             len(self.samples) > 2
@@ -372,6 +381,106 @@ class _RateTracker:
         if last_at <= first_at:
             return None
         return max(0.0, (last_value - first_value) / (last_at - first_at))
+
+
+def _attach_worker_counter_identities(
+    workers: list[dict], processes: list[dict], run_id: str,
+) -> None:
+    """Attach a stable process-generation token to each worker snapshot.
+
+    Worker status files are deliberately small and do not need to carry PID
+    metadata on every heartbeat.  The diagnostics records already contain the
+    child PID and run ID, so use the newest matching worker record when it is
+    available.  The status-file fallback still detects ordinary counter
+    decreases when diagnostics are unavailable.
+    """
+
+    latest_by_worker: dict[int, dict] = {}
+    for item in processes:
+        role = str(item.get("role") or "")
+        if not role.startswith("worker-") or role.startswith("worker-supervisor-"):
+            continue
+        try:
+            worker_id = int(role.rsplit("-", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        previous = latest_by_worker.get(worker_id)
+        if previous is None or float(item.get("updated_at", 0) or 0) >= float(
+            previous.get("updated_at", 0) or 0
+        ):
+            latest_by_worker[worker_id] = item
+    for worker in workers:
+        worker_id = _int(worker.get("worker_id", -1), -1)
+        metadata = latest_by_worker.get(worker_id) or {}
+        pid = _int(metadata.get("pid", 0), 0)
+        status_path = str(worker.get("_path") or "")
+        worker["_counter_identity"] = (
+            f"{run_id}|worker:{worker_id}|pid:{pid}|status:{status_path}"
+        )
+
+
+def _transport_counter(
+    workers: list[dict],
+    field: str,
+    *,
+    fallback_fields: tuple[str, ...] = (),
+) -> tuple[float | None, object | None, list[str]]:
+    """Return a bounded transport counter and its process identity."""
+
+    if not workers:
+        return None, None, ["live_worker_status"]
+    values: list[tuple[str, float]] = []
+    reasons: list[str] = []
+    for worker in workers:
+        worker_id = _int(worker.get("worker_id", -1), -1)
+        transports = (worker.get("snapshot") or {}).get("transports")
+        if not isinstance(transports, list) or not transports:
+            reasons.append(f"{field}:worker_{worker_id}_snapshot_missing")
+            continue
+        total = 0.0
+        complete = True
+        for transport in transports:
+            value = None
+            if field in transport:
+                value = _float_or_none(transport.get(field))
+            elif fallback_fields and all(name in transport for name in fallback_fields):
+                value = sum(
+                    _float_or_none(transport.get(name)) or 0.0
+                    for name in fallback_fields
+                )
+            if value is None:
+                complete = False
+                break
+            total += value
+        if complete:
+            values.append((str(worker.get("_counter_identity") or worker_id), total))
+        else:
+            reasons.append(f"{field}:worker_{worker_id}_counter_missing")
+    if reasons or len(values) != len(workers):
+        return None, None, reasons or [f"{field}:incomplete"]
+    identity = tuple(sorted(identity for identity, _ in values))
+    return sum(value for _, value in values), identity, []
+
+
+def _durable_socket_counter(
+    progress_values: list[dict], aggregates: list[dict], run_id: str,
+) -> tuple[float | None, object | None, list[str]]:
+    """Read the cumulative socket-written PDU count after successful fsync."""
+
+    if progress_values and all("durable_socket_written_pdus" in item for item in progress_values):
+        return (
+            sum(_float_or_none(item.get("durable_socket_written_pdus")) or 0.0
+                for item in progress_values),
+            (run_id, "journal-progress"),
+            [],
+        )
+    if aggregates:
+        total = 0.0
+        for aggregate in aggregates:
+            for campaign in aggregate.get("campaigns") or []:
+                total += _float_or_none(campaign.get("socket_written_pdus")) or 0.0
+        return total, (run_id, "journal-aggregate"), []
+    return None, None, ["journal_durable_socket_counter"]
 
 
 def _parse_campaign_filter(values: list[str]) -> list[tuple[str | None, int]]:
@@ -405,10 +514,20 @@ def _parse_campaign_filter(values: list[str]) -> list[tuple[str | None, int]]:
 def _build_snapshot(
     root: Path,
     *,
-    rate_tracker: _RateTracker,
+    rate_tracker: _RateTracker | None = None,
+    rate_trackers: dict[str, _RateTracker] | None = None,
     interval: float,
 ) -> dict:
     observed_at = time.time()
+    if rate_trackers is None:
+        rate_trackers = {
+            "journal_durable": rate_tracker or _RateTracker(DEFAULT_RATE_WINDOW),
+        }
+    else:
+        rate_trackers = dict(rate_trackers)
+    rate_trackers.setdefault("socket_write", _RateTracker(DEFAULT_RATE_WINDOW))
+    rate_trackers.setdefault("journal_durable", _RateTracker(DEFAULT_RATE_WINDOW))
+    rate_trackers.setdefault("response_observed", _RateTracker(DEFAULT_RATE_WINDOW))
     warnings: list[str] = []
     incomplete: list[str] = []
     processes = _read_processes(root, warnings)
@@ -424,6 +543,7 @@ def _build_snapshot(
     projection = _read_projection(root, warnings)
     spool = _read_spool(root, warnings)
     controls = _read_controls(root, warnings)
+    _attach_worker_counter_identities(workers, processes, run_id)
 
     status_ages = [
         float(item.get("_age_seconds") or 0.0)
@@ -526,6 +646,21 @@ def _build_snapshot(
             for item in transport_values
         ) or None,
     }
+    socket_counter, socket_identity, socket_rate_reasons = _transport_counter(
+        workers, "socket_written_parts"
+    )
+    response_counter, response_identity, response_rate_reasons = _transport_counter(
+        workers,
+        "response_observed_total",
+        fallback_fields=(
+            "response_observed_success",
+            "response_observed_error",
+            "response_observed_unknown",
+        ),
+    )
+    durable_counter, durable_identity, durable_rate_reasons = _durable_socket_counter(
+        progress_values, aggregates, run_id
+    )
     campaign_map, campaign_source, campaign_complete = _merge_campaigns(
         aggregates, workers
     )
@@ -778,11 +913,60 @@ def _build_snapshot(
         ),
         "",
     )
-    total_pdus = smpp_section["written_pdus"]
-    rate = rate_tracker.update(
-        float(total_pdus) if total_pdus is not None else None,
-        time.monotonic(),
+    rate_unavailable_reasons: list[str] = []
+    if stale:
+        rate_unavailable_reasons.append("stale_snapshot")
+    rate_unavailable_reasons.extend(socket_rate_reasons)
+    rate_unavailable_reasons.extend(durable_rate_reasons)
+    rate_unavailable_reasons.extend(response_rate_reasons)
+    rate_now = time.monotonic()
+    if stale:
+        socket_rate = None
+        durable_rate = None
+        response_rate = None
+    else:
+        socket_rate = rate_trackers["socket_write"].update(
+            socket_counter, rate_now, identity=socket_identity
+        )
+        durable_rate = rate_trackers["journal_durable"].update(
+            durable_counter, rate_now, identity=durable_identity
+        )
+        response_rate = rate_trackers["response_observed"].update(
+            response_counter, rate_now, identity=response_identity
+        )
+    for counter, value, tracker in (
+        (socket_counter, socket_rate, rate_trackers["socket_write"]),
+        (durable_counter, durable_rate, rate_trackers["journal_durable"]),
+        (response_counter, response_rate, rate_trackers["response_observed"]),
+    ):
+        if (
+            counter is not None
+            and value is None
+            and not stale
+            and not tracker.last_reset_reason
+        ):
+            rate_unavailable_reasons.append("first_sample")
+    for name, value in (
+        ("socket_write_rate", socket_rate),
+        ("journal_durable_rate", durable_rate),
+        ("response_observed_rate", response_rate),
+    ):
+        if value is None:
+            incomplete.append(name)
+    for tracker in rate_trackers.values():
+        if tracker.last_reset_reason:
+            rate_unavailable_reasons.append(tracker.last_reset_reason)
+    rate_unavailable_reasons = sorted(set(rate_unavailable_reasons))
+    counter_reset = any(
+        tracker.counter_reset for tracker in rate_trackers.values()
     )
+    smpp_section.update({
+        "socket_written_observed_pdus": socket_counter,
+        "durable_socket_written_pdus": durable_counter,
+        "socket_write_rate_pdu_per_second": socket_rate,
+        "journal_durable_rate_pdu_per_second": durable_rate,
+        "response_observed_rate_pdu_per_second": response_rate,
+    })
     if (
         journal_section["unresolved_events"]
         or journal_section["fsync_errors"]
@@ -846,9 +1030,23 @@ def _build_snapshot(
         "backpressure": admission_reason or "NONE",
         "fsync_errors": journal_section["fsync_errors"],
         "unresolved_events": journal_section["unresolved_events"],
-        "rate_pdu_per_second": rate,
-        "rate_window_seconds": rate_tracker.window_seconds,
-        "counter_reset": rate_tracker.counter_reset,
+        # Compatibility alias: the historical rate was derived from the
+        # durable socket-written counter, not an observed socket write.
+        "rate_pdu_per_second": durable_rate,
+        "rate_window_seconds": DEFAULT_RATE_WINDOW,
+        "counter_reset": counter_reset,
+        "rates": {
+            "socket_write_rate_pdu_per_second": socket_rate,
+            "journal_durable_rate_pdu_per_second": durable_rate,
+            "response_observed_rate_pdu_per_second": response_rate,
+            "window_seconds": DEFAULT_RATE_WINDOW,
+            "counter_reset": counter_reset,
+            "unavailable_reasons": rate_unavailable_reasons,
+        },
+        "socket_write_rate_pdu_per_second": socket_rate,
+        "journal_durable_rate_pdu_per_second": durable_rate,
+        "response_observed_rate_pdu_per_second": response_rate,
+        "rate_unavailable_reasons": rate_unavailable_reasons,
     }
 
 
@@ -909,7 +1107,11 @@ def _format_human(snapshot: dict) -> str:
     lines.append(
         f"SMPP         binds={_fmt(smpp['binds_active'])}/{_fmt(smpp['binds_configured'])}       "
         f"written={_fmt(smpp['written_pdus'])} PDU   "
-        f"rate(5s)={_fmt(snapshot.get('rate_pdu_per_second'), digits=1, suffix=' PDU/s')}"
+        f"observed_total={_fmt(smpp.get('socket_written_observed_pdus'))} PDU"
+    )
+    lines.append(
+        f"SMPP rates   socket_write={_fmt(snapshot.get('socket_write_rate_pdu_per_second'), digits=1, suffix=' PDU/s')}   "
+        f"journal_durable={_fmt(snapshot.get('journal_durable_rate_pdu_per_second'), digits=1, suffix=' PDU/s')}"
     )
     responses = snapshot["responses"]
     lines.append(
@@ -917,6 +1119,7 @@ def _format_human(snapshot: dict) -> str:
         f"durable={_fmt(responses['durable_success'] + responses['durable_error'] + responses['durable_unknown'])}     "
         f"unknown={_fmt(responses['observed_unknown'])}  "
         f"pending_durable={_fmt(responses['pending_durable'])}  "
+        f"observed_rate={_fmt(snapshot.get('response_observed_rate_pdu_per_second'), digits=1, suffix=' PDU/s')}  "
         f"callback_err={_fmt(responses['callback_errors'])}"
     )
     journal = snapshot["journal"]
@@ -961,6 +1164,10 @@ def _format_human(snapshot: dict) -> str:
         f"Fsync errors: {_fmt(snapshot['fsync_errors'])} | "
         f"Last update: {snapshot.get('observed_at_iso')}"
     )
+    if snapshot.get("rate_unavailable_reasons"):
+        lines.append(
+            "Rate notes: " + "; ".join(snapshot["rate_unavailable_reasons"][:5])
+        )
     if incomplete:
         lines.append("Incomplete: " + ", ".join(incomplete))
     if snapshot.get("warnings"):
@@ -1049,7 +1256,11 @@ def main(argv: list[str] | None = None) -> int:
     watch = bool(args.watch)
     if not watch and not args.once:
         args.once = True
-    rate_tracker = _RateTracker(DEFAULT_RATE_WINDOW)
+    rate_trackers = {
+        "socket_write": _RateTracker(DEFAULT_RATE_WINDOW),
+        "journal_durable": _RateTracker(DEFAULT_RATE_WINDOW),
+        "response_observed": _RateTracker(DEFAULT_RATE_WINDOW),
+    }
     color = (
         not args.json
         and not args.no_color
@@ -1058,7 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while True:
             snapshot = _build_snapshot(
-                root, rate_tracker=rate_tracker, interval=args.interval
+                root, rate_trackers=rate_trackers, interval=args.interval
             )
             _filter_campaigns(snapshot, campaign_filters)
             if args.json:
