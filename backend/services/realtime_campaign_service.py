@@ -1932,7 +1932,7 @@ def get_realtime_watch_files(
             client, sftp, entries = sftp_watch_service.list_directory(campaign)
             prefix = campaign.get("watch_filename_prefix") or ""
             remote_label = f"sftp://{campaign.get('sftp_host')}:{campaign.get('sftp_port')}{campaign.get('watch_dir')}"
-            for entry in sorted(entries, key=lambda item: item.filename):
+            for entry in sorted(entries, key=lambda item: item.filename, reverse=True):
                 name = entry.filename
                 ext = os.path.splitext(name)[1].lower()
                 if (
@@ -2002,7 +2002,9 @@ def get_realtime_watch_files(
     except OSError:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
 
-    for name, path, ext, file_size, file_mtime in sorted(directory_entries, key=lambda item: item[0]):
+    for name, path, ext, file_size, file_mtime in sorted(
+        directory_entries, key=lambda item: item[0], reverse=True
+    ):
 
         match_prefix = bool(prefix and name.startswith(prefix))
         match_schedule = _watch_file_matches_campaign(name, campaign)

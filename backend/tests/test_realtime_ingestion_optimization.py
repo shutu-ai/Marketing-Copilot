@@ -59,13 +59,13 @@ def test_realtime_watch_files_are_scoped_to_campaign_and_paginated(isolated_db):
     result = realtime_campaign_service.get_realtime_watch_files(campaign_id, page=1, page_size=1)
     assert result["total"] == 2
     assert len(result["items"]) == 1
-    assert result["items"][0]["filename"] == current_name
-    assert result["items"][0]["status"] == "pending"
-    assert result["items"][0]["row_count"] == 1
+    assert result["items"][0]["filename"] == "other.csv"
+    assert result["items"][0]["status"] == "ignored"
 
     second_page = realtime_campaign_service.get_realtime_watch_files(campaign_id, page=2, page_size=1)
-    assert second_page["items"][0]["filename"] == "other.csv"
-    assert second_page["items"][0]["status"] == "ignored"
+    assert second_page["items"][0]["filename"] == current_name
+    assert second_page["items"][0]["status"] == "pending"
+    assert second_page["items"][0]["row_count"] == 1
 
 
 def test_local_watch_ignores_historical_files_and_caches_unchanged_directory(isolated_db, monkeypatch):
