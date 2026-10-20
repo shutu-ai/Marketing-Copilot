@@ -1002,6 +1002,7 @@ _DB_REALTIME_CLEANUP_MARKER = "db_realtime_cleanup_v1"
 _DB_PROCESSED_FILES_MARKER = "db_processed_files_unique_v1"
 _DB_DATA_NORMALIZATION_MARKER = "db_data_normalization_v1"
 _DB_RECEIPT_INDEXES_MARKER = "db_receipt_indexes_v2"
+_DB_CANONICAL_READY_MARKER = "db_canonical_ready_v1"
 
 _RECEIPT_INDEX_DEFINITIONS = (
     (
@@ -2065,6 +2066,19 @@ def init_db():
         "[DB] init stage=base_schema elapsed=%.3fs",
         time.perf_counter() - started,
     )
+
+    # A cutover-built database has already completed every expensive schema,
+    # deduplication, normalization, backfill and index operation offline.  A
+    # normal service start must not rediscover or revalidate multi-million-row
+    # tables; the explicit marker is written only by the offline cutover
+    # command after its verification gate passes.
+    if _db_marker_completed(conn, _DB_CANONICAL_READY_MARKER):
+        conn.commit()
+        logger.info(
+            "[DB] init_db fast path=canonical_ready elapsed=%.3fs",
+            time.perf_counter() - started,
+        )
+        return
 
     migrations = [
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS batch_id INTEGER",

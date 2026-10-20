@@ -21,6 +21,11 @@ class IngressResult:
     by_partition: Counter = field(default_factory=Counter)
     by_campaign: Counter = field(default_factory=Counter)
     accepted_msisdns: list[str] = field(default_factory=list)
+    # Keep the accepted spool records available to the runtime control plane so
+    # it can publish a bounded, asynchronous task-index hint.  The records are
+    # already materialized by ``append_many``; retaining this list avoids a
+    # second spool scan and does not add a database write to the ingress path.
+    accepted_records: list[SpoolRecord] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -69,8 +74,10 @@ class IngressRouter:
                       route_id: int = 0, phone_prefix: str = "",
                       source_id: str = "source", payload_ref: str = "",
                       row_ordinal_start: int = 0, flash_sms: bool = False,
-                      source_addr: str = "", business_day: str | None = None,
+                      source_addr: str = "", campaign_name: str = "",
+                      business_day: str | None = None,
                       expires_at: float | None = None) -> IngressResult:
+        del campaign_name  # retained at runtime for the asynchronous index hint
         result = IngressResult()
         self.spool.rollover_if_needed()
         active_day = self.spool.current_business_day
@@ -140,6 +147,7 @@ class IngressRouter:
                 result.by_partition[item.partition_id] += 1
                 result.by_campaign[(item.campaign_type, item.campaign_id)] += 1
                 result.accepted_msisdns.append(item.normalized_msisdn)
+            result.accepted_records.extend(inserted)
         except SpoolExpiredError:
             result.rejected += len(records)
             result.rejected_reasons["expired_business_day"] += len(records)

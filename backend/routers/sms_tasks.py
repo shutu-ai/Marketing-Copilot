@@ -18,22 +18,21 @@ def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = 
                campaign_type: str = "", smpp_config_id: int = Query(-1),
                cursor: Optional[int] = Query(None, ge=1), msisdn: str = Query("")):
     from services import vnext_service
-    if vnext_service.is_active():
-        return vnext_service.list_tasks(
-            page, page_size, status, campaign_type, smpp_config_id, cursor,
-            msisdn=msisdn,
-        )
-    return sms_task_service.list_tasks(
-        page, page_size, status, campaign_type, smpp_config_id, cursor, msisdn
+    return vnext_service.list_tasks(
+        page=page,
+        page_size=page_size,
+        status=status,
+        campaign_type=campaign_type,
+        smpp_config_id=smpp_config_id,
+        cursor=cursor,
+        msisdn=msisdn,
     )
 
 
 @router.get("/stats")
 def stats():
     from services import vnext_service
-    if vnext_service.is_active():
-        return vnext_service.task_stats()
-    return sms_task_service.task_stats()
+    return vnext_service.task_stats()
 
 
 @router.get("/dlr-codes")
@@ -42,28 +41,13 @@ def dlr_codes():
 
 
 @router.post("/{task_id}/retry")
-def retry(task_id: int):
-    from services import vnext_service
-    if vnext_service.is_active():
-        raise HTTPException(409, "VNext uses socket_written/unknown evidence; manual legacy retry is disabled")
-    try:
-        retried = sms_task_service.retry_task(task_id)
-    except sms_task_service.TaskRetryRejected as exc:
-        raise HTTPException(status_code=409, detail=exc.reason) from exc
-    if not retried:
-        raise HTTPException(404, "Task not found")
-    return {"success": True}
+def retry(task_id: str):
+    raise HTTPException(409, "VNext task retry is not supported; submit a new campaign batch")
 
 
 @router.post("/{task_id}/deliver")
-def confirm_delivered(task_id: int):
-    from services import vnext_service
-    if vnext_service.is_active():
-        raise HTTPException(409, "VNext does not infer handset delivery from submit_sm")
-    ok, message = sms_task_service.mark_delivered(task_id)
-    if not ok:
-        raise HTTPException(400, message)
-    return {"success": True, "message": message}
+def confirm_delivered(task_id: str):
+    raise HTTPException(409, "VNext does not infer handset delivery from submit_sm")
 
 
 @router.get("/exclusions/list")

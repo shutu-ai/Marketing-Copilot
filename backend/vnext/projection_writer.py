@@ -25,6 +25,59 @@ class ProjectionBackpressure(RuntimeError):
     pass
 
 
+TASK_INDEX_TABLE = "vnext_task_index"
+
+
+def ensure_task_index_schema(connection) -> None:
+    """Create the canonical logical-task read model in the VNext store.
+
+    ``vnext_progress_events`` is an append-only evidence table.  It is the
+    right shape for replay and aggregate accounting, but it is not the right
+    shape for a UI task list because one logical task can produce a send event
+    and one or more response events.  The task index is maintained by the
+    existing single projection writer, so API reads stay bounded and the send
+    workers never open DuckDB.
+    """
+
+    connection.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TASK_INDEX_TABLE} (
+            event_id VARCHAR PRIMARY KEY,
+            partition_id INTEGER NOT NULL DEFAULT 0,
+            ordinal BIGINT NOT NULL DEFAULT 0,
+            campaign_type VARCHAR NOT NULL DEFAULT '',
+            campaign_id BIGINT NOT NULL DEFAULT 0,
+            route_id BIGINT NOT NULL DEFAULT 0,
+            normalized_msisdn VARCHAR NOT NULL DEFAULT '',
+            language VARCHAR NOT NULL DEFAULT '',
+            campaign_name VARCHAR NOT NULL DEFAULT '',
+            state VARCHAR NOT NULL DEFAULT 'queued',
+            parts_written INTEGER NOT NULL DEFAULT 0,
+            parts_total INTEGER NOT NULL DEFAULT 0,
+            message VARCHAR NOT NULL DEFAULT '',
+            error VARCHAR NOT NULL DEFAULT '',
+            created_at DOUBLE NOT NULL DEFAULT 0,
+            business_day VARCHAR NOT NULL DEFAULT '',
+            expires_at DOUBLE NOT NULL DEFAULT 0,
+            last_event_at DOUBLE NOT NULL DEFAULT 0
+        )
+        """
+    )
+    for statement in (
+        f"""CREATE INDEX IF NOT EXISTS idx_vnext_task_day_order
+                ON {TASK_INDEX_TABLE}(business_day,created_at,ordinal,event_id)""",
+        f"""CREATE INDEX IF NOT EXISTS idx_vnext_task_day_type_order
+                ON {TASK_INDEX_TABLE}(business_day,campaign_type,created_at,ordinal,event_id)""",
+        f"""CREATE INDEX IF NOT EXISTS idx_vnext_task_day_status_order
+                ON {TASK_INDEX_TABLE}(business_day,state,created_at,ordinal,event_id)""",
+        f"""CREATE INDEX IF NOT EXISTS idx_vnext_task_day_msisdn_order
+                ON {TASK_INDEX_TABLE}(business_day,normalized_msisdn,created_at,ordinal,event_id)""",
+        f"""CREATE INDEX IF NOT EXISTS idx_vnext_task_campaign_order
+                ON {TASK_INDEX_TABLE}(campaign_type,campaign_id,created_at,ordinal,event_id)""",
+    ):
+        connection.execute(statement)
+
+
 class ProgressJournal:
     """Durable append-only progress events with bounded generation segments.
 
@@ -567,6 +620,7 @@ class ProjectionWriter:
                         0,0,response_success,response_error,last_ordinal,updated_at
                     FROM vnext_projection_legacy"""
                 )
+        ensure_task_index_schema(self._conn)
 
     def stop(self) -> None:
         if self._conn is not None:
@@ -604,6 +658,106 @@ class ProjectionWriter:
             int(event.get("response_success", state == "submit_sm_resp_success")),
             int(event.get("response_error", state == "submit_sm_resp_error")),
         )
+
+    @staticmethod
+    def _logical_task_id(event: dict) -> str:
+        explicit = str(event.get("logical_task_id") or "").strip()
+        if explicit:
+            return explicit
+        return str(event.get("event_id") or "").split(":resp:", 1)[0]
+
+    @classmethod
+    def _task_index_row(cls, event: dict) -> tuple:
+        state = str(event.get("state") or "queued")
+        return (
+            cls._logical_task_id(event),
+            int(event.get("partition_id") or 0),
+            int(event.get("ordinal") or 0),
+            str(event.get("campaign_type") or ""),
+            int(event.get("campaign_id") or 0),
+            int(event.get("route_id") or 0),
+            str(event.get("normalized_msisdn") or ""),
+            str(event.get("language") or ""),
+            str(event.get("campaign_name") or ""),
+            state,
+            int(event.get("parts_written") or 0),
+            int(event.get("parts_total") or 0),
+            str(event.get("message") or ""),
+            str(event.get("error") or ""),
+            float(event.get("created_at") or time.time()),
+            str(event.get("business_day") or ""),
+            float(event.get("expires_at") or 0.0),
+            float(event.get("event_at") or event.get("created_at") or time.time()),
+        )
+
+    def _apply_task_index_batch(self, batch: list[dict], execute, executemany) -> int:
+        """Upsert one bounded latest-state row per logical task.
+
+        Queue hints and worker progress events share this path.  Queue hints
+        are deliberately excluded from ``vnext_progress_events`` and the
+        aggregate table, but they make newly admitted tasks visible before a
+        worker reaches them.  Later worker events replace the hint by
+        ``event_at`` in the same projection transaction.
+        """
+
+        latest: dict[str, tuple] = {}
+        for event in batch:
+            key = self._logical_task_id(event)
+            if not key:
+                continue
+            row = self._task_index_row(event)
+            previous = latest.get(key)
+            if previous is None or row[-1] >= previous[-1]:
+                latest[key] = row
+        if not latest:
+            return 0
+        execute(
+            """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_task_index_batch (
+                event_id VARCHAR, partition_id INTEGER, ordinal BIGINT,
+                campaign_type VARCHAR, campaign_id BIGINT, route_id BIGINT,
+                normalized_msisdn VARCHAR, language VARCHAR, campaign_name VARCHAR,
+                state VARCHAR, parts_written INTEGER, parts_total INTEGER,
+                message VARCHAR, error VARCHAR, created_at DOUBLE,
+                business_day VARCHAR, expires_at DOUBLE, last_event_at DOUBLE
+            )"""
+        )
+        execute("DELETE FROM _vnext_task_index_batch")
+        executemany(
+            """INSERT INTO _vnext_task_index_batch VALUES
+               (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            list(latest.values()),
+        )
+        execute(
+            f"""INSERT INTO {TASK_INDEX_TABLE}(
+                    event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
+                    normalized_msisdn,language,campaign_name,state,parts_written,parts_total,
+                    message,error,created_at,business_day,expires_at,last_event_at
+                )
+                SELECT event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
+                       normalized_msisdn,language,campaign_name,state,parts_written,parts_total,
+                       message,error,created_at,business_day,expires_at,last_event_at
+                  FROM _vnext_task_index_batch
+                ON CONFLICT(event_id) DO UPDATE SET
+                    partition_id=excluded.partition_id,
+                    ordinal=excluded.ordinal,
+                    campaign_type=excluded.campaign_type,
+                    campaign_id=excluded.campaign_id,
+                    route_id=excluded.route_id,
+                    normalized_msisdn=COALESCE(NULLIF(excluded.normalized_msisdn,''), {TASK_INDEX_TABLE}.normalized_msisdn),
+                    language=COALESCE(NULLIF(excluded.language,''), {TASK_INDEX_TABLE}.language),
+                    campaign_name=COALESCE(NULLIF(excluded.campaign_name,''), {TASK_INDEX_TABLE}.campaign_name),
+                    state=excluded.state,
+                    parts_written=excluded.parts_written,
+                    parts_total=GREATEST(excluded.parts_total,{TASK_INDEX_TABLE}.parts_total),
+                    message=COALESCE(NULLIF(excluded.message,''), {TASK_INDEX_TABLE}.message),
+                    error=excluded.error,
+                    created_at=LEAST({TASK_INDEX_TABLE}.created_at,excluded.created_at),
+                    business_day=COALESCE(NULLIF(excluded.business_day,''), {TASK_INDEX_TABLE}.business_day),
+                    expires_at=GREATEST({TASK_INDEX_TABLE}.expires_at,excluded.expires_at),
+                    last_event_at=excluded.last_event_at
+                WHERE excluded.last_event_at >= {TASK_INDEX_TABLE}.last_event_at"""
+        )
+        return len(latest)
 
     def _clear_staging(self, execute, batch_table_sql: str) -> None:
         """Clear/reuse the staging tables without changing transaction scope.
@@ -693,10 +847,16 @@ class ProjectionWriter:
         if self._conn is None:
             raise RuntimeError("projection writer is not started")
         batch_started_ns = time.perf_counter_ns()
+        # Queue hints feed only the logical task index.  Worker events remain
+        # the authoritative append-only evidence and aggregate input.
+        progress_batch = [
+            event for event in batch
+            if str(event.get("event_kind") or "") != "task_index"
+        ]
         unique: dict[str, dict] = {}
-        for event in batch:
+        for event in progress_batch:
             unique.setdefault(str(event["event_id"]), event)
-        duplicate_in_batch = len(batch) - len(unique)
+        duplicate_in_batch = len(progress_batch) - len(unique)
         sql_calls = 0
 
         def execute(statement: str, parameters=None):
@@ -715,6 +875,20 @@ class ProjectionWriter:
             self._metrics["sql_calls"] += 1
             self._metrics["executemany_calls"] += 1
             return self._conn.executemany(statement, parameters)
+
+        index_count = self._apply_task_index_batch(batch, execute, executemany)
+
+        if not progress_batch:
+            self._metrics["events_read"] += len(batch)
+            # Task-index hints are a separate read-model update; keep the
+            # existing projection event metric contract unchanged.
+            self._metrics["events_new"] += 0
+            self._metrics["projection_events_applied"] = self._applied
+            self._metrics["batches_total"] += 1
+            self._batch_sizes.append(len(batch))
+            if batch:
+                self._last_applied_at = time.time()
+            return 0
 
         batch_table_sql = """
             CREATE TEMPORARY TABLE _vnext_projection_batch (
@@ -1140,6 +1314,7 @@ def _process_main(
     offsets = _load_offsets(offsets_file) if offsets_file else {}
     pending_events: list[dict] = []
     pending_offsets: dict[str, int] = {}
+    pending_input_events: list[dict] = []
     graceful_stop = False
     journal_cursor = 0
 
@@ -1212,6 +1387,11 @@ def _process_main(
 
     try:
         writer.start()
+        # Publish a readable readiness snapshot before the first journal
+        # quantum.  With a quiet or small batch the loop can otherwise reach
+        # its first status tick only after the caller has already finished its
+        # work and started health/diagnostic polling.
+        write_status()
         if ready_event is not None:
             ready_event.set()
         diagnostic(phase="running", status="running", progress={"applied": 0, "queue_depth": 0})
@@ -1268,6 +1448,24 @@ def _process_main(
                         hint = input_queue.get_nowait()
                         if hint is None:
                             graceful_stop = True
+                        elif (
+                            isinstance(hint, dict)
+                            and str(hint.get("event_kind") or "") in {
+                                "task_index", "task_index_batch"
+                            }
+                        ):
+                            # Worker hints remain non-authoritative because the
+                            # worker journals are replayed above.  Only the
+                            # parent-owned ingress task-index hints are
+                            # materialized here.
+                            if str(hint.get("event_kind") or "") == "task_index_batch":
+                                pending_input_events.extend(
+                                    dict(item)
+                                    for item in (hint.get("events") or [])
+                                    if isinstance(item, dict)
+                                )
+                            else:
+                                pending_input_events.append(dict(hint))
                 except queue.Empty:
                     pass
                 except (EOFError, OSError):
@@ -1276,6 +1474,11 @@ def _process_main(
                 budget = writer.batch_size
                 batch: list[dict] = []
                 candidates: dict[str, int] = {}
+                if pending_input_events:
+                    direct_count = min(budget, len(pending_input_events))
+                    batch.extend(pending_input_events[:direct_count])
+                    del pending_input_events[:direct_count]
+                    budget -= direct_count
                 if journals:
                     # A bounded quantum per journal prevents a hot worker or
                     # large campaign from consuming the whole batch budget.
@@ -1325,7 +1528,9 @@ def _process_main(
                     pending_events = batch
                     pending_offsets = candidates
                     continue
-                if graceful_stop or (stop_event.is_set() and not pending_events):
+                if graceful_stop or (
+                    stop_event.is_set() and not pending_events and not pending_input_events
+                ):
                     break
                 write_status()
                 time.sleep(min(0.05, writer.flush_interval_seconds))
@@ -1354,22 +1559,31 @@ def _process_main(
                     break
                 if event is None:
                     break
-                writer.submit(event)
-                if (
-                    len(writer._queue) >= writer.batch_size
-                    or time.monotonic() - writer._last_flush_monotonic >= writer.flush_interval_seconds
-                ):
-                    try:
-                        writer.flush()
-                    except ProjectionWriterBusy:
-                        pass
-                    except Exception as exc:
-                        diagnostic(
-                            phase="flush_retry",
-                            status="degraded",
-                            extra={"last_error": f"{type(exc).__name__}: {exc}"},
-                        )
-                        time.sleep(writer.retry_seconds)
+                input_events = (
+                    event.get("events") or []
+                    if isinstance(event, dict)
+                    and str(event.get("event_kind") or "") == "task_index_batch"
+                    else [event]
+                )
+                for input_event in input_events:
+                    if not isinstance(input_event, dict):
+                        continue
+                    writer.submit(input_event)
+                    if (
+                        len(writer._queue) >= writer.batch_size
+                        or time.monotonic() - writer._last_flush_monotonic >= writer.flush_interval_seconds
+                    ):
+                        try:
+                            writer.flush()
+                        except ProjectionWriterBusy:
+                            pass
+                        except Exception as exc:
+                            diagnostic(
+                                phase="flush_retry",
+                                status="degraded",
+                                extra={"last_error": f"{type(exc).__name__}: {exc}"},
+                            )
+                            time.sleep(writer.retry_seconds)
                 diagnostic(
                     phase="event", status="running",
                     progress={"applied": writer.snapshot().get("applied", 0), "queue_depth": len(writer._queue)},

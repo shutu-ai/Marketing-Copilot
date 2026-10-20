@@ -370,7 +370,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             campaign_generation=generation, route_id=route_id, phone_prefix=phone_prefix,
             source_id=stable_source, payload_ref=str(source_file or stable_source),
             row_ordinal_start=int(row_ordinal_start), flash_sms=bool(campaign.get("flash_sms")),
-            source_addr=source_addr,
+            source_addr=source_addr, campaign_name=str(campaign.get("name") or ""),
         )
     except SpoolCapacityError as exc:
         result.update(success=False, status="pressure", message=str(exc))
@@ -668,53 +668,24 @@ def dashboard_stats() -> dict:
 
 
 def _campaign_names_for_rows(rows: Iterable[dict]) -> dict[tuple[str, int], str]:
-    """Resolve names for the bounded page of VNext task rows.
+    """Read campaign names already materialized in the new task store.
 
-    VNext projection rows intentionally keep only the compact campaign type
-    and id needed by the send path.  The task-list API can enrich one page at
-    a time from the control-plane database without adding campaign names to
-    journal/projection writes or the worker hot path.
+    Task-list reads deliberately do not enrich rows from the control database.
+    Ingress hints carry the name once and historical cutover imports it once;
+    this keeps every filter page on the same bounded projection database.
     """
 
-    ids_by_type = {"batch": set(), "realtime": set()}
+    result = {}
     for row in rows:
         campaign_type = str(row.get("campaign_type") or "")
-        if campaign_type not in ids_by_type:
-            continue
         try:
             campaign_id = int(row.get("campaign_id") or 0)
         except (TypeError, ValueError):
             continue
-        if campaign_id > 0:
-            ids_by_type[campaign_type].add(campaign_id)
-    if not any(ids_by_type.values()):
-        return {}
-
-    tables = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}
-
-    def read(conn):
-        names = {}
-        for campaign_type, table in tables.items():
-            campaign_ids = sorted(ids_by_type[campaign_type])
-            if not campaign_ids:
-                continue
-            placeholders = ",".join("?" for _ in campaign_ids)
-            records = conn.execute(
-                f"SELECT id, name FROM {table} WHERE id IN ({placeholders})",
-                campaign_ids,
-            ).fetchall()
-            for record in records:
-                name = str(record["name"] or "").strip()
-                if name:
-                    names[(campaign_type, int(record["id"]))] = name
-        return names
-
-    try:
-        return read_transaction(read, operation="vnext.task_campaign_names")
-    except Exception:
-        # The list is diagnostic. A transient control-plane read failure must
-        # not make task listing fail or affect the sending data plane.
-        return {}
+        name = str(row.get("campaign_name") or "").strip()
+        if name and campaign_id > 0:
+            result[(campaign_type, campaign_id)] = name
+    return result
 
 
 def _task_item_from_event(
@@ -758,7 +729,9 @@ def _task_item_from_event(
         "status": str(row.get("state") or "unknown"),
         "attempts": 0,
         "error_msg": str(row.get("error") or ""),
-        "updated_at": _format_event_timestamp(row.get("created_at")),
+        "updated_at": _format_event_timestamp(
+            row.get("last_event_at") or row.get("created_at")
+        ),
         "parts_written": int(row.get("parts_written") or 0),
         "parts_total": int(row.get("parts_total") or 0),
     }
@@ -783,11 +756,14 @@ def _projection_task_page(
     page: int, page_size: int, status: str, campaign_type: str,
     smpp_config_id: int, business_day: str | None, msisdn: str = "",
 ) -> tuple[int, list[dict]] | None:
-    """Read only one task page from the bounded VNext projection database.
+    """Read one page from the canonical logical-task index.
 
     The projection writer remains the sole writer.  This connection is
     read-only and is intentionally opened only for the API query, so the
-    send workers and their journal path are not involved.
+    send workers and their journal path are not involved.  There is no
+    fallback to the old task table or to journal replay: a missing projection
+    store is reported as unavailable and is repaired by the offline cutover
+    command.
     """
 
     try:
@@ -798,9 +774,18 @@ def _projection_task_page(
         db_path = snapshot.get("db_path")
         if not db_path:
             return None
-        selected_day = str(business_day or value.spool.current_business_day)
-        conditions = ["e.business_day=?"]
-        params: list[object] = [selected_day]
+        selected_day = str(business_day or "")
+        # Keep the unfiltered operations page cheap by defaulting it to the
+        # active business day.  A user-supplied filter is an explicit lookup
+        # request and searches the retained task index across days, which is
+        # what makes historical batch/phone filters deterministic.
+        if not selected_day and not any((status, campaign_type, msisdn)) and int(smpp_config_id) < 0:
+            selected_day = str(value.spool.current_business_day)
+        conditions: list[str] = []
+        params: list[object] = []
+        if selected_day:
+            conditions.append("e.business_day=?")
+            params.append(selected_day)
         if status:
             conditions.append("e.state=?")
             params.append(str(status))
@@ -811,37 +796,23 @@ def _projection_task_page(
             conditions.append("e.route_id=?")
             params.append(int(smpp_config_id))
         if msisdn:
-            conditions.append(
-                "COALESCE(NULLIF(e.normalized_msisdn,''), base.normalized_msisdn, '')=?"
-            )
+            conditions.append("e.normalized_msisdn=?")
             params.append(msisdn)
         where = " AND ".join(conditions)
         offset = (max(1, int(page)) - 1) * max(1, int(page_size))
         connection = duckdb.connect(str(db_path), read_only=True)
         try:
-            count_join = ""
-            if msisdn:
-                count_join = """
-                  LEFT JOIN vnext_progress_events base
-                    ON base.event_id=split_part(e.event_id, ':resp:', 1)
-                   AND base.business_day=e.business_day
-                """
             total = int(connection.execute(
-                f"SELECT COUNT(*) FROM vnext_progress_events e{count_join} WHERE {where}",
+                f"SELECT COUNT(*) FROM vnext_task_index e WHERE {where}",
                 params,
             ).fetchone()[0])
             rows = connection.execute(
                 f"""
                 SELECT e.event_id, e.campaign_type, e.campaign_id, e.route_id,
-                       COALESCE(NULLIF(e.normalized_msisdn,''), base.normalized_msisdn, '')
-                           AS normalized_msisdn,
-                       COALESCE(NULLIF(e.language,''), base.language, '') AS language,
-                       COALESCE(NULLIF(e.message,''), base.message, '') AS message,
-                       e.state, e.parts_written, e.parts_total, e.error, e.created_at
-                  FROM vnext_progress_events e
-                  LEFT JOIN vnext_progress_events base
-                    ON base.event_id=split_part(e.event_id, ':resp:', 1)
-                   AND base.business_day=e.business_day
+                       e.normalized_msisdn, e.language, e.campaign_name,
+                       e.message, e.state, e.parts_written, e.parts_total,
+                       e.error, e.created_at, e.last_event_at, e.business_day
+                  FROM vnext_task_index e
                  WHERE {where}
                  ORDER BY e.created_at DESC, e.ordinal DESC, e.event_id DESC
                  LIMIT ? OFFSET ?
@@ -853,8 +824,8 @@ def _projection_task_page(
         finally:
             connection.close()
     except Exception:
-        # A read-only diagnostic/list query must never make the API or send
-        # path fail.  The caller falls back to the compatibility journal view.
+        # Task listing is a projection read model.  Do not silently switch to
+        # an old database or replay unbounded journals on a request thread.
         return None
 
 
@@ -869,8 +840,8 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     if page <= 1 and cursor is not None and int(cursor) > 0:
         page = int(cursor)
     page_size = max(1, min(200, int(page_size)))
-    from services import sms_task_service
-    normalized_msisdn = sms_task_service.normalize_msisdn(msisdn)
+    from vnext.partition import normalize_msisdn
+    normalized_msisdn = normalize_msisdn(msisdn)
     projection_page = _projection_task_page(
         page, page_size, status, campaign_type, smpp_config_id, business_day,
         normalized_msisdn,
@@ -887,47 +858,47 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
             "pipeline": "vnext", "total": total, "page": page,
             "page_size": page_size, "items": items,
             "next_cursor": page + 1 if has_more else None, "has_more": has_more,
-            "stats_source": "vnext_projection_page",
+            "stats_source": "vnext_task_index",
         }
 
-    # Compatibility fallback for a runtime whose projection database has not
-    # been initialized yet.  Normal production requests use the bounded SQL
-    # path above and do not replay the worker journals.
-    all_events = list(_progress_events(business_day))
-    by_id = {str(item.get("event_id") or ""): item for item in all_events}
-
-    def event_msisdn(item: dict) -> str:
-        value = str(item.get("normalized_msisdn") or "")
-        if value:
-            return value
-        parent_id = str(item.get("event_id") or "").split(":resp:", 1)[0]
-        return str(by_id.get(parent_id, {}).get("normalized_msisdn") or "")
-
-    events = [item for item in all_events
-              if (not status or str(item.get("state")) == str(status))
-              and (not campaign_type or str(item.get("campaign_type")) == str(campaign_type))
-              and (int(smpp_config_id) < 0 or int(item.get("route_id") or 0) == int(smpp_config_id))
-              and (not normalized_msisdn or event_msisdn(item) == normalized_msisdn)]
-    events.sort(key=lambda item: (float(item.get("created_at") or 0), str(item.get("event_id"))), reverse=True)
-    total = len(events)
-    offset = (page - 1) * page_size
-    rows = events[offset:offset + page_size]
-    campaign_names = _campaign_names_for_rows(rows)
-    items = []
-    for row in rows:
-        parent_id = str(row.get("event_id") or "").split(":resp:", 1)[0]
-        items.append(
-            _task_item_from_event(
-                row, by_id.get(parent_id), campaign_names=campaign_names
-            )
-        )
-    has_more = offset + len(items) < total
+    # The new store is unavailable.  Return a bounded diagnostic result rather
+    # than reintroducing the old task table or a full journal replay.
     return {
-        "pipeline": "vnext", "total": total, "page": page,
-        "page_size": page_size, "items": items,
-        "next_cursor": page + 1 if has_more else None, "has_more": has_more,
-        "stats_source": "vnext_journal_fallback",
+        "pipeline": "vnext", "total": 0, "page": page,
+        "page_size": page_size, "items": [],
+        "next_cursor": None, "has_more": False,
+        "stats_source": "vnext_task_index_unavailable",
     }
+
+
+def export_tasks() -> list[dict]:
+    """Export the canonical VNext task index without opening the business DB."""
+
+    try:
+        import duckdb
+
+        value = runtime()
+        db_path = (value.projection.snapshot() or {}).get("db_path")
+        if not db_path:
+            return []
+        connection = duckdb.connect(str(db_path), read_only=True)
+        try:
+            rows = connection.execute(
+                """SELECT event_id,campaign_name,campaign_type,campaign_id,route_id,
+                          normalized_msisdn,language,message,state,parts_written,
+                          parts_total,error,created_at,last_event_at,business_day
+                     FROM vnext_task_index
+                    ORDER BY created_at DESC,ordinal DESC,event_id DESC"""
+            ).fetchall()
+            columns = [str(item[0]) for item in connection.description]
+            return [
+                _task_item_from_event(dict(zip(columns, row)))
+                for row in rows
+            ]
+        finally:
+            connection.close()
+    except Exception:
+        return []
 
 
 def task_stats(business_day: str | None = None) -> dict:

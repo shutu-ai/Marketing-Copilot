@@ -49,6 +49,43 @@ def test_projection_writer_batches_idempotently_and_replays_journal(tmp_path):
         conn.close()
 
 
+def test_task_index_keeps_one_latest_row_without_changing_event_aggregates(tmp_path):
+    writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=8)
+    writer.start()
+    try:
+        queued = event("logical-1", state="queued", ordinal=1)
+        queued.update({
+            "event_kind": "task_index",
+            "logical_task_id": "logical-1",
+            "normalized_msisdn": "251908341307",
+            "message": "hello",
+            "created_at": 10.0,
+            "event_at": 10.0,
+        })
+        sent = event("logical-1", state="socket_written", ordinal=1)
+        sent.update({
+            "normalized_msisdn": "251908341307",
+            "message": "hello",
+            "created_at": 10.0,
+            "event_at": 11.0,
+        })
+        writer.submit(queued)
+        writer.submit(sent)
+        assert writer.flush() == 2
+        task = writer._conn.execute(
+            "SELECT event_id,normalized_msisdn,state,message,last_event_at FROM vnext_task_index"
+        ).fetchone()
+        assert task == ("logical-1", "251908341307", "socket_written", "hello", 11.0)
+        assert writer._conn.execute(
+            "SELECT COUNT(*) FROM vnext_progress_events"
+        ).fetchone()[0] == 1
+        assert writer._conn.execute(
+            "SELECT socket_written FROM vnext_projection"
+        ).fetchone()[0] == 1
+    finally:
+        writer.stop()
+
+
 def test_projection_snapshot_publishes_day_level_metric_contract(tmp_path):
     writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=10)
     writer.start()
@@ -142,6 +179,71 @@ def test_projection_process_flushes_low_rate_event_before_batch_size(tmp_path):
         assert process.snapshot()["flush_interval_seconds"] == 0.05
     finally:
         process.stop(timeout=10)
+
+
+def test_projection_process_materializes_task_index_batch_without_journals(tmp_path):
+    process = ProjectionWriterProcess(
+        tmp_path / "task-index-batch", batch_size=16, flush_interval_seconds=0.05,
+    )
+    process.start()
+    try:
+        process.submit({
+            "event_kind": "task_index_batch",
+            "events": [
+                {
+                    "event_id": "task-index-1",
+                    "partition_id": 1,
+                    "ordinal": 1,
+                    "campaign_type": "batch",
+                    "campaign_id": 10,
+                    "route_id": 2,
+                    "normalized_msisdn": "251900000001",
+                    "campaign_name": "batch campaign",
+                    "state": "queued",
+                    "message": "hello",
+                    "created_at": time.time(),
+                    "event_at": time.time(),
+                    "business_day": "2026-10-20",
+                },
+                {
+                    "event_id": "task-index-2",
+                    "partition_id": 1,
+                    "ordinal": 2,
+                    "campaign_type": "realtime",
+                    "campaign_id": 11,
+                    "route_id": 3,
+                    "normalized_msisdn": "251900000002",
+                    "campaign_name": "realtime campaign",
+                    "state": "queued",
+                    "message": "hi",
+                    "created_at": time.time(),
+                    "event_at": time.time(),
+                    "business_day": "2026-10-20",
+                },
+            ],
+        }, timeout=2)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if process.snapshot().get("queue_depth", 0) == 0:
+                break
+            time.sleep(0.02)
+    finally:
+        process.stop(timeout=10)
+
+    import duckdb
+
+    connection = duckdb.connect(str(process.db_path), read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, campaign_type, normalized_msisdn "
+            "FROM vnext_task_index ORDER BY event_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [
+        ("task-index-1", "batch", "251900000001"),
+        ("task-index-2", "realtime", "251900000002"),
+    ]
 
 
 def test_vectorized_staging_matches_executemany_and_reports_stage_metrics(tmp_path):

@@ -19,6 +19,37 @@ class _FakeRuntime:
         return self.ingress.enqueue_chunk(*args, **kwargs)
 
 
+def test_sms_task_router_passes_msisdn_as_a_named_vnext_filter(monkeypatch):
+    from routers import sms_tasks
+
+    captured = {}
+
+    def fake_list_tasks(**kwargs):
+        captured.update(kwargs)
+        return {"items": [], "total": 0}
+
+    monkeypatch.setattr(vnext_service, "list_tasks", fake_list_tasks)
+    sms_tasks.list_tasks(
+        page=2,
+        page_size=25,
+        status="write_failed",
+        campaign_type="batch",
+        smpp_config_id=7,
+        cursor=3,
+        msisdn="251908341307",
+    )
+
+    assert captured == {
+        "page": 2,
+        "page_size": 25,
+        "status": "write_failed",
+        "campaign_type": "batch",
+        "smpp_config_id": 7,
+        "cursor": 3,
+        "msisdn": "251908341307",
+    }
+
+
 def test_spool_budget_defaults_to_four_gib_and_accepts_larger_values(monkeypatch):
     monkeypatch.delenv("MC_VNEXT_MAX_SPOOL_BYTES", raising=False)
     assert vnext_service._env_bytes(
@@ -72,6 +103,7 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
     tmp_path, monkeypatch
 ):
     import duckdb
+    from vnext.projection_writer import ensure_task_index_schema
 
     fake = _FakeRuntime(tmp_path)
     db_path = tmp_path / "vnext-projection.duckdb"
@@ -121,6 +153,26 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
             ),
         ],
     )
+    ensure_task_index_schema(connection)
+    connection.executemany(
+        """INSERT INTO vnext_task_index(
+            event_id,partition_id,ordinal,campaign_type,campaign_id,route_id,
+            normalized_msisdn,language,campaign_name,state,parts_written,parts_total,
+            message,error,created_at,business_day,expires_at,last_event_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            (
+                "task-1", 0, 1, "batch", 11, 7, "251900000001", "english",
+                "批量活动 11", "submit_sm_resp_success", 1, 1,
+                "Hello 251900000001", "", 3.0, business_day, 0.0, 4.0,
+            ),
+            (
+                "task-2", 0, 3, "batch", 12, 7, "251900000002", "amharic",
+                "批量活动 12", "write_failed", 0, 1,
+                "Selam 251900000002", "timeout", 2.0, business_day, 0.0, 2.0,
+            ),
+        ],
+    )
     connection.close()
 
     class Projection:
@@ -138,67 +190,46 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
     )
 
     first_page = vnext_service.list_tasks(page=1, page_size=1)
-    assert first_page["total"] == 3
+    assert first_page["total"] == 2
     assert first_page["page"] == 1
     assert first_page["page_size"] == 1
     assert first_page["has_more"] is True
-    assert first_page["stats_source"] == "vnext_projection_page"
-    assert first_page["items"][0]["event_id"] == "task-1:resp:1"
+    assert first_page["stats_source"] == "vnext_task_index"
+    assert first_page["items"][0]["event_id"] == "task-1"
     assert first_page["items"][0]["msisdn"] == "251900000001"
     assert first_page["items"][0]["language"] == "english"
     assert first_page["items"][0]["content"] == "Hello 251900000001"
     assert first_page["items"][0]["updated_at"] == "1970-01-01T00:00:04+00:00"
 
     second_page = vnext_service.list_tasks(page=2, page_size=1)
-    assert second_page["items"][0]["event_id"] == "task-1"
-    assert second_page["has_more"] is True
+    assert second_page["items"][0]["event_id"] == "task-2"
+    assert second_page["has_more"] is False
 
     cursor_page = vnext_service.list_tasks(page=1, page_size=1, cursor=2)
     assert cursor_page["page"] == 2
-    assert cursor_page["items"][0]["event_id"] == "task-1"
+    assert cursor_page["items"][0]["event_id"] == "task-2"
 
     filtered_page = vnext_service.list_tasks(
         page=1, page_size=10, msisdn="251900000001"
     )
-    assert filtered_page["total"] == 2
+    assert filtered_page["total"] == 1
     assert {item["msisdn"] for item in filtered_page["items"]} == {"251900000001"}
 
 
-def test_vnext_task_campaign_names_are_resolved_in_one_bounded_control_read(monkeypatch):
+def test_vnext_task_campaign_names_are_read_from_the_new_task_index(monkeypatch):
     calls = []
 
-    class Result:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def fetchall(self):
-            return self.rows
-
-    class Connection:
-        def execute(self, query, params):
-            calls.append((query, tuple(params)))
-            if "batch_campaigns" in query:
-                return Result([{"id": 11, "name": "批量活动 11"}])
-            return Result([{"id": 6, "name": "实时活动 6"}])
-
-    monkeypatch.setattr(
-        vnext_service,
-        "read_transaction",
-        lambda callback, **_kwargs: callback(Connection()),
-    )
-
     names = vnext_service._campaign_names_for_rows([
-        {"campaign_type": "batch", "campaign_id": 11},
-        {"campaign_type": "realtime", "campaign_id": 6},
-        {"campaign_type": "realtime", "campaign_id": 6},
+        {"campaign_type": "batch", "campaign_id": 11, "campaign_name": "批量活动 11"},
+        {"campaign_type": "realtime", "campaign_id": 6, "campaign_name": "实时活动 6"},
+        {"campaign_type": "realtime", "campaign_id": 6, "campaign_name": "实时活动 6"},
     ])
 
     assert names == {
         ("batch", 11): "批量活动 11",
         ("realtime", 6): "实时活动 6",
     }
-    assert len(calls) == 2
-    assert {call[1] for call in calls} == {(11,), (6,)}
+    assert calls == []
 
 
 def test_service_control_maps_campaign_states(tmp_path, monkeypatch):

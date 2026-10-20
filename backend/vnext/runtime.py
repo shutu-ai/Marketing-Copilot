@@ -18,7 +18,7 @@ from .critical_path_profiler import CriticalPathProfiler
 from .ingress import IngressRouter
 from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
 from .process_lifecycle import set_parent_death_signal
-from .projection_writer import ProjectionWriterProcess, ProgressJournal
+from .projection_writer import ProjectionBackpressure, ProjectionWriterProcess, ProgressJournal
 from .progress import ProgressPersistence
 from .pressure import StageCredit
 from .route_credits import RouteCreditBroker
@@ -830,8 +830,52 @@ class VNextRuntime:
     def enqueue_chunk(self, *args, **kwargs):
         if not self._started:
             raise RuntimeError("VNext runtime is not started")
+        campaign_name = str(kwargs.pop("campaign_name", "") or "")
         self.rollover_if_needed()
-        return self.ingress.enqueue_chunk(*args, **kwargs)
+        result = self.ingress.enqueue_chunk(*args, **kwargs)
+        # The spool append is the admission/durability boundary.  These
+        # zero-wait IPC hints only feed the background projection's logical
+        # task index; a full projection queue never rejects an accepted SMS
+        # and never blocks the worker/send path.
+        if result.accepted_records and self.projection is not None:
+            hints = [
+                {
+                    "event_kind": "task_index",
+                    "logical_task_id": str(record.event_id),
+                    "event_id": str(record.event_id),
+                    "partition_id": int(record.partition_id),
+                    "ordinal": int(record.ordinal),
+                    "campaign_type": str(record.campaign_type),
+                    "campaign_id": int(record.campaign_id),
+                    "route_id": int(record.route_id),
+                    "normalized_msisdn": str(record.normalized_msisdn),
+                    "language": str(record.language or ""),
+                    "campaign_name": campaign_name,
+                    "state": "queued",
+                    "parts_written": 0,
+                    "parts_total": int(record.part_count_hint or 0),
+                    "message": str(record.message or ""),
+                    "error": "",
+                    "created_at": float(record.created_at),
+                    "business_day": str(record.business_day or self.spool.current_business_day),
+                    "expires_at": float(record.expires_at or 0.0),
+                    "event_at": time.time(),
+                }
+                for record in result.accepted_records
+            ]
+            try:
+                # One IPC item per uploaded chunk keeps the read-model hint
+                # overhead bounded even for a large customer list.
+                self.projection.submit({
+                    "event_kind": "task_index_batch",
+                    "events": hints,
+                })
+            except ProjectionBackpressure:
+                # Worker progress remains authoritative and will populate the
+                # same row when the task reaches dispatch.  Do not turn a
+                # diagnostic read-model delay into ingress pressure.
+                pass
+        return result
 
     def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str) -> None:
         with self._control_lock:

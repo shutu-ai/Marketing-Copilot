@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from database import read_transaction
 from services import p1_service
 from services import task_archive_service
+from services import vnext_service
 
 router = APIRouter(prefix="/api/operations", tags=["Operations"])
 
@@ -123,7 +124,7 @@ def audits(page: int = 1, page_size: int = Query(100, le=500), action: str = "")
 
 def _export_rows(report: str):
     if report == "tasks":
-        query = "SELECT * FROM sms_tasks ORDER BY created_at DESC"
+        return vnext_service.export_tasks()
     elif report == "files":
         query = "SELECT * FROM processed_files ORDER BY detected_at DESC"
     elif report == "failures":
