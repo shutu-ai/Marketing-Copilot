@@ -480,7 +480,7 @@ function handleUpload(row: Campaign) {
 
 function downloadProspectTemplate() {
   const blob = new Blob(
-    ['msisdn,region,language\n66812345678,TH,th\n'],
+    ['msisdn,region,language\n66812345678,TH,English\n'],
     { type: 'text/csv;charset=utf-8' }
   )
   const url = URL.createObjectURL(blob)
