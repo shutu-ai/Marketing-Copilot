@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .critical_path_profiler import CriticalPathProfiler
 from .diagnostics import enable_native_fault_capture, write_process_metadata
+from .process_lifecycle import set_parent_death_signal
 
 
 class ProjectionWriterBusy(RuntimeError):
@@ -445,7 +446,31 @@ class ProjectionWriter:
     def start(self) -> None:
         import duckdb
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = duckdb.connect(self.db_path)
+        try:
+            lock_wait_seconds = max(
+                0.0,
+                float(os.environ.get("MC_VNEXT_PROJECTION_LOCK_WAIT_SECONDS", "30")),
+            )
+        except (TypeError, ValueError):
+            lock_wait_seconds = 30.0
+        deadline = time.monotonic() + lock_wait_seconds
+        while True:
+            try:
+                self._conn = duckdb.connect(self.db_path)
+                break
+            except Exception as exc:
+                # A stale/old owner is a process-lifecycle problem, not a
+                # reason to hot-loop a new child every 250 ms.  Keep the child
+                # alive for a bounded period so the owner can release cleanly;
+                # normal connections still take the single fast path above.
+                text = str(exc).lower()
+                lock_conflict = (
+                    "could not set lock on file" in text
+                    or "conflicting lock is held" in text
+                )
+                if not lock_conflict or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(self.retry_seconds, max(0.001, deadline - time.monotonic())))
         self._batch_table_created = False
         legacy_projection = False
         projection_columns = self._table_columns("vnext_projection")
@@ -1069,7 +1094,9 @@ def _process_main(
     reuse_staging: bool = True,
     profile_root: str = "",
     profile_interval_seconds: float = 1.0,
+    ready_event=None,
 ) -> None:
+    set_parent_death_signal()
     status_file = Path(status_path)
     role = "projection-writer"
     native_fault_path = enable_native_fault_capture(diagnostic_root, role)
@@ -1185,6 +1212,8 @@ def _process_main(
 
     try:
         writer.start()
+        if ready_event is not None:
+            ready_event.set()
         diagnostic(phase="running", status="running", progress={"applied": 0, "queue_depth": 0})
         if journals:
             while True:
@@ -1370,6 +1399,8 @@ def _process_main(
         )
         raise
     finally:
+        if ready_event is not None:
+            ready_event.clear()
         writer.stop()
         profiler.publish(force=True)
 
@@ -1411,6 +1442,7 @@ class ProjectionWriterProcess:
         self.restart_count = 0
         self.queue = None
         self.stop_event = None
+        self.ready_event = None
         self.process = None
         self._create_process()
 
@@ -1418,6 +1450,7 @@ class ProjectionWriterProcess:
         context = self._mp_context
         self.queue = context.Queue(maxsize=self.queue_size)
         self.stop_event = context.Event()
+        self.ready_event = context.Event()
         self.process = context.Process(
             target=_process_main,
             args=(
@@ -1427,6 +1460,7 @@ class ProjectionWriterProcess:
                 self.start_method, self.staging_mode, self.reuse_staging,
                 str(self.profile_root) if self.profile_root else "",
                 self.profile_interval_seconds,
+                self.ready_event,
             ),
             name="mc-vnext-projection-writer",
             daemon=True,
@@ -1499,6 +1533,11 @@ class ProjectionWriterProcess:
         if process.is_alive():
             process.terminate()
             process.join(timeout=2.0)
+        if process.is_alive():
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+                process.join(timeout=2.0)
         write_process_metadata(
             self.diagnostics_root,
             "projection-parent",
@@ -1514,6 +1553,12 @@ class ProjectionWriterProcess:
             return {
                 "queue_depth": None,
                 "alive": bool(self.process and self.process.is_alive()),
+                "ready": bool(
+                    self.process
+                    and self.process.is_alive()
+                    and self.ready_event
+                    and self.ready_event.is_set()
+                ),
                 "journal_replay": bool(self.journal_paths),
                 "pid": getattr(self.process, "pid", None),
                 "exitcode": getattr(self.process, "exitcode", None),
@@ -1529,6 +1574,12 @@ class ProjectionWriterProcess:
         return {
             **value,
             "alive": bool(self.process and self.process.is_alive()),
+            "ready": bool(
+                self.process
+                and self.process.is_alive()
+                and self.ready_event
+                and self.ready_event.is_set()
+            ),
             "journal_replay": bool(self.journal_paths),
             "pid": getattr(self.process, "pid", None),
             "exitcode": getattr(self.process, "exitcode", None),

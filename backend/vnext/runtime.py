@@ -17,6 +17,7 @@ from .business_day import BusinessClock, FileWallClock, ensure_clock
 from .critical_path_profiler import CriticalPathProfiler
 from .ingress import IngressRouter
 from .diagnostics import enable_native_fault_capture, read_process_metadata, write_process_metadata
+from .process_lifecycle import set_parent_death_signal
 from .projection_writer import ProjectionWriterProcess, ProgressJournal
 from .progress import ProgressPersistence
 from .pressure import StageCredit
@@ -27,6 +28,7 @@ from .worker import ShardWorker
 
 
 def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, context: dict) -> None:
+    set_parent_death_signal()
     diagnostic_root = str(context.get("diagnostics_root") or "")
     run_id = str(context.get("run_id") or "")
     start_method = str(context.get("start_method") or "spawn")
@@ -546,8 +548,16 @@ class VNextRuntime:
                 if not self.projection.snapshot().get("alive", False):
                     restarted = self.projection.restart()
                     if restarted:
-                        self._projection_restart_failures = 0
-                        self._projection_restart_not_before = 0.0
+                        # ``Process.start()`` only means that the child was
+                        # forked.  It may still fail while opening DuckDB.
+                        # Count the launch as a retry and back off; otherwise
+                        # a file-lock conflict creates a traceback/spawn loop.
+                        self._projection_restart_failures += 1
+                        delay = min(
+                            5.0,
+                            0.25 * (2 ** min(self._projection_restart_failures - 1, 5)),
+                        )
+                        self._projection_restart_not_before = time.monotonic() + delay
             except (OSError, RuntimeError):
                 self._projection_restart_failures += 1
                 self._projection_restart_not_before = time.monotonic() + min(

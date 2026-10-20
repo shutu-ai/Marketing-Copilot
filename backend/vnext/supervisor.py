@@ -278,6 +278,14 @@ class WorkerSupervisor:
                     handle.process.join(timeout=2.0)
                 except Exception:
                     pass
+            if getattr(handle.process, "is_alive", lambda: False)():
+                try:
+                    kill = getattr(handle.process, "kill", None)
+                    if callable(kill):
+                        kill()
+                        handle.process.join(timeout=2.0)
+                except Exception:
+                    pass
             self._last_exitcodes[handle.worker_id] = getattr(handle.process, "exitcode", None)
             write_process_metadata(
                 self._diagnostics_root,
@@ -312,6 +320,11 @@ class WorkerSupervisor:
             if getattr(old.process, "is_alive", lambda: False)():
                 old.process.terminate()
                 old.process.join(timeout=2.0)
+            if getattr(old.process, "is_alive", lambda: False)():
+                kill = getattr(old.process, "kill", None)
+                if callable(kill):
+                    kill()
+                    old.process.join(timeout=2.0)
             self._last_exitcodes[worker] = getattr(old.process, "exitcode", None)
             write_process_metadata(
                 self._diagnostics_root,

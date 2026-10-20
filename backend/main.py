@@ -296,7 +296,10 @@ def health():
         pass
     from services import vnext_service
     if vnext_service.is_active():
-        pipeline = vnext_service.status()
+        # Health probes must remain cheap under journal backlog.  The full
+        # status() path reconciles retained progress journals and belongs to
+        # diagnostics, not liveness/readiness traffic.
+        pipeline = vnext_service.capacity_snapshot()
         smpp = {"state": "vnext", "connected": any(
             item.get("alive") for item in (pipeline.get("supervisor") or {}).get("workers", [])
         ), "routes": pipeline.get("routes", []), "projection": pipeline.get("projection", {})}
