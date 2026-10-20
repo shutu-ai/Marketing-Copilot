@@ -35,6 +35,7 @@ const isVnext=computed(()=>stats.value.pipeline==='vnext')
 const statuses=computed(()=>isVnext.value?['socket_written','submit_sm_resp_success','submit_sm_resp_error','write_failed','unknown','cancelled','expired']:['queued','sending','submitted','accepted','delivered','retrying','failed','partial','unknown','cancelled','expired'])
 const statItems=computed(()=>isVnext.value?[
   {key:'socket_written',label:i18n.global.t('smsTasks.socketWritten')},
+  {key:'socket_written_pdus',label:i18n.global.t('smsTasks.socketWrittenPdu')},
   {key:'submit_sm_resp_success',label:i18n.global.t('smsTasks.smscAccepted')},
   {key:'submit_sm_resp_error',label:i18n.global.t('smsTasks.smscRejected')},
   {key:'write_failed',label:i18n.global.t('smsTasks.writeFailed')},

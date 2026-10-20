@@ -1512,7 +1512,7 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     if not campaign:
         return None
     campaign["daily_stats"] = get_daily_stats(campaign_id)
-    _attach_daily_smpp(campaign_id, campaign["daily_stats"])
+    _attach_daily_smpp(campaign_id, campaign["daily_stats"], campaign)
     campaign["batches"] = get_batches(campaign_id)
     reached = read_transaction(
         lambda conn: conn.execute(
@@ -1527,10 +1527,75 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     return campaign
 
 
-def _attach_daily_smpp(campaign_id: int, daily_stats: list) -> None:
-    """Attach the SMSC label(s) used per stats date, derived from sms_tasks."""
+def _vnext_route_ids_by_day(campaign_id: int, days: set[str]) -> dict[str, list[int]]:
+    """Read VNext route ids from the compact projection, never the send path.
+
+    ``vnext_projection`` is already aggregated by business day, campaign and
+    route.  Reading it avoids replaying progress journals or scanning the
+    high-volume ``vnext_progress_events`` table when the detail page opens.
+    """
+    if not days:
+        return {}
+    try:
+        from services import vnext_service
+
+        if not vnext_service.is_active():
+            return {}
+        runtime = vnext_service.runtime()
+        db_path = getattr(runtime.projection, "db_path", "")
+        if not db_path:
+            return {}
+
+        import duckdb
+
+        values = sorted(str(day)[:10] for day in days if str(day))
+        if not values:
+            return {}
+        placeholders = ",".join("?" for _ in values)
+        connection = duckdb.connect(str(db_path), read_only=True)
+        try:
+            rows = connection.execute(
+                f"""SELECT business_day, route_id
+                       FROM vnext_projection
+                      WHERE campaign_type='batch' AND campaign_id=?
+                        AND business_day IN ({placeholders})
+                      GROUP BY business_day, route_id""",
+                [int(campaign_id), *values],
+            ).fetchall()
+        finally:
+            connection.close()
+
+        result: dict[str, set[int]] = {}
+        for business_day, route_id in rows:
+            day = str(business_day or "")[:10]
+            try:
+                resolved_route = int(route_id)
+            except (TypeError, ValueError):
+                continue
+            if day and resolved_route > 0:
+                result.setdefault(day, set()).add(resolved_route)
+        return {day: sorted(route_ids) for day, route_ids in result.items()}
+    except Exception:
+        # Detail statistics are diagnostic. A projection read failure must not
+        # affect ingestion, workers, SMPP connections, or the detail endpoint.
+        logger.debug(
+            "Unable to read VNext route projection campaign=%s",
+            campaign_id,
+            exc_info=True,
+        )
+        return {}
+
+
+def _attach_daily_smpp(campaign_id: int, daily_stats: list,
+                       campaign: Optional[dict] = None) -> None:
+    """Attach SMPP labels without coupling VNext details to legacy sms_tasks."""
     if not daily_stats:
         return
+    days = {
+        str(item.get("stats_date") or "")[:10]
+        for item in daily_stats
+        if str(item.get("stats_date") or "")
+    }
     rows, config_rows = read_transaction(
         lambda conn: (
             conn.execute(
@@ -1540,7 +1605,9 @@ def _attach_daily_smpp(campaign_id: int, daily_stats: list) -> None:
                    GROUP BY d, smpp_config_id""",
                 (campaign_id,),
             ).fetchall(),
-            conn.execute("SELECT id, name, host, port FROM smpp_configs").fetchall(),
+            conn.execute(
+                "SELECT id, name, host, port, enabled, priority FROM smpp_configs"
+            ).fetchall(),
         ),
         operation="batch_campaign.detail.smpp",
     )
@@ -1554,11 +1621,43 @@ def _attach_daily_smpp(campaign_id: int, daily_stats: list) -> None:
             return f"{cfg['name']} ({cfg['host']}:{cfg['port']})"
         return f"#{config_id}"
 
-    by_date = {}
+    by_date: dict[str, list] = {}
     for r in rows:
-        by_date.setdefault(str(r["d"]), []).append(r["smpp_config_id"])
+        by_date.setdefault(str(r["d"] or "")[:10], []).append(r["smpp_config_id"])
+
+    # VNext does not create sms_tasks. Use its low-cardinality projection for
+    # the actual route, then fall back to the campaign association for a day
+    # whose projection is not flushed yet.
+    for day, route_ids in _vnext_route_ids_by_day(campaign_id, days).items():
+        by_date.setdefault(day, []).extend(route_ids)
+
+    fallback_route_id = None
+    if campaign:
+        try:
+            configured_id = int(campaign.get("smpp_config_id") or 0)
+        except (TypeError, ValueError):
+            configured_id = 0
+        if configured_id > 0:
+            fallback_route_id = configured_id
+    if fallback_route_id is None:
+        enabled = [
+            r for r in config_rows
+            if int(r["enabled"] or 0) == 1
+        ]
+        if enabled:
+            default_config = min(
+                enabled,
+                key=lambda item: (
+                    int(item["priority"] or 100), int(item["id"]),
+                ),
+            )
+            fallback_route_id = int(default_config["id"])
+
     for item in daily_stats:
-        ids = by_date.get(item["stats_date"], [])
+        day = str(item.get("stats_date") or "")[:10]
+        ids = by_date.get(day, [])
+        if not ids and fallback_route_id is not None:
+            ids = [fallback_route_id]
         item["smpp_label"] = "、".join(dict.fromkeys(label(i) for i in ids)) or "-"
 
 

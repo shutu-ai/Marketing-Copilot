@@ -7,6 +7,7 @@ export interface DashboardStats {
   in_progress_batch_campaigns: number
   in_progress_realtime_campaigns: number
   ended_campaigns: number
+  today_completed_campaigns: number
   today_sent_count: number
   today_socket_written_count?: number
   today_smsc_accepted_count?: number
@@ -20,7 +21,7 @@ export interface DashboardStats {
   today_realtime_files: number
   today_realtime_event_users: number
   today_realtime_matched_users: number
-  daily_trend: Array<{ stats_date: string; sent_count: number; conversion_count: number }>
+  daily_trend: Array<{ stats_date: string; sent_count: number; conversion_count: number; matched_count: number; received_file_count: number }>
   today_open_exception_count: number
   today_recent_exceptions: Array<{ id: number; category: string; severity: string; code: string; message: string; created_at: string }>
 }

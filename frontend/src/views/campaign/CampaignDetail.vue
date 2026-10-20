@@ -55,7 +55,7 @@
           <template v-if="campaign?.customer_list_path">
             <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px">
               <el-select v-model="filterField" clearable :placeholder="$t('legacy.x9caecd93')" size="small" style="width:100px" @change="filterValue = ''">
-                <el-option v-for="h in prospectHeaders" :key="h" :label="h" :value="h" />
+                <el-option v-for="h in visibleProspectHeaders" :key="h" :label="h" :value="h" />
               </el-select>
               <el-input v-if="filterField" v-model="filterValue" :placeholder="$t('legacy.xe125986c')" size="small" style="width:130px" clearable @input="handleFilter" />
               <el-input v-model="searchText" :placeholder="$t('legacy.x681c0f39')" size="small" style="width:180px" clearable @input="handleFilter">
@@ -65,7 +65,7 @@
             <el-empty v-if="!prospectLoading && prospectTotal === 0" :description="searchText || filterField ? i18n.global.t('legacy.xa32c4660') : i18n.global.t('common.noData')" />
             <template v-else>
               <el-table ref="prospectTableRef" :data="prospectRows" stripe border size="small" max-height="500" v-loading="prospectLoading">
-                <el-table-column v-for="h in prospectHeaders" :key="h" :prop="h" :label="h" min-width="120" />
+                <el-table-column v-for="h in visibleProspectHeaders" :key="h" :prop="h" :label="h" min-width="120" />
               </el-table>
               <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">
                 <span style="font-size:13px;color:#909399">{{ $t('legacy.xfbd2b1fb') }} {{ prospectTotal }}</span>
@@ -85,8 +85,8 @@
         <el-tab-pane :label="$t('legacy.xe7502eb1')" name="sent">
           <el-table ref="sentTableRef" v-if="(campaign.daily_stats || []).length" :data="pagedStats" stripe border size="small">
             <el-table-column prop="stats_date" :label="$t('campaign.date')" width="140" />
-            <el-table-column prop="total_prospects" :label="$t('remaining.x35240e82')" width="120" />
-            <el-table-column prop="sent_count" :label="$t('smsLog.status_sent')" width="120" />
+            <el-table-column prop="total_prospects" :label="$t('campaign.totalProspects')" width="120" />
+            <el-table-column prop="sent_count" :label="$t('campaign.sentUsers')" width="120" />
             <el-table-column prop="smpp_label" label="SMPP" min-width="180" />
           </el-table>
           <el-empty v-else :description="$t('legacy.x4c105d20')" />
@@ -118,6 +118,8 @@ const campaign = ref<any>(null)
 const basicInfoActive = ref('basic')
 const prospectHeaders = ref<string[]>([])
 const prospectRows = ref<Record<string, string>[]>([])
+const hiddenProspectFields = new Set(['cell_id', 'customer_name', 'offer_code', 'event_filter_id'])
+const visibleProspectHeaders = computed(() => prospectHeaders.value.filter(h => !hiddenProspectFields.has(h)))
 const prospectTotal = ref(0)
 const prospectPage = ref(1)
 const prospectPageSize = ref(50)

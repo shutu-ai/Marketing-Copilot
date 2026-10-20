@@ -62,6 +62,68 @@ def test_dashboard_stats_builds_daily_trend_from_coalesced_task_date(isolated_db
     assert all(point["sent_count"] == 0 for point in stats["daily_trend"])
 
 
+def test_dashboard_daily_trend_includes_realtime_file_metrics(isolated_db):
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    conn = database.get_connection()
+    conn.execute(
+        """INSERT INTO realtime_campaign_files
+           (campaign_id,filename,total_msisdn,matched_count,created_at)
+           VALUES (1,?,?,?,?)""",
+        ("yesterday.csv", 10, 3, f"{yesterday} 08:00:00"),
+    )
+    conn.execute(
+        """INSERT INTO realtime_campaign_files
+           (campaign_id,filename,total_msisdn,matched_count,created_at)
+           VALUES (1,?,?,?,?)""",
+        ("today-1.csv", 12, 5, f"{today} 08:00:00"),
+    )
+    conn.execute(
+        """INSERT INTO realtime_campaign_files
+           (campaign_id,filename,total_msisdn,matched_count,created_at)
+           VALUES (1,?,?,?,?)""",
+        ("today-2.csv", 8, 2, f"{today} 09:00:00"),
+    )
+    conn.commit()
+
+    stats = dashboard_service._get_stats(conn, include_legacy_send_metrics=False)
+    conn.close()
+
+    trend = {point["stats_date"]: point for point in stats["daily_trend"]}
+    assert trend[yesterday]["matched_count"] == 3
+    assert trend[yesterday]["received_file_count"] == 1
+    assert trend[today]["matched_count"] == 7
+    assert trend[today]["received_file_count"] == 2
+    assert stats["today_realtime_matched_users"] == 7
+    assert stats["today_realtime_files"] == 2
+
+
+def test_dashboard_counts_only_campaigns_completed_today(isolated_db):
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO batch_campaigns(name,status,updated_at) VALUES (?,?,?)",
+        ("batch-completed-today", "completed", f"{today} 08:00:00"),
+    )
+    conn.execute(
+        "INSERT INTO realtime_campaigns(name,status,updated_at) VALUES (?,?,?)",
+        ("realtime-ended-today", "ended", f"{today} 09:00:00"),
+    )
+    conn.execute(
+        "INSERT INTO batch_campaigns(name,status,updated_at) VALUES (?,?,?)",
+        ("batch-completed-yesterday", "completed", f"{yesterday} 08:00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    conn = database.get_connection()
+    stats = dashboard_service._get_stats(conn, include_legacy_send_metrics=False)
+    conn.close()
+
+    assert stats["today_completed_campaigns"] == 2
+
+
 def test_submitted_task_records_transport_config_and_submit_parts(isolated_db):
     task_id = _insert_tasks(1)[0]
 
