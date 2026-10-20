@@ -93,8 +93,12 @@ normalize_text "$ROOT/backend/tools/mcctl.py" "$STAGE/bin/mcctl.py"
 normalize_text "$ROOT/deploy/marketing-copilot-cli" "$STAGE/bin/marketing-copilot-cli"
 chmod 0755 "$STAGE/bin/marketing-copilot-cli"
 # Version metadata for the online-update feature.
-GIT_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
-if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+# Windows checkouts can expose CRLF files to the Linux-side builder.  Make
+# Git apply the repository's autocrlf policy while checking tracked changes so
+# line-ending normalization does not turn a clean commit into a false dirty
+# release; real content changes still remain visible.
+GIT_SHA=$(git -C "$ROOT" -c core.autocrlf=true rev-parse --short HEAD 2>/dev/null || true)
+if [ -n "$(git -C "$ROOT" -c core.autocrlf=true status --porcelain --untracked-files=no 2>/dev/null)" ]; then
   GIT_SHA="${GIT_SHA}-dirty"
 fi
 cat > "$STAGE/backend/release.json" <<JSON
