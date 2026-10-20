@@ -87,7 +87,7 @@ def decode_short_message(data: bytes, data_coding: int, esm_class: int):
         payload = data[1 + udh_length:]
         if len(udh) >= 5 and udh[:2] == b"\x00\x03":
             concat = {"reference": udh[2], "total": udh[3], "part": udh[4]}
-    if data_coding == 8:
+    if data_coding in (8, 0x18):
         text = payload.decode("utf-16-be", errors="replace")
     else:
         gsm_overrides = {

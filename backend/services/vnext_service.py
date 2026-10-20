@@ -12,7 +12,7 @@ import os
 import json
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -758,10 +758,25 @@ def _task_item_from_event(
         "status": str(row.get("state") or "unknown"),
         "attempts": 0,
         "error_msg": str(row.get("error") or ""),
-        "updated_at": row.get("created_at"),
+        "updated_at": _format_event_timestamp(row.get("created_at")),
         "parts_written": int(row.get("parts_written") or 0),
         "parts_total": int(row.get("parts_total") or 0),
     }
+
+
+def _format_event_timestamp(value: object) -> str:
+    """Expose VNext epoch timestamps in the same string shape as legacy rows."""
+
+    if value is None or value == "":
+        return ""
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(
+            timespec="seconds"
+        )
+    except (TypeError, ValueError, OverflowError, OSError):
+        # Keep the adapter tolerant of already-formatted timestamps from old
+        # journal/projection data rather than making task listing fail.
+        return str(value)
 
 
 def _projection_task_page(

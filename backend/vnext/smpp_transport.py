@@ -25,6 +25,15 @@ UNBIND = 0x00000006
 RESPONSE_MASK = 0x80000000
 ESME_ROK = 0
 
+# The Flash SMS message class is carried by data_coding.  Keep these values
+# aligned with the legacy gateway and the Ethio Telecom SMPP profile used by
+# the application: default alphabet Class 0 is 0xF0 and UCS-2 Class 0 is
+# 0x18.
+SMPP_ENCODING_DEFAULT = 0x00
+SMPP_ENCODING_ISO10646 = 0x08
+FLASH_DCS_DEFAULT_ALPHABET = 0xF0
+FLASH_DCS_UCS2 = 0x18
+
 
 class SmppTransportError(RuntimeError):
     pass
@@ -45,12 +54,26 @@ def _split_text(message: str) -> tuple[list[bytes], int]:
         encoded = text.encode("utf-16-be")
         unit = 134  # 140 octets minus the six-octet concatenation UDH.
         if len(encoded) <= 140:
-            return [encoded], 8
-        return [encoded[index:index + unit] for index in range(0, len(encoded), unit)], 8
+            return [encoded], SMPP_ENCODING_ISO10646
+        return (
+            [encoded[index:index + unit] for index in range(0, len(encoded), unit)],
+            SMPP_ENCODING_ISO10646,
+        )
     encoded = text.encode("ascii", errors="replace")
     if len(encoded) <= 140:
-        return [encoded], 0
-    return [encoded[index:index + 134] for index in range(0, len(encoded), 134)], 0
+        return [encoded], SMPP_ENCODING_DEFAULT
+    return (
+        [encoded[index:index + 134] for index in range(0, len(encoded), 134)],
+        SMPP_ENCODING_DEFAULT,
+    )
+
+
+def _flash_data_coding(coding: int) -> int:
+    """Return the Flash SMS Class 0 DCS for the detected text alphabet."""
+
+    if int(coding) == SMPP_ENCODING_ISO10646:
+        return FLASH_DCS_UCS2
+    return FLASH_DCS_DEFAULT_ALPHABET
 
 
 def count_parts(message: str) -> int:
@@ -85,8 +108,15 @@ def build_submit_sm(sequence: int, *, source_addr: str, destination_addr: str,
     if len(parts) != int(total_parts):
         raise ValueError("total_parts does not match encoded message parts")
     effective_coding = detected_coding if data_coding is None else int(data_coding)
+    if flash_sms:
+        # Flash changes the DCS message class, but the alphabet must still
+        # match the bytes that were encoded from the message.  Do not let a
+        # route-level normal-message override turn Flash into an ordinary SMS.
+        effective_coding = _flash_data_coding(detected_coding)
     body_message = parts[int(part) - 1]
-    esm_class = 0x20 if flash_sms else 0
+    # Flash is represented by the DCS above.  Keep ESM/UDH semantics identical
+    # to an ordinary message; multipart messages add only the normal UDHI bit.
+    esm_class = 0
     if total_parts > 1:
         body_message = bytes((0x05, 0x00, 0x03, int(reference) & 0xFF,
                               int(total_parts) & 0xFF, int(part) & 0xFF)) + body_message

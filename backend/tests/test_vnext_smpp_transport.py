@@ -17,6 +17,7 @@ from vnext.smpp_transport import (
     build_bind,
     read_pdu,
 )
+from tools.smsc_simulator import parse_submit_sm
 
 
 async def _loopback_server():
@@ -149,6 +150,30 @@ def test_submit_sm_multipart_contains_standard_concat_udh():
     assert command == SUBMIT_SM
     assert status == 0 and sequence == 7
     assert b"\x05\x00\x03\x09\x03\x01" in packet
+
+
+@pytest.mark.parametrize(
+    ("message", "configured_coding", "expected_coding"),
+    [
+        ("hello", None, 0xF0),
+        ("hello", 0x08, 0xF0),
+        ("እንደምን", None, 0x18),
+        ("እንደምን", 0x00, 0x18),
+    ],
+)
+def test_flash_submit_sm_uses_class_zero_dcs_and_preserves_esm(
+    message, configured_coding, expected_coding,
+):
+    packet = build_submit_sm(
+        8, source_addr="VNEXT", destination_addr="251900000001",
+        message=message, flash_sms=True, data_coding=configured_coding,
+        registered_delivery=0,
+    )
+
+    fields = parse_submit_sm(packet[16:])
+    assert fields["data_coding"] == expected_coding
+    assert fields["esm_class"] == 0
+    assert fields["text"] == message
 
 
 def test_smpp_bind_and_submit_honor_route_protocol_fields():

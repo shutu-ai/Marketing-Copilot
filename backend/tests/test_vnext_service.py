@@ -147,6 +147,7 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
     assert first_page["items"][0]["msisdn"] == "251900000001"
     assert first_page["items"][0]["language"] == "english"
     assert first_page["items"][0]["content"] == "Hello 251900000001"
+    assert first_page["items"][0]["updated_at"] == "1970-01-01T00:00:04+00:00"
 
     second_page = vnext_service.list_tasks(page=2, page_size=1)
     assert second_page["items"][0]["event_id"] == "task-1"
