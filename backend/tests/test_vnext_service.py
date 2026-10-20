@@ -157,6 +157,12 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
     assert cursor_page["page"] == 2
     assert cursor_page["items"][0]["event_id"] == "task-1"
 
+    filtered_page = vnext_service.list_tasks(
+        page=1, page_size=10, msisdn="251900000001"
+    )
+    assert filtered_page["total"] == 2
+    assert {item["msisdn"] for item in filtered_page["items"]} == {"251900000001"}
+
 
 def test_vnext_task_campaign_names_are_resolved_in_one_bounded_control_read(monkeypatch):
     calls = []

@@ -9,7 +9,43 @@
     </div>
     <el-row :gutter="12" class="stats"><el-col v-for="item in statItems" :key="item.key" class="stat-col"><el-card shadow="never"><div class="stat-label">{{ item.label }}</div><div class="stat-period">{{ $t('campaign.today') }}</div><div class="stat-value">{{ stats[`today_${item.key}`] ?? stats[item.key] ?? 0 }}</div></el-card></el-col></el-row>
     <el-alert v-if="stats.pipeline==='vnext'" type="info" :closable="false" show-icon :title="$t('smsTasks.vnextNotice')" :description="$t('smsTasks.vnextNoticeDescription',{lag:Number(stats.projection_lag_seconds || 0).toFixed(3)})" style="margin-bottom:16px" />
-    <el-card shadow="never" class="filters"><div class="filter-bar"><el-form inline><el-form-item :label="$t('common.status')"><el-select v-model="status" clearable style="width:150px" @change="applyFilters"><el-option v-for="value in statuses" :key="value" :label="value" :value="value"/></el-select></el-form-item><el-form-item :label="$t('legacy.x13955e03')"><el-select v-model="campaignType" clearable style="width:140px" @change="applyFilters"><el-option :label="$t('legacy.xe099c261')" value="batch"/><el-option :label="$t('legacy.x2843e2f6')" value="realtime"/></el-select></el-form-item><el-form-item :label="$t('legacy.xb2db9f1c')"><el-select v-model="smppFilter" style="width:180px" @change="applyFilters"><el-option :label="$t('common.all')" :value="-1"/><el-option :label="$t('legacy.x18c63459')" :value="0"/><el-option v-for="cfg in smppConfigs" :key="cfg.id" :value="cfg.id" :label="`${cfg.name} (${cfg.host}:${cfg.port})`"/></el-select></el-form-item></el-form><el-button :loading="loading" @click="fetchData()"><el-icon><Refresh /></el-icon>{{ $t('common.refresh') }}</el-button></div></el-card>
+    <el-card shadow="never" class="filters">
+      <div class="filter-bar">
+        <el-form inline>
+          <el-form-item :label="$t('common.status')">
+            <el-select v-model="status" clearable style="width:150px" @change="applyFilters">
+              <el-option v-for="value in statuses" :key="value" :label="value" :value="value"/>
+            </el-select>
+          </el-form-item>
+          <el-form-item :label="$t('legacy.x13955e03')">
+            <el-select v-model="campaignType" clearable style="width:140px" @change="applyFilters">
+              <el-option :label="$t('legacy.xe099c261')" value="batch"/>
+              <el-option :label="$t('legacy.x2843e2f6')" value="realtime"/>
+            </el-select>
+          </el-form-item>
+          <el-form-item :label="$t('legacy.xb2db9f1c')">
+            <el-select v-model="smppFilter" style="width:180px" @change="applyFilters">
+              <el-option :label="$t('common.all')" :value="-1"/>
+              <el-option :label="$t('legacy.x18c63459')" :value="0"/>
+              <el-option v-for="cfg in smppConfigs" :key="cfg.id" :value="cfg.id" :label="`${cfg.name} (${cfg.host}:${cfg.port})`"/>
+            </el-select>
+          </el-form-item>
+          <el-form-item :label="$t('smsLog.msisdn')">
+            <el-input
+              v-model="msisdnFilter"
+              clearable
+              inputmode="numeric"
+              style="width:180px"
+              :placeholder="$t('smsTasks.phoneFilterPlaceholder')"
+              @input="msisdnFilter = normalizeMsisdnFilter($event)"
+              @change="applyFilters"
+              @keyup.enter="applyFilters"
+            />
+          </el-form-item>
+        </el-form>
+        <el-button :loading="loading" @click="fetchData()"><el-icon><Refresh /></el-icon>{{ $t('common.refresh') }}</el-button>
+      </div>
+    </el-card>
     <div class="table-shell"><DataState :loading="loading" :has-data="items.length>0" :empty="!loading&&!error&&!items.length" :error="error" :empty-title="$t('legacy.xf388438a')" :empty-description="$t('legacy.xfb24ae8e')" @retry="fetchData()">
       <el-alert v-if="error" type="warning" :closable="false" show-icon :title="$t('legacy.x1e823103')"/>
     <el-table :data="items" stripe><el-table-column prop="campaign_name" :label="$t('legacy.x36c6f572')" min-width="150"/><el-table-column prop="campaign_type" :label="$t('legacy.x226b0912')" width="90"/><el-table-column label="SMPP" width="170"><template #default="{row}"><span v-if="row.smpp_config_id">{{ smppName(row.smpp_config_id) }}</span><span v-else class="muted">{{ $t('legacy.x18c63459') }}</span></template></el-table-column><el-table-column prop="msisdn" :label="$t('smsLog.msisdn')" width="150"/><el-table-column prop="language" :label="$t('common.language')" width="80"/><el-table-column prop="content" :label="$t('legacy.x2d711b09')" min-width="220" show-overflow-tooltip/><el-table-column :label="$t('common.status')" width="150"><template #default="{row}"><StatusTag :status="row.status"/></template></el-table-column><el-table-column prop="attempts" :label="$t('legacy.xfa8f026e')" width="70"/><el-table-column prop="error_msg" :label="$t('legacy.x7030ff64')" min-width="160" show-overflow-tooltip/><el-table-column :label="$t('common.updated_at')" width="180"><template #default="{row}">{{ formatDateTime(row.updated_at) }}</template></el-table-column><el-table-column v-if="stats.pipeline !== 'vnext'" :label="$t('common.action')" width="90" fixed="right"><template #default="{row}"><el-dropdown v-if="['submitted','accepted','failed','expired'].includes(row.status)" trigger="click" @command="(cmd:any)=>onAction(cmd,row)"><el-button link type="primary">{{ $t('common.more') }}<el-icon><ArrowDown/></el-icon></el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="retry">{{ $t('legacy.xe3095030') }}</el-dropdown-item><el-dropdown-item v-if="['submitted','accepted'].includes(row.status)" command="confirm-delivered">{{ $t('legacy.xc28d5575') }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown><span v-else class="muted">—</span></template></el-table-column></el-table>
@@ -29,7 +65,8 @@ import {getSmppConfigs} from '@/api/smpp'
 import { formatDateTime } from '@/utils/format'
 import { useAuthStore } from '@/stores/auth'
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
-const PAGE_SIZE_KEY='mc.sms-tasks.page-size',route=useRoute(),router=useRouter(),items=ref<any[]>([]),stats=ref<Record<string,any>>({}),loading=ref(false),error=ref(''),total=ref(0),page=ref(1),pageSize=ref(Number(localStorage.getItem(PAGE_SIZE_KEY))||50),cursorHistory=ref<Array<number|undefined>>([undefined]),nextCursor=ref<number|null>(null),hasMore=ref(false),status=ref(typeof route.query.status==='string'?route.query.status:''),campaignType=ref(typeof route.query.type==='string'?route.query.type:''),smppFilter=ref(typeof route.query.smpp==='string'&&Number.isFinite(Number(route.query.smpp))?Number(route.query.smpp):-1),smppConfigs=ref<any[]>([]),autoRefresh=ref(true),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale'),exclusionVisible=ref(false),exclusions=ref<any[]>([]),exclusionForm=ref({msisdn:'',reason:''}),exclusionPage=ref(1),exclusionPageSize=ref(50),exclusionTotal=ref(0)
+function normalizeMsisdnFilter(value: unknown): string { return String(value ?? '').replace(/\D/g, '') }
+const PAGE_SIZE_KEY='mc.sms-tasks.page-size',route=useRoute(),router=useRouter(),items=ref<any[]>([]),stats=ref<Record<string,any>>({}),loading=ref(false),error=ref(''),total=ref(0),page=ref(1),pageSize=ref(Number(localStorage.getItem(PAGE_SIZE_KEY))||50),cursorHistory=ref<Array<number|undefined>>([undefined]),nextCursor=ref<number|null>(null),hasMore=ref(false),status=ref(typeof route.query.status==='string'?route.query.status:''),campaignType=ref(typeof route.query.type==='string'?route.query.type:''),smppFilter=ref(typeof route.query.smpp==='string'&&Number.isFinite(Number(route.query.smpp))?Number(route.query.smpp):-1),msisdnFilter=ref(typeof route.query.msisdn==='string'?normalizeMsisdnFilter(route.query.msisdn):''),smppConfigs=ref<any[]>([]),autoRefresh=ref(true),lastUpdated=ref<Date|null>(null),pollState=ref<'live'|'stale'|'offline'>('stale'),exclusionVisible=ref(false),exclusions=ref<any[]>([]),exclusionForm=ref({msisdn:'',reason:''}),exclusionPage=ref(1),exclusionPageSize=ref(50),exclusionTotal=ref(0)
 const authStore = useAuthStore()
 const canOperate = computed(() => ['admin', 'marketing'].includes(authStore.role))
 const isVnext=computed(()=>stats.value.pipeline==='vnext')
@@ -47,8 +84,8 @@ const statItems=computed(()=>isVnext.value?[
   {key:'total',label:i18n.global.t('legacy.x0f7991c2')},{key:'queued',label:i18n.global.t('legacy.xe5ac1d20')},{key:'submitted',label:i18n.global.t('legacy.xf5e626da')},{key:'accepted',label:i18n.global.t('smsTasks.accepted')},{key:'delivered',label:i18n.global.t('smsTasks.delivered')},{key:'retrying',label:i18n.global.t('legacy.xd7a2a293')},{key:'failed',label:i18n.global.t('common.fail')},{key:'unknown',label:i18n.global.t('smsTasks.unknown')},{key:'cancelled',label:i18n.global.t('smsTasks.cancelled')},
 ]);let timer=0,inFlight=false
 function smppName(configId:number){const cfg=smppConfigs.value.find((c:any)=>c.id===configId);return cfg?`${cfg.name} (${cfg.host}:${cfg.port})`:`#${configId}`}
-function syncUrl(){router.replace({query:{...route.query,status:status.value||undefined,type:campaignType.value||undefined,smpp:smppFilter.value>=0?String(smppFilter.value):undefined,page:page.value>1?String(page.value):undefined}})}
-async function fetchData(silent=false){if(inFlight)return;inFlight=true;if(!silent)loading.value=true;try{const [tasks,summary]=await Promise.all([getSmsTasks({page:page.value,page_size:pageSize.value,cursor:cursorHistory.value[page.value-1],status:status.value||undefined,campaign_type:campaignType.value||undefined,smpp_config_id:smppFilter.value>=0?smppFilter.value:undefined}),getSmsTaskStats()]);items.value=tasks.data.items;total.value=tasks.data.total;nextCursor.value=tasks.data.next_cursor??null;hasMore.value=!!tasks.data.has_more;stats.value=summary.data;lastUpdated.value=new Date();pollState.value='live';error.value=''}catch(e:any){error.value=e.response?.data?.detail||i18n.global.t('common.connectionFailed');pollState.value=lastUpdated.value?'stale':'offline'}finally{inFlight=false;loading.value=false}}
+function syncUrl(){router.replace({query:{...route.query,status:status.value||undefined,type:campaignType.value||undefined,smpp:smppFilter.value>=0?String(smppFilter.value):undefined,msisdn:msisdnFilter.value||undefined,page:page.value>1?String(page.value):undefined}})}
+async function fetchData(silent=false){if(inFlight)return;inFlight=true;if(!silent)loading.value=true;try{const [tasks,summary]=await Promise.all([getSmsTasks({page:page.value,page_size:pageSize.value,cursor:cursorHistory.value[page.value-1],status:status.value||undefined,campaign_type:campaignType.value||undefined,smpp_config_id:smppFilter.value>=0?smppFilter.value:undefined,msisdn:msisdnFilter.value||undefined}),getSmsTaskStats()]);items.value=tasks.data.items;total.value=tasks.data.total;nextCursor.value=tasks.data.next_cursor??null;hasMore.value=!!tasks.data.has_more;stats.value=summary.data;lastUpdated.value=new Date();pollState.value='live';error.value=''}catch(e:any){error.value=e.response?.data?.detail||i18n.global.t('common.connectionFailed');pollState.value=lastUpdated.value?'stale':'offline'}finally{inFlight=false;loading.value=false}}
 function resetTaskPaging(){page.value=1;cursorHistory.value=[undefined];nextCursor.value=null;hasMore.value=false} function applyFilters(){resetTaskPaging();syncUrl();fetchData()} function previousPage(){if(page.value<=1)return;page.value-=1;syncUrl();fetchData()} function nextPage(){if(!hasMore.value||!nextCursor.value)return;cursorHistory.value[page.value]=nextCursor.value;page.value+=1;syncUrl();fetchData()} function changePageSize(size:number){pageSize.value=size;localStorage.setItem(PAGE_SIZE_KEY,String(size));resetTaskPaging();syncUrl();fetchData()}
 async function onAction(cmd:string,row:any){try{if(cmd==='retry'){await retrySmsTask(row.id);ElMessage.success(i18n.global.t('legacy.x324dd993'))}else if(cmd==='confirm-delivered'){await confirmDelivered(row.id);ElMessage.success(i18n.global.t('legacy.x093c631e'))}fetchData()}catch(e:any){ElMessage.error(e.response?.data?.detail||i18n.global.t('legacy.xfb5dedea'))}}
 async function openExclusions(){exclusionVisible.value=true;const res=await getExclusions({page:exclusionPage.value,page_size:exclusionPageSize.value});exclusions.value=res.data.items||[];exclusionTotal.value=res.data.total??exclusions.value.length} async function createExclusion(){if(!exclusionForm.value.msisdn)return ElMessage.warning(i18n.global.t('legacy.x6e4f4b33'));await addExclusion(exclusionForm.value.msisdn,exclusionForm.value.reason);exclusionForm.value={msisdn:'',reason:''};await openExclusions()} async function removeExclusion(id:number){await deleteExclusion(id);await openExclusions()} function changeExclusionPage(nextPage:number){exclusionPage.value=nextPage;void openExclusions()}

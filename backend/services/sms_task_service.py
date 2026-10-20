@@ -3068,8 +3068,10 @@ def _cached_task_count(conn, where: str, params: list) -> int:
         return total
 
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
-               smpp_config_id: int = -1, cursor: Optional[int] = None) -> dict:
+               smpp_config_id: int = -1, cursor: Optional[int] = None,
+               msisdn: str = "") -> dict:
     conditions, params = [], []
+    normalized_msisdn = normalize_msisdn(msisdn)
     if status:
         conditions.append("status=?")
         params.append(status)
@@ -3082,6 +3084,9 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
         else:
             conditions.append("smpp_config_id=?")
             params.append(smpp_config_id)
+    if normalized_msisdn:
+        conditions.append("msisdn=?")
+        params.append(normalized_msisdn)
     count_where = "WHERE " + " AND ".join(conditions) if conditions else ""
     def read(conn):
         total = task_stats()["total"] if not conditions else _cached_task_count(conn, count_where, params)

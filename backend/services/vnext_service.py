@@ -781,7 +781,7 @@ def _format_event_timestamp(value: object) -> str:
 
 def _projection_task_page(
     page: int, page_size: int, status: str, campaign_type: str,
-    smpp_config_id: int, business_day: str | None,
+    smpp_config_id: int, business_day: str | None, msisdn: str = "",
 ) -> tuple[int, list[dict]] | None:
     """Read only one task page from the bounded VNext projection database.
 
@@ -810,12 +810,24 @@ def _projection_task_page(
         if int(smpp_config_id) >= 0:
             conditions.append("e.route_id=?")
             params.append(int(smpp_config_id))
+        if msisdn:
+            conditions.append(
+                "COALESCE(NULLIF(e.normalized_msisdn,''), base.normalized_msisdn, '')=?"
+            )
+            params.append(msisdn)
         where = " AND ".join(conditions)
         offset = (max(1, int(page)) - 1) * max(1, int(page_size))
         connection = duckdb.connect(str(db_path), read_only=True)
         try:
+            count_join = ""
+            if msisdn:
+                count_join = """
+                  LEFT JOIN vnext_progress_events base
+                    ON base.event_id=split_part(e.event_id, ':resp:', 1)
+                   AND base.business_day=e.business_day
+                """
             total = int(connection.execute(
-                f"SELECT COUNT(*) FROM vnext_progress_events e WHERE {where}",
+                f"SELECT COUNT(*) FROM vnext_progress_events e{count_join} WHERE {where}",
                 params,
             ).fetchone()[0])
             rows = connection.execute(
@@ -848,7 +860,7 @@ def _projection_task_page(
 
 def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_type: str = "",
                smpp_config_id: int = -1, cursor: Optional[int] = None,
-               business_day: str | None = None) -> dict:
+               business_day: str | None = None, msisdn: str = "") -> dict:
     page = max(1, int(page))
     # Keep the existing cursor-based API usable by acceptance tools and older
     # clients.  VNext cursors are page tokens, while the legacy implementation
@@ -857,8 +869,11 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     if page <= 1 and cursor is not None and int(cursor) > 0:
         page = int(cursor)
     page_size = max(1, min(200, int(page_size)))
+    from services import sms_task_service
+    normalized_msisdn = sms_task_service.normalize_msisdn(msisdn)
     projection_page = _projection_task_page(
         page, page_size, status, campaign_type, smpp_config_id, business_day,
+        normalized_msisdn,
     )
     if projection_page is not None:
         total, rows = projection_page
@@ -878,13 +893,23 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     # Compatibility fallback for a runtime whose projection database has not
     # been initialized yet.  Normal production requests use the bounded SQL
     # path above and do not replay the worker journals.
-    events = [item for item in _progress_events(business_day)
+    all_events = list(_progress_events(business_day))
+    by_id = {str(item.get("event_id") or ""): item for item in all_events}
+
+    def event_msisdn(item: dict) -> str:
+        value = str(item.get("normalized_msisdn") or "")
+        if value:
+            return value
+        parent_id = str(item.get("event_id") or "").split(":resp:", 1)[0]
+        return str(by_id.get(parent_id, {}).get("normalized_msisdn") or "")
+
+    events = [item for item in all_events
               if (not status or str(item.get("state")) == str(status))
               and (not campaign_type or str(item.get("campaign_type")) == str(campaign_type))
-              and (int(smpp_config_id) < 0 or int(item.get("route_id") or 0) == int(smpp_config_id))]
+              and (int(smpp_config_id) < 0 or int(item.get("route_id") or 0) == int(smpp_config_id))
+              and (not normalized_msisdn or event_msisdn(item) == normalized_msisdn)]
     events.sort(key=lambda item: (float(item.get("created_at") or 0), str(item.get("event_id"))), reverse=True)
     total = len(events)
-    by_id = {str(item.get("event_id") or ""): item for item in events}
     offset = (page - 1) * page_size
     rows = events[offset:offset + page_size]
     campaign_names = _campaign_names_for_rows(rows)

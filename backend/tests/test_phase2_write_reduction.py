@@ -562,6 +562,17 @@ def test_task_list_uses_stable_keyset_cursor(isolated_db):
     assert max(second_ids) < min(first_ids)
 
 
+def test_task_list_filters_by_normalized_msisdn(isolated_db):
+    _insert_tasks(3, status="queued")
+
+    result = sms_task_service.list_tasks(
+        page_size=20, msisdn="+251 900000001"
+    )
+
+    assert result["total"] == 1
+    assert [item["msisdn"] for item in result["items"]] == ["251900000001"]
+
+
 def test_failure_views_use_id_keyset_cursors(isolated_db):
     task_ids = _insert_tasks(7, status="failed")
     conn = database.get_connection()

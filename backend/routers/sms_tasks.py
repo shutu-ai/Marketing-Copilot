@@ -16,12 +16,15 @@ class ExclusionRequest(BaseModel):
 @router.get("")
 def list_tasks(page: int = 1, page_size: int = Query(50, le=200), status: str = "",
                campaign_type: str = "", smpp_config_id: int = Query(-1),
-               cursor: Optional[int] = Query(None, ge=1)):
+               cursor: Optional[int] = Query(None, ge=1), msisdn: str = Query("")):
     from services import vnext_service
     if vnext_service.is_active():
-        return vnext_service.list_tasks(page, page_size, status, campaign_type, smpp_config_id, cursor)
+        return vnext_service.list_tasks(
+            page, page_size, status, campaign_type, smpp_config_id, cursor,
+            msisdn=msisdn,
+        )
     return sms_task_service.list_tasks(
-        page, page_size, status, campaign_type, smpp_config_id, cursor
+        page, page_size, status, campaign_type, smpp_config_id, cursor, msisdn
     )
 
 
