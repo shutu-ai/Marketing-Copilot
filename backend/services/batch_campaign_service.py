@@ -31,7 +31,6 @@ _batch_generation_lock = threading.RLock()
 _batch_source_lock = threading.RLock()
 _batch_source_cursors = {}
 _batch_generation_cursors = {}
-
 try:
     _BATCH_INGEST_QUANTUM = max(
         1, min(100, int(os.environ.get("MC_BATCH_INGEST_QUANTUM", "1")))
@@ -45,6 +44,11 @@ BATCH_CUSTOMER_LIST_EXTENSIONS = {".csv", ".txt", ".xlsx", ".xls"}
 CUSTOMER_LIST_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "latin-1")
 INGEST_QUEUE_HIGH_WATERMARK = backpressure_service.TASK_HIGH
 INGEST_QUEUE_LOW_WATERMARK = backpressure_service.TASK_LOW
+
+
+def _normalize_phone_prefix(value) -> str:
+    """Keep the configured country prefix separate from subscriber numbers."""
+    return re.sub(r"\D", "", str(value or ""))
 
 
 def _run_campaign_write(operation: str, writer):
@@ -379,7 +383,8 @@ def get_one(campaign_id: int) -> Optional[dict]:
 
 def create(data: BatchCampaignCreate) -> dict:
     name = campaign_name_service.ensure_unique_name(data.name)
-    if not (data.phone_prefix or "").strip():
+    phone_prefix = _normalize_phone_prefix(data.phone_prefix)
+    if not phone_prefix:
         raise ValueError("请输入号码前缀")
     use_custom_directory = bool(data.use_custom_directory and (data.campaign_dir or "").strip())
     campaign_dir = (data.campaign_dir or "").strip() if use_custom_directory else ""
@@ -391,7 +396,7 @@ def create(data: BatchCampaignCreate) -> dict:
              data.send_start_time or "", data.send_end_time or "",
              _fmt_days(data.send_days), data.batch_size or 500, campaign_dir,
              use_custom_directory, data.sms_template_id, data.smpp_config_id,
-             bool(data.flash_sms), data.phone_prefix or ""),
+             bool(data.flash_sms), phone_prefix),
         )
         return dict(conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)
@@ -464,9 +469,15 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
         if not only_allowed:
             raise ValueError("Campaign has already started - cannot edit")
 
+    normalized_phone_prefix = (
+        _normalize_phone_prefix(data.phone_prefix)
+        if data.phone_prefix is not None else None
+    )
     fields = {}
     for field in ["name", "start_time", "end_time", "status", "send_start_time", "send_end_time", "batch_size", "campaign_dir", "use_custom_directory", "sms_template_id", "smpp_config_id", "flash_sms", "phone_prefix"]:
         value = getattr(data, field, None)
+        if field == "phone_prefix":
+            value = normalized_phone_prefix
         if value is not None:
             fields[field] = value
     if data.send_days is not None:
@@ -646,7 +657,7 @@ def copy(campaign_id: int) -> Optional[dict]:
              orig.get("send_start_time", ""), orig.get("send_end_time", ""),
              orig.get("send_days", "[]"), orig.get("batch_size", 500),
              orig.get("sms_template_id"), orig.get("smpp_config_id"),
-             bool(orig.get("flash_sms")), orig.get("phone_prefix", "")),
+             bool(orig.get("flash_sms")), _normalize_phone_prefix(orig.get("phone_prefix", ""))),
         )
         new_row = conn.execute(
             "SELECT * FROM batch_campaigns WHERE id=?", (cursor.lastrowid,)

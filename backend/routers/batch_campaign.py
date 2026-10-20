@@ -61,7 +61,10 @@ def process_batch(batch_id: int):
 
 @router.post("/{campaign_id}/copy")
 def copy_campaign(campaign_id: int):
-    campaign = batch_campaign_service.copy(campaign_id)
+    try:
+        campaign = batch_campaign_service.copy(campaign_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not campaign:
         raise HTTPException(status_code=404, detail="活动不存在")
     return campaign

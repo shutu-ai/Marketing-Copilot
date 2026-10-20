@@ -197,7 +197,13 @@
           </el-checkbox-group>
         </el-form-item>
         <el-form-item :label="$t('campaign.phonePrefix')" required>
-          <el-input v-model="editForm.phone_prefix" placeholder="251" />
+          <el-input
+            v-model="editForm.phone_prefix"
+            placeholder="251"
+            inputmode="numeric"
+            autocomplete="off"
+            @input="editForm.phone_prefix = normalizePhonePrefix($event)"
+          />
           <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
         </el-form-item>
         </template>
@@ -340,6 +346,10 @@ const directoryPickerVisible = ref(false)
 const smppOptions = ref<any[]>([])
 const enabledSmppOptions = computed(() => smppOptions.value.filter((item: any) => item.enabled === 1))
 
+function normalizePhonePrefix(value: unknown): string {
+  return String(value ?? '').replace(/\D/g, '')
+}
+
 function smppName(configId: number | null) {
   const cfg = smppOptions.value.find((item: any) => item.id === configId)
   return cfg ? `${cfg.name} (${cfg.host}:${cfg.port})` : `#${configId}`
@@ -425,7 +435,8 @@ async function handleSave() {
     ElMessage.warning(i18n.global.t('legacy.x7528b32e'))
     return
   }
-  if (!editForm.value.id && !editForm.value.phone_prefix.trim()) {
+  const phonePrefix = String(editForm.value.phone_prefix || '').trim()
+  if (!editForm.value.id && !phonePrefix) {
     ElMessage.warning('\u8bf7\u8f93\u5165\u53f7\u7801\u524d\u7f00')
     return
   }
@@ -443,7 +454,7 @@ async function handleSave() {
       use_custom_directory: customDirectory.value,
       smpp_config_id: editForm.value.smpp_config_id || undefined,
       flash_sms: editForm.value.flash_sms,
-      phone_prefix: editForm.value.phone_prefix || undefined,
+      phone_prefix: phonePrefix || undefined,
     }
     if (editForm.value.id && editForm.value.status !== 'not_started' && editForm.value.status !== 'ended') {
       payload = { smpp_config_id: editForm.value.smpp_config_id || undefined }

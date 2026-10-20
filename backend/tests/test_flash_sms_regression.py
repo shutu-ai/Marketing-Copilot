@@ -220,6 +220,29 @@ def test_create_defaults_and_copy_preserves_flash_flag(isolated_db, monkeypatch,
     assert realtime_campaign_service.copy(realtime_flash["id"])["flash_sms"] is True
 
 
+def test_batch_phone_prefix_stays_separate_from_subscriber_number(isolated_db, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        batch_campaign_service,
+        "_get_batch_base_dir",
+        lambda: str(tmp_path / "batch-root"),
+    )
+    campaign = batch_campaign_service.create(
+        BatchCampaignCreate(name="prefix-normalization", phone_prefix=" +251 ")
+    )
+    assert campaign["phone_prefix"] == "251"
+
+    updated = batch_campaign_service.update(
+        campaign["id"], BatchCampaignUpdate(phone_prefix="251")
+    )
+    assert updated["phone_prefix"] == "251"
+    assert batch_campaign_service.get_one(campaign["id"])["phone_prefix"] == "251"
+
+    extended = batch_campaign_service.update(
+        campaign["id"], BatchCampaignUpdate(phone_prefix="251980665666")
+    )
+    assert extended["phone_prefix"] == "251980665666"
+
+
 def test_task_generation_captures_flash_flag_once(isolated_db):
     conn = database.get_connection()
     content_campaign_id = conn.execute(
