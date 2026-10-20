@@ -246,6 +246,45 @@ def test_vnext_stats_contract_uses_socket_written_as_sent(tmp_path, monkeypatch)
     assert dashboard["sent_metric"] == "socket_written"
 
 
+def test_campaign_daily_totals_filters_projection_to_one_campaign(tmp_path, monkeypatch):
+    fake = _FakeRuntime(tmp_path)
+
+    class Projection:
+        def snapshot(self):
+            return {
+                "campaign_daily_totals": [
+                    {
+                        "business_day": "2026-10-20",
+                        "campaign_type": "batch",
+                        "campaign_id": 11,
+                        "socket_written": 37,
+                    },
+                    {
+                        "business_day": "2026-10-19",
+                        "campaign_type": "batch",
+                        "campaign_id": 11,
+                        "socket_written": 12,
+                    },
+                    {
+                        "business_day": "2026-10-20",
+                        "campaign_type": "batch",
+                        "campaign_id": 12,
+                        "socket_written": 99,
+                    },
+                ]
+            }
+
+    fake.projection = Projection()
+    monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
+
+    result = vnext_service.campaign_daily_totals("batch", 11)
+
+    assert [(item["business_day"], item["socket_written"]) for item in result] == [
+        ("2026-10-20", 37),
+        ("2026-10-19", 12),
+    ]
+
+
 def test_vnext_task_stats_use_projection_and_campaign_stats_use_live_aggregate(tmp_path, monkeypatch):
     fake = _FakeRuntime(tmp_path)
 

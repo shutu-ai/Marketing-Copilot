@@ -690,6 +690,70 @@ def get_daily_stats(campaign_id: int) -> list:
     return [dict(r) for r in rows]
 
 
+def _merge_vnext_daily_stats(
+    campaign_id: int,
+    campaign: dict,
+    legacy_daily_stats: list[dict],
+) -> list[dict]:
+    """Use the VNext send contract for batch-detail daily counts.
+
+    ``batch_campaign_daily_stats`` belongs to the legacy task-table path.  In
+    VNext, the dashboard's send metric is ``socket_written`` from the bounded
+    projection snapshot.  Merge that read-only source by day while retaining
+    legacy rows for dates that predate VNext or are not present in the
+    projection snapshot.
+    """
+
+    try:
+        from services import vnext_service
+
+        if not vnext_service.is_active():
+            return legacy_daily_stats
+        vnext_rows = vnext_service.campaign_daily_totals("batch", campaign_id)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        logger.debug(
+            "Unable to read VNext daily stats for batch campaign=%s",
+            campaign_id,
+            exc_info=True,
+        )
+        return legacy_daily_stats
+
+    if not vnext_rows:
+        return legacy_daily_stats
+
+    by_day = {
+        str(item.get("stats_date") or "")[:10]: dict(item)
+        for item in legacy_daily_stats
+        if str(item.get("stats_date") or "")[:10]
+    }
+    default_total = int(campaign.get("row_count") or 0)
+    for item in vnext_rows:
+        stats_date = str(item.get("business_day") or "")[:10]
+        if not stats_date:
+            continue
+        current = by_day.get(stats_date, {})
+        current.update({
+            "stats_date": stats_date,
+            "total_prospects": int(current.get("total_prospects") or default_total),
+            # One logical VNext send event represents one recipient task;
+            # multipart PDU counts remain separate evidence fields.
+            "sent_count": int(item.get("socket_written") or 0),
+            "socket_written_events": int(item.get("socket_written") or 0),
+            "socket_written_pdus": int(item.get("socket_written_pdus") or 0),
+            "smsc_accepted_pdus": int(item.get("response_success") or 0),
+            "smsc_rejected_pdus": int(item.get("response_error") or 0),
+            "stats_source": "vnext_projection",
+        })
+        current.setdefault("conversion_count", 0)
+        by_day[stats_date] = current
+
+    return sorted(
+        by_day.values(),
+        key=lambda item: str(item.get("stats_date") or ""),
+        reverse=True,
+    )
+
+
 def reset_batches_for_today(campaign_id: int) -> bool:
     """Mark all batches pending again for the current day (daily-repeat send).
 
@@ -1511,7 +1575,11 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     campaign = get_one(campaign_id)
     if not campaign:
         return None
-    campaign["daily_stats"] = get_daily_stats(campaign_id)
+    campaign["daily_stats"] = _merge_vnext_daily_stats(
+        campaign_id,
+        campaign,
+        get_daily_stats(campaign_id),
+    )
     _attach_daily_smpp(campaign_id, campaign["daily_stats"], campaign)
     campaign["batches"] = get_batches(campaign_id)
     reached = read_transaction(

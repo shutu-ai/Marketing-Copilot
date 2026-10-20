@@ -13,7 +13,7 @@
           <div class="panel__header"><div><h3>{{ $t('dashboard.trendTitle') }}</h3><p>{{ $t(stats.pipeline === 'vnext' ? 'dashboard.vnextTrendDescription' : 'dashboard.trendDescription') }}</p></div></div>
           <div class="bar-chart" role="img" :aria-label="$t('dashboard.chartLabel')">
             <div v-for="point in stats.daily_trend" :key="point.stats_date" class="bar-chart__item" tabindex="0" :aria-label="point.stats_date">
-              <div class="trend-bars"><div class="trend-series trend-series--files"><span class="trend-series__value">{{ point.received_file_count }}</span><div class="trend-series__track"><div class="trend-series__fill trend-series__fill--files" :style="{height: `${filesHeight(point.received_file_count)}%`}" /></div></div><div class="trend-series trend-series--matched"><span class="trend-series__value">{{ point.matched_count }}</span><div class="trend-series__track"><div class="trend-series__fill trend-series__fill--matched" :style="{height: `${matchedHeight(point.matched_count)}%`}" /></div></div><div class="trend-series trend-series--sent"><span class="trend-series__value">{{ point.sent_count }}</span><div class="trend-series__track"><div class="trend-series__fill trend-series__fill--sent" :style="{height: `${barHeight(point.sent_count)}%`}" /></div></div></div><div class="trend-tooltip" role="tooltip"><strong>{{ point.stats_date }}</strong><span><i class="trend-legend__swatch trend-legend__swatch--files" />{{ $t('dashboard.trendFiles') }}: <strong>{{ formatTrendNumber(point.received_file_count) }}</strong></span><span><i class="trend-legend__swatch trend-legend__swatch--matched" />{{ $t('dashboard.trendMatched') }}: <strong>{{ formatTrendNumber(point.matched_count) }}</strong></span><span><i class="trend-legend__swatch trend-legend__swatch--sent" />{{ $t('dashboard.trendSent') }}: <strong>{{ formatTrendNumber(point.sent_count) }}</strong></span></div><span>{{ point.stats_date.slice(5) }}</span>
+              <div class="trend-bars"><div class="trend-series trend-series--files"><div class="trend-series__track"><div class="trend-series__fill trend-series__fill--files" :style="{height: `${filesHeight(point.received_file_count)}%`}" /></div></div><div class="trend-series trend-series--matched"><div class="trend-series__track"><div class="trend-series__fill trend-series__fill--matched" :style="{height: `${matchedHeight(point.matched_count)}%`}" /></div></div><div class="trend-series trend-series--sent"><div class="trend-series__track"><div class="trend-series__fill trend-series__fill--sent" :style="{height: `${barHeight(point.sent_count)}%`}" /></div></div></div><div class="trend-tooltip" role="tooltip"><strong>{{ point.stats_date }}</strong><span><i class="trend-legend__swatch trend-legend__swatch--files" />{{ $t('dashboard.trendFiles') }}: <strong>{{ formatTrendNumber(point.received_file_count) }}</strong></span><span><i class="trend-legend__swatch trend-legend__swatch--matched" />{{ $t('dashboard.trendMatched') }}: <strong>{{ formatTrendNumber(point.matched_count) }}</strong></span><span><i class="trend-legend__swatch trend-legend__swatch--sent" />{{ $t('dashboard.trendSent') }}: <strong>{{ formatTrendNumber(point.sent_count) }}</strong></span></div><span>{{ point.stats_date.slice(5) }}</span>
             </div>
           </div>
           <div class="trend-legend"><span><i class="trend-legend__swatch trend-legend__swatch--files" />{{ $t('dashboard.trendFiles') }}</span><span><i class="trend-legend__swatch trend-legend__swatch--matched" />{{ $t('dashboard.trendMatched') }}</span><span><i class="trend-legend__swatch trend-legend__swatch--sent" />{{ $t('dashboard.trendSent') }}</span></div>
@@ -40,12 +40,10 @@ const stats=reactive({pipeline:'legacy',total_batch_campaigns:0,in_progress_camp
 const loading=ref(false),loaded=ref(false),error=ref('')
 const { t } = useI18n()
 const kpis=computed(()=>[{label:t('dashboard.inProgress'),value:stats.in_progress_campaigns,hint:t('dashboard.batchRealtime',{batch:stats.in_progress_batch_campaigns,realtime:stats.in_progress_realtime_campaigns})},{label:t('dashboard.completed'),value:stats.today_completed_campaigns,hint:t('dashboard.completedToday')},{label:t('dashboard.realtimeMatched'),value:stats.today_realtime_matched_users,hint:t('dashboard.fromFiles',{count:stats.today_realtime_files})},{label:t('dashboard.todaySent'),value:stats.today_sent_count,hint:stats.pipeline==='vnext'?t('dashboard.sentViaSocket'):t('dashboard.deliveredSms')},{label:t('dashboard.openExceptions'),value:stats.today_open_exception_count,hint:stats.today_open_exception_count?t('dashboard.handleSoon'):t('dashboard.healthy')}])
-const trendMax=computed(()=>Math.max(1,...stats.daily_trend.map(item=>item.sent_count)))
-const trendMatchedMax=computed(()=>Math.max(1,...stats.daily_trend.map(item=>item.matched_count||0)))
-const trendFilesMax=computed(()=>Math.max(1,...stats.daily_trend.map(item=>item.received_file_count||0)))
-const barHeight=(value:number)=>value?Math.max(8,Math.round(value/trendMax.value*100)):2
-const matchedHeight=(value:number)=>value?Math.max(8,Math.round(value/trendMatchedMax.value*100)):2
-const filesHeight=(value:number)=>value?Math.max(8,Math.round(value/trendFilesMax.value*100)):2
+const trendMax=computed(()=>Math.max(1,...stats.daily_trend.flatMap(item=>[item.received_file_count||0,item.matched_count||0,item.sent_count||0])))
+const barHeight=(value:number)=>value?Math.max(2,Math.round(value/trendMax.value*100)):0
+const matchedHeight=barHeight
+const filesHeight=barHeight
 const formatTrendNumber=(value:number|undefined)=>Number(value||0).toLocaleString()
 async function load(){loading.value=true;error.value='';try{Object.assign(stats,(await getDashboardStats()).data);loaded.value=true}catch(e:any){error.value=e.response?.data?.detail||t('common.connectionFailed')}finally{loading.value=false}}
 onMounted(load)
@@ -56,10 +54,9 @@ onMounted(load)
 .bar-chart__value { width: 100%; text-align: center; }
 .bar-chart__track { justify-content: center; }
 .bar-chart__bar { width: min(42%, 24px); }
-.trend-bars { display:flex; align-items:flex-end; justify-content:center; gap:3px; width:100%; height:100%; }
-.trend-series { display:flex; flex:0 1 18px; width:18px; min-width:0; height:100%; flex-direction:column; align-items:center; gap:4px; }
-.trend-series__value { width:100%; overflow:hidden; color:var(--mc-text-secondary); font-size:9px; line-height:1; text-align:center; text-overflow:ellipsis; white-space:nowrap; }
-.trend-series__track { display:flex; width:100%; height:100%; align-items:flex-end; justify-content:center; border-bottom:1px solid var(--mc-border); background:repeating-linear-gradient(to bottom,transparent 0,transparent calc(25% - 1px),#edf2f1 25%); }
+.trend-bars { display:flex; flex:1 1 auto; align-items:stretch; justify-content:center; gap:3px; width:100%; min-height:0; }
+.trend-series { display:flex; flex:0 1 18px; width:18px; min-width:0; min-height:0; flex-direction:column; align-items:center; align-self:stretch; }
+.trend-series__track { display:flex; flex:1 1 auto; width:100%; min-height:0; align-items:flex-end; justify-content:center; border-bottom:1px solid var(--mc-border); background:repeating-linear-gradient(to bottom,transparent 0,transparent calc(25% - 1px),#edf2f1 25%); }
 .trend-series__fill { width:min(100%,18px); min-height:2px; border-radius:5px 5px 0 0; transition:height .25s ease; }
 .trend-series__fill--sent { background:var(--mc-primary); box-shadow:0 7px 16px rgb(201 150 23 / 16%); }
 .trend-series__fill--matched { background:#3f7ea8; }

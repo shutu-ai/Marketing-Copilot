@@ -69,3 +69,36 @@ def test_batch_detail_smpp_falls_back_to_campaign_route(monkeypatch):
     )
 
     assert daily_stats[0]["smpp_label"] == "configured-route (configured.example:2775)"
+
+
+def test_batch_detail_daily_sent_users_use_vnext_socket_written(monkeypatch):
+    from services import vnext_service
+
+    monkeypatch.setattr(vnext_service, "is_active", lambda: True)
+    monkeypatch.setattr(
+        vnext_service,
+        "campaign_daily_totals",
+        lambda campaign_type, campaign_id: [
+            {
+                "business_day": "2026-10-20",
+                "campaign_type": campaign_type,
+                "campaign_id": campaign_id,
+                "socket_written": 37,
+                "socket_written_pdus": 42,
+                "response_success": 35,
+                "response_error": 2,
+            }
+        ],
+    )
+
+    result = batch_campaign_service._merge_vnext_daily_stats(
+        7,
+        {"row_count": 100},
+        [{"stats_date": "2026-10-20", "total_prospects": 100, "sent_count": 9}],
+    )
+
+    assert result[0]["sent_count"] == 37
+    assert result[0]["socket_written_events"] == 37
+    assert result[0]["socket_written_pdus"] == 42
+    assert result[0]["smsc_accepted_pdus"] == 35
+    assert result[0]["stats_source"] == "vnext_projection"

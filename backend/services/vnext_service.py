@@ -537,6 +537,36 @@ def _projection_campaign_totals(
     return None
 
 
+def campaign_daily_totals(campaign_type: str, campaign_id: int) -> list[dict]:
+    """Return bounded per-day totals for one campaign from the VNext snapshot.
+
+    The projection snapshot is already cached and aggregated by the projection
+    writer.  Keeping this read-only adapter here lets detail pages consume the
+    same ``socket_written`` contract as the dashboard without replaying the
+    progress journal or scanning the legacy ``sms_tasks`` table.
+    """
+
+    try:
+        value = runtime()
+        snapshot = value.projection.snapshot()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return []
+
+    result = []
+    for item in snapshot.get("campaign_daily_totals") or []:
+        if (
+            str(item.get("campaign_type") or "") != str(campaign_type)
+            or int(item.get("campaign_id") or 0) != int(campaign_id)
+        ):
+            continue
+        business_day = str(item.get("business_day") or "")[:10]
+        if not business_day:
+            continue
+        result.append(dict(item))
+    result.sort(key=lambda item: str(item.get("business_day") or ""), reverse=True)
+    return result
+
+
 def _add_today_campaign_stats(stats: dict, daily: dict | None) -> dict:
     """Attach today/day counters without changing the cumulative contract."""
 
