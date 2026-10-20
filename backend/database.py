@@ -992,6 +992,117 @@ TABLE_SEQUENCES = {
     "task_archive_manifests": "seq_task_archive_manifests",
 }
 
+# Database initialization used to be a collection of idempotent-looking
+# statements, but several of the data/index operations were not cheap when
+# repeated.  Keep the maintenance boundaries explicit and versioned.  When a
+# future schema change is added to one of these groups, bump its marker rather
+# than making every process start repeat the work.
+_DB_SCHEMA_COLUMNS_MARKER = "db_schema_columns_v1"
+_DB_REALTIME_CLEANUP_MARKER = "db_realtime_cleanup_v1"
+_DB_PROCESSED_FILES_MARKER = "db_processed_files_unique_v1"
+_DB_DATA_NORMALIZATION_MARKER = "db_data_normalization_v1"
+_DB_RECEIPT_INDEXES_MARKER = "db_receipt_indexes_v2"
+
+_RECEIPT_INDEX_DEFINITIONS = (
+    (
+        "idx_delivery_message_id",
+        "delivery_receipts",
+        False,
+        ("source_namespace", "smsc_message_id"),
+        "CREATE INDEX IF NOT EXISTS idx_delivery_message_id "
+        "ON delivery_receipts(source_namespace,smsc_message_id)",
+    ),
+    (
+        "idx_receipt_unique",
+        "delivery_receipts",
+        True,
+        ("source_namespace", "task_id", "smsc_message_id", "message_state"),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique "
+        "ON delivery_receipts(source_namespace,task_id,smsc_message_id,message_state)",
+    ),
+)
+
+
+def _db_marker_completed(conn, key: str) -> bool:
+    """Return whether a one-time database maintenance marker is complete."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key=?",
+            (key,),
+        ).fetchone()
+    except Exception:
+        # The base schema is created immediately before these checks.  Treat a
+        # missing/unreadable marker as incomplete so a repair is never skipped.
+        return False
+    return bool(row and str(row[0] or "").strip().lower() == "completed")
+
+
+def _record_db_marker(conn, key: str) -> bool:
+    try:
+        conn.execute(
+            """INSERT INTO app_settings (key, value) VALUES (?, ?)
+               ON CONFLICT (key) DO UPDATE SET value=excluded.value""",
+            (key, "completed"),
+        )
+        return True
+    except Exception as exc:
+        # Marker persistence is an optimization, not a reason to prevent the
+        # service from starting on an older app_settings schema.  The guarded
+        # work remains correct and will be retried on the next maintenance run.
+        logger.warning("[DB] Could not persist migration marker key=%s: %s", key, exc)
+        return False
+
+
+def _index_definition_matches(conn, name: str, table: str,
+                              unique: bool, expressions) -> bool:
+    """Check an index definition without rebuilding a valid large-table index."""
+    try:
+        row = conn.execute(
+            """SELECT table_name, is_unique, expressions
+               FROM duckdb_indexes() WHERE index_name=?""",
+            (name,),
+        ).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    actual_expressions = str(row[2] or "").lower().replace(" ", "")
+    actual_expressions = actual_expressions.replace("'", "").replace('"', "")
+    expected_expressions = "[" + ",".join(expressions) + "]"
+    return (
+        str(row[0] or "").lower() == table.lower()
+        and bool(row[1]) == bool(unique)
+        and actual_expressions == expected_expressions.lower()
+    )
+
+
+def _ensure_receipt_indexes(conn) -> None:
+    """Repair receipt indexes once; completed startups do no large-table work."""
+    if _db_marker_completed(conn, _DB_RECEIPT_INDEXES_MARKER):
+        return
+
+    started = time.perf_counter()
+    complete = True
+    for name, table, unique, expressions, create_sql in _RECEIPT_INDEX_DEFINITIONS:
+        try:
+            # Existing production databases commonly already have the desired
+            # definition.  Do not drop/rebuild those large indexes merely
+            # because the service restarted.
+            if _index_definition_matches(conn, name, table, unique, expressions):
+                continue
+            conn.execute(f"DROP INDEX IF EXISTS {name}")
+            conn.execute(create_sql)
+        except Exception as exc:
+            complete = False
+            logger.warning("[DB] Receipt index maintenance failed index=%s: %s", name, exc)
+
+    marker_recorded = complete and _record_db_marker(conn, _DB_RECEIPT_INDEXES_MARKER)
+    logger.info(
+        "[DB] Receipt index maintenance complete=%s elapsed=%.3fs",
+        marker_recorded,
+        time.perf_counter() - started,
+    )
+
 
 class DuckRow:
     """Dict-like row wrapper so existing service code works unchanged."""
@@ -1381,6 +1492,7 @@ def get_database_file() -> str:
 
 
 def init_db():
+    started = time.perf_counter()
     try:
         conn = get_connection()
     except Exception as e:
@@ -1949,11 +2061,13 @@ def init_db():
         except Exception as e:
             logger.warning("[DB] Skipping DDL: %s", e)
 
-    try:
-        conn.execute("ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS batch_id INTEGER")
-    except Exception as e:
-        logger.warning("[DB] Skipping sms_tasks.batch_id migration: %s", e)
+    logger.info(
+        "[DB] init stage=base_schema elapsed=%.3fs",
+        time.perf_counter() - started,
+    )
+
     migrations = [
+        "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS batch_id INTEGER",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS claim_token TEXT",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS task_date DATE DEFAULT CURRENT_DATE",
         "ALTER TABLE sms_tasks ADD COLUMN IF NOT EXISTS sms_template_id INTEGER",
@@ -2031,22 +2145,54 @@ def init_db():
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS delivered_count INTEGER DEFAULT 0",
         "ALTER TABLE batch_campaign_batches ADD COLUMN IF NOT EXISTS failed_count INTEGER DEFAULT 0",
    ]
-    for stmt in migrations:
-        try:
-            conn.execute(stmt)
-        except Exception as e:
-            logger.warning("[DB] Skipping migration: %s", e)
-    for stmt in [
-        "DELETE FROM app_settings WHERE key='realtime_watch_dir'",
-        "DELETE FROM app_settings WHERE key='realtime_watch_filename_prefix'",
-        "ALTER TABLE realtime_campaigns DROP COLUMN IF EXISTS first_listen_offset",
-    ]:
-        try:
-            conn.execute(stmt)
-        except Exception as e:
-            logger.warning("[DB] Skipping obsolete realtime cleanup: %s", e)
+    schema_migration_started = time.perf_counter()
+    if not _db_marker_completed(conn, _DB_SCHEMA_COLUMNS_MARKER):
+        schema_migration_complete = True
+        for stmt in migrations:
+            try:
+                conn.execute(stmt)
+            except Exception as e:
+                schema_migration_complete = False
+                logger.warning("[DB] Skipping migration: %s", e)
+        if schema_migration_complete:
+            _record_db_marker(conn, _DB_SCHEMA_COLUMNS_MARKER)
+        logger.info(
+            "[DB] schema migration complete=%s elapsed=%.3fs",
+            schema_migration_complete,
+            time.perf_counter() - schema_migration_started,
+        )
+    else:
+        logger.debug("[DB] schema migration marker already complete")
+
+    cleanup_started = time.perf_counter()
+    if not _db_marker_completed(conn, _DB_REALTIME_CLEANUP_MARKER):
+        cleanup_complete = True
+        for stmt in [
+            "DELETE FROM app_settings WHERE key='realtime_watch_dir'",
+            "DELETE FROM app_settings WHERE key='realtime_watch_filename_prefix'",
+            "ALTER TABLE realtime_campaigns DROP COLUMN IF EXISTS first_listen_offset",
+        ]:
+            try:
+                conn.execute(stmt)
+            except Exception as e:
+                cleanup_complete = False
+                logger.warning("[DB] Skipping obsolete realtime cleanup: %s", e)
+        if cleanup_complete:
+            _record_db_marker(conn, _DB_REALTIME_CLEANUP_MARKER)
+        logger.info(
+            "[DB] obsolete cleanup complete=%s elapsed=%.3fs",
+            cleanup_complete,
+            time.perf_counter() - cleanup_started,
+        )
+    else:
+        logger.debug("[DB] obsolete realtime cleanup marker already complete")
+    processed_files_started = time.perf_counter()
+    processed_files_marker_completed = _db_marker_completed(
+        conn, _DB_PROCESSED_FILES_MARKER
+    )
+    processed_files_migration_complete = True
     try:
-        constraints = conn.execute(
+        constraints = [] if processed_files_marker_completed else conn.execute(
             """SELECT constraint_column_names
                FROM duckdb_constraints()
                WHERE table_name='processed_files' AND constraint_type='UNIQUE'"""
@@ -2092,8 +2238,20 @@ def init_db():
             conn.execute("DROP TABLE processed_files")
             conn.execute("ALTER TABLE processed_files_new RENAME TO processed_files")
     except Exception as e:
+        processed_files_migration_complete = False
         logger.warning("[DB] Skipping processed_files uniqueness migration: %s", e)
-    for stmt in [
+    if not processed_files_marker_completed and processed_files_migration_complete:
+        _record_db_marker(conn, _DB_PROCESSED_FILES_MARKER)
+    logger.info(
+        "[DB] processed_files migration complete=%s elapsed=%.3fs",
+        processed_files_marker_completed or processed_files_migration_complete,
+        time.perf_counter() - processed_files_started,
+    )
+    data_normalization_started = time.perf_counter()
+    data_normalization_marker_completed = _db_marker_completed(
+        conn, _DB_DATA_NORMALIZATION_MARKER
+    )
+    data_normalization_statements = [] if data_normalization_marker_completed else [
         "UPDATE users SET role='marketing' WHERE role='operator'",
         "UPDATE users SET role='analyst' WHERE role='viewer'",
         "UPDATE sms_tasks SET claim_token='' WHERE claim_token IS NULL",
@@ -2120,11 +2278,22 @@ def init_db():
                GROUP BY t.batch_id
            ) s
            WHERE b.id=s.batch_id AND COALESCE(b.task_count,0)=0""",
-    ]:
+    ]
+    data_normalization_complete = True
+    for stmt in data_normalization_statements:
         try:
             conn.execute(stmt)
         except Exception as e:
+            data_normalization_complete = False
             logger.warning("[DB] Skipping migration backfill: %s", e)
+
+    if not data_normalization_marker_completed and data_normalization_complete:
+        _record_db_marker(conn, _DB_DATA_NORMALIZATION_MARKER)
+    logger.info(
+        "[DB] data normalization complete=%s elapsed=%.3fs",
+        data_normalization_marker_completed or data_normalization_complete,
+        time.perf_counter() - data_normalization_started,
+    )
 
     conn.commit()
 
@@ -2137,7 +2306,6 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_campaign ON sms_tasks(campaign_type, campaign_id)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_dispatch_eligibility ON sms_tasks(campaign_type, campaign_id, dispatch_generation, status, next_attempt_at, created_at, id)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_date ON sms_tasks(campaign_type, task_date, status, next_attempt_at)",
-        "DROP INDEX IF EXISTS idx_delivery_message_id",
         "CREATE INDEX IF NOT EXISTS idx_delivery_message_id ON delivery_receipts(source_namespace,smsc_message_id)",
         "CREATE INDEX IF NOT EXISTS idx_exclusion_msisdn ON exclusion_users(msisdn)",
         "CREATE INDEX IF NOT EXISTS idx_sms_tasks_created ON sms_tasks(created_at)",
@@ -2149,7 +2317,6 @@ def init_db():
         # Receipt dedup is per-task: SMSC message ids may be reused across
         # tasks (simulator restarts its counter, some SMSCs recycle ids), so
         # the same (message_id, state) must be allowed on different tasks.
-        "DROP INDEX IF EXISTS idx_receipt_unique",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique ON delivery_receipts(source_namespace,task_id,smsc_message_id,message_state)",
         "CREATE INDEX IF NOT EXISTS idx_receipt_task ON delivery_receipts(task_id)",
         "CREATE INDEX IF NOT EXISTS idx_task_msg_task ON sms_task_message_ids(task_id)",
@@ -2179,11 +2346,17 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_update_history_created ON update_history(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
     ]
+    index_started = time.perf_counter()
     for idx in indexes:
         try:
             conn.execute(idx)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[DB] Skipping index creation: %s", exc)
+    _ensure_receipt_indexes(conn)
+    logger.info(
+        "[DB] index checks complete elapsed=%.3fs",
+        time.perf_counter() - index_started,
+    )
 
     try:
         marker = conn.execute(
@@ -2236,3 +2409,7 @@ def init_db():
             pass
 
     conn.commit()
+    logger.info(
+        "[DB] init_db complete elapsed=%.3fs",
+        time.perf_counter() - started,
+    )
