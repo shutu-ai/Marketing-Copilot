@@ -8,6 +8,7 @@ from vnext.projection_writer import (
     ProjectionWriter,
     ProjectionBackpressure,
     ProjectionWriterBusy,
+    ProjectionWriterOwnerBusy,
     ProjectionWriterProcess,
     ProgressJournal,
 )
@@ -24,6 +25,22 @@ def event(event_id: str, state: str = "socket_written", ordinal: int = 1) -> dic
         "write_failed": int(state == "write_failed"), "unknown": int(state == "unknown"),
         "created_at": time.time(),
     }
+
+
+def test_projection_owner_lock_prevents_competing_duckdb_writer(tmp_path, monkeypatch):
+    monkeypatch.setenv("MC_VNEXT_PROJECTION_LOCK_WAIT_SECONDS", "0")
+    db = tmp_path / "projection.duckdb"
+    first = ProjectionWriter(db, batch_size=8)
+    second = ProjectionWriter(db, batch_size=8)
+    first.start()
+    try:
+        with pytest.raises(ProjectionWriterOwnerBusy):
+            second.start()
+        assert second.snapshot()["owner_lock_held"] is False
+        assert first.snapshot()["owner_lock_held"] is True
+    finally:
+        second.stop()
+        first.stop()
 
 
 def test_projection_writer_batches_idempotently_and_replays_journal(tmp_path):

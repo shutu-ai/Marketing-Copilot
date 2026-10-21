@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import multiprocessing
@@ -468,6 +469,38 @@ class VNextRuntime:
         self._projection_watchdog_thread: threading.Thread | None = None
         self._projection_restart_failures = 0
         self._projection_restart_not_before = 0.0
+        try:
+            self._projection_restart_max_failures = max(
+                1,
+                min(
+                    100,
+                    int(os.environ.get("MC_VNEXT_PROJECTION_RESTART_MAX_FAILURES", "5")),
+                ),
+            )
+        except (TypeError, ValueError):
+            self._projection_restart_max_failures = 5
+        try:
+            self._projection_restart_cooldown_seconds = max(
+                5.0,
+                min(
+                    86400.0,
+                    float(os.environ.get("MC_VNEXT_PROJECTION_RESTART_COOLDOWN_SECONDS", "60")),
+                ),
+            )
+        except (TypeError, ValueError):
+            self._projection_restart_cooldown_seconds = 60.0
+        try:
+            self._projection_restart_max_backoff_seconds = max(
+                1.0,
+                min(
+                    3600.0,
+                    float(os.environ.get("MC_VNEXT_PROJECTION_RESTART_MAX_BACKOFF_SECONDS", "30")),
+                ),
+            )
+        except (TypeError, ValueError):
+            self._projection_restart_max_backoff_seconds = 30.0
+        self._projection_degraded = False
+        self._projection_last_error = ""
         self._daily_epoch_stop = threading.Event()
         self._daily_epoch_thread: threading.Thread | None = None
         write_process_metadata(
@@ -542,27 +575,87 @@ class VNextRuntime:
         while not self._projection_watchdog_stop.wait(0.25):
             if not self._started:
                 continue
-            if time.monotonic() < self._projection_restart_not_before:
-                continue
             try:
-                if not self.projection.snapshot().get("alive", False):
-                    restarted = self.projection.restart()
-                    if restarted:
-                        # ``Process.start()`` only means that the child was
-                        # forked.  It may still fail while opening DuckDB.
-                        # Count the launch as a retry and back off; otherwise
-                        # a file-lock conflict creates a traceback/spawn loop.
-                        self._projection_restart_failures += 1
+                snapshot = self.projection.snapshot()
+                if snapshot.get("ready", False):
+                    # A successful start closes the current failure streak.
+                    self._projection_restart_failures = 0
+                    self._projection_restart_not_before = 0.0
+                    self._projection_degraded = False
+                    self._projection_last_error = ""
+                    continue
+                if snapshot.get("alive", False):
+                    # The child may still be opening DuckDB or replaying its
+                    # journals.  Do not start a competing child while it is
+                    # alive; this is deliberately outside the send path.
+                    continue
+                if time.monotonic() < self._projection_restart_not_before:
+                    continue
+                restarted = self.projection.restart()
+                if restarted:
+                    # Process.start() only means that the child was forked. It
+                    # may still fail while opening DuckDB, so count this as a
+                    # bounded recovery attempt and apply a circuit cooldown
+                    # after repeated native/database failures.
+                    self._projection_restart_failures += 1
+                    self._projection_degraded = True
+                    exitcode = snapshot.get("exitcode")
+                    self._projection_last_error = (
+                        f"projection child exited exitcode={exitcode}"
+                    )
+                    failures = self._projection_restart_failures
+                    if failures >= self._projection_restart_max_failures:
+                        delay = self._projection_restart_cooldown_seconds
+                    else:
                         delay = min(
-                            5.0,
-                            0.25 * (2 ** min(self._projection_restart_failures - 1, 5)),
+                            self._projection_restart_max_backoff_seconds,
+                            0.25 * (2 ** min(failures - 1, 8)),
                         )
-                        self._projection_restart_not_before = time.monotonic() + delay
-            except (OSError, RuntimeError):
+                    self._projection_restart_not_before = time.monotonic() + delay
+                    with contextlib.suppress(Exception):
+                        write_process_metadata(
+                            self.diagnostics_root,
+                            "runtime-parent",
+                            run_id=self.run_id,
+                            start_method=self.start_method,
+                            phase="projection_restart",
+                            status="degraded",
+                            extra={
+                                "last_error": self._projection_last_error,
+                                "restart_failures": failures,
+                                "next_retry_seconds": round(delay, 3),
+                            },
+                        )
+            except Exception as exc:
+                # A watchdog error must not silently terminate the recovery
+                # thread (for example an old child/status shape raising
+                # AttributeError).  The sender remains independent while the
+                # next bounded check retries projection recovery.
                 self._projection_restart_failures += 1
-                self._projection_restart_not_before = time.monotonic() + min(
-                    5.0, 0.25 * (2 ** min(self._projection_restart_failures - 1, 5))
+                self._projection_degraded = True
+                self._projection_last_error = f"{type(exc).__name__}: {exc}"
+                failures = self._projection_restart_failures
+                delay = min(
+                    self._projection_restart_max_backoff_seconds,
+                    self._projection_restart_cooldown_seconds
+                    if failures >= self._projection_restart_max_failures
+                    else 0.25 * (2 ** min(failures - 1, 8)),
                 )
+                self._projection_restart_not_before = time.monotonic() + delay
+                with contextlib.suppress(Exception):
+                    write_process_metadata(
+                        self.diagnostics_root,
+                        "runtime-parent",
+                        run_id=self.run_id,
+                        start_method=self.start_method,
+                        phase="projection_watchdog_error",
+                        status="degraded",
+                        extra={
+                            "last_error": self._projection_last_error,
+                            "restart_failures": failures,
+                            "next_retry_seconds": round(delay, 3),
+                        },
+                    )
                 continue
 
     def start(self) -> None:
@@ -574,6 +667,10 @@ class VNextRuntime:
             self._load_control_state()
             if not self.control_state_path.exists():
                 self._persist_control_state()
+        self._projection_restart_failures = 0
+        self._projection_restart_not_before = 0.0
+        self._projection_degraded = False
+        self._projection_last_error = ""
         self.projection.start()
         context = {
             "spool_root": str(self.spool_root),
@@ -942,6 +1039,12 @@ class VNextRuntime:
             "projection_restart_failures": int(self._projection_restart_failures),
             "projection_restart_backoff_seconds": round(
                 max(0.0, self._projection_restart_not_before - time.monotonic()), 3
+            ),
+            "projection_degraded": bool(self._projection_degraded),
+            "projection_last_error": str(self._projection_last_error or ""),
+            "projection_restart_max_failures": int(self._projection_restart_max_failures),
+            "projection_restart_cooldown_seconds": float(
+                self._projection_restart_cooldown_seconds
             ),
         }
 

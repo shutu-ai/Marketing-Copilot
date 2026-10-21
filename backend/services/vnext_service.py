@@ -629,11 +629,33 @@ def _daily_totals_by_day(snapshot: dict) -> dict[str, dict[str, int]]:
     return result
 
 
+def _projection_read_health(snapshot: dict) -> tuple[bool, str]:
+    """Describe whether a projection snapshot is safe to present as complete.
+
+    Older test doubles and stopped-process inspection tools may not include
+    the ``ready`` field.  Treat those snapshots as available for backwards
+    compatibility; live snapshots from ``ProjectionWriterProcess`` always
+    include it and therefore cannot silently turn a crashed writer into a
+    valid-looking all-zero result.
+    """
+
+    if "ready" not in snapshot:
+        return True, ""
+    if bool(snapshot.get("ready")) and bool(snapshot.get("alive", True)):
+        return True, ""
+    if bool(snapshot.get("native_crash")):
+        return False, "projection_writer_native_crash"
+    if not bool(snapshot.get("alive", True)):
+        return False, "projection_writer_not_alive"
+    return False, "projection_writer_not_ready"
+
+
 def dashboard_stats() -> dict:
     """Return dashboard counters using the VNext projection contract."""
 
     value = runtime()
     projection = value.projection.snapshot()
+    projection_available, projection_warning = _projection_read_health(projection)
     current_day = str(value.spool.current_business_day)
     totals = _daily_totals_by_day(projection)
     days = _business_days(current_day)
@@ -668,7 +690,14 @@ def dashboard_stats() -> dict:
         "today_write_failed_count": int(today.get("write_failed", 0)),
         "daily_trend": trend,
         "projection_lag_seconds": float(projection.get("projection_lag_seconds") or 0.0),
-        "stats_source": "vnext_projection",
+        "stats_complete": projection_available,
+        "stats_source": (
+            "vnext_projection" if projection_available
+            else "vnext_projection_unavailable"
+        ),
+        "projection_available": projection_available,
+        "degraded": not projection_available,
+        "degraded_reason": projection_warning,
     }
 
 
@@ -881,6 +910,9 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
             "page_size": page_size, "items": items,
             "next_cursor": page + 1 if has_more else None, "has_more": has_more,
             "stats_source": "vnext_task_index",
+            "projection_available": True,
+            "degraded": False,
+            "degraded_reason": "",
         }
 
     # The new store is unavailable.  Return a bounded diagnostic result rather
@@ -890,6 +922,9 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
         "page_size": page_size, "items": [],
         "next_cursor": None, "has_more": False,
         "stats_source": "vnext_task_index_unavailable",
+        "projection_available": False,
+        "degraded": True,
+        "degraded_reason": "vnext_task_index_unavailable",
     }
 
 
@@ -940,6 +975,7 @@ def export_tasks() -> list[dict]:
 def task_stats(business_day: str | None = None) -> dict:
     value = runtime()
     projection = value.projection.snapshot()
+    projection_available, projection_warning = _projection_read_health(projection)
     current_day = str(value.spool.current_business_day)
     selected_day = str(business_day or current_day)
     row = _daily_totals_by_day(projection).get(selected_day, {})
@@ -985,8 +1021,14 @@ def task_stats(business_day: str | None = None) -> dict:
         "delivery_receipts_available": False,
         "metric_contract": dict(VNEXT_METRIC_CONTRACT),
         "pipeline": "vnext",
-        "stats_complete": True,
-        "stats_source": "vnext_projection",
+        "stats_complete": projection_available,
+        "stats_source": (
+            "vnext_projection" if projection_available
+            else "vnext_projection_unavailable"
+        ),
+        "projection_available": projection_available,
+        "degraded": not projection_available,
+        "degraded_reason": projection_warning,
         "projection_lag_seconds": float(projection.get("projection_lag_seconds") or 0.0),
     }
 

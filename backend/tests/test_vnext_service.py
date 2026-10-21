@@ -404,6 +404,36 @@ def test_vnext_task_stats_use_projection_and_campaign_stats_use_live_aggregate(t
     assert campaign_stats["today_smsc_accepted_pdus"] == 4
 
 
+def test_vnext_read_models_mark_projection_failure_instead_of_false_complete(tmp_path, monkeypatch):
+    fake = _FakeRuntime(tmp_path)
+
+    class Projection:
+        def snapshot(self):
+            return {
+                "ready": False,
+                "alive": False,
+                "native_crash": True,
+                "daily_totals": [],
+            }
+
+    fake.projection = Projection()
+    monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
+
+    task_stats = vnext_service.task_stats()
+    dashboard = vnext_service.dashboard_stats()
+    tasks = vnext_service.list_tasks()
+
+    for result in (task_stats, dashboard, tasks):
+        assert result["projection_available"] is False
+        assert result["degraded"] is True
+    assert task_stats["stats_complete"] is False
+    assert task_stats["stats_source"] == "vnext_projection_unavailable"
+    assert dashboard["stats_complete"] is False
+    assert dashboard["degraded_reason"] == "projection_writer_native_crash"
+    assert tasks["stats_source"] == "vnext_task_index_unavailable"
+    assert tasks["degraded_reason"] == "vnext_task_index_unavailable"
+
+
 def test_vnext_realtime_stats_do_not_query_legacy_task_table(monkeypatch):
     statements = []
 

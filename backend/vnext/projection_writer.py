@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import multiprocessing
 import os
 import queue
@@ -31,11 +32,103 @@ class ProjectionWriterBusy(RuntimeError):
     pass
 
 
+class ProjectionWriterOwnerBusy(RuntimeError):
+    """Another process currently owns the projection database."""
+
+
 class ProjectionBackpressure(RuntimeError):
     pass
 
 
 TASK_INDEX_TABLE = "vnext_task_index"
+
+
+class _ProjectionOwnerLock:
+    """Small cross-process lock used only during projection ownership.
+
+    DuckDB still remains the final database lock.  This separate lock makes
+    the application-level single-writer contract explicit and prevents a
+    restart race from repeatedly opening competing read-write connections.
+    It is acquired once per projection child, never on the send path.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path).resolve()
+        self._fd: int | None = None
+        self._backend = ""
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    @staticmethod
+    def _is_busy(error: OSError) -> bool:
+        return getattr(error, "errno", None) in {
+            errno.EACCES, errno.EAGAIN, errno.EBUSY,
+        }
+
+    def acquire(self, timeout_seconds: float) -> None:
+        if self._fd is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | int(getattr(os, "O_BINARY", 0))
+        fd = os.open(str(self.path), flags, 0o640)
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        try:
+            if os.name == "posix":
+                import fcntl
+                backend = "fcntl"
+            elif os.name == "nt":
+                import msvcrt
+                backend = "msvcrt"
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\\0")
+            else:
+                raise RuntimeError(
+                    f"unsupported platform for projection owner lock: {os.name}"
+                )
+
+            while True:
+                try:
+                    if backend == "fcntl":
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    self._fd = fd
+                    self._backend = backend
+                    return
+                except OSError as exc:
+                    if not self._is_busy(exc):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ProjectionWriterOwnerBusy(
+                            f"projection owner lock is held: {self.path}"
+                        ) from exc
+                    time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        backend = self._backend
+        self._backend = ""
+        try:
+            if backend == "fcntl":
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif backend == "msvcrt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def ensure_task_index_schema(connection) -> None:
@@ -446,6 +539,9 @@ class ProjectionWriter:
             raise ValueError("staging_mode must be executemany or vectorized")
         self.reuse_staging = bool(reuse_staging)
         self.profiler = profiler
+        self.owner_lock = _ProjectionOwnerLock(
+            f"{self.db_path}.owner.lock"
+        )
         self._queue: deque[dict] = deque(maxlen=self.queue_size)
         self._conn = None
         self._task_index_conn = None
@@ -517,6 +613,25 @@ class ProjectionWriter:
         return {str(row[0]) for row in rows}
 
     def start(self) -> None:
+        if self._conn is not None:
+            return
+        try:
+            lock_wait_seconds = max(
+                0.0,
+                float(os.environ.get("MC_VNEXT_PROJECTION_LOCK_WAIT_SECONDS", "30")),
+            )
+        except (TypeError, ValueError):
+            lock_wait_seconds = 30.0
+        self.owner_lock.acquire(lock_wait_seconds)
+        try:
+            self._start_connection()
+        except BaseException:
+            # Direct callers may not have a surrounding process-finally block.
+            # Release the ownership lock even when schema setup fails.
+            self.stop()
+            raise
+
+    def _start_connection(self) -> None:
         import duckdb
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -658,12 +773,17 @@ class ProjectionWriter:
                 self._task_index_ready = True
 
     def stop(self) -> None:
-        if self._task_index_conn is not None:
-            self._task_index_conn.close()
-            self._task_index_conn = None
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        try:
+            if self._task_index_conn is not None:
+                with contextlib.suppress(Exception):
+                    self._task_index_conn.close()
+                self._task_index_conn = None
+            if self._conn is not None:
+                with contextlib.suppress(Exception):
+                    self._conn.close()
+                self._conn = None
+        finally:
+            self.owner_lock.release()
 
     def submit(self, event: dict) -> None:
         if len(self._queue) >= self.queue_size:
@@ -1425,6 +1545,8 @@ class ProjectionWriter:
             "staging_mode": self.staging_mode,
             "reuse_staging": self.reuse_staging,
             "projection_storage": "one_writer_one_duckdb",
+            "owner_lock_path": str(self.owner_lock.path),
+            "owner_lock_held": self.owner_lock.held,
             "flush_interval_seconds": self.flush_interval_seconds,
             "flush_due": bool(self._queue and time.monotonic() - self._last_flush_monotonic >= self.flush_interval_seconds),
             "projection_lag_seconds": max(0.0, self._last_event_at - self._last_applied_at) if self._last_applied_at else 0.0,
@@ -1931,6 +2053,7 @@ class ProjectionWriterProcess:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / db_name
+        self.owner_lock_path = Path(f"{self.db_path}.owner.lock")
         self.task_index_path = self.root / "vnext-task-index.sqlite3"
         self.status_path = self.root / "projection-writer-status.json"
         self.queue_size = max(1, int(queue_size))
@@ -2002,6 +2125,12 @@ class ProjectionWriterProcess:
         with self._lock:
             if self._stopping or (self.process is not None and self.process.is_alive()):
                 return False
+            if self.process is not None:
+                # Reap a naturally exited child before replacing the
+                # multiprocessing handle.  This is a lifecycle operation and
+                # never runs on the SMS submission path.
+                with contextlib.suppress(Exception):
+                    self.process.join(timeout=0)
             self._create_process()
             self.process.start()
             self._started = True
@@ -2051,6 +2180,8 @@ class ProjectionWriterProcess:
             if callable(kill):
                 kill()
                 process.join(timeout=2.0)
+        if self.ready_event is not None:
+            self.ready_event.clear()
         write_process_metadata(
             self.diagnostics_root,
             "projection-parent",
@@ -2062,19 +2193,26 @@ class ProjectionWriterProcess:
         )
 
     def snapshot(self) -> dict:
+        process = self.process
+        exitcode = getattr(process, "exitcode", None)
+        alive = bool(process and process.is_alive())
+        ready = bool(
+            process
+            and alive
+            and self.ready_event
+            and self.ready_event.is_set()
+        )
+        native_crash = bool(isinstance(exitcode, int) and exitcode < 0)
         if not self.status_path.exists():
             return {
                 "queue_depth": None,
-                "alive": bool(self.process and self.process.is_alive()),
-                "ready": bool(
-                    self.process
-                    and self.process.is_alive()
-                    and self.ready_event
-                    and self.ready_event.is_set()
-                ),
+                "alive": alive,
+                "ready": ready,
                 "journal_replay": bool(self.journal_paths),
-                "pid": getattr(self.process, "pid", None),
-                "exitcode": getattr(self.process, "exitcode", None),
+                "pid": getattr(process, "pid", None),
+                "exitcode": exitcode,
+                "native_crash": native_crash,
+                "owner_lock_path": str(self.owner_lock_path),
                 "start_method": self.start_method,
                 "staging_mode": self.staging_mode,
                 "reuse_staging": self.reuse_staging,
@@ -2086,16 +2224,13 @@ class ProjectionWriterProcess:
             value = {}
         return {
             **value,
-            "alive": bool(self.process and self.process.is_alive()),
-            "ready": bool(
-                self.process
-                and self.process.is_alive()
-                and self.ready_event
-                and self.ready_event.is_set()
-            ),
+            "alive": alive,
+            "ready": ready,
             "journal_replay": bool(self.journal_paths),
-            "pid": getattr(self.process, "pid", None),
-            "exitcode": getattr(self.process, "exitcode", None),
+            "pid": getattr(process, "pid", None),
+            "exitcode": exitcode,
+            "native_crash": native_crash,
+            "owner_lock_path": str(self.owner_lock_path),
             "start_method": self.start_method,
             "staging_mode": self.staging_mode,
             "reuse_staging": self.reuse_staging,
