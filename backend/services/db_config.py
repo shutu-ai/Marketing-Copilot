@@ -1,11 +1,6 @@
 import json
 import os
 import logging
-from typing import Optional
-
-import duckdb
-
-from database import prepare_duckdb_connection
 
 logger = logging.getLogger(__name__)
 
@@ -48,109 +43,47 @@ def _write_file(data: dict):
 
 def get_config() -> dict:
     data = _read_file()
-    return data or dict(DEFAULT_CONFIG)
-
-
-def is_db_empty(path: str) -> Optional[bool]:
-    """Return True when the DuckDB file holds no business data, False when it does,
-    or None when the file is missing / cannot be opened."""
-    if not path or not os.path.exists(path) or os.path.isdir(path):
-        return None
-    try:
-        conn = duckdb.connect(
-            path, read_only=True, config=prepare_duckdb_connection()
-        )
-    except Exception as exc:
-        logger.warning("Cannot open database for emptiness check %s: %s", path, exc)
-        return None
-    try:
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
-            ).fetchall()
-        }
-        known = [table for table in BUSINESS_TABLES if table in tables]
-        if not known:
-            return True
-        total = 0
-        for table in known:
-            try:
-                total += conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-            except Exception:
-                pass
-        return total == 0
-    finally:
-        conn.close()
-
-
-def get_effective_db_path(seed: str) -> str:
-    """Resolve the database path to use, seeding it from *seed* on first use.
-
-    Guard rules:
-    - No persisted config (fresh deployment): persist *seed* and use it.
-    - Persisted path missing: log an error and fall back to *seed* for this run
-      (the persisted config is kept so the operator can fix it in the UI).
-    - Persisted database is empty while *seed* contains business data: log an
-      error, correct the persisted config, and use *seed* so a restart can never
-      silently serve an empty database.
-    """
-    cfg = get_config()
-    path = (cfg.get("db_path") or "").strip()
-    if not path:
-        path = seed
-        cfg["db_path"] = path
-        save_config(cfg)
-        logger.info("Seeded database path %s into %s", path, CONFIG_PATH)
-        return path
-
-    if not os.path.exists(path):
-        logger.error(
-            "Persisted database path does not exist (%s); falling back to %s for this run. "
-            "Fix the path in the Database Config page or remove %s.",
-            path, seed, CONFIG_PATH,
-        )
-        return seed
-
-    persisted_empty = is_db_empty(path)
-    seed_empty = is_db_empty(seed)
-    if persisted_empty is True and seed_empty is False:
-        logger.error(
-            "Persisted database %s is EMPTY while %s contains business data; "
-            "falling back to %s and updating the persisted config to prevent "
-            "serving an empty database after a restart.",
-            path, seed, seed,
-        )
-        cfg["db_path"] = seed
-        save_config(cfg)
-        return seed
-
-    logger.info("Using persisted database path %s", path)
-    return path
-
-
-def save_config(data: dict) -> dict:
-    _write_file(data)
-    logger.info(f"Database config saved to {CONFIG_PATH}")
+    from database import get_database_file
+    data.update({"db_path": get_database_file(), "storage_mode": "canonical"})
     return data
 
 
+def get_effective_db_path(seed: str) -> str:
+    """Return the process-selected canonical path without opening a file.
+
+    Kept as a no-op shim for stopped-service test harnesses. Production
+    startup no longer calls this resolver or consults a persisted path.
+    """
+
+    del seed
+    from database import get_database_file
+    return get_database_file()
+
+
+def canonical_path() -> str:
+    from database import get_database_file
+    return get_database_file()
+
+
+def record_canonical_path(path: str = "") -> dict:
+    value = str(path or canonical_path())
+    data = {"db_path": value, "storage_mode": "canonical"}
+    _write_file(data)
+    return data
+
+
+def save_config(data: dict) -> dict:
+    del data
+    result = record_canonical_path()
+    logger.info("Canonical database path recorded in %s", CONFIG_PATH)
+    return result
+
+
 def test_connection(data: dict) -> tuple[bool, str]:
-    db_path = data.get("db_path", "")
-    if not db_path:
-        return False, "Database path is empty"
-    if not os.path.exists(db_path):
-        return False, f"Database file does not exist: {db_path}"
-    if os.path.isdir(db_path):
-        return False, "Database path points to a directory"
-    try:
-        # read-only + no auto-create: a typo must never silently create an empty DB
-        config = prepare_duckdb_connection()
-        conn = duckdb.connect(
-            db_path, read_only=True, config=config
-        )
-        conn.execute("SELECT 1")
-        conn.close()
-        return True, "Connection successful"
-    except Exception as e:
-        return False, str(e)
+    requested = str(data.get("db_path") or "").strip()
+    active = canonical_path()
+    if requested and os.path.abspath(requested) != os.path.abspath(active):
+        return False, "The canonical control database path cannot be changed at runtime"
+    if not os.path.isfile(active):
+        return False, f"Canonical control database does not exist: {active}"
+    return True, "Canonical control database is configured"

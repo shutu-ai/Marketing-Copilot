@@ -148,13 +148,17 @@ def release_instance_lock():
 
 def backup_database(target_dir: str = "", *, resolve_database: bool = True) -> str:
     import database
-    from services import db_config as db_config_service
-    # The running API has already resolved the dynamic database path during
-    # startup.  Re-running the config emptiness probe from the owner endpoint
-    # would open a second DuckDB connection while the service is busy.  The
-    # standalone stopped-service CLI keeps the original resolution behavior.
+    # The runtime path is immutable for the process and is selected by the
+    # canonical MC_CONTROL_DB_PATH environment variable.  ``resolve_database``
+    # is retained as a harmless CLI/API compatibility argument; it no longer
+    # probes or switches to another database file.
     if resolve_database:
-        database.set_database_file(db_config_service.get_effective_db_path(database.get_database_file()))
+        try:
+            from services import db_config as db_config_service
+            db_config_service.record_canonical_path(database.get_database_file())
+        except Exception:
+            # A backup must not depend on the retired path-config sidecar.
+            pass
     source = Path(database.get_database_file())
     if str(source) == ":memory:" or not source.exists():
         raise RuntimeError("database file is not available for backup")

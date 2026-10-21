@@ -86,6 +86,129 @@ def test_task_index_keeps_one_latest_row_without_changing_event_aggregates(tmp_p
         writer.stop()
 
 
+def test_task_index_sidecar_is_readable_while_projection_writer_is_open(tmp_path):
+    from vnext.task_index import connect_reader, is_ready
+
+    writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=8)
+    writer.start()
+    try:
+        item = event("sidecar-task", state="queued")
+        item.update({
+            "event_kind": "task_index",
+            "logical_task_id": "sidecar-task",
+            "normalized_msisdn": "251908341307",
+            "message": "hello",
+            "business_day": "2026-10-20",
+            "event_at": 10.0,
+            "created_at": 10.0,
+        })
+        writer.submit(item)
+        assert writer.flush() == 1
+        reader = connect_reader(writer.task_index_path)
+        assert reader is not None
+        try:
+            assert is_ready(reader) is True
+            row = reader.execute(
+                "SELECT event_id,normalized_msisdn FROM vnext_task_index"
+            ).fetchone()
+            assert tuple(row) == ("sidecar-task", "251908341307")
+        finally:
+            reader.close()
+    finally:
+        writer.stop()
+
+
+def test_projection_writer_ages_duckdb_and_sidecar_in_bounded_window(tmp_path):
+    from vnext.task_index import connect_reader
+
+    writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=8)
+    writer.start()
+    try:
+        old = event("old-task", state="socket_written")
+        old.update({
+            "business_day": "2026-10-10",
+            "created_at": 100.0,
+            "event_at": 101.0,
+            "logical_task_id": "old-task",
+        })
+        current = event("current-task", state="socket_written")
+        current.update({
+            "business_day": "2026-10-20",
+            "created_at": 200.0,
+            "event_at": 201.0,
+            "logical_task_id": "current-task",
+        })
+        writer.submit(old)
+        writer.submit(current)
+        assert writer.flush() == 2
+
+        result = writer.age_expired(
+            retention_days=7,
+            max_rows=100,
+            reference_day="2026-10-21",
+        )
+        assert result["cutoff_business_day"] == "2026-10-14"
+        assert result["task_index_deleted"] == 1
+        assert result["progress_events_deleted"] == 1
+        assert result["projection_rows_deleted"] == 1
+        assert result["sidecar_rows_deleted"] == 1
+
+        assert writer._conn.execute(
+            "SELECT event_id FROM vnext_task_index ORDER BY event_id"
+        ).fetchall() == [("current-task",)]
+        assert writer._conn.execute(
+            "SELECT event_id FROM vnext_progress_events ORDER BY event_id"
+        ).fetchall() == [("current-task",)]
+        assert writer._conn.execute(
+            "SELECT COUNT(*) FROM vnext_projection"
+        ).fetchone()[0] == 1
+
+        reader = connect_reader(writer.task_index_path)
+        assert reader is not None
+        try:
+            assert [tuple(row) for row in reader.execute(
+                "SELECT event_id FROM vnext_task_index ORDER BY event_id"
+            ).fetchall()] == [("current-task",)]
+        finally:
+            reader.close()
+    finally:
+        writer.stop()
+
+
+def test_task_index_sidecar_can_be_rebuilt_offline(tmp_path):
+    from vnext.task_index import connect_reader, is_ready, rebuild_from_duckdb
+
+    writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=8)
+    writer.start()
+    item = event("rebuild-task", state="queued")
+    item.update({
+        "event_kind": "task_index",
+        "logical_task_id": "rebuild-task",
+        "normalized_msisdn": "251908341307",
+        "message": "hello",
+        "business_day": "2026-10-20",
+        "event_at": 10.0,
+        "created_at": 10.0,
+    })
+    writer.submit(item)
+    assert writer.flush() == 1
+    writer.stop()
+    for path in tmp_path.glob("vnext-task-index.sqlite3*"):
+        path.unlink()
+
+    result = rebuild_from_duckdb(tmp_path / "projection.duckdb")
+    assert result["ready"] is True
+    reader = connect_reader(tmp_path / "vnext-task-index.sqlite3")
+    assert reader is not None
+    try:
+        assert is_ready(reader) is True
+        assert tuple(reader.execute(
+            "SELECT event_id,normalized_msisdn FROM vnext_task_index"
+        ).fetchone()) == ("rebuild-task", "251908341307")
+    finally:
+        reader.close()
+
+
 def test_projection_snapshot_publishes_day_level_metric_contract(tmp_path):
     writer = ProjectionWriter(tmp_path / "projection.duckdb", batch_size=10)
     writer.start()

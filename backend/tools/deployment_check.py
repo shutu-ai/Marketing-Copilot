@@ -20,7 +20,7 @@ def main():
     if args.require_linux and platform.system() != "Linux": failures.append("operating system is not Linux")
     if sys.version_info < (3, 11) or sys.version_info >= (3, 13): failures.append("Python 3.11 or 3.12 is required")
     paths = {
-        "database": os.environ.get("DUCKDB_PATH", ""),
+        "database": os.environ.get("MC_CONTROL_DB_PATH", ""),
         "log": os.environ.get("MC_LOG_PATH", ""),
         "instance lock": os.environ.get("MC_INSTANCE_LOCK", ""),
         "backup": os.environ.get("MC_BACKUP_DIR", ""),
@@ -32,8 +32,9 @@ def main():
     frontend = Path(os.environ.get("MC_FRONTEND_DIR", ""))
     if not (frontend / "index.html").is_file(): failures.append(f"frontend build is missing: {frontend / 'index.html'}")
     try:
-        from database import init_db, get_connection
-        init_db(); conn = get_connection(); conn.execute("SELECT 1"); conn.close()
+        from database import get_connection, init_runtime_db
+        init_runtime_db()
+        conn = get_connection(); conn.execute("SELECT 1"); conn.close()
     except Exception as exc: failures.append(f"database check failed: {exc}")
     if failures:
         for failure in failures: print(f"FAIL: {failure}")

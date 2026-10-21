@@ -60,6 +60,33 @@ automatic rollback. `run.sh` prepares `$APP_HOME/updates` and exports the
 `MC_UPDATE_MODE=manual` settings automatically. See
 `Docs/前端在线更新与认证.md` for details.
 
+## 3.1 One-time stopped-service storage cutover
+
+Before the first start of this release, stop the service and run the cutover
+once. It copies the old control-plane database to the canonical control path,
+materializes the VNext task read index, and builds the spool recovery index.
+The full scans happen here, outside application startup:
+
+```bash
+cd /opt/marketing-copilot-manual/backend
+./../venv/bin/python -m tools.cutover_vnext_store \
+  --source /opt/marketing-copilot/data/marketing_copilot.duckdb \
+  --control-target /opt/marketing-copilot/data/control/vnext-control.duckdb \
+  --projection-target /opt/marketing-copilot/data/vnext/projection/vnext-projection.duckdb \
+  --spool-root /opt/marketing-copilot/data/vnext/spool \
+  --manifest /opt/marketing-copilot/data/vnext/cutover-manifest.json \
+  --min-business-day 2026-10-19 \
+  --replace
+```
+
+The cutoff is inclusive: records before `2026-10-19` are not imported into the
+new task index or control database. Review the manifest counts before starting.
+Keep the old database as an offline rollback archive; the running service uses
+only `MC_CONTROL_DB_PATH`, the VNext projection, and its read/recovery
+sidecars. VNext ages records older than seven business days in bounded idle
+maintenance batches; it does not scan the old database or journals at startup.
+Do not run the command while the service owns either DuckDB file.
+
 ## Local version and rollback CLI
 
 The Web UI is not required for local recovery. Run the CLI with the bundled

@@ -34,7 +34,9 @@ def main(argv=None) -> int:
     if args.repair and args.campaign_id is None and args.file_id is None and not args.filename:
         parser.error("--repair requires --campaign-id, --file-id, or --filename")
 
-    database.init_db()
+    # The production store has already been prepared by the stopped-service
+    # cutover.  This maintenance command must not repeat schema/index work.
+    database.init_runtime_db()
     result = realtime_ingestion_state.reconcile_processed_files(
         campaign_id=args.campaign_id,
         file_id=args.file_id,

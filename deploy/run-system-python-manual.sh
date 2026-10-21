@@ -85,12 +85,18 @@ fi
 
 mkdir -p "$APP_HOME/data" "$APP_HOME/logs" "$APP_HOME/run" "$APP_HOME/backups" "$APP_HOME/updates"
 export MC_STATE_DIR="${MC_STATE_DIR:-$APP_HOME/data}"
+export MC_CONTROL_DB_PATH="${MC_CONTROL_DB_PATH:-$MC_STATE_DIR/control/vnext-control.duckdb}"
+# Keep older tooling pointed at the canonical file too.  The old database is
+# an offline migration input only and is never selected by the service.
+export DUCKDB_PATH="$MC_CONTROL_DB_PATH"
+export MC_REQUIRE_CANONICAL_STORE="${MC_REQUIRE_CANONICAL_STORE:-1}"
 export MC_UPDATE_DIR="${MC_UPDATE_DIR:-$APP_HOME/updates}"
 export MC_UPDATE_MODE="${MC_UPDATE_MODE:-manual}"
 export MC_FRONTEND_DIR="${MC_FRONTEND_DIR:-$APP_HOME/frontend/dist}"
 export MC_PIPELINE_MODE="${MC_PIPELINE_MODE:-vnext}"
 export MC_VNEXT_RUN_ROOT="${MC_VNEXT_RUN_ROOT:-$MC_STATE_DIR/vnext}"
 mkdir -p "$MC_VNEXT_RUN_ROOT"
+mkdir -p "$(dirname "$MC_CONTROL_DB_PATH")"
 
 # When invoked by systemd, this script must remain the managed foreground
 # process only for legacy units that still use run.sh as ExecStart.

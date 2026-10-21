@@ -10,11 +10,21 @@ import threading
 import time
 import contextlib
 from collections import deque
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 
+from .business_day import business_timezone, normalize_business_day
 from .critical_path_profiler import CriticalPathProfiler
 from .diagnostics import enable_native_fault_capture, write_process_metadata
 from .process_lifecycle import set_parent_death_signal
+from .task_index import (
+    connect_writer as connect_task_index_writer,
+    delete_rows as delete_task_index_rows,
+    default_task_index_path,
+    is_ready as task_index_is_ready,
+    mark_ready as mark_task_index_ready,
+    upsert_rows as upsert_task_index_rows,
+)
 
 
 class ProjectionWriterBusy(RuntimeError):
@@ -423,8 +433,10 @@ class ProjectionWriter:
                  batch_size: int = 512, retry_seconds: float = 0.05,
                  flush_interval_seconds: float = 0.1,
                  staging_mode: str = "vectorized", reuse_staging: bool = True,
+                 task_index_path: str | os.PathLike[str] | None = None,
                  profiler: CriticalPathProfiler | None = None):
         self.db_path = str(Path(db_path).resolve())
+        self.task_index_path = Path(task_index_path).resolve() if task_index_path else default_task_index_path(self.db_path)
         self.queue_size = max(1, int(queue_size))
         self.batch_size = max(1, int(batch_size))
         self.retry_seconds = max(0.001, float(retry_seconds))
@@ -436,6 +448,8 @@ class ProjectionWriter:
         self.profiler = profiler
         self._queue: deque[dict] = deque(maxlen=self.queue_size)
         self._conn = None
+        self._task_index_conn = None
+        self._task_index_ready = False
         self._paused_until = 0.0
         self._applied = 0
         self._duplicates = 0
@@ -477,6 +491,11 @@ class ProjectionWriter:
             "journal_backlog_bytes": 0,
             "journal_backlog_events_estimate": 0,
             "projection_events_applied": 0,
+            "retention_runs": 0,
+            "retention_task_index_deleted": 0,
+            "retention_progress_events_deleted": 0,
+            "retention_projection_rows_deleted": 0,
+            "retention_sidecar_rows_deleted": 0,
         }
         self._batch_sizes: deque[int] = deque(maxlen=4096)
         self._staging_batch_durations_ns: deque[int] = deque(maxlen=4096)
@@ -488,6 +507,7 @@ class ProjectionWriter:
         self._daily_totals_cache: list[dict] = []
         self._campaign_daily_totals_cached_at = 0.0
         self._campaign_daily_totals_cache: list[dict] = []
+        self._retention_pending_sidecar_ids: set[str] = set()
 
     def _table_columns(self, table: str) -> set[str]:
         try:
@@ -621,8 +641,26 @@ class ProjectionWriter:
                     FROM vnext_projection_legacy"""
                 )
         ensure_task_index_schema(self._conn)
+        self._task_index_conn = connect_task_index_writer(self.task_index_path)
+        self._task_index_ready = task_index_is_ready(self._task_index_conn)
+        if not self._task_index_ready:
+            # A pre-existing projection may need an offline sidecar rebuild.
+            # Do not scan its historical task index here: that would put the
+            # migration back on the service startup critical path.
+            try:
+                existing = int(self._conn.execute(
+                    f"SELECT COUNT(*) FROM {TASK_INDEX_TABLE}"
+                ).fetchone()[0])
+            except Exception:
+                existing = 0
+            if existing == 0:
+                mark_task_index_ready(self._task_index_conn, True)
+                self._task_index_ready = True
 
     def stop(self) -> None:
+        if self._task_index_conn is not None:
+            self._task_index_conn.close()
+            self._task_index_conn = None
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -690,6 +728,18 @@ class ProjectionWriter:
             float(event.get("event_at") or event.get("created_at") or time.time()),
         )
 
+    def _latest_task_index_rows(self, batch: list[dict]) -> list[tuple]:
+        latest: dict[str, tuple] = {}
+        for event in batch:
+            key = self._logical_task_id(event)
+            if not key:
+                continue
+            row = self._task_index_row(event)
+            previous = latest.get(key)
+            if previous is None or row[-1] >= previous[-1]:
+                latest[key] = row
+        return list(latest.values())
+
     def _apply_task_index_batch(self, batch: list[dict], execute, executemany) -> int:
         """Upsert one bounded latest-state row per logical task.
 
@@ -700,16 +750,8 @@ class ProjectionWriter:
         ``event_at`` in the same projection transaction.
         """
 
-        latest: dict[str, tuple] = {}
-        for event in batch:
-            key = self._logical_task_id(event)
-            if not key:
-                continue
-            row = self._task_index_row(event)
-            previous = latest.get(key)
-            if previous is None or row[-1] >= previous[-1]:
-                latest[key] = row
-        if not latest:
+        latest_rows = self._latest_task_index_rows(batch)
+        if not latest_rows:
             return 0
         execute(
             """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_task_index_batch (
@@ -725,7 +767,7 @@ class ProjectionWriter:
         executemany(
             """INSERT INTO _vnext_task_index_batch VALUES
                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            list(latest.values()),
+            latest_rows,
         )
         execute(
             f"""INSERT INTO {TASK_INDEX_TABLE}(
@@ -757,7 +799,20 @@ class ProjectionWriter:
                     last_event_at=excluded.last_event_at
                 WHERE excluded.last_event_at >= {TASK_INDEX_TABLE}.last_event_at"""
         )
-        return len(latest)
+        if self._task_index_conn is not None:
+            # Keep the read sidecar in the same bounded projection quantum.
+            # It is committed before the DuckDB transaction is committed; if
+            # DuckDB fails, the sidecar transaction is rolled back and the
+            # journal offset is not advanced, so replay repairs it.
+            self._task_index_conn.execute("BEGIN")
+            try:
+                upsert_task_index_rows(self._task_index_conn, latest_rows)
+                self._task_index_conn.execute("COMMIT")
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self._task_index_conn.execute("ROLLBACK")
+                raise
+        return len(latest_rows)
 
     def _clear_staging(self, execute, batch_table_sql: str) -> None:
         """Clear/reuse the staging tables without changing transaction scope.
@@ -1039,6 +1094,170 @@ class ProjectionWriter:
         self._last_flush_monotonic = time.monotonic()
         return len(batch)
 
+    @staticmethod
+    def _retention_boundary(
+        retention_days: int,
+        reference_day: str | date | None = None,
+    ) -> tuple[str, float]:
+        """Return the inclusive business-day cutoff and its midnight epoch.
+
+        ``business_day < cutoff`` is aged.  Keeping the cutoff day itself
+        matches the usual seven-calendar-day retention window and prevents a
+        timezone boundary from removing a still-visible day's records.
+        """
+
+        days = max(1, min(3650, int(retention_days)))
+        _timezone_name, timezone_value = business_timezone()
+        if reference_day is None:
+            current_day = datetime.now(timezone.utc).astimezone(timezone_value).date()
+        else:
+            current_day = date.fromisoformat(normalize_business_day(reference_day))
+        cutoff = current_day - timedelta(days=days)
+        boundary = datetime.combine(
+            cutoff, datetime_time.min, tzinfo=timezone_value,
+        ).timestamp()
+        return cutoff.isoformat(), boundary
+
+    def age_expired(
+        self,
+        retention_days: int = 7,
+        max_rows: int = 5000,
+        *,
+        reference_day: str | date | None = None,
+    ) -> dict:
+        """Age a bounded batch without scanning journals or opening another DB.
+
+        The projection child is the sole DuckDB owner, so this maintenance is
+        run there between projection quanta.  Dates are indexed and the batch
+        is bounded; the send workers continue writing their durable journals
+        and spool while this short transaction runs.  The SQLite sidecar is
+        updated only after the DuckDB transaction commits and is repaired on a
+        later interval if it is temporarily unavailable.
+        """
+
+        if self._conn is None:
+            raise RuntimeError("projection writer is not started")
+        limit = max(1, min(100_000, int(max_rows)))
+        cutoff_day, cutoff_epoch = self._retention_boundary(
+            retention_days, reference_day,
+        )
+        task_predicate = "((business_day <> '' AND business_day < ?) OR (business_day = '' AND created_at < ?))"
+        progress_predicate = task_predicate
+        projection_predicate = (
+            "((business_day <> '' AND business_day < ?) OR "
+            "(business_day = '' AND updated_at < ?))"
+        )
+        task_ids: list[str] = []
+        progress_ids: list[str] = []
+        projection_deleted = 0
+
+        self._conn.execute("BEGIN TRANSACTION")
+        try:
+            task_ids = [
+                str(row[0])
+                for row in self._conn.execute(
+                    f"""SELECT event_id FROM {TASK_INDEX_TABLE}
+                        WHERE {task_predicate}
+                        ORDER BY business_day, created_at, ordinal, event_id
+                        LIMIT ?""",
+                    (cutoff_day, cutoff_epoch, limit),
+                ).fetchall()
+            ]
+            progress_ids = [
+                str(row[0])
+                for row in self._conn.execute(
+                    f"""SELECT event_id FROM vnext_progress_events
+                        WHERE {progress_predicate}
+                        ORDER BY business_day, created_at, ordinal, event_id
+                        LIMIT ?""",
+                    (cutoff_day, cutoff_epoch, limit),
+                ).fetchall()
+            ]
+
+            self._conn.execute(
+                """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_retention_task_ids(
+                       event_id VARCHAR PRIMARY KEY
+                   )"""
+            )
+            self._conn.execute("DELETE FROM _vnext_retention_task_ids")
+            if task_ids:
+                self._conn.executemany(
+                    "INSERT INTO _vnext_retention_task_ids VALUES (?)",
+                    [(value,) for value in task_ids],
+                )
+                self._conn.execute(
+                    f"""DELETE FROM {TASK_INDEX_TABLE}
+                        WHERE event_id IN (
+                            SELECT event_id FROM _vnext_retention_task_ids
+                        )"""
+                )
+
+            self._conn.execute(
+                """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_retention_progress_ids(
+                       event_id VARCHAR PRIMARY KEY
+                   )"""
+            )
+            self._conn.execute("DELETE FROM _vnext_retention_progress_ids")
+            if progress_ids:
+                self._conn.executemany(
+                    "INSERT INTO _vnext_retention_progress_ids VALUES (?)",
+                    [(value,) for value in progress_ids],
+                )
+                self._conn.execute(
+                    """DELETE FROM vnext_progress_events
+                        WHERE event_id IN (
+                            SELECT event_id FROM _vnext_retention_progress_ids
+                        )"""
+                )
+
+            projection_deleted = int(self._conn.execute(
+                f"SELECT COUNT(*) FROM vnext_projection WHERE {projection_predicate}",
+                (cutoff_day, cutoff_epoch),
+            ).fetchone()[0])
+            if projection_deleted:
+                self._conn.execute(
+                    f"DELETE FROM vnext_projection WHERE {projection_predicate}",
+                    (cutoff_day, cutoff_epoch),
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("ROLLBACK")
+            raise
+
+        sidecar_deleted = 0
+        sidecar_error = ""
+        sidecar_ids = list(dict.fromkeys(
+            [*self._retention_pending_sidecar_ids, *task_ids]
+        ))
+        if self._task_index_conn is not None and sidecar_ids:
+            try:
+                sidecar_deleted = delete_task_index_rows(
+                    self._task_index_conn, sidecar_ids,
+                )
+                self._retention_pending_sidecar_ids.clear()
+            except Exception as exc:  # retry on the next bounded interval
+                sidecar_error = f"{type(exc).__name__}: {exc}"
+                self._retention_pending_sidecar_ids.update(sidecar_ids)
+
+        self._metrics["retention_runs"] += 1
+        self._metrics["retention_task_index_deleted"] += len(task_ids)
+        self._metrics["retention_progress_events_deleted"] += len(progress_ids)
+        self._metrics["retention_projection_rows_deleted"] += projection_deleted
+        self._metrics["retention_sidecar_rows_deleted"] += sidecar_deleted
+        self._daily_totals_cached_at = 0.0
+        self._campaign_daily_totals_cached_at = 0.0
+        return {
+            "cutoff_business_day": cutoff_day,
+            "retention_days": max(1, int(retention_days)),
+            "task_index_deleted": len(task_ids),
+            "progress_events_deleted": len(progress_ids),
+            "projection_rows_deleted": projection_deleted,
+            "sidecar_rows_deleted": sidecar_deleted,
+            "pending_sidecar_rows": len(self._retention_pending_sidecar_ids),
+            "sidecar_error": sidecar_error,
+        }
+
     def replay(self, journal: ProgressJournal) -> int:
         events = journal.read()
         for event in events:
@@ -1193,6 +1412,8 @@ class ProjectionWriter:
         metrics = self._publish_metrics(force=force_metrics)
         return {
             "db_path": self.db_path,
+            "task_index_path": str(self.task_index_path),
+            "task_index_ready": bool(self._task_index_ready),
             "queue_depth": len(self._queue),
             "queue_capacity": self.queue_size,
             "batch_size": self.batch_size,
@@ -1266,6 +1487,7 @@ def _process_main(
     start_method: str = "spawn",
     staging_mode: str = "vectorized",
     reuse_staging: bool = True,
+    task_index_path: str = "",
     profile_root: str = "",
     profile_interval_seconds: float = 1.0,
     ready_event=None,
@@ -1307,6 +1529,7 @@ def _process_main(
         flush_interval_seconds=flush_interval_seconds,
         staging_mode=staging_mode,
         reuse_staging=reuse_staging,
+        task_index_path=task_index_path or None,
         profiler=profiler,
     )
     journals = tuple(ProgressJournal(path, profiler=profiler) for path in journal_paths)
@@ -1317,6 +1540,30 @@ def _process_main(
     pending_input_events: list[dict] = []
     graceful_stop = False
     journal_cursor = 0
+    try:
+        retention_days = max(
+            1, min(3650, int(os.environ.get("MC_VNEXT_RETENTION_DAYS", "7")))
+        )
+    except (TypeError, ValueError):
+        retention_days = 7
+    try:
+        retention_batch = max(
+            100, min(100_000, int(os.environ.get("MC_VNEXT_RETENTION_BATCH", "5000")))
+        )
+    except (TypeError, ValueError):
+        retention_batch = 5000
+    try:
+        retention_interval = max(
+            10.0, min(86400.0, float(
+                os.environ.get("MC_VNEXT_RETENTION_INTERVAL_SECONDS", "60")
+            ))
+        )
+    except (TypeError, ValueError):
+        retention_interval = 60.0
+    retention_last_run_monotonic = time.monotonic() - retention_interval
+    retention_last_run_at = 0.0
+    retention_last_result: dict = {}
+    retention_last_error = ""
 
     def status(*, force_metrics: bool = False) -> dict:
         value = writer.snapshot(force_metrics=force_metrics)
@@ -1374,6 +1621,15 @@ def _process_main(
             "journal_events_read": journal_events_read,
             "journal_bytes_read": journal_bytes_read,
         })
+        value["retention"] = {
+            "enabled": True,
+            "retention_days": retention_days,
+            "batch_size": retention_batch,
+            "interval_seconds": retention_interval,
+            "last_run_at": retention_last_run_at,
+            "last_result": dict(retention_last_result),
+            "last_error": retention_last_error,
+        }
         if profiler.enabled:
             value["critical_path"] = profiler.snapshot()
         return value
@@ -1384,6 +1640,43 @@ def _process_main(
         profiler.inc("process_status_write_count")
         profiler.observe_ns("process_status_write", time.perf_counter_ns() - started_ns)
         profiler.publish_if_due()
+
+    def maybe_age(*, force: bool = False) -> None:
+        nonlocal retention_last_run_monotonic, retention_last_run_at
+        nonlocal retention_last_result, retention_last_error
+        if pending_events or pending_input_events or writer._queue:
+            return
+        now = time.monotonic()
+        if not force and now - retention_last_run_monotonic < retention_interval:
+            return
+        retention_last_run_monotonic = now
+        retention_last_run_at = time.time()
+        try:
+            result = writer.age_expired(
+                retention_days=retention_days,
+                max_rows=retention_batch,
+            )
+            retention_last_result = result
+            retention_last_error = str(result.get("sidecar_error") or "")
+            if any(
+                int(result.get(key, 0) or 0)
+                for key in (
+                    "task_index_deleted", "progress_events_deleted",
+                    "projection_rows_deleted", "sidecar_rows_deleted",
+                )
+            ):
+                diagnostic(
+                    phase="retention",
+                    status="running",
+                    progress=result,
+                )
+        except Exception as exc:
+            retention_last_error = f"{type(exc).__name__}: {exc}"
+            diagnostic(
+                phase="retention_retry",
+                status="degraded",
+                extra={"last_error": retention_last_error},
+            )
 
     try:
         writer.start()
@@ -1435,6 +1728,7 @@ def _process_main(
                             profiler.mark("last_projection_offset_durable_monotonic")
                     pending_events = []
                     pending_offsets = {}
+                    maybe_age()
                     diagnostic(
                         phase="journal_flush",
                         status="running",
@@ -1532,6 +1826,7 @@ def _process_main(
                     stop_event.is_set() and not pending_events and not pending_input_events
                 ):
                     break
+                maybe_age()
                 write_status()
                 time.sleep(min(0.05, writer.flush_interval_seconds))
         else:
@@ -1553,6 +1848,7 @@ def _process_main(
                             time.sleep(writer.retry_seconds)
                     if stop_event.is_set() and not writer._queue:
                         break
+                    maybe_age()
                     write_status()
                     continue
                 except (EOFError, OSError):
@@ -1601,6 +1897,7 @@ def _process_main(
                         extra={"last_error": f"{type(exc).__name__}: {exc}"},
                     )
                     time.sleep(writer.retry_seconds)
+        maybe_age(force=True)
         write_status(force_metrics=True)
         diagnostic(
             phase="stopped", status="stopped",
@@ -1634,6 +1931,7 @@ class ProjectionWriterProcess:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / db_name
+        self.task_index_path = self.root / "vnext-task-index.sqlite3"
         self.status_path = self.root / "projection-writer-status.json"
         self.queue_size = max(1, int(queue_size))
         self.batch_size = max(1, int(batch_size))
@@ -1672,6 +1970,7 @@ class ProjectionWriterProcess:
                 self.batch_size, self.journal_paths, str(self.offsets_path),
                 self.flush_interval_seconds, str(self.diagnostics_root), self.run_id,
                 self.start_method, self.staging_mode, self.reuse_staging,
+                str(self.task_index_path),
                 str(self.profile_root) if self.profile_root else "",
                 self.profile_interval_seconds,
                 self.ready_event,

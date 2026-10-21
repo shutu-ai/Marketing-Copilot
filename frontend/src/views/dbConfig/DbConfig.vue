@@ -17,7 +17,7 @@
         <el-row :gutter="20">
           <el-col :span="16">
             <el-form-item :label="$t('dbConfig.dbPath')" required>
-              <el-input v-model="form.db_path" placeholder="marketing_copilot.duckdb" />
+              <el-input v-model="form.db_path" readonly />
             </el-form-item>
             <el-form-item :label="$t('dbConfig.activeDbPath')">
               <el-input :model-value="activeDbPath" readonly />
@@ -27,32 +27,24 @@
             </el-form-item>
           </el-col>
         </el-row>
-        <el-form-item>
-          <el-button type="primary" :loading="saving" @click="handleSave">
-            <el-icon><Check /></el-icon>
-            {{ $t('common.save') }}
-          </el-button>
-          <el-button :loading="testing" @click="handleTest">
-            <el-icon><Refresh /></el-icon>
-            {{ $t('common.test') }}
-          </el-button>
-        </el-form-item>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="Canonical control database is fixed after offline migration."
+        />
       </el-form>
     </el-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import i18n from '@/i18n'
 import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
-import { getDbConfig, saveDbConfig, testDbConnection } from '@/api/dbConfig'
+import { getDbConfig } from '@/api/dbConfig'
 
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
 
 const connected = ref(false)
-const saving = ref(false)
-const testing = ref(false)
 const activeDbPath = ref('')
 
 const form = ref({
@@ -70,35 +62,6 @@ onMounted(async () => {
   }
 })
 
-async function handleSave() {
-  saving.value = true
-  try {
-    await saveDbConfig(form.value)
-    ElMessage.success(i18n.global.t('common.saveSuccess'))
-    connected.value = true
-  } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || i18n.global.t('common.saveFailed'))
-    connected.value = false
-  } finally {
-    saving.value = false
-  }
-}
-
-async function handleTest() {
-  testing.value = true
-  try {
-    const res = await testDbConnection(form.value)
-    if (res.data.success) {
-      ElMessage.success(res.data.message)
-    } else {
-      ElMessage.warning(res.data.message)
-    }
-  } catch (e: any) {
-    ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x9710d9b9'))
-  } finally {
-    testing.value = false
-  }
-}
 </script>
 
 <style scoped>

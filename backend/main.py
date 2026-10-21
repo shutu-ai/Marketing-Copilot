@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from database import (
-    init_db,
+    init_runtime_db,
     is_database_read_error,
     is_transient_write_error,
     read_transaction,
@@ -197,10 +197,11 @@ def startup():
     from services import bounded_dispatch_service
     bounded_dispatch_service.freeze_mode()
     acquire_instance_lock()
-    from services import db_config as db_config_service
-    from database import get_database_file, set_database_file
-    set_database_file(db_config_service.get_effective_db_path(get_database_file()))
-    init_db()
+    # The canonical control-plane path is selected by MC_CONTROL_DB_PATH (or
+    # the isolated test DUCKDB_PATH).  Startup only validates its prepared
+    # marker; schema migrations, backfills, and index creation are offline
+    # cutover work and never run on the request-service startup path.
+    init_runtime_db()
     start_stall_watchdog(
         os.environ.get("MC_STALL_DIAGNOSTICS_DIR"),
         os.environ.get("MC_STALL_DIAGNOSTICS_THRESHOLD_SECONDS", "30"),

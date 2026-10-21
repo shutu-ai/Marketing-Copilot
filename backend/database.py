@@ -955,8 +955,11 @@ def prepare_duckdb_connection() -> dict:
     return config
 
 DATABASE_FILE = os.environ.get(
-    "DUCKDB_PATH",
-    os.path.join(os.path.dirname(__file__), "marketing_copilot.duckdb")
+    "MC_CONTROL_DB_PATH",
+    os.environ.get(
+        "DUCKDB_PATH",
+        os.path.join(os.path.dirname(__file__), "marketing_copilot.duckdb"),
+    ),
 )
 
 TABLE_SEQUENCES = {
@@ -2427,3 +2430,71 @@ def init_db():
         "[DB] init_db complete elapsed=%.3fs",
         time.perf_counter() - started,
     )
+
+
+def init_runtime_db() -> dict:
+    """Validate the prepared canonical store without running maintenance.
+
+    ``init_db`` remains an offline schema/migration operation for tests and
+    the stopped-service cutover tool.  The web process must never repeat its
+    data normalization, backfills, or index checks while starting against a
+    multi-gigabyte store.
+    """
+
+    path = str(DATABASE_FILE)
+    strict = _env_bool(os.environ.get("MC_REQUIRE_CANONICAL_STORE"), False)
+    if strict and not str(os.environ.get("MC_CONTROL_DB_PATH") or "").strip():
+        raise RuntimeError(
+            "MC_CONTROL_DB_PATH is required in canonical production mode; "
+            "the legacy DUCKDB_PATH selector is not a runtime fallback"
+        )
+    required = {
+        "app_settings", "users", "smpp_configs", "campaigns",
+        "batch_campaigns", "realtime_campaigns", "ingestion_files",
+    }
+    try:
+        conn = get_connection().set_operation("database.runtime_schema_check")
+    except Exception as exc:
+        if not strict and (path == ":memory:" or not os.path.exists(path)):
+            init_db()
+            return {"path": path, "ready": True, "initialized": True}
+        raise RuntimeError(
+            f"canonical control database is unavailable: {path}; "
+            "run tools/cutover_vnext_store.py before starting the service"
+        ) from exc
+    try:
+        tables = {
+            str(row[0]) for row in conn.execute(
+                """SELECT table_name FROM information_schema.tables
+                   WHERE table_schema='main' AND table_type='BASE TABLE'"""
+            ).fetchall()
+        }
+        missing = sorted(required.difference(tables))
+        if missing:
+            if not strict:
+                conn.close()
+                init_db()
+                return {"path": path, "ready": True, "initialized": True}
+            raise RuntimeError(
+                f"canonical control database is incomplete ({', '.join(missing)}); "
+                "run tools/cutover_vnext_store.py while the service is stopped"
+            )
+        marker = conn.execute(
+            "SELECT value FROM app_settings WHERE key=?",
+            ("db_canonical_ready_v1",),
+        ).fetchone()
+        ready = bool(marker and str(marker[0]) == "completed")
+        if strict and not ready:
+            raise RuntimeError(
+                f"canonical control database has not completed migration: {path}; "
+                "run tools/cutover_vnext_store.py before starting the service"
+            )
+        logger.info(
+            "[DB] runtime canonical store ready path=%s marker=%s "
+            "(startup maintenance skipped)",
+            path,
+            ready,
+        )
+        return {"path": path, "ready": ready, "initialized": False}
+    finally:
+        conn.close()

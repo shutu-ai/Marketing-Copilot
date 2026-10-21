@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -89,3 +90,66 @@ def test_spool_idle_reader_skips_fully_checkpointed_segments(tmp_path, monkeypat
 
     monkeypatch.setattr(SpoolRecord, "from_dict", staticmethod(fail_if_decoded))
     assert list(spool.iter_from(0, spool.cursor(0))) == []
+
+
+def test_spool_restart_uses_persistent_offsets_without_scanning_segments(tmp_path, monkeypatch):
+    root = tmp_path / "spool"
+    spool = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    spool.append(record("persisted", partition=0))
+    spool._recovery_index.close()
+
+    def fail_scan(*_args, **_kwargs):
+        raise AssertionError("restart scanned an unchanged historical segment")
+
+    monkeypatch.setattr(TaskSpool, "_scan_segment", fail_scan)
+    recovered = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    assert recovered.recovery_report()["recovery_index"]["ready"] is True
+    assert recovered.recovery_report()["recovery_index"]["segment_offsets"] == 1
+
+
+def test_spool_without_recovery_index_defers_full_scan_to_offline_rebuild(tmp_path, monkeypatch):
+    root = tmp_path / "legacy-spool"
+    spool = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    spool.append(record("legacy-persisted", partition=0))
+    spool._recovery_index.close()
+    for path in root.glob("recovery-index.sqlite3*"):
+        path.unlink()
+
+    def fail_scan(*_args, **_kwargs):
+        raise AssertionError("missing recovery index triggered a startup scan")
+
+    monkeypatch.setattr(TaskSpool, "_scan_segment", fail_scan)
+    recovered = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    report = recovered.recovery_report()
+    assert report["recovery_index"]["ready"] is False
+    assert report["recovery_index"]["segment_offsets"] == 0
+
+
+def test_spool_refresh_can_use_recovery_index_from_background_thread(tmp_path):
+    root = tmp_path / "threaded-spool"
+    writer = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    writer.append(record("first", partition=0))
+
+    # The long-lived runtime creates its spool on the owner thread, then a
+    # later manifest update is observed by a background ingestion/scheduler
+    # thread.  Keep a second instance as the writer so refresh has a real
+    # appended tail to index.
+    reader = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    writer.append(record("second", partition=0))
+    errors = []
+
+    def refresh_from_worker() -> None:
+        try:
+            reader.refresh()
+        except Exception as exc:  # pragma: no cover - assertion reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=refresh_from_worker, name="spool-refresh-test")
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+    writer._recovery_index.close()
+    reader._recovery_index.close()

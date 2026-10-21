@@ -20,6 +20,11 @@ from database import read_transaction
 from vnext.ingress import IngressRouter
 from vnext.runtime import VNextRuntime
 from vnext.spool import DEFAULT_MAX_SPOOL_BYTES, SpoolCapacityError
+from vnext.task_index import (
+    connect_reader as connect_task_index_reader,
+    default_task_index_path,
+    is_ready as task_index_is_ready,
+)
 
 
 _LOCK = threading.RLock()
@@ -767,13 +772,27 @@ def _projection_task_page(
     """
 
     try:
-        import duckdb
-
         value = runtime()
         snapshot = value.projection.snapshot()
         db_path = snapshot.get("db_path")
         if not db_path:
             return None
+        # The projection child owns DuckDB exclusively.  The sidecar is the
+        # normal live read path; only stopped-process tools/tests may use the
+        # DuckDB fallback to inspect a projection that is not being written.
+        task_index_path = snapshot.get("task_index_path") or str(
+            default_task_index_path(db_path)
+        )
+        connection = connect_task_index_reader(task_index_path)
+        using_sidecar = connection is not None
+        if using_sidecar and not task_index_is_ready(connection):
+            connection.close()
+            return None
+        if connection is None:
+            if bool(snapshot.get("alive")):
+                return None
+            import duckdb
+            connection = duckdb.connect(str(db_path), read_only=True)
         selected_day = str(business_day or "")
         # Keep the unfiltered operations page cheap by defaulting it to the
         # active business day.  A user-supplied filter is an explicit lookup
@@ -800,13 +819,13 @@ def _projection_task_page(
             params.append(msisdn)
         where = " AND ".join(conditions)
         offset = (max(1, int(page)) - 1) * max(1, int(page_size))
-        connection = duckdb.connect(str(db_path), read_only=True)
         try:
-            total = int(connection.execute(
+            total_cursor = connection.execute(
                 f"SELECT COUNT(*) FROM vnext_task_index e WHERE {where}",
                 params,
-            ).fetchone()[0])
-            rows = connection.execute(
+            )
+            total = int(total_cursor.fetchone()[0])
+            rows_cursor = connection.execute(
                 f"""
                 SELECT e.event_id, e.campaign_type, e.campaign_id, e.route_id,
                        e.normalized_msisdn, e.language, e.campaign_name,
@@ -818,7 +837,10 @@ def _projection_task_page(
                  LIMIT ? OFFSET ?
                 """,
                 params + [max(1, int(page_size)), offset],
-            ).fetchall()
+            )
+            rows = rows_cursor.fetchall()
+            if using_sidecar:
+                return total, [dict(row) for row in rows]
             columns = [str(item[0]) for item in connection.description]
             return total, [dict(zip(columns, row)) for row in rows]
         finally:
@@ -875,21 +897,35 @@ def export_tasks() -> list[dict]:
     """Export the canonical VNext task index without opening the business DB."""
 
     try:
-        import duckdb
-
         value = runtime()
-        db_path = (value.projection.snapshot() or {}).get("db_path")
+        snapshot = value.projection.snapshot() or {}
+        db_path = snapshot.get("db_path")
         if not db_path:
             return []
-        connection = duckdb.connect(str(db_path), read_only=True)
+        task_index_path = snapshot.get("task_index_path") or str(
+            default_task_index_path(db_path)
+        )
+        connection = connect_task_index_reader(task_index_path)
+        if connection is not None:
+            if not task_index_is_ready(connection):
+                connection.close()
+                return []
+        elif bool(snapshot.get("alive")):
+            return []
+        else:
+            import duckdb
+            connection = duckdb.connect(str(db_path), read_only=True)
         try:
-            rows = connection.execute(
+            rows_cursor = connection.execute(
                 """SELECT event_id,campaign_name,campaign_type,campaign_id,route_id,
                           normalized_msisdn,language,message,state,parts_written,
                           parts_total,error,created_at,last_event_at,business_day
                      FROM vnext_task_index
                     ORDER BY created_at DESC,ordinal DESC,event_id DESC"""
-            ).fetchall()
+            )
+            rows = rows_cursor.fetchall()
+            if connection.__class__.__module__.startswith("sqlite3"):
+                return [_task_item_from_event(dict(row)) for row in rows]
             columns = [str(item[0]) for item in connection.description]
             return [
                 _task_item_from_event(dict(zip(columns, row)))

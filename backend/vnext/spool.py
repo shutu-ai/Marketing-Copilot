@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 import zlib
+import contextlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -206,13 +208,22 @@ class TaskSpool:
         self._taken_path = self.root / "taken.json"
         self._cursor_dir = self.root / "cursors"
         self._taken_dir = self.root / "taken"
+        self._recovery_index_path = self.root / "recovery-index.sqlite3"
         self._manifest = self._load_manifest()
         self._cursors = self._load_cursors()
         self._taken_pending = self._load_taken()
+        # The historical implementation rebuilt this dictionary by decoding
+        # every JSONL segment.  Keep only a bounded recent-record cache in
+        # memory; the durable event-id/offset index below is the restart
+        # authority and the segments remain the payload authority.
         self._event_index: dict[str, SpoolRecord] = {}
+        self._event_ids: set[str] = set()
+        self._recovery_index = self._open_recovery_index()
+        self._recovery_index_ready = False
         self._recovery_issues: list[str] = []
         self._manifest_signature = self._file_signature(self._manifest_path)
         self._segment_offsets: dict[Path, int] = {}
+        self._segment_signatures: dict[Path, tuple[int, int]] = {}
         self._lightweight_manifest_signature = self._manifest_signature
         self._lightweight_cursor_signatures: dict[str, tuple[int, int] | None] = {}
         self._lightweight_taken_signatures: dict[str, tuple[int, int] | None] = {}
@@ -231,6 +242,51 @@ class TaskSpool:
         self._manifest.setdefault("daily_bytes", {})
         self._recover_index()
 
+    def _open_recovery_index(self) -> sqlite3.Connection:
+        self._recovery_index_path.parent.mkdir(parents=True, exist_ok=True)
+        # The parent runtime shares one TaskSpool between the activity
+        # scheduler, realtime ingestion workers, and API-triggered ingress.
+        # ``self._lock`` serializes every access to this connection, but the
+        # default sqlite3 thread-affinity check rejects that safe, serialized
+        # use when the connection was opened by the process owner thread.
+        connection = sqlite3.connect(
+            str(self._recovery_index_path),
+            timeout=5.0,
+            check_same_thread=False,
+        )
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS spool_recovery_records (
+                event_id TEXT PRIMARY KEY,
+                partition_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                business_day TEXT NOT NULL DEFAULT '',
+                expires_at REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL DEFAULT 0,
+                segment_path TEXT NOT NULL,
+                offset_start INTEGER NOT NULL,
+                offset_end INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_spool_recovery_partition_ordinal
+                ON spool_recovery_records(partition_id, ordinal);
+            CREATE TABLE IF NOT EXISTS spool_recovery_segments (
+                segment_path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL DEFAULT 0,
+                mtime_ns INTEGER NOT NULL DEFAULT 0,
+                offset INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS spool_recovery_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        connection.commit()
+        return connection
+
     @staticmethod
     def _file_signature(path: Path) -> tuple[int, int] | None:
         try:
@@ -242,6 +298,140 @@ class TaskSpool:
     def _add_recovery_issue(self, value: str) -> None:
         if value not in self._recovery_issues:
             self._recovery_issues.append(value)
+
+    def _load_persistent_recovery_index(self) -> None:
+        """Load compact event/offset metadata without opening JSONL payloads."""
+
+        self._event_ids.clear()
+        self._segment_offsets.clear()
+        self._segment_signatures.clear()
+        row = self._recovery_index.execute(
+            "SELECT value FROM spool_recovery_meta WHERE key='ready'"
+        ).fetchone()
+        self._recovery_index_ready = bool(row and str(row[0]) == "1")
+        if not self._recovery_index_ready:
+            return
+        for item in self._recovery_index.execute(
+            "SELECT event_id FROM spool_recovery_records"
+        ):
+            self._event_ids.add(str(item[0]))
+        for item in self._recovery_index.execute(
+            "SELECT segment_path,size,mtime_ns,offset FROM spool_recovery_segments"
+        ):
+            path = Path(str(item[0])).resolve()
+            self._segment_signatures[path] = (int(item[2]), int(item[1]))
+            self._segment_offsets[path] = max(0, int(item[3]))
+
+    def _persist_recovery_index(
+        self,
+        rows: Iterable[tuple],
+        *,
+        ready: bool | None = None,
+    ) -> None:
+        values = list(rows)
+        segments = {}
+        for item in values:
+            segments[str(item[6])] = item
+        self._recovery_index.execute("BEGIN")
+        try:
+            if values:
+                self._recovery_index.executemany(
+                    """INSERT INTO spool_recovery_records(
+                           event_id,partition_id,ordinal,business_day,
+                           expires_at,created_at,segment_path,offset_start,offset_end
+                       ) VALUES (?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(event_id) DO UPDATE SET
+                           partition_id=excluded.partition_id,
+                           ordinal=excluded.ordinal,
+                           business_day=excluded.business_day,
+                           expires_at=excluded.expires_at,
+                           created_at=excluded.created_at,
+                           segment_path=excluded.segment_path,
+                           offset_start=excluded.offset_start,
+                           offset_end=excluded.offset_end""",
+                    values,
+                )
+            for path_text, item in segments.items():
+                path = Path(path_text).resolve()
+                signature = self._file_signature(path)
+                if signature is None:
+                    continue
+                offset = int(item[8])
+                self._recovery_index.execute(
+                    """INSERT INTO spool_recovery_segments(
+                           segment_path,size,mtime_ns,offset
+                       ) VALUES (?,?,?,?)
+                       ON CONFLICT(segment_path) DO UPDATE SET
+                           size=excluded.size,
+                           mtime_ns=excluded.mtime_ns,
+                           offset=excluded.offset""",
+                    (str(path), int(signature[1]), int(signature[0]), offset),
+                )
+                self._segment_offsets[path] = offset
+                self._segment_signatures[path] = signature
+            if ready is not None:
+                self._recovery_index.execute(
+                    """INSERT INTO spool_recovery_meta(key,value) VALUES('ready',?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                    ("1" if ready else "0",),
+                )
+                self._recovery_index_ready = bool(ready)
+            self._recovery_index.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._recovery_index.execute("ROLLBACK")
+            raise
+
+    def _delete_recovery_segments(self, paths: Iterable[Path]) -> None:
+        values = [str(Path(path).resolve()) for path in paths]
+        if not values:
+            return
+        self._recovery_index.execute("BEGIN")
+        try:
+            self._recovery_index.executemany(
+                "DELETE FROM spool_recovery_segments WHERE segment_path=?",
+                [(value,) for value in values],
+            )
+            self._recovery_index.executemany(
+                "DELETE FROM spool_recovery_records WHERE segment_path=?",
+                [(value,) for value in values],
+            )
+            self._recovery_index.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._recovery_index.execute("ROLLBACK")
+            raise
+
+    def _contains_event(self, event_id: str) -> bool:
+        return str(event_id) in self._event_ids
+
+    def _remember_record(self, record: SpoolRecord) -> None:
+        self._event_ids.add(record.event_id)
+        self._event_index[record.event_id] = record
+        # Duplicate suppression only needs a small hot cache.  Loading the
+        # whole 1.9G spool into Python objects is precisely what this index
+        # removes from startup.
+        while len(self._event_index) > 8192:
+            self._event_index.pop(next(iter(self._event_index)))
+
+    def _existing_record(self, record: SpoolRecord) -> SpoolRecord:
+        cached = self._event_index.get(record.event_id)
+        if cached is not None:
+            return cached
+        row = self._recovery_index.execute(
+            """SELECT partition_id,ordinal,business_day,expires_at
+                 FROM spool_recovery_records WHERE event_id=?""",
+            (record.event_id,),
+        ).fetchone()
+        if row is None:
+            return record
+        return replace(
+            record,
+            partition_id=int(row[0]),
+            ordinal=int(row[1]),
+            business_day=str(row[2] or record.business_day),
+            expires_at=float(row[3] or record.expires_at),
+        )
 
     @property
     def current_business_day(self) -> str:
@@ -260,15 +450,11 @@ class TaskSpool:
     def _rebuild_daily_metadata(self) -> None:
         records: dict[str, int] = {}
         bytes_by_day: dict[str, int] = {}
-        for record in self._event_index.values():
-            day = str(record.business_day or "")
-            records[day] = records.get(day, 0) + 1
-            # The exact segment byte count is retained separately in the
-            # manifest.  This estimate is only a bounded status hint.
-            bytes_by_day[day] = bytes_by_day.get(day, 0) + len(
-                json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True,
-                           separators=(",", ":")).encode("utf-8")
-            ) + 1
+        for entries in self._manifest.get("segments", {}).values():
+            for entry in entries:
+                day = str(entry.get("business_day") or "")
+                records[day] = records.get(day, 0) + int(entry.get("records", 0) or 0)
+                bytes_by_day[day] = bytes_by_day.get(day, 0) + int(entry.get("bytes", 0) or 0)
         self._manifest["daily_records"] = records
         self._manifest["daily_bytes"] = bytes_by_day
 
@@ -305,18 +491,20 @@ class TaskSpool:
         }
 
     def _day_summary_locked(self, day: str) -> dict:
-        total = 0
+        total = int(self._manifest.get("daily_records", {}).get(day, 0) or 0)
         pending = 0
-        for record in self._event_index.values():
-            if record.business_day != day:
-                continue
-            total += 1
-            taken = int(record.ordinal) <= self.cursor(record.partition_id)
-            taken = taken or int(record.ordinal) in self._taken_pending.get(
-                str(record.partition_id), set()
-            )
-            if not taken:
-                pending += 1
+        for partition_id in range(self.virtual_partition_count):
+            cursor = self.cursor(partition_id)
+            taken = self._taken_pending.get(str(partition_id), set())
+            for entry in self._manifest.get("segments", {}).get(str(partition_id), []):
+                if str(entry.get("business_day") or "") != day:
+                    continue
+                records = int(entry.get("records", 0) or 0)
+                first = int(entry.get("first_ordinal", 0) or 0)
+                last = int(entry.get("last_ordinal", first + records - 1) or 0)
+                consumed = max(0, min(last, cursor) - first + 1)
+                taken_in_segment = sum(1 for ordinal in taken if first <= int(ordinal) <= last)
+                pending += max(0, records - consumed - taken_in_segment)
         return {
             "business_day": day,
             "total_records": total,
@@ -346,8 +534,8 @@ class TaskSpool:
             return self._rollover_locked(normalize_business_day(target))
 
     def _normalize_for_append(self, record: SpoolRecord) -> SpoolRecord:
-        if record.event_id in self._event_index:
-            return record
+        if self._contains_event(record.event_id):
+            return self._existing_record(record)
         current = self.current_business_day
         business_day = str(record.business_day or current)
         try:
@@ -460,7 +648,12 @@ class TaskSpool:
     def _recover_index(self) -> None:
         with self._lock:
             self._event_index.clear()
-            self._segment_offsets = {}
+            self._load_persistent_recovery_index()
+            if not self._recovery_index_ready and not int(
+                self._manifest.get("total_records", 0) or 0
+            ):
+                self._persist_recovery_index([], ready=True)
+            pending_index_rows: list[tuple] = []
             for partition_id in range(self.virtual_partition_count):
                 entries = self._manifest["segments"].get(str(partition_id), [])
                 for entry in entries:
@@ -468,16 +661,41 @@ class TaskSpool:
                     if not path.exists():
                         self._add_recovery_issue(f"missing segment: {path.name}")
                         continue
-                    self._scan_segment(path, start=0)
-            self._manifest["total_records"] = len(self._event_index)
-            self._manifest["total_bytes"] = self._disk_bytes()
-            self._rebuild_daily_metadata()
+                    # A missing sidecar is repaired by the offline cutover
+                    # tool, never by a full startup scan.  Once present, only
+                    # an appended tail or a changed/truncated file is read.
+                    if not self._recovery_index_ready:
+                        continue
+                    size = int(path.stat().st_size)
+                    signature = self._file_signature(path)
+                    previous = self._segment_offsets.get(path, 0)
+                    previous_signature = self._segment_signatures.get(path)
+                    if previous_signature is not None and signature == previous_signature:
+                        if previous >= size:
+                            continue
+                        start = previous
+                    else:
+                        start = 0 if previous_signature is not None else previous
+                    pending_index_rows.extend(self._scan_segment(path, start=start))
+            if pending_index_rows:
+                self._persist_recovery_index(pending_index_rows)
+            if not self._manifest.get("total_records") and self._recovery_index_ready:
+                self._manifest["total_records"] = len(self._event_ids)
+            # Manifest counters are maintained by the single spool writer;
+            # use them directly instead of walking every historical shard.
+            if not self._manifest.get("total_bytes"):
+                self._manifest["total_bytes"] = sum(
+                    int(entry.get("bytes", 0) or 0)
+                    for entries in self._manifest.get("segments", {}).values()
+                    for entry in entries
+                )
             self._manifest_signature = self._file_signature(self._manifest_path)
 
-    def _scan_segment(self, path: Path, *, start: int = 0) -> None:
+    def _scan_segment(self, path: Path, *, start: int = 0) -> list[tuple]:
         """Index complete records from *start*, retaining a safe tail offset."""
 
         scan_start = max(0, int(start))
+        indexed: list[tuple] = []
         try:
             size = int(path.stat().st_size)
             if scan_start > size:
@@ -489,20 +707,92 @@ class TaskSpool:
                     raw = handle.readline()
                     if not raw:
                         self._segment_offsets[path] = handle.tell()
-                        return
+                        self._segment_signatures[path] = self._file_signature(path) or (0, 0)
+                        return indexed
                     if not raw.endswith(b"\n"):
                         self._add_recovery_issue(f"ignored partial final line: {path.name}")
                         self._segment_offsets[path] = line_start
-                        return
+                        self._segment_signatures[path] = self._file_signature(path) or (0, 0)
+                        return indexed
                     try:
                         record = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
                     except (ValueError, UnicodeError, SpoolError) as exc:
                         self._add_recovery_issue(f"invalid spool record {path.name}: {exc}")
                         self._segment_offsets[path] = handle.tell()
                         continue
-                    self._event_index.setdefault(record.event_id, record)
+                    self._remember_record(record)
+                    indexed.append((
+                        record.event_id, int(record.partition_id), int(record.ordinal),
+                        str(record.business_day or ""), float(record.expires_at or 0),
+                        float(record.created_at or 0), str(path.resolve()),
+                        int(line_start), int(handle.tell()),
+                    ))
+                    self._segment_offsets[path] = handle.tell()
+                    self._segment_signatures[path] = self._file_signature(path) or (0, 0)
+            return indexed
         except OSError as exc:
             self._add_recovery_issue(f"cannot read segment {path.name}: {exc}")
+            return indexed
+
+    def rebuild_recovery_index(self) -> dict:
+        """Build the persistent recovery index in an offline maintenance window.
+
+        This is intentionally explicit because it is the only operation that
+        scans all retained JSONL payloads.  Normal application startup uses
+        the resulting offsets and never calls this method.
+        """
+
+        with self._lock:
+            self._recovery_index.execute("BEGIN")
+            try:
+                self._recovery_index.execute("DELETE FROM spool_recovery_records")
+                self._recovery_index.execute("DELETE FROM spool_recovery_segments")
+                self._recovery_index.execute(
+                    """INSERT INTO spool_recovery_meta(key,value) VALUES('ready','0')
+                       ON CONFLICT(key) DO UPDATE SET value='0'"""
+                )
+                self._recovery_index.execute("COMMIT")
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self._recovery_index.execute("ROLLBACK")
+                raise
+            self._event_ids.clear()
+            self._event_index.clear()
+            self._segment_offsets.clear()
+            self._segment_signatures.clear()
+            rows: list[tuple] = []
+            scanned_bytes = 0
+            for partition_id in range(self.virtual_partition_count):
+                for entry in self._manifest.get("segments", {}).get(str(partition_id), []):
+                    path = self._segment_path(partition_id, str(entry["filename"]))
+                    if not path.exists():
+                        self._add_recovery_issue(f"missing segment: {path.name}")
+                        continue
+                    try:
+                        scanned_bytes += int(path.stat().st_size)
+                    except OSError:
+                        pass
+                    rows.extend(self._scan_segment(path, start=0))
+                    # Keep memory bounded while retaining one transaction per
+                    # moderate group of records for long-lived production
+                    # spools.
+                    if len(rows) >= 50_000:
+                        self._persist_recovery_index(rows)
+                        rows.clear()
+            if rows:
+                self._persist_recovery_index(rows)
+            self._persist_recovery_index([], ready=True)
+            self._manifest["total_records"] = int(
+                self._manifest.get("total_records", len(self._event_ids)) or len(self._event_ids)
+            )
+            self._manifest["total_bytes"] = self._disk_bytes()
+            self._manifest_signature = self._file_signature(self._manifest_path)
+            return {
+                "path": str(self._recovery_index_path),
+                "ready": self._recovery_index_ready,
+                "records": len(self._event_ids),
+                "scanned_bytes": scanned_bytes,
+            }
 
     def refresh(self, partition_id: int | None = None, *, scan_segments: bool = True) -> None:
         """Refresh append-only state written by another process.
@@ -524,7 +814,8 @@ class TaskSpool:
                 if loaded is not None:
                     self._manifest = loaded
                     self._refresh_current_day_locked()
-                    if scan_segments:
+                    pending_index_rows: list[tuple] = []
+                    if scan_segments and self._recovery_index_ready:
                         for value in range(self.virtual_partition_count):
                             entries = self._manifest["segments"].get(str(value), [])
                             for entry in entries:
@@ -534,9 +825,21 @@ class TaskSpool:
                                     continue
                                 previous = self._segment_offsets.get(path, 0)
                                 size = int(path.stat().st_size)
-                                self._scan_segment(path, start=previous if previous <= size else 0)
-                        self._manifest["total_records"] = len(self._event_index)
-                        self._manifest["total_bytes"] = self._disk_bytes()
+                                pending_index_rows.extend(
+                                    self._scan_segment(
+                                        path, start=previous if previous <= size else 0
+                                    )
+                                )
+                        if pending_index_rows:
+                            self._persist_recovery_index(pending_index_rows)
+                        if not self._manifest.get("total_records"):
+                            self._manifest["total_records"] = len(self._event_ids)
+                        if not self._manifest.get("total_bytes"):
+                            self._manifest["total_bytes"] = sum(
+                                int(entry.get("bytes", 0) or 0)
+                                for entries in self._manifest.get("segments", {}).values()
+                                for entry in entries
+                            )
                     self._manifest_signature = signature
 
             if partition_id is None:
@@ -570,7 +873,8 @@ class TaskSpool:
 
         with self._lock:
             self._event_index.clear()
-            self._segment_offsets.clear()
+            # Keep event ids and durable offsets; only the small hot record
+            # cache is dropped after workers release their readers.
             self._manifest_signature = None
 
     def _disk_bytes(self) -> int:
@@ -719,12 +1023,17 @@ class TaskSpool:
         entries.append(current)
         return current, self._segment_path(partition_id, filename)
 
-    def _append_locked(self, record: SpoolRecord, handle_cache: dict[Path, object]) -> SpoolRecord:
+    def _append_locked(
+        self,
+        record: SpoolRecord,
+        handle_cache: dict[Path, object],
+        recovery_rows: list[tuple] | None = None,
+    ) -> SpoolRecord:
         partition_id = int(record.partition_id)
         if not 0 <= partition_id < self.virtual_partition_count:
             raise ValueError("record partition_id out of range")
-        if record.event_id in self._event_index:
-            return self._event_index[record.event_id]
+        if self._contains_event(record.event_id):
+            return self._existing_record(record)
         record = self._normalize_for_append(record)
         next_ordinal = int(self._manifest["next_ordinal"].get(str(partition_id), 1))
         if int(record.ordinal) <= 0:
@@ -751,7 +1060,9 @@ class TaskSpool:
         if handle is None:
             handle = path.open("ab")
             handle_cache[path] = handle
+        offset_start = int(handle.tell())
         handle.write(encoded)
+        offset_end = int(handle.tell())
         entry["records"] = int(entry["records"]) + 1
         entry["bytes"] = int(entry["bytes"]) + len(encoded)
         entry["first_ordinal"] = int(entry["first_ordinal"] or record.ordinal)
@@ -763,7 +1074,14 @@ class TaskSpool:
         daily_bytes = self._manifest.setdefault("daily_bytes", {})
         daily_records[record.business_day] = int(daily_records.get(record.business_day, 0)) + 1
         daily_bytes[record.business_day] = int(daily_bytes.get(record.business_day, 0)) + len(encoded)
-        self._event_index[record.event_id] = record
+        self._remember_record(record)
+        if recovery_rows is not None:
+            recovery_rows.append((
+                record.event_id, int(record.partition_id), int(record.ordinal),
+                str(record.business_day or ""), float(record.expires_at or 0),
+                float(record.created_at or 0), str(path.resolve()),
+                offset_start, offset_end,
+            ))
         return record
 
     def append(self, record: SpoolRecord) -> tuple[SpoolRecord, bool]:
@@ -775,17 +1093,19 @@ class TaskSpool:
                 self.refresh()
                 if today != self.current_business_day:
                     self._rollover_locked(today)
-            if record.event_id in self._event_index:
-                return self._event_index[record.event_id], False
+            if self._contains_event(record.event_id):
+                return self._existing_record(record), False
             record = self._normalize_for_append(record)
             handles: dict[Path, object] = {}
+            recovery_rows: list[tuple] = []
             try:
-                inserted = self._append_locked(record, handles)
+                inserted = self._append_locked(record, handles, recovery_rows)
                 for handle in handles.values():
                     handle.flush()
                     if self.fsync:
                         os.fsync(handle.fileno())
                 self._persist_manifest()
+                self._persist_recovery_index(recovery_rows)
                 return inserted, True
             finally:
                 for handle in handles.values():
@@ -808,16 +1128,18 @@ class TaskSpool:
             prepared = []
             for record in values:
                 prepared.append(
-                    record if record.event_id in self._event_index
+                    self._existing_record(record)
+                    if self._contains_event(record.event_id)
                     else self._normalize_for_append(record)
                 )
             handles: dict[Path, object] = {}
+            recovery_rows: list[tuple] = []
             appended: list[SpoolRecord] = []
             inserted_count = 0
             try:
                 for record in prepared:
-                    before = record.event_id in self._event_index
-                    item = self._append_locked(record, handles)
+                    before = self._contains_event(record.event_id)
+                    item = self._append_locked(record, handles, recovery_rows)
                     appended.append(item)
                     inserted_count += int(not before)
                 for handle in handles.values():
@@ -825,6 +1147,7 @@ class TaskSpool:
                     if self.fsync:
                         os.fsync(handle.fileno())
                 self._persist_manifest()
+                self._persist_recovery_index(recovery_rows)
                 return appended, inserted_count
             finally:
                 for handle in handles.values():
@@ -929,25 +1252,43 @@ class TaskSpool:
                 cursor = self.cursor(partition)
                 pending = 0
                 taken = self._taken_pending.get(str(partition), set())
-                for record in self._event_index.values():
-                    if record.partition_id != partition or record.business_day != self.current_business_day:
+                for entry in self._manifest.get("segments", {}).get(str(partition), []):
+                    if str(entry.get("business_day") or "") != self.current_business_day:
                         continue
-                    if record.is_expired(self._now()):
-                        expired += 1
-                    if int(record.ordinal) > cursor and int(record.ordinal) not in taken:
-                        pending += 1
+                    records = int(entry.get("records", 0) or 0)
+                    first = int(entry.get("first_ordinal", 0) or 0)
+                    last = int(entry.get("last_ordinal", first + records - 1) or 0)
+                    consumed = max(0, min(last, cursor) - first + 1)
+                    taken_in_segment = sum(
+                        1 for ordinal in taken if first <= int(ordinal) <= last
+                    )
+                    pending += max(0, records - consumed - taken_in_segment)
+                # A changed/tampered segment is rescanned only when its
+                # persisted signature changes.  Use that bounded cache for
+                # exact expiry/legacy-day checks when available; otherwise the
+                # manifest metadata is the no-scan startup contract.
+                for record in self._event_index.values():
+                    if record.partition_id == partition and record.business_day == self.current_business_day:
+                        if record.is_expired(self._now()):
+                            expired += 1
+                if self._event_ids and len(self._event_ids) <= len(self._event_index):
+                    pending = sum(
+                        1
+                        for record in self._event_index.values()
+                        if record.partition_id == partition
+                        and record.business_day == self.current_business_day
+                        and int(record.ordinal) > cursor
+                        and int(record.ordinal) not in taken
+                    )
                 pending_by_partition[str(partition)] = pending
-            for record in self._event_index.values():
-                if record.business_day:
-                    pending_by_day.setdefault(record.business_day, 0)
-                    if (record.business_day == self.current_business_day
-                            and record.ordinal > self.cursor(record.partition_id)
-                            and record.ordinal not in self._taken_pending.get(str(record.partition_id), set())):
-                        pending_by_day[record.business_day] += 1
+            for day, records in (self._manifest.get("daily_records", {}) or {}).items():
+                pending_by_day.setdefault(str(day), 0)
+                if str(day) == self.current_business_day:
+                    pending_by_day[str(day)] = sum(pending_by_partition.values())
             return {
                 "schema_version": SPOOL_SCHEMA_VERSION,
                 "virtual_partition_count": self.virtual_partition_count,
-                "total_records": len(self._event_index),
+                "total_records": int(self._manifest.get("total_records", 0) or 0),
                 "total_bytes": self._disk_bytes(),
                 "business_day": self.current_business_day,
                 "business_epoch": self.business_epoch,
@@ -960,6 +1301,12 @@ class TaskSpool:
                 "cursors": dict(self._cursors),
                 "taken_pending": {key: sorted(value) for key, value in self._taken_pending.items() if value},
                 "recovery_issues": list(self._recovery_issues),
+                "recovery_index": {
+                    "path": str(self._recovery_index_path),
+                    "ready": bool(self._recovery_index_ready),
+                    "indexed_events": len(self._event_ids),
+                    "startup_scan": "tail_only" if self._recovery_index_ready else "deferred_offline_rebuild",
+                },
             }
 
     def reclaim_business_day(self, business_day: str, *, force: bool = False) -> dict:
@@ -983,6 +1330,7 @@ class TaskSpool:
             removed_records = 0
             removed_bytes = 0
             retained_segments = 0
+            removed_paths: list[Path] = []
             for partition in range(self.virtual_partition_count):
                 key = str(partition)
                 entries = list(self._manifest["segments"].get(key, []))
@@ -1018,6 +1366,7 @@ class TaskSpool:
                             path.unlink()
                         except FileNotFoundError:
                             pass
+                        removed_paths.append(path)
                         removed_records += int(entry.get("records", 0) or 0)
                         removed_bytes += size
                     else:
@@ -1034,7 +1383,21 @@ class TaskSpool:
                     key: item for key, item in self._event_index.items()
                     if item.business_day != day
                 }
-                self._manifest["total_records"] = len(self._event_index)
+                if removed_paths:
+                    removed_event_ids = self._recovery_index.execute(
+                        "SELECT event_id FROM spool_recovery_records WHERE segment_path IN ({})".format(
+                            ",".join("?" for _ in removed_paths)
+                        ),
+                        [str(path.resolve()) for path in removed_paths],
+                    ).fetchall()
+                    self._event_ids.difference_update(
+                        str(row[0]) for row in removed_event_ids
+                    )
+                    self._delete_recovery_segments(removed_paths)
+                self._manifest["total_records"] = max(
+                    0,
+                    int(self._manifest.get("total_records", 0) or 0) - removed_records,
+                )
                 self._manifest["total_bytes"] = self._disk_bytes()
                 closed = self._manifest.setdefault("closed_days", {}).setdefault(day, {})
                 closed.update({
@@ -1062,10 +1425,16 @@ class TaskSpool:
     def recovery_report(self) -> dict:
         return {
             "root": str(self.root),
-            "total_records": len(self._event_index),
+            "total_records": int(self._manifest.get("total_records", 0) or 0),
             "business_day": self.current_business_day,
             "business_epoch": self.business_epoch,
             "closed_days": dict(self._manifest.get("closed_days", {})),
             "issues": list(self._recovery_issues),
             "crc_verified": True,
+            "recovery_index": {
+                "path": str(self._recovery_index_path),
+                "ready": bool(self._recovery_index_ready),
+                "indexed_events": len(self._event_ids),
+                "segment_offsets": len(self._segment_offsets),
+            },
         }
