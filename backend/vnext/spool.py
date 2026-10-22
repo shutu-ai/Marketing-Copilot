@@ -235,12 +235,20 @@ class TaskSpool:
             self._manifest.get("current_business_day") or self.clock.business_day()
         )
         self._manifest["current_business_day"] = self._current_business_day
-        self._manifest.setdefault("business_timezone", self.clock.timezone_name)
+        manifest_timezone = str(self._manifest.get("business_timezone") or "")
+        timezone_changed = manifest_timezone != self.clock.timezone_name
+        self._manifest["business_timezone"] = self.clock.timezone_name
         self._manifest.setdefault("business_epoch", 1)
         self._manifest.setdefault("closed_days", {})
         self._manifest.setdefault("daily_records", {})
         self._manifest.setdefault("daily_bytes", {})
         self._recover_index()
+        if timezone_changed:
+            # Existing records retain their original business-day labels; the
+            # metadata is updated once so status and future records agree with
+            # the host timezone. The normal startup rollover still fences a
+            # stale current day when the wall-clock date changed.
+            self._persist_manifest()
 
     def _open_recovery_index(self) -> sqlite3.Connection:
         self._recovery_index_path.parent.mkdir(parents=True, exist_ok=True)

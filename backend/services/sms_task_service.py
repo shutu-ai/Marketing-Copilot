@@ -7,11 +7,12 @@ import threading
 import uuid
 import time
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from database import get_connection, read_transaction, write_transaction
 from services import metrics_service, settings_service
+from vnext.business_day import business_timezone
 
 logger = logging.getLogger(__name__)
 detail_logger = logging.getLogger("mc.detail")
@@ -701,16 +702,35 @@ def _find_excluded_msisdns(conn, msisdns, chunk_size: int = 1000) -> set[str]:
         excluded.update(row["msisdn"] for row in rows)
     return excluded
 
+
+def _business_now(now: Optional[datetime] = None) -> datetime:
+    """Normalize a schedule comparison to the deployment's business zone."""
+
+    _name, tz = business_timezone()
+    if now is None:
+        return datetime.now(timezone.utc).astimezone(tz)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=tz)
+    return now.astimezone(tz)
+
+
+def _parse_business_datetime(value: object, tz) -> datetime:
+    parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
+
+
 def campaign_is_active(campaign: dict, now: Optional[datetime] = None) -> tuple[bool, str]:
-    now = now or datetime.now().astimezone()
+    now = _business_now(now)
     if campaign.get("status") != "in_progress":
         return False, "campaign is not enabled"
     try:
         start = campaign.get("start_time") or ""
         end = campaign.get("end_time") or ""
-        if start and now.replace(tzinfo=None) < datetime.fromisoformat(start).replace(tzinfo=None):
+        if start and now < _parse_business_datetime(start, now.tzinfo):
             return False, "campaign has not started"
-        if end and now.replace(tzinfo=None) > datetime.fromisoformat(end).replace(tzinfo=None):
+        if end and now > _parse_business_datetime(end, now.tzinfo):
             return False, "campaign has ended"
         days = campaign.get("send_days") or []
         if isinstance(days, str):
@@ -829,7 +849,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
 
     conn = get_connection()
     try:
-        task_date = datetime.now().astimezone().date().isoformat()
+        task_date = _business_now().date().isoformat()
         if campaign_type == "realtime":
             match = re.search(r"(\d{14})", os.path.basename(source_file or ""))
             if match:
@@ -1432,15 +1452,13 @@ def _fast_campaign_window_deadline(campaign: dict) -> Optional[float]:
     """
     if not campaign:
         return None
-    now = datetime.now().astimezone()
+    now = _business_now()
     deadlines = []
     end_time = str(campaign.get("end_time") or "").strip()
     if end_time:
         try:
-            parsed = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=now.tzinfo)
-            deadlines.append(parsed.astimezone().timestamp())
+            parsed = _parse_business_datetime(end_time, now.tzinfo)
+            deadlines.append(parsed.timestamp())
         except ValueError:
             pass
     start = str(campaign.get("send_start_time") or "").strip()[:5]
@@ -1841,7 +1859,7 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
         if int(task.get("dispatch_generation") or 0) != int(current.get("dispatch_generation") or 0):
             return False
         if current.get("campaign_type") == "realtime" and current.get("task_date") is not None:
-            if str(current["task_date"])[:10] != datetime.now().astimezone().date().isoformat():
+            if str(current["task_date"])[:10] != _business_now().date().isoformat():
                 return False
         table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(
             current.get("campaign_type")
@@ -1857,7 +1875,7 @@ def record_send_intent(task: dict, smpp_config_id: int, slot: int,
             dict(campaign_row).get("dispatch_generation") or 0
         ):
             return False
-        active, _reason = campaign_is_active(dict(campaign_row), datetime.now().astimezone())
+        active, _reason = campaign_is_active(dict(campaign_row), _business_now())
         if not active:
             return False
 
@@ -3316,7 +3334,7 @@ def mark_delivered(task_id: int) -> tuple[bool, str]:
 def validate_task_schedule(task: dict) -> tuple[bool, str]:
     task_date = task.get("task_date")
     if task.get("campaign_type") == "realtime" and task_date is not None:
-        current_date = datetime.now().astimezone().date().isoformat()
+        current_date = _business_now().date().isoformat()
         if str(task_date)[:10] != current_date:
             return False, "task belongs to a previous day"
     campaign = _cached_campaign(None, task["campaign_type"], task["campaign_id"])

@@ -5,7 +5,7 @@ export function getSmsTasks(params: { page?: number; page_size?: number; cursor?
 }
 
 export function getSmsTaskStats() {
-  return api.get<Record<string, number>>('/sms-tasks/stats')
+  return api.get<Record<string, any>>('/sms-tasks/stats')
 }
 
 export function retrySmsTask(id: number) {

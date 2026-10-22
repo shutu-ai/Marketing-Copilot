@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from database import read_transaction
+from vnext.business_day import business_timezone
 from vnext.ingress import IngressRouter
 from vnext.runtime import VNextRuntime
 from vnext.spool import DEFAULT_MAX_SPOOL_BYTES, SpoolCapacityError
@@ -219,6 +220,16 @@ def start() -> VNextRuntime | None:
         _CONFIG_CHANGE_AT = 0.0
         _CONFIG_CHANGE_REASON = ""
         return value
+
+
+def _runtime_business_timezone(value: object) -> str:
+    """Return the effective timezone once per API response."""
+
+    clock = getattr(value, "clock", None)
+    name = getattr(clock, "timezone_name", None)
+    if name:
+        return str(name)
+    return str(business_timezone()[0])
 
 
 def stop() -> None:
@@ -891,6 +902,7 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
     if page <= 1 and cursor is not None and int(cursor) > 0:
         page = int(cursor)
     page_size = max(1, min(200, int(page_size)))
+    business_timezone_name = _runtime_business_timezone(runtime())
     from vnext.partition import normalize_msisdn
     normalized_msisdn = normalize_msisdn(msisdn)
     projection_page = _projection_task_page(
@@ -909,6 +921,7 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
             "pipeline": "vnext", "total": total, "page": page,
             "page_size": page_size, "items": items,
             "next_cursor": page + 1 if has_more else None, "has_more": has_more,
+            "business_timezone": business_timezone_name,
             "stats_source": "vnext_task_index",
             "projection_available": True,
             "degraded": False,
@@ -921,6 +934,7 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
         "pipeline": "vnext", "total": 0, "page": page,
         "page_size": page_size, "items": [],
         "next_cursor": None, "has_more": False,
+        "business_timezone": business_timezone_name,
         "stats_source": "vnext_task_index_unavailable",
         "projection_available": False,
         "degraded": True,
@@ -1030,6 +1044,7 @@ def task_stats(business_day: str | None = None) -> dict:
         "degraded": not projection_available,
         "degraded_reason": projection_warning,
         "projection_lag_seconds": float(projection.get("projection_lag_seconds") or 0.0),
+        "business_timezone": _runtime_business_timezone(value),
     }
 
 

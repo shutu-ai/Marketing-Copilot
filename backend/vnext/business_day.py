@@ -9,6 +9,7 @@ timeouts.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -16,16 +17,59 @@ from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-DEFAULT_TIMEZONE = "UTC"
+DEFAULT_TIMEZONE = "local"
+FALLBACK_TIMEZONE = "UTC"
+
+
+@lru_cache(maxsize=1)
+def system_timezone() -> tuple[str, tzinfo]:
+    """Return the host's IANA timezone without touching the hot path.
+
+    Linux deployments normally expose the zone through ``/etc/localtime``.
+    Resolving that symlink gives us a DST-aware ``ZoneInfo`` instead of the
+    fixed-offset object returned by ``datetime.now().astimezone().tzinfo``.
+    The fallback keeps unit tests and non-Linux development hosts usable.
+    """
+
+    candidates: list[str] = []
+    configured = str(os.environ.get("TZ") or "").strip()
+    if configured:
+        configured = configured[1:] if configured.startswith(":") else configured
+        if "/" in configured and not configured.startswith("/"):
+            candidates.append(configured)
+
+    localtime = Path("/etc/localtime")
+    try:
+        resolved = localtime.resolve(strict=True)
+        parts = resolved.parts
+        if "zoneinfo" in parts:
+            index = parts.index("zoneinfo")
+            candidates.append("/".join(parts[index + 1:]))
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    try:
+        candidates.append(Path("/etc/timezone").read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeError):
+        pass
+
+    for name in candidates:
+        try:
+            return name, ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+
+    local = datetime.now().astimezone().tzinfo or timezone.utc
+    return "local", local
 
 
 def configured_timezone_name(value: str | None = None) -> str:
     """Return the configured business timezone name.
 
     ``MC_VNEXT_BUSINESS_TIMEZONE`` is preferred.  ``MC_BUSINESS_TIMEZONE`` is
-    accepted for compatibility with deployment environments.  UTC is the
-    safe deterministic default when neither is set; callers never infer a
-    user's local timezone.
+    accepted for compatibility with deployment environments.  When neither
+    is set, the operating system timezone is used so a standalone deployment
+    follows the timezone configured for its host.
     """
 
     selected = value
@@ -46,14 +90,13 @@ def business_timezone(value: str | tzinfo | None = None) -> tuple[str, tzinfo]:
     if name.upper() in {"UTC", "Z"}:
         return "UTC", timezone.utc
     if name.lower() in {"local", "system"}:
-        local = datetime.now().astimezone().tzinfo or timezone.utc
-        return "local", local
+        return system_timezone()
     try:
         return name, ZoneInfo(name)
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         # A bad deployment setting must be deterministic and visible rather
         # than silently making different processes choose different dates.
-        return DEFAULT_TIMEZONE, timezone.utc
+        return FALLBACK_TIMEZONE, timezone.utc
 
 
 def _coerce_datetime(value, tz: tzinfo) -> datetime:
@@ -153,9 +196,11 @@ __all__ = [
     "BusinessClock",
     "FileWallClock",
     "DEFAULT_TIMEZONE",
+    "FALLBACK_TIMEZONE",
     "business_timezone",
     "configured_timezone_name",
     "cutoff_timestamp",
     "ensure_clock",
     "normalize_business_day",
+    "system_timezone",
 ]
