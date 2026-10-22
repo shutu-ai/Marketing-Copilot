@@ -19,13 +19,6 @@
               <el-input v-model="form.realtime_base_dir" placeholder="D:/realtime_campaign_data" />
               <div class="form-tip">{{ $t('settings.realtimeBaseDirTip') }}</div>
             </el-form-item>
-            <el-form-item :label="$t('settings.systemMode')">
-              <el-radio-group v-model="form.system_mode">
-                <el-radio value="production">{{ $t('settings.production') }}</el-radio>
-                <el-radio value="development">{{ $t('settings.development') }}</el-radio>
-              </el-radio-group>
-              <div class="form-tip">{{ $t('settings.systemModeTip') }}</div>
-            </el-form-item>
             <el-form-item :label="$t('settings.logLevel')">
               <div class="log-level-row">
                 <el-select v-model="form.log_level" style="width: 160px">
@@ -37,7 +30,7 @@
               </div>
               <div class="form-tip">{{ $t('settings.logLevelTip') }}</div>
             </el-form-item>
-                        <el-form-item :label="$t('settings.smsTaskRetentionDays')">
+            <el-form-item :label="$t('settings.smsTaskRetentionDays')">
               <el-input-number v-model="form.sms_task_retention_days" :min="1" :precision="0" controls-position="right" />
               <div class="form-tip">{{ $t('settings.smsTaskRetentionDaysTip') }}</div>
             </el-form-item>
@@ -61,6 +54,10 @@
             </el-form-item>
             <el-form-item label="Whitelist build timeout (seconds)">
               <el-input-number v-model="form.realtime_index_build_timeout" :min="0" :max="86400" :precision="0" controls-position="right" />
+            </el-form-item>
+            <el-form-item label="Whitelist upload timeout (seconds)">
+              <el-input-number v-model="form.realtime_whitelist_upload_timeout" :min="1" :max="86400" :precision="0" controls-position="right" />
+              <div class="form-tip">Client request timeout for uploading the whitelist; index build timeout is configured separately.</div>
             </el-form-item>
             <el-form-item label="Whitelist retention (days)">
               <el-input-number v-model="form.realtime_whitelist_retention_days" :min="1" :max="3650" :precision="0" controls-position="right" />
@@ -166,19 +163,26 @@ const saving = ref(false)
 const form = reactive({
   batch_base_dir: '',
   realtime_base_dir: '',
-  system_mode: 'production',
   log_level: 'INFO',
   detail_logging: '0',
-  sms_task_retention_days: 3,
+  sms_task_retention_days: 7,
   realtime_file_retention_days: 1,
   realtime_output_retention_days: 30,
   realtime_match_chunk_size: 5000,
   realtime_whitelist_build_memory_limit: '4GB',
   realtime_whitelist_build_threads: 1,
   realtime_index_build_timeout: 7200,
+  realtime_whitelist_upload_timeout: 3600,
   realtime_whitelist_retention_days: 7,
 })
 const logLevels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+
+function parseSettingNumber(value: unknown, fallback: number): number {
+  const text = String(value ?? '').trim()
+  if (!text) return fallback
+  const parsed = Number(text)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
 
 watch(() => route.query.tab, value => {
   activeTab.value = normalizeTab(value)
@@ -203,28 +207,28 @@ onMounted(async () => {
         form.batch_base_dir = s.value
       } else if (s.key === 'realtime_base_dir') {
         form.realtime_base_dir = s.value
-      } else if (s.key === 'system_mode') {
-        form.system_mode = s.value
       } else if (s.key === 'log_level') {
         form.log_level = s.value
       } else if (s.key === 'detail_logging') {
         form.detail_logging = s.value
       } else if (s.key === 'sms_task_retention_days') {
-        form.sms_task_retention_days = Number(s.value) || 3
+        form.sms_task_retention_days = parseSettingNumber(s.value, 7)
       } else if (s.key === 'realtime_file_retention_days') {
-        form.realtime_file_retention_days = Number(s.value) || 1
+        form.realtime_file_retention_days = parseSettingNumber(s.value, 1)
       } else if (s.key === 'realtime_output_retention_days') {
-        form.realtime_output_retention_days = Number(s.value) || 30
+        form.realtime_output_retention_days = parseSettingNumber(s.value, 30)
       } else if (s.key === 'realtime_match_chunk_size') {
-        form.realtime_match_chunk_size = Number(s.value) || 5000
+        form.realtime_match_chunk_size = parseSettingNumber(s.value, 5000)
       } else if (s.key === 'realtime_whitelist_build_memory_limit') {
         form.realtime_whitelist_build_memory_limit = s.value || '4GB'
       } else if (s.key === 'realtime_whitelist_build_threads') {
-        form.realtime_whitelist_build_threads = Number(s.value) || 1
+        form.realtime_whitelist_build_threads = parseSettingNumber(s.value, 1)
       } else if (s.key === 'realtime_index_build_timeout') {
-        form.realtime_index_build_timeout = Number(s.value) || 7200
+        form.realtime_index_build_timeout = parseSettingNumber(s.value, 7200)
+      } else if (s.key === 'realtime_whitelist_upload_timeout') {
+        form.realtime_whitelist_upload_timeout = parseSettingNumber(s.value, 3600)
       } else if (s.key === 'realtime_whitelist_retention_days') {
-        form.realtime_whitelist_retention_days = Number(s.value) || 7
+        form.realtime_whitelist_retention_days = parseSettingNumber(s.value, 7)
       }
     }
   } catch {
@@ -237,7 +241,6 @@ async function handleSave() {
   try {
     await updateSetting('batch_base_dir', form.batch_base_dir)
     await updateSetting('realtime_base_dir', form.realtime_base_dir)
-    await updateSetting('system_mode', form.system_mode)
     await updateSetting('log_level', form.log_level)
     await updateSetting('detail_logging', form.detail_logging)
     await updateSetting('sms_task_retention_days', String(form.sms_task_retention_days))
@@ -247,6 +250,7 @@ async function handleSave() {
     await updateSetting('realtime_whitelist_build_memory_limit', form.realtime_whitelist_build_memory_limit)
     await updateSetting('realtime_whitelist_build_threads', String(form.realtime_whitelist_build_threads))
     await updateSetting('realtime_index_build_timeout', String(form.realtime_index_build_timeout))
+    await updateSetting('realtime_whitelist_upload_timeout', String(form.realtime_whitelist_upload_timeout))
     await updateSetting('realtime_whitelist_retention_days', String(form.realtime_whitelist_retention_days))
     ElMessage.success(t('common.saveSuccess'))
   } catch (e: any) {

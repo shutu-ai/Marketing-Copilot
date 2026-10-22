@@ -1,5 +1,27 @@
 import api from './index'
 
+const DEFAULT_WHITELIST_UPLOAD_TIMEOUT_SECONDS = 3600
+const MAX_WHITELIST_UPLOAD_TIMEOUT_SECONDS = 86400
+const SETTINGS_REQUEST_TIMEOUT_MS = 10000
+
+async function getWhitelistUploadTimeoutMs(): Promise<number> {
+  try {
+    const response = await api.get<{ key: string; value: string }>(
+      '/settings/realtime_whitelist_upload_timeout',
+      { timeout: SETTINGS_REQUEST_TIMEOUT_MS },
+    )
+    const seconds = Number(response.data?.value)
+    if (Number.isInteger(seconds)
+      && seconds >= 1
+      && seconds <= MAX_WHITELIST_UPLOAD_TIMEOUT_SECONDS) {
+      return seconds * 1000
+    }
+  } catch {
+    // Keep uploads usable if an older server does not expose this setting.
+  }
+  return DEFAULT_WHITELIST_UPLOAD_TIMEOUT_SECONDS * 1000
+}
+
 export interface RealtimeCampaign {
   id: number
   name: string
@@ -66,26 +88,28 @@ export function deleteRealtimeCampaign(id: number) {
   return api.delete(`/realtime-campaigns/${id}`)
 }
 
-export function uploadRealtimeCustomerList(campaignId: number, file: File) {
+export async function uploadRealtimeCustomerList(campaignId: number, file: File) {
   const form = new FormData()
   form.append('file', file)
+  const timeout = await getWhitelistUploadTimeoutMs()
   return api.post<RealtimeCampaign>(`/realtime-campaigns/${campaignId}/upload`, form, {
-    timeout: 600000, // 10 minutes for large files
+    timeout,
     onUploadProgress: (progressEvent) => {
       // stub — caller overrides via request interceptor or config
     },
   })
 }
 
-export function uploadRealtimeCustomerListWithProgress(
+export async function uploadRealtimeCustomerListWithProgress(
   campaignId: number,
   file: File,
   onUploadProgress: (percent: number) => void,
 ) {
   const form = new FormData()
   form.append('file', file)
+  const timeout = await getWhitelistUploadTimeoutMs()
   return api.post<RealtimeCampaign>(`/realtime-campaigns/${campaignId}/upload`, form, {
-    timeout: 600000,
+    timeout,
     onUploadProgress: (progressEvent) => {
       if (progressEvent.total) {
         const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total)

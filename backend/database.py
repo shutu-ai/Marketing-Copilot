@@ -2409,7 +2409,7 @@ def init_db():
         ("system_mode", "production"),
         ("log_level", "INFO"),
         ("detail_logging", normalize_detail_logging(os.environ.get("MC_DETAIL_LOGGING", "0"))),
-        ("sms_task_retention_days", "3"),
+        ("sms_task_retention_days", os.environ.get("MC_VNEXT_RETENTION_DAYS", "7")),
         ("realtime_file_retention_days", "1"),
         ("realtime_output_retention_days", "30"),
         ("realtime_match_chunk_size", os.environ.get("MC_REALTIME_MATCH_CHUNK_SIZE", "5000")),
@@ -2417,6 +2417,7 @@ def init_db():
         ("realtime_whitelist_build_memory_limit", os.environ.get("MC_REALTIME_WHITELIST_BUILD_MEMORY_LIMIT", "4GB")),
         ("realtime_whitelist_build_threads", os.environ.get("MC_REALTIME_WHITELIST_BUILD_THREADS", "1")),
         ("realtime_index_build_timeout", os.environ.get("MC_REALTIME_INDEX_BUILD_TIMEOUT", "7200")),
+        ("realtime_whitelist_upload_timeout", os.environ.get("MC_REALTIME_WHITELIST_UPLOAD_TIMEOUT", "3600")),
         ("realtime_whitelist_retention_days", os.environ.get("MC_REALTIME_WHITELIST_RETENTION_DAYS", "7")),
     ]
     for k, v in defaults:
