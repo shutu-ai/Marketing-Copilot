@@ -128,109 +128,148 @@
     </div>
 
     <el-dialog
-      :model-value="dialogVisible"
+      v-model="dialogVisible"
+      class="campaign-editor-dialog"
       :title="editForm.id ? $t('common.edit') : $t('campaign.addCampaign')"
-      width="520px"
+      width="860px"
       align-center
+      :close-on-click-modal="false"
       @close="dialogVisible = false"
     >
-      <el-form :model="editForm" label-width="120px" size="small">
-        <template v-if="!inProgressEdit">
-        <el-form-item :label="$t('campaign.name')" required>
-          <el-input v-model="editForm.name" />
-        </el-form-item>
-        <div v-if="editForm.status !== 'ended'" class="advanced-toggle">
-          <el-switch v-model="customDirectory" :active-text="$t('campaign.customDirectory')" @change="handleCustomDirectoryChange" />
-          <el-tag size="small" type="info" effect="plain">{{ $t('campaign.optional') }}</el-tag>
-        </div>
-        <el-form-item v-if="customDirectory" :label="$t('campaign.campaignDir')">
-          <el-input v-model="editForm.campaign_dir" :placeholder="$t('campaign.campaignDirPlaceholder')">
-            <template #append><el-button @click="directoryPickerVisible = true">{{ $t('campaign.browseDirectory') }}</el-button></template>
-          </el-input>
-          <div style="font-size:12px;color:#909399;margin-top:4px">{{ $t('campaign.campaignDirTip') }}</div>
-        </el-form-item>
-        <el-form-item :label="$t('campaign.startTime')">
-          <el-date-picker
-            v-model="editForm.start_time"
-            type="datetime"
-            :placeholder="$t('campaign.selectTime')"
-            value-format="YYYY-MM-DD HH:mm:ss"
-            :disabled="editForm.status === 'ended'"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item :label="$t('campaign.endTime')">
-          <el-date-picker
-            v-model="editForm.end_time"
-            type="datetime"
-            :placeholder="$t('campaign.selectTime')"
-            value-format="YYYY-MM-DD HH:mm:ss"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item :label="$t('campaign.sendStartTime')">
-          <el-time-picker
-            v-model="editForm.send_start_time"
-            :placeholder="$t('campaign.selectTime')"
-            value-format="HH:mm"
-            format="HH:mm"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item :label="$t('campaign.sendEndTime')">
-          <el-time-picker
-            v-model="editForm.send_end_time"
-            :placeholder="$t('campaign.selectTime')"
-            value-format="HH:mm"
-            format="HH:mm"
-            style="width: 100%"
-          />
-        </el-form-item>
-        <el-form-item :label="$t('campaign.batchSize')">
-          <el-input-number v-model="editForm.batch_size" :min="1" :max="10000" :disabled="editForm.status === 'ended'" style="width: 100%" />
-        </el-form-item>
-        <el-form-item :label="$t('campaign.sendDays')">
-          <el-checkbox-group v-model="editForm.send_days">
-            <el-checkbox v-for="d in weekDays" :key="d.value" :label="d.value" size="small">
-              {{ $t('campaign.day_' + d.value) }}
-            </el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-        <el-form-item :label="$t('campaign.phonePrefix')" required>
-          <el-input
-            v-model="editForm.phone_prefix"
-            placeholder="251"
-            inputmode="numeric"
-            autocomplete="off"
-            @input="editForm.phone_prefix = normalizePhonePrefix($event)"
-          />
-          <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
-        </el-form-item>
-        </template>
-        <el-alert
-          v-if="inProgressEdit"
-          :title="$t('campaign.inProgressSmppOnly')"
-          type="info"
-          show-icon
-          :closable="false"
-          style="margin-bottom: 12px"
-        />
-        <el-form-item :label="$t('campaign.associateSmpp')" required>
-          <el-select v-model="editForm.smpp_config_id" clearable filterable :placeholder="$t('campaign.associateSmppPlaceholder')" style="width:100%">
-            <el-option v-for="cfg in enabledSmppOptions" :key="cfg.id" :value="cfg.id" :label="`${cfg.name} (${cfg.host}:${cfg.port})`" />
-          </el-select>
-          <div class="form-tip">{{ $t('campaign.associateSmppTip') }}</div>
-        </el-form-item>
-        <el-form-item :label="$t('campaign.flashSms')">
-          <el-checkbox v-model="editForm.flash_sms" :disabled="inProgressEdit || !editForm.smpp_config_id">
-            {{ $t('campaign.flashSms') }}
-          </el-checkbox>
-          <div class="form-tip">{{ $t('campaign.flashSmsTip') }}</div>
-        </el-form-item>
+      <el-form :model="editForm" label-position="top" size="small" class="campaign-editor-form">
+        <el-tabs v-model="activeEditorTab" class="campaign-editor-tabs" stretch>
+          <el-tab-pane v-if="!inProgressEdit" name="basics" :label="$t('campaign.basicInfo')">
+            <div class="editor-section-intro">
+              <div>
+                <strong>{{ $t('campaign.basicInfo') }}</strong>
+                <span>{{ $t('campaign.editorBasicsHint') }}</span>
+              </div>
+            </div>
+            <div class="form-grid">
+              <el-form-item class="form-grid__full" :label="$t('campaign.name')" required>
+                <el-input v-model="editForm.name" />
+              </el-form-item>
+              <div v-if="editForm.status !== 'ended'" class="field-card form-grid__full">
+                <span class="field-card__label">{{ $t('campaign.customDirectory') }}</span>
+                <div class="field-card__control">
+                  <el-switch v-model="customDirectory" @change="handleCustomDirectoryChange" />
+                  <el-tag size="small" type="info" effect="plain">{{ $t('campaign.optional') }}</el-tag>
+                </div>
+              </div>
+              <el-form-item :label="$t('campaign.startTime')">
+                <el-date-picker
+                  v-model="editForm.start_time"
+                  type="datetime"
+                  :placeholder="$t('campaign.selectTime')"
+                  value-format="YYYY-MM-DD HH:mm:ss"
+                  :disabled="editForm.status === 'ended'"
+                  style="width: 100%"
+                />
+              </el-form-item>
+              <el-form-item :label="$t('campaign.endTime')">
+                <el-date-picker
+                  v-model="editForm.end_time"
+                  type="datetime"
+                  :placeholder="$t('campaign.selectTime')"
+                  value-format="YYYY-MM-DD HH:mm:ss"
+                  style="width: 100%"
+                />
+              </el-form-item>
+              <el-form-item v-if="customDirectory" class="form-grid__full" :label="$t('campaign.campaignDir')">
+                <el-input v-model="editForm.campaign_dir" :placeholder="$t('campaign.campaignDirPlaceholder')">
+                  <template #append><el-button @click="directoryPickerVisible = true">{{ $t('campaign.browseDirectory') }}</el-button></template>
+                </el-input>
+                <div class="form-tip">{{ $t('campaign.campaignDirTip') }}</div>
+              </el-form-item>
+            </div>
+          </el-tab-pane>
+
+          <el-tab-pane name="delivery" :label="$t('campaign.editorDelivery')">
+            <div class="editor-section-intro">
+              <div>
+                <strong>{{ $t('campaign.editorDelivery') }}</strong>
+                <span>{{ $t('campaign.editorDeliveryHint') }}</span>
+              </div>
+            </div>
+            <el-alert
+              v-if="inProgressEdit"
+              :title="$t('campaign.inProgressSmppOnly')"
+              type="info"
+              show-icon
+              :closable="false"
+              class="editor-alert"
+            />
+            <template v-if="!inProgressEdit">
+              <div class="form-grid">
+                <el-form-item :label="$t('campaign.sendStartTime')">
+                  <el-time-picker
+                    v-model="editForm.send_start_time"
+                    :placeholder="$t('campaign.selectTime')"
+                    value-format="HH:mm"
+                    format="HH:mm"
+                    style="width: 100%"
+                  />
+                </el-form-item>
+                <el-form-item :label="$t('campaign.sendEndTime')">
+                  <el-time-picker
+                    v-model="editForm.send_end_time"
+                    :placeholder="$t('campaign.selectTime')"
+                    value-format="HH:mm"
+                    format="HH:mm"
+                    style="width: 100%"
+                  />
+                </el-form-item>
+                <el-form-item :label="$t('campaign.batchSize')">
+                  <el-input-number v-model="editForm.batch_size" :min="1" :max="10000" :disabled="editForm.status === 'ended'" style="width: 100%" />
+                </el-form-item>
+                <el-form-item class="form-grid__full" :label="$t('campaign.sendDays')">
+                  <el-checkbox-group v-model="editForm.send_days" class="send-days">
+                    <el-checkbox v-for="d in weekDays" :key="d.value" :value="d.value" size="small">
+                      {{ $t('campaign.day_' + d.value) }}
+                    </el-checkbox>
+                  </el-checkbox-group>
+                </el-form-item>
+                <el-form-item class="form-grid__full" :label="$t('campaign.phonePrefix')" required>
+                  <el-input
+                    v-model="editForm.phone_prefix"
+                    placeholder="251"
+                    inputmode="numeric"
+                    autocomplete="off"
+                    @input="editForm.phone_prefix = normalizePhonePrefix($event)"
+                  />
+                  <div class="form-tip">{{ $t('campaign.phonePrefixTip') }}</div>
+                </el-form-item>
+              </div>
+            </template>
+            <div class="form-grid">
+              <el-form-item class="form-grid__full" :label="$t('campaign.associateSmpp')" required>
+                <el-select v-model="editForm.smpp_config_id" clearable filterable :placeholder="$t('campaign.associateSmppPlaceholder')" style="width: 100%">
+                  <el-option v-for="cfg in enabledSmppOptions" :key="cfg.id" :value="cfg.id" :label="`${cfg.name} (${cfg.host}:${cfg.port})`" />
+                </el-select>
+                <div class="form-tip">{{ $t('campaign.associateSmppTip') }}</div>
+              </el-form-item>
+              <div class="field-card form-grid__full">
+                <span class="field-card__label">{{ $t('campaign.flashSms') }}</span>
+                <div>
+                  <el-checkbox v-model="editForm.flash_sms" :disabled="inProgressEdit || !editForm.smpp_config_id">
+                    {{ $t('campaign.flashSms') }}
+                  </el-checkbox>
+                  <div class="form-tip">{{ $t('campaign.flashSmsTip') }}</div>
+                </div>
+              </div>
+            </div>
+          </el-tab-pane>
+        </el-tabs>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
-        <el-button v-if="canManage" type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
+        <div class="editor-footer">
+          <div class="editor-footer__actions">
+            <el-button v-if="!inProgressEdit && activeEditorTab !== 'basics'" @click="goPrevious">{{ $t('common.back') }}</el-button>
+            <el-button v-if="!inProgressEdit && activeEditorTab !== 'delivery'" @click="goNext">{{ $t('common.next') }}</el-button>
+            <el-button @click="dialogVisible = false">{{ $t('common.cancel') }}</el-button>
+            <el-button v-if="canManage" type="primary" :loading="saving" @click="handleSave">{{ $t('common.save') }}</el-button>
+          </div>
+        </div>
       </template>
     </el-dialog>
 
@@ -324,6 +363,7 @@ const page = ref(1)
 const pageSize = ref(50)
 const loading = ref(false)
 const dialogVisible = ref(false)
+const activeEditorTab = ref<'basics' | 'delivery'>('basics')
 const saving = ref(false)
 const editForm = ref<{
   id: number; name: string; start_time: string; end_time: string;
@@ -400,7 +440,16 @@ function showDialog(row: Campaign | null) {
       smpp_config_id: null, flash_sms: false, phone_prefix: '',
     }
   }
+  activeEditorTab.value = inProgressEdit.value ? 'delivery' : 'basics'
   dialogVisible.value = true
+}
+
+function goNext() {
+  if (activeEditorTab.value === 'basics') activeEditorTab.value = 'delivery'
+}
+
+function goPrevious() {
+  if (activeEditorTab.value === 'delivery') activeEditorTab.value = 'basics'
 }
 
 function readinessItems(row: Campaign) {
@@ -623,10 +672,141 @@ onMounted(() => {
   margin-bottom: 20px;
 }
 .page-header h2 { margin: 0; font-size: 22px; font-weight: 600; }
-.advanced-toggle { display:flex; align-items:center; gap:8px; }
+.campaign-editor-dialog :deep(.el-dialog) {
+  max-width: calc(100vw - 32px);
+  margin-top: 5vh;
+  margin-bottom: 5vh;
+}
+.campaign-editor-dialog :deep(.el-dialog__body) {
+  padding: 0 24px 4px;
+}
+.campaign-editor-dialog :deep(.el-dialog__footer) {
+  padding: 14px 24px 18px;
+  border-top: 1px solid var(--mc-border);
+}
+.editor-section-intro,
+.editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.editor-section-intro {
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+.editor-section-intro > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.editor-section-intro strong {
+  color: var(--mc-text);
+  font-size: 15px;
+}
+.editor-section-intro span {
+  color: var(--mc-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.campaign-editor-tabs :deep(.el-tabs__header) {
+  margin-bottom: 0;
+}
+.campaign-editor-tabs :deep(.el-tabs__item) {
+  height: 42px;
+  font-weight: 600;
+}
+.campaign-editor-tabs :deep(.el-tabs__content) {
+  padding-top: 18px;
+}
+.campaign-editor-form :deep(.el-form-item) {
+  margin-bottom: 16px;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+}
+.form-grid__full {
+  grid-column: 1 / -1;
+}
+.field-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 54px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  border: 1px solid var(--mc-border);
+  border-radius: 8px;
+  background: var(--mc-surface-soft, #f8fafc);
+}
+.field-card__label {
+  color: var(--mc-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+.field-card__control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.editor-alert {
+  margin-bottom: 16px;
+}
+.send-days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+.editor-footer__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.form-tip {
+  font-size: 12px;
+  color: var(--mc-text-tertiary);
+  margin-top: 4px;
+}
 .readiness-item { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--mc-text-secondary); }
 .readiness-item .el-icon.ok { color:var(--mc-success); }
 .readiness-item .el-icon:not(.ok) { color:var(--mc-warning); }
 .pagination { justify-content:flex-end; padding:12px 0; }
+
+@media (max-width: 700px) {
+  .campaign-editor-dialog :deep(.el-dialog__body),
+  .campaign-editor-dialog :deep(.el-dialog__footer) {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+  .form-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .form-grid__full {
+    grid-column: auto;
+  }
+  .editor-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .editor-footer__actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .editor-footer__actions .el-button:last-child {
+    margin-left: auto;
+  }
+  .field-card {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .field-card > div {
+    min-width: 0;
+  }
+}
 
 </style>

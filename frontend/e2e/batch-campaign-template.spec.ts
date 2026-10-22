@@ -124,6 +124,11 @@ test('batch campaign saves only the configured phone prefix', async ({ page }) =
   await page.getByRole('menuitem', { name: 'Edit' }).click()
 
   const dialog = page.getByRole('dialog')
+  await expect(page.getByRole('tab', { name: 'Basic Info' })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Sending settings' })).toBeVisible()
+  const deliveryTab = page.getByRole('tab', { name: 'Sending settings' })
+  await deliveryTab.click()
+  await expect(deliveryTab).toHaveAttribute('aria-selected', 'true')
   const prefixInput = dialog.locator('input[placeholder="251"]')
   await expect(prefixInput).toHaveValue('251')
   await prefixInput.fill('251980665666')
@@ -137,4 +142,62 @@ test('batch campaign saves only the configured phone prefix', async ({ page }) =
     path: path.join(os.tmpdir(), 'marketing-copilot-batch-phone-prefix.png'),
     fullPage: false,
   })
+})
+
+test('batch campaign editor follows the shared responsive layout', async ({ page }) => {
+  const runtimeErrors: string[] = []
+  page.on('pageerror', error => runtimeErrors.push(`pageerror: ${error.message}`))
+  page.on('console', message => {
+    if (message.type() === 'error') runtimeErrors.push(`console: ${message.text()}`)
+  })
+
+  await page.addInitScript(() => {
+    localStorage.setItem('mc_token', 'e2e-token')
+    localStorage.setItem('mc_user', 'admin')
+    localStorage.setItem('mc_role', 'admin')
+    localStorage.setItem('locale', 'en')
+  })
+
+  await page.route(/^https?:\/\/[^/]+\/api\//, async route => {
+    const url = new URL(route.request().url())
+    const body = url.pathname === '/api/batch-campaigns'
+      ? { total: 0, page: 1, page_size: 50, items: [] }
+      : url.pathname === '/api/smpp/configs' ? [] : {}
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    })
+  })
+
+  await page.goto('/campaign/batch')
+  await page.getByRole('button', { name: 'Add Campaign' }).click()
+
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Basic Info' })).toBeVisible()
+  const deliveryTab = page.getByRole('tab', { name: 'Sending settings' })
+  await expect(deliveryTab).toBeVisible()
+  await deliveryTab.click()
+  await expect(deliveryTab).toHaveAttribute('aria-selected', 'true')
+  await expect(dialog.locator('input[placeholder="251"]')).toBeVisible()
+
+  const desktopBox = await dialog.boundingBox()
+  expect(desktopBox).not.toBeNull()
+  expect(desktopBox!.width).toBeGreaterThan(700)
+  await page.screenshot({
+    path: path.join(os.tmpdir(), 'marketing-copilot-batch-editor-desktop.png'),
+    fullPage: false,
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(dialog.locator('input[placeholder="251"]')).toBeVisible()
+  const mobileBox = await dialog.boundingBox()
+  expect(mobileBox).not.toBeNull()
+  expect(mobileBox!.width).toBeLessThanOrEqual(390)
+  await page.screenshot({
+    path: path.join(os.tmpdir(), 'marketing-copilot-batch-editor-mobile.png'),
+    fullPage: false,
+  })
+  expect(runtimeErrors).toEqual([])
 })
