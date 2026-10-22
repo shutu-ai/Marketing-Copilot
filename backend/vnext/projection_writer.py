@@ -17,7 +17,7 @@ from pathlib import Path
 from .business_day import business_timezone, normalize_business_day
 from .critical_path_profiler import CriticalPathProfiler
 from .diagnostics import enable_native_fault_capture, write_process_metadata
-from .process_lifecycle import set_parent_death_signal
+from .process_lifecycle import disable_kernel_core_dump, set_parent_death_signal
 from .task_index import (
     connect_writer as connect_task_index_writer,
     delete_rows as delete_task_index_rows,
@@ -38,6 +38,16 @@ class ProjectionWriterOwnerBusy(RuntimeError):
 
 class ProjectionBackpressure(RuntimeError):
     pass
+
+
+def _fatal_storage_error(error: Exception) -> bool:
+    """An invalidated engine cannot recover by retrying on its connection."""
+    return type(error).__name__ in {"FatalException", "InternalException"} or any(
+        message in str(error).lower() for message in (
+            "cannot perform io in in-memory database",
+            "database has been invalidated",
+        )
+    )
 
 
 TASK_INDEX_TABLE = "vnext_task_index"
@@ -525,7 +535,7 @@ class ProjectionWriter:
     def __init__(self, db_path: str | os.PathLike[str], *, queue_size: int = 8192,
                  batch_size: int = 512, retry_seconds: float = 0.05,
                  flush_interval_seconds: float = 0.1,
-                 staging_mode: str = "vectorized", reuse_staging: bool = True,
+                 staging_mode: str = "vectorized", reuse_staging: bool = False,
                  task_index_path: str | os.PathLike[str] | None = None,
                  profiler: CriticalPathProfiler | None = None):
         self.db_path = str(Path(db_path).resolve())
@@ -573,6 +583,8 @@ class ProjectionWriter:
             "events_insert_ns": 0,
             "aggregate_upsert_ns": 0,
             "db_commit_ns": 0,
+            "checkpoint_ns": 0,
+            "checkpoints_total": 0,
             "offset_persist_ns": 0,
             "batch_end_to_end_ns": 0,
             "batches_total": 0,
@@ -604,6 +616,18 @@ class ProjectionWriter:
         self._campaign_daily_totals_cached_at = 0.0
         self._campaign_daily_totals_cache: list[dict] = []
         self._retention_pending_sidecar_ids: set[str] = set()
+        # Keep durable WAL commits in the hot path, but leave checkpointing to
+        # the stopped-service maintenance command by default. Tests and
+        # operators can still opt in explicitly.
+        try:
+            configured_checkpoint_bytes = int(
+                os.environ.get('MC_VNEXT_PROJECTION_CHECKPOINT_BYTES', '0')
+            )
+        except (TypeError, ValueError):
+            configured_checkpoint_bytes = 0
+        self._checkpoint_bytes = max(0, configured_checkpoint_bytes)
+        self._checkpoint_retry_at = 0.0
+        self._checkpoint_error = ""
 
     def _table_columns(self, table: str) -> set[str]:
         try:
@@ -644,7 +668,33 @@ class ProjectionWriter:
         deadline = time.monotonic() + lock_wait_seconds
         while True:
             try:
+                # Keep checkpointing out of the mixed temporary/persistent
+                # batch COMMIT path. WAL commits remain durable; checkpoint
+                # only at a clean boundary. Use the supported setting rather
+                # than DuckDB's debug-only commit shortcut: the latter can
+                # leave long-running WAL transactions on an unstable storage
+                # path once the WAL becomes large.
                 self._conn = duckdb.connect(self.db_path)
+                try:
+                    # A very high threshold disables automatic checkpoints
+                    # for the hot writer without using the debug-only
+                    # per-commit switch. Offline maintenance performs
+                    # explicit checkpoints at clean batch boundaries.
+                    self._conn.execute("SET wal_autocheckpoint='1TB'")
+                except Exception:
+                    # Keep compatibility with older DuckDB builds that do
+                    # not expose the byte-valued setting. Production packages
+                    # use DuckDB >= 1.2.2 and take the supported path above.
+                    self._conn.execute("SET debug_skip_checkpoint_on_commit=true")
+                try:
+                    configured_threads = int(
+                        os.environ.get('MC_VNEXT_PROJECTION_THREADS', '4')
+                    )
+                except (TypeError, ValueError):
+                    configured_threads = 4
+                self._conn.execute(
+                    f"SET threads TO {max(1, min(32, configured_threads))}"
+                )
                 break
             except Exception as exc:
                 # A stale/old owner is a process-lifecycle problem, not a
@@ -873,8 +923,14 @@ class ProjectionWriter:
         latest_rows = self._latest_task_index_rows(batch)
         if not latest_rows:
             return 0
+        # Do not reuse this staging table. DuckDB versions in the 1.2 line
+        # have had crash-prone paths when a transaction deletes many rows
+        # from a table and then inserts from a SELECT into indexed storage.
+        # Dropping and recreating the unindexed temporary relation avoids the
+        # DELETE -> INSERT sequence without changing the persistent upsert.
+        execute("DROP TABLE IF EXISTS _vnext_task_index_batch")
         execute(
-            """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_task_index_batch (
+            """CREATE TEMPORARY TABLE _vnext_task_index_batch (
                 event_id VARCHAR, partition_id INTEGER, ordinal BIGINT,
                 campaign_type VARCHAR, campaign_id BIGINT, route_id BIGINT,
                 normalized_msisdn VARCHAR, language VARCHAR, campaign_name VARCHAR,
@@ -883,7 +939,6 @@ class ProjectionWriter:
                 business_day VARCHAR, expires_at DOUBLE, last_event_at DOUBLE
             )"""
         )
-        execute("DELETE FROM _vnext_task_index_batch")
         executemany(
             """INSERT INTO _vnext_task_index_batch VALUES
                (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -919,6 +974,7 @@ class ProjectionWriter:
                     last_event_at=excluded.last_event_at
                 WHERE excluded.last_event_at >= {TASK_INDEX_TABLE}.last_event_at"""
         )
+        execute("DROP TABLE IF EXISTS _vnext_task_index_batch")
         if self._task_index_conn is not None:
             # Keep the read sidecar in the same bounded projection quantum.
             # It is committed before the DuckDB transaction is committed; if
@@ -935,7 +991,7 @@ class ProjectionWriter:
         return len(latest_rows)
 
     def _clear_staging(self, execute, batch_table_sql: str) -> None:
-        """Clear/reuse the staging tables without changing transaction scope.
+        """Prepare staging tables without a DELETE -> INSERT reuse cycle.
 
         The method is intentionally small so isolated benchmark adapters can
         vary only the cleanup order while retaining the production DML path.
@@ -1193,6 +1249,12 @@ class ProjectionWriter:
         if not batch:
             return 0
         batch_started_ns = time.perf_counter_ns()
+        accounting = (
+            self._applied, self._duplicates, self._last_batch_new,
+            self._last_batch_duplicates, self._last_applied_at,
+        )
+        counter_keys = ("batches_total", "events_read", "events_new", "events_replayed")
+        committed_metrics = {key: self._metrics[key] for key in counter_keys}
         try:
             self._conn.execute("BEGIN TRANSACTION")
             self._apply_batch(batch)
@@ -1202,17 +1264,58 @@ class ProjectionWriter:
             if self.profiler:
                 self.profiler.mark("last_projection_db_commit_monotonic")
                 self.profiler.inc("projection_commits")
-            self._metrics["batch_end_to_end_ns"] += time.perf_counter_ns() - batch_started_ns
             if self.profiler:
                 self.profiler.publish_if_due()
         except Exception:
             with contextlib.suppress(Exception):
                 self._conn.execute("ROLLBACK")
+            (
+                self._applied, self._duplicates, self._last_batch_new,
+                self._last_batch_duplicates, self._last_applied_at,
+            ) = accounting
+            self._metrics["projection_events_applied"] = self._applied
+            self._metrics.update(committed_metrics)
+            # CREATE TEMP TABLE may have been rolled back with this batch.
+            self._batch_table_created = False
             for event in reversed(batch):
                 self._queue.appendleft(event)
             raise
         self._last_flush_monotonic = time.monotonic()
+        try:
+            self._checkpoint_if_due()
+        except Exception as exc:
+            if _fatal_storage_error(exc):
+                raise
+            self._checkpoint_error = f"{type(exc).__name__}: {exc}"
+            self._checkpoint_retry_at = time.monotonic() + 5.0
+        self._metrics["batch_end_to_end_ns"] += time.perf_counter_ns() - batch_started_ns
         return len(batch)
+
+    def _checkpoint_if_due(self) -> None:
+        """Bound WAL growth without checkpointing a mixed-catalog COMMIT.
+
+        This runs only after a durable commit, before journal acknowledgement.
+        A failed checkpoint must not requeue an already committed batch.
+        """
+        wal = Path(f"{self.db_path}.wal")
+        if time.monotonic() < self._checkpoint_retry_at:
+            return
+        if self._checkpoint_bytes <= 0:
+            return
+        if not wal.exists() or wal.stat().st_size < self._checkpoint_bytes:
+            return
+        started_ns = time.perf_counter_ns()
+        # Discard transient string buffers/row groups before storage compaction.
+        self._batch_table_created = False
+        for table in (
+            "_vnext_projection_new", "_vnext_projection_batch", "_vnext_task_index_batch",
+            "_vnext_retention_task_ids", "_vnext_retention_progress_ids",
+        ):
+            self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+        self._conn.execute("CHECKPOINT")
+        self._metrics["checkpoint_ns"] += time.perf_counter_ns() - started_ns
+        self._metrics["checkpoints_total"] += 1
+        self._checkpoint_error = ""
 
     @staticmethod
     def _retention_boundary(
@@ -1294,12 +1397,12 @@ class ProjectionWriter:
                 ).fetchall()
             ]
 
+            self._conn.execute("DROP TABLE IF EXISTS _vnext_retention_task_ids")
             self._conn.execute(
-                """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_retention_task_ids(
+                """CREATE TEMPORARY TABLE _vnext_retention_task_ids(
                        event_id VARCHAR PRIMARY KEY
                    )"""
             )
-            self._conn.execute("DELETE FROM _vnext_retention_task_ids")
             if task_ids:
                 self._conn.executemany(
                     "INSERT INTO _vnext_retention_task_ids VALUES (?)",
@@ -1312,12 +1415,12 @@ class ProjectionWriter:
                         )"""
                 )
 
+            self._conn.execute("DROP TABLE IF EXISTS _vnext_retention_progress_ids")
             self._conn.execute(
-                """CREATE TEMPORARY TABLE IF NOT EXISTS _vnext_retention_progress_ids(
+                """CREATE TEMPORARY TABLE _vnext_retention_progress_ids(
                        event_id VARCHAR PRIMARY KEY
                    )"""
             )
-            self._conn.execute("DELETE FROM _vnext_retention_progress_ids")
             if progress_ids:
                 self._conn.executemany(
                     "INSERT INTO _vnext_retention_progress_ids VALUES (?)",
@@ -1545,6 +1648,8 @@ class ProjectionWriter:
             "staging_mode": self.staging_mode,
             "reuse_staging": self.reuse_staging,
             "projection_storage": "one_writer_one_duckdb",
+            "checkpoint_mode": "explicit_between_batches",
+            "checkpoint_error": self._checkpoint_error,
             "owner_lock_path": str(self.owner_lock.path),
             "owner_lock_held": self.owner_lock.held,
             "flush_interval_seconds": self.flush_interval_seconds,
@@ -1595,6 +1700,13 @@ def _write_process_status(path: Path, value: dict) -> None:
         pass
 
 
+def _bounded_retention_days(value, default: int = 7) -> int:
+    try:
+        return max(1, min(3650, int(value)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _process_main(
     db_path: str,
     input_queue,
@@ -1608,13 +1720,17 @@ def _process_main(
     run_id: str = "",
     start_method: str = "spawn",
     staging_mode: str = "vectorized",
-    reuse_staging: bool = True,
+    reuse_staging: bool = False,
     task_index_path: str = "",
     profile_root: str = "",
     profile_interval_seconds: float = 1.0,
     ready_event=None,
+    retention_days: int | None = None,
 ) -> None:
     set_parent_death_signal()
+    core_dump_disabled = False
+    if os.environ.get("MC_VNEXT_PROJECTION_ALLOW_CORE_DUMP", "0") != "1":
+        core_dump_disabled = disable_kernel_core_dump()
     status_file = Path(status_path)
     role = "projection-writer"
     native_fault_path = enable_native_fault_capture(diagnostic_root, role)
@@ -1623,8 +1739,15 @@ def _process_main(
         role,
         interval_seconds=float(profile_interval_seconds or 1.0),
     )
+    last_progress_diagnostic_at = 0.0
 
     def diagnostic(**kwargs) -> None:
+        nonlocal last_progress_diagnostic_at
+        if kwargs.get("phase") in {"event", "journal_flush"}:
+            now = time.monotonic()
+            if now - last_progress_diagnostic_at < 0.25:
+                return
+            last_progress_diagnostic_at = now
         started_ns = time.perf_counter_ns()
         try:
             write_process_metadata(
@@ -1643,7 +1766,10 @@ def _process_main(
     diagnostic(
         phase="starting",
         status="starting",
-        extra={"native_fault_log": str(native_fault_path) if native_fault_path else ""},
+        extra={
+            "native_fault_log": str(native_fault_path) if native_fault_path else "",
+            "kernel_core_dump_disabled": core_dump_disabled,
+        },
     )
     writer = ProjectionWriter(
         db_path,
@@ -1662,12 +1788,12 @@ def _process_main(
     pending_input_events: list[dict] = []
     graceful_stop = False
     journal_cursor = 0
-    try:
-        retention_days = max(
-            1, min(3650, int(os.environ.get("MC_VNEXT_RETENTION_DAYS", "7")))
+    if retention_days is None:
+        retention_days = _bounded_retention_days(
+            os.environ.get("MC_VNEXT_RETENTION_DAYS", "7")
         )
-    except (TypeError, ValueError):
-        retention_days = 7
+    else:
+        retention_days = _bounded_retention_days(retention_days)
     try:
         retention_batch = max(
             100, min(100_000, int(os.environ.get("MC_VNEXT_RETENTION_BATCH", "5000")))
@@ -1686,6 +1812,17 @@ def _process_main(
     retention_last_run_at = 0.0
     retention_last_result: dict = {}
     retention_last_error = ""
+
+    def update_retention_days(value) -> bool:
+        nonlocal retention_days, retention_last_run_monotonic
+        updated = _bounded_retention_days(value)
+        changed = updated != retention_days
+        retention_days = updated
+        if changed:
+            # Apply the new value on the next idle maintenance opportunity;
+            # never interrupt an in-flight projection quantum.
+            retention_last_run_monotonic = time.monotonic() - retention_interval
+        return changed
 
     def status(*, force_metrics: bool = False) -> dict:
         value = writer.snapshot(force_metrics=force_metrics)
@@ -1756,9 +1893,18 @@ def _process_main(
             value["critical_path"] = profiler.snapshot()
         return value
 
+    last_status_write_at = 0.0
+
     def write_status(*, force_metrics: bool = False) -> None:
+        nonlocal last_status_write_at
+        now = time.monotonic()
+        if not force_metrics and now - last_status_write_at < 0.25:
+            return
         started_ns = time.perf_counter_ns()
-        _write_process_status(status_file, status(force_metrics=force_metrics))
+        value = status(force_metrics=force_metrics)
+        value["status_updated_at"] = time.time()
+        _write_process_status(status_file, value)
+        last_status_write_at = now
         profiler.inc("process_status_write_count")
         profiler.observe_ns("process_status_write", time.perf_counter_ns() - started_ns)
         profiler.publish_if_due()
@@ -1793,6 +1939,8 @@ def _process_main(
                     progress=result,
                 )
         except Exception as exc:
+            if _fatal_storage_error(exc):
+                raise
             retention_last_error = f"{type(exc).__name__}: {exc}"
             diagnostic(
                 phase="retention_retry",
@@ -1816,6 +1964,8 @@ def _process_main(
                     try:
                         flushed = writer.flush(max_events=len(pending_events))
                     except Exception as exc:
+                        if _fatal_storage_error(exc):
+                            raise
                         diagnostic(
                             phase="flush_retry",
                             status="degraded",
@@ -1864,6 +2014,12 @@ def _process_main(
                         hint = input_queue.get_nowait()
                         if hint is None:
                             graceful_stop = True
+                        elif (
+                            isinstance(hint, dict)
+                            and str(hint.get("event_kind") or "") == "projection_control"
+                        ):
+                            if str(hint.get("control") or "") == "retention_days":
+                                update_retention_days(hint.get("value"))
                         elif (
                             isinstance(hint, dict)
                             and str(hint.get("event_kind") or "") in {
@@ -1962,14 +2118,17 @@ def _process_main(
                         except ProjectionWriterBusy:
                             pass
                         except Exception as exc:
+                            if _fatal_storage_error(exc):
+                                raise
                             diagnostic(
                                 phase="flush_retry",
                                 status="degraded",
                                 extra={"last_error": f"{type(exc).__name__}: {exc}"},
                             )
                             time.sleep(writer.retry_seconds)
-                    if stop_event.is_set() and not writer._queue:
-                        break
+                    # The parent's Queue feeder may still be delivering
+                    # accepted events. Only the FIFO sentinel/EOF establishes
+                    # that IPC input is drained; stop_event alone does not.
                     maybe_age()
                     write_status()
                     continue
@@ -1977,6 +2136,14 @@ def _process_main(
                     break
                 if event is None:
                     break
+                if (
+                    isinstance(event, dict)
+                    and str(event.get("event_kind") or "") == "projection_control"
+                ):
+                    if str(event.get("control") or "") == "retention_days":
+                        update_retention_days(event.get("value"))
+                    write_status()
+                    continue
                 input_events = (
                     event.get("events") or []
                     if isinstance(event, dict)
@@ -1996,6 +2163,8 @@ def _process_main(
                         except ProjectionWriterBusy:
                             pass
                         except Exception as exc:
+                            if _fatal_storage_error(exc):
+                                raise
                             diagnostic(
                                 phase="flush_retry",
                                 status="degraded",
@@ -2013,6 +2182,8 @@ def _process_main(
                 except ProjectionWriterBusy:
                     time.sleep(writer.retry_seconds)
                 except Exception as exc:
+                    if _fatal_storage_error(exc):
+                        raise
                     diagnostic(
                         phase="flush_retry",
                         status="degraded",
@@ -2047,9 +2218,10 @@ class ProjectionWriterProcess:
                  flush_interval_seconds: float = 0.1, start_method: str = "spawn",
                  mp_context=None, diagnostics_root: str | os.PathLike[str] | None = None,
                  run_id: str = "", staging_mode: str = "vectorized",
-                  reuse_staging: bool = True,
+                  reuse_staging: bool = False,
                   profile_root: str | os.PathLike[str] | None = None,
-                  profile_interval_seconds: float = 1.0):
+                  profile_interval_seconds: float = 1.0,
+                  retention_days: int | None = None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / db_name
@@ -2065,6 +2237,9 @@ class ProjectionWriterProcess:
         self.reuse_staging = bool(reuse_staging)
         self.profile_root = Path(profile_root).resolve() if profile_root else None
         self.profile_interval_seconds = max(0.1, float(profile_interval_seconds))
+        self.retention_days = (
+            None if retention_days is None else _bounded_retention_days(retention_days)
+        )
         self._mp_context = mp_context or multiprocessing.get_context(start_method or "spawn")
         self.start_method = self._mp_context.get_start_method()
         self.journal_paths = tuple(str(Path(path).resolve()) for path in journal_paths)
@@ -2097,6 +2272,7 @@ class ProjectionWriterProcess:
                 str(self.profile_root) if self.profile_root else "",
                 self.profile_interval_seconds,
                 self.ready_event,
+                self.retention_days,
             ),
             name="mc-vnext-projection-writer",
             daemon=True,
@@ -2154,6 +2330,37 @@ class ProjectionWriterProcess:
         except queue.Full as exc:
             raise ProjectionBackpressure("projection writer IPC queue is full") from exc
 
+    def set_retention_days(self, value: int) -> bool:
+        """Update idle-only aging without restarting workers or the writer."""
+
+        normalized = _bounded_retention_days(value)
+        # Keep the parent-side restart configuration current even when the
+        # child is between lifecycle states and the control message must be
+        # retried later.
+        self.retention_days = normalized
+        process = self.process
+        if (
+            self.queue is None
+            or not self._started
+            or process is None
+            or not process.is_alive()
+        ):
+            return False
+        try:
+            self.queue.put(
+                {
+                    "event_kind": "projection_control",
+                    "control": "retention_days",
+                    "value": normalized,
+                },
+                timeout=0.0,
+            )
+            return True
+        except (queue.Full, OSError, ValueError):
+            # The durable setting remains saved.  The scheduler retries this
+            # small control message on its next maintenance tick.
+            return False
+
     def stop(self, timeout: float = 30.0) -> None:
         with self._lock:
             if not self._started or self.process is None:
@@ -2207,7 +2414,11 @@ class ProjectionWriterProcess:
             return {
                 "queue_depth": None,
                 "alive": alive,
-                "ready": ready,
+                "ready": False,
+                "status_stale": True,
+                "status_age_seconds": None,
+                "status_pid_matches": False,
+                "core_dumping": False,
                 "journal_replay": bool(self.journal_paths),
                 "pid": getattr(process, "pid", None),
                 "exitcode": exitcode,
@@ -2220,12 +2431,35 @@ class ProjectionWriterProcess:
             }
         try:
             value = json.loads(self.status_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            if not isinstance(value, dict):
+                value = {}
+            updated_at = float(value.get("status_updated_at") or self.status_path.stat().st_mtime)
+        except (OSError, ValueError, TypeError):
             value = {}
+            updated_at = 0.0
+        status_pid_matches = value.get("pid") == getattr(process, "pid", None)
+        status_age = max(0.0, time.time() - updated_at)
+        status_stale = not status_pid_matches or status_age > 30.0
+        # multiprocessing reports a core-dumping process as alive until the
+        # collector finishes. Linux PF_DUMPCORE identifies that interval.
+        core_dumping = False
+        if alive and os.name == "posix":
+            try:
+                stat = Path(f"/proc/{process.pid}/stat").read_text()
+                fields = stat[stat.rfind(")") + 2:].split()
+                core_dumping = bool(int(fields[6]) & 0x200)
+            except (OSError, ValueError, IndexError):
+                pass
+        ready = ready and not status_stale and not core_dumping
+        native_crash = native_crash or core_dumping
         return {
             **value,
             "alive": alive,
             "ready": ready,
+            "status_stale": status_stale,
+            "status_age_seconds": round(status_age, 3),
+            "status_pid_matches": status_pid_matches,
+            "core_dumping": core_dumping,
             "journal_replay": bool(self.journal_paths),
             "pid": getattr(process, "pid", None),
             "exitcode": exitcode,

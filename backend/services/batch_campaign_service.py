@@ -625,14 +625,47 @@ def delete(campaign_id: int) -> bool:
     if not row:
         return False
 
-    _run_campaign_write(
-        "delete",
-        lambda conn: (
-            conn.execute("DELETE FROM batch_campaign_daily_stats WHERE campaign_id=?", (campaign_id,)),
-            conn.execute("DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,)),
-            conn.execute("DELETE FROM batch_campaigns WHERE id=?", (campaign_id,)),
-        ),
+    # DuckDB's foreign-key checker does not treat a child DELETE as removing
+    # the reference until that transaction is committed.  Deleting the child
+    # rows and their parent in one transaction therefore fails with
+    # ``ConstraintException`` even though the SQL order is correct.  Keep the
+    # two commits intentionally short and make the first one mark the activity
+    # as deleting so the scheduler cannot create new batches in the gap.
+    def remove_children(conn):
+        current = conn.execute(
+            "SELECT 1 FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()
+        if not current:
+            return False
+        conn.execute(
+            "UPDATE batch_campaigns SET status='deleting', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (campaign_id,),
+        )
+        conn.execute(
+            "DELETE FROM batch_campaign_daily_stats WHERE campaign_id=?", (campaign_id,)
+        )
+        conn.execute(
+            "DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,)
+        )
+        # Manifests are not declared as an FK in every historical schema, but
+        # they are campaign-owned state and must not be left orphaned.
+        conn.execute(
+            "DELETE FROM batch_campaign_manifests WHERE campaign_id=?", (campaign_id,)
+        )
+        return True
+
+    if not _run_campaign_write("delete.children", remove_children):
+        return False
+
+    # This must be a new committed transaction; see the FK note above.
+    deleted = _run_campaign_write(
+        "delete.parent",
+        lambda conn: conn.execute(
+            "DELETE FROM batch_campaigns WHERE id=?", (campaign_id,)
+        ).rowcount,
     )
+    if not deleted:
+        return False
     campaign_dir = dict(row).get("campaign_dir", "")
     if campaign_dir and os.path.isdir(campaign_dir):
         try:

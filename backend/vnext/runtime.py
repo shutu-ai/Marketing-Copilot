@@ -353,6 +353,7 @@ class VNextRuntime:
                  worker_count: int = 4, virtual_partition_count: int = 256,
                  max_spool_bytes: int = DEFAULT_MAX_SPOOL_BYTES, projection_queue_size: int = 8192,
                  max_inflight: int = 128, prefetch_per_partition: int = 64,
+                 retention_days: int | None = None,
                  projection_batch_size: int = 512,
                  start_method: str = "spawn", projection_flush_interval_seconds: float | None = None,
                  run_id: str = "", clock: BusinessClock | object | None = None,
@@ -458,6 +459,7 @@ class VNextRuntime:
             run_id=self.run_id,
             profile_root=self.profile_root,
             profile_interval_seconds=self.profile_interval_seconds,
+            retention_days=retention_days,
         )
         self.supervisor: WorkerSupervisor | None = None
         self._started = False
@@ -585,6 +587,12 @@ class VNextRuntime:
                     self._projection_last_error = ""
                     continue
                 if snapshot.get("alive", False):
+                    if snapshot.get("status_stale") or snapshot.get("core_dumping"):
+                        self._projection_degraded = True
+                        self._projection_last_error = (
+                            "projection child is dumping core" if snapshot.get("core_dumping")
+                            else "projection child status heartbeat is stale"
+                        )
                     # The child may still be opening DuckDB or replaying its
                     # journals.  Do not start a competing child while it is
                     # alive; this is deliberately outside the send path.
@@ -733,6 +741,18 @@ class VNextRuntime:
             target=self._daily_epoch_loop, name="mc-vnext-daily-epoch", daemon=True,
         )
         self._daily_epoch_thread.start()
+
+    def apply_retention_days(self, value: int) -> dict:
+        """Apply task aging through the projection owner control channel."""
+
+        setter = getattr(self.projection, "set_retention_days", None)
+        if not callable(setter):
+            return {"ok": False, "reason": "projection_control_unavailable"}
+        applied = bool(setter(value))
+        return {
+            "ok": applied,
+            "reason": "applied" if applied else "projection_control_deferred",
+        }
 
     def reload_route_rates(self, route_configs: dict[int | str, dict]) -> dict:
         """Apply only TPS settings to live workers without closing SMPP binds."""

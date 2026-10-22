@@ -11,7 +11,7 @@ watchfiles==0.24.0
 aiofiles==24.1.0
 websockets==13.0
 pika==1.3.2
-duckdb==1.2.0
+duckdb==1.2.2
 smpplib==2.2.4
 paramiko==3.5.1
 # Pin SSH crypto wheels to manylinux2014 for the SLES 12 SP5 glibc 2.17 runtime.

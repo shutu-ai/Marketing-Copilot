@@ -11,6 +11,22 @@ import sys
 _PR_SET_PDEATHSIG = 1
 
 
+def disable_kernel_core_dump() -> bool:
+    """Keep a crashing Linux child from waiting on a piped core collector.
+
+    RLIMIT_CORE is ignored for piped core_pattern handlers. PR_SET_DUMPABLE
+    also covers that case; Python faulthandler remains available. This changes
+    only the calling child, never the parent's or host's crash policy.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 def set_parent_death_signal(signum: int = signal.SIGTERM) -> bool:
     """Ask Linux to signal this child when its owning parent disappears.
 

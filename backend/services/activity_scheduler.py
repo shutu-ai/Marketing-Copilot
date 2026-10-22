@@ -202,7 +202,11 @@ def _run():
                 _run_stage("realtime_retention", realtime_campaign_service.cleanup_realtime_retention)
                 from services import realtime_whitelist_service
                 _run_stage("whitelist_cleanup", realtime_whitelist_service.cleanup_versions)
-                if not _vnext_active():
+                if _vnext_active():
+                    # Retry a deferred control message without entering the
+                    # VNext send path or restarting its workers.
+                    _run_stage("vnext_retention_config", vnext_service.apply_retention_days)
+                else:
                     _run_stage("task_retention", sms_task_service.cleanup_task_retention)
                 _run_stage("campaign_auto_complete", p1_service.auto_complete_campaigns)
                 if not _vnext_active():

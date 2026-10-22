@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +28,194 @@ def event(event_id: str, state: str = "socket_written", ordinal: int = 1) -> dic
         "write_failed": int(state == "write_failed"), "unknown": int(state == "unknown"),
         "created_at": time.time(),
     }
+
+
+def test_failed_commit_restores_accounting_and_retry_is_exactly_once(tmp_path):
+    writer = ProjectionWriter(tmp_path / "retry.duckdb")
+    writer.start()
+    connection = writer._conn
+
+    class FailCommitOnce:
+        failed = False
+
+        def execute(self, statement, *args):
+            if statement == "COMMIT" and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected commit failure")
+            return connection.execute(statement, *args)
+
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+    writer._conn = FailCommitOnce()
+    try:
+        writer.submit(event("commit-retry"))
+        with pytest.raises(RuntimeError, match="injected commit failure"):
+            writer.flush()
+        assert writer._applied == 0
+        assert writer._metrics["events_new"] == 0
+        assert len(writer._queue) == 1
+        assert writer.flush() == 1
+        assert writer._applied == 1
+        assert writer._metrics["events_new"] == 1
+        assert connection.execute("SELECT SUM(socket_written) FROM vnext_projection").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM vnext_progress_events").fetchone() == (1,)
+    finally:
+        writer.stop()
+
+
+def test_checkpoint_boundary_recreates_staging_and_survives_reopen(tmp_path):
+    path = tmp_path / "checkpoint.duckdb"
+    writer = ProjectionWriter(path)
+    writer._checkpoint_bytes = 1  # exercise checkpoint on every batch
+    writer.start()
+    try:
+        for index in range(5):
+            item = event(f"checkpoint-{index}")
+            item["message"] = "多语言短信 Ethiopic ሰላም " * 30
+            writer.submit(item)
+            assert writer.flush() == 1
+            assert not writer._batch_table_created
+            assert writer._checkpoint_error == ""
+            assert writer._conn.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE temporary"
+            ).fetchall() == []
+    finally:
+        writer.stop()
+    import duckdb
+    with duckdb.connect(str(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM vnext_progress_events").fetchone() == (5,)
+        assert conn.execute("SELECT SUM(socket_written) FROM vnext_projection").fetchone() == (5,)
+
+
+def test_hot_checkpoint_is_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv('MC_VNEXT_PROJECTION_CHECKPOINT_BYTES', raising=False)
+    writer = ProjectionWriter(tmp_path / 'no-hot-checkpoint.duckdb')
+    assert writer._checkpoint_bytes == 0
+
+
+def test_hot_checkpoint_can_be_enabled_explicitly(monkeypatch, tmp_path):
+    monkeypatch.setenv('MC_VNEXT_PROJECTION_CHECKPOINT_BYTES', '4096')
+    writer = ProjectionWriter(tmp_path / 'configured-checkpoint.duckdb')
+    assert writer._checkpoint_bytes == 4096
+
+
+def test_checkpoint_failure_does_not_retry_committed_events(tmp_path, monkeypatch):
+    writer = ProjectionWriter(tmp_path / "checkpoint-error.duckdb")
+    writer.start()
+    try:
+        def fail_checkpoint():
+            raise RuntimeError("injected checkpoint failure")
+
+        monkeypatch.setattr(writer, "_checkpoint_if_due", fail_checkpoint)
+        writer.submit(event("durable"))
+        assert writer.flush() == 1
+        assert not writer._queue
+        assert writer._applied == 1
+        assert "injected checkpoint failure" in writer.snapshot()["checkpoint_error"]
+        assert writer._conn.execute("SELECT COUNT(*) FROM vnext_progress_events").fetchone() == (1,)
+    finally:
+        writer.stop()
+
+
+@pytest.mark.parametrize("age,pid_matches", [(60, True), (0, False)])
+def test_projection_readiness_rejects_stale_or_previous_child_status(tmp_path, age, pid_matches):
+    import json
+
+    process = ProjectionWriterProcess(tmp_path)
+
+    class LiveProcess:
+        pid = 987654321
+        exitcode = None
+
+        def is_alive(self):
+            return True
+
+    process.process = LiveProcess()
+    process.ready_event.set()
+    process.status_path.write_text(json.dumps({
+        "pid": process.process.pid if pid_matches else 123,
+        "status_updated_at": time.time() - age,
+    }), encoding="utf-8")
+    snapshot = process.snapshot()
+    assert snapshot["alive"] is True
+    assert snapshot["ready"] is False
+    assert snapshot["status_stale"] is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Linux /proc crash detection")
+def test_projection_reports_coredumping_child_as_unready(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+
+    process = ProjectionWriterProcess(tmp_path)
+
+    class DumpingProcess:
+        pid = 987654321
+        exitcode = None
+
+        def is_alive(self):
+            return True
+
+    process.process = DumpingProcess()
+    process.ready_event.set()
+    process.status_path.write_text(json.dumps({
+        "pid": process.process.pid, "status_updated_at": time.time(),
+    }), encoding="utf-8")
+    original = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if str(path).replace("\\", "/") == "/proc/987654321/stat":
+            return "987654321 (python child) S 1 1 1 0 0 512"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    snapshot = process.snapshot()
+    assert snapshot["core_dumping"] is True
+    assert snapshot["native_crash"] is True
+    assert snapshot["ready"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SIGBUS/core collector")
+def test_sigbus_exits_promptly_and_restart_replays_without_duplicates(tmp_path):
+    import json
+    import signal
+
+    journal = ProgressJournal(tmp_path / "progress.jsonl")
+    journal.append_many([event("before-crash")])
+    process = ProjectionWriterProcess(tmp_path / "projection", journal_paths=[journal.path])
+    process.start()
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if process.snapshot().get("applied", 0) >= 1:
+                break
+            time.sleep(0.05)
+        assert process.snapshot().get("applied") == 1
+        metadata = json.loads((process.diagnostics_root / "processes" /
+                               f"projection-writer-{process.process.pid}.json").read_text())
+        assert metadata["kernel_core_dump_disabled"] is True
+        os.kill(process.process.pid, signal.SIGBUS)
+        process.process.join(timeout=5)
+        assert not process.process.is_alive()
+        assert process.process.exitcode == -signal.SIGBUS
+        assert process.snapshot()["native_crash"] is True
+        assert "Bus error" in Path(metadata["native_fault_log"]).read_text()
+        journal.append_many([event("after-crash", ordinal=2)])
+        assert process.restart()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if process.snapshot().get("applied", 0) >= 1 and process.snapshot().get("ready"):
+                break
+            time.sleep(0.05)
+        assert process.snapshot().get("ready") is True
+        assert process.snapshot().get("applied") == 1
+    finally:
+        process.stop(timeout=5)
+    import duckdb
+    with duckdb.connect(str(process.db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM vnext_progress_events").fetchone() == (2,)
+        assert conn.execute("SELECT SUM(socket_written) FROM vnext_projection").fetchone() == (2,)
 
 
 def test_projection_owner_lock_prevents_competing_duckdb_writer(tmp_path, monkeypatch):
@@ -424,6 +615,24 @@ def test_vectorized_staging_matches_executemany_and_reports_stage_metrics(tmp_pa
         finally:
             writer.stop()
     assert summaries["vectorized"] == summaries["executemany"] == (128, 128, 1)
+
+
+def test_projection_defaults_to_non_reused_staging(tmp_path):
+    writer = ProjectionWriter(tmp_path / "non-reused-staging.duckdb", batch_size=2)
+    assert writer.reuse_staging is False
+    writer.start()
+    try:
+        writer.submit(event("non-reused-1", ordinal=1))
+        writer.submit(event("non-reused-2", ordinal=2))
+        assert writer.flush() == 2
+        writer.submit(event("non-reused-3", ordinal=3))
+        assert writer.flush() == 1
+        assert writer.snapshot()["reuse_staging"] is False
+        assert writer._conn.execute(
+            "SELECT COUNT(*) FROM vnext_progress_events"
+        ).fetchone() == (3,)
+    finally:
+        writer.stop()
 
 
 def test_journal_generation_recovery_reclaims_only_acknowledged_segments(tmp_path):

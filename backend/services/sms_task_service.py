@@ -3016,7 +3016,9 @@ def _find_task_by_message_id(conn, message_id: str,
 
 
 def cleanup_task_retention() -> int:
-    retention_days = max(1, int(settings_service.get_setting("sms_task_retention_days", "3")))
+    retention_days = max(1, int(settings_service.get_setting(
+        "sms_task_retention_days", os.environ.get("MC_VNEXT_RETENTION_DAYS", "7")
+    )))
     cleanup_batch = max(1000, min(20000, int(os.environ.get("MC_TASK_CLEANUP_BATCH", "5000"))))
     from datetime import timedelta
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")

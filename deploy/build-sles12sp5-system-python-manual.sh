@@ -79,6 +79,8 @@ PRODUCTION_TOOLS=(
   install_systemd_service.py
   reconcile_processed_files.py
   cutover_vnext_store.py
+  maintain_projection.py
+  bulk_rebuild_projection.py
   vnext_stats.py
 )
 mkdir -p "$STAGE/backend/tools"

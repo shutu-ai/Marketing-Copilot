@@ -95,7 +95,8 @@ def enable_native_fault_capture(
         _NATIVE_FAULTHANDLER_ROLES[safe_role] = process_id
         return Path(str(existing["path"]))
     directory = Path(root).resolve() / "native-crash"
-    path = directory / f"{safe_role}-faulthandler.log"
+    # A replacement child must not truncate the evidence from its predecessor.
+    path = directory / f"{safe_role}-{process_id}-faulthandler.log"
     try:
         directory.mkdir(parents=True, exist_ok=True)
         handle = path.open("w", encoding="utf-8")

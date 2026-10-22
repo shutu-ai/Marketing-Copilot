@@ -105,6 +105,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _configured_retention_days(value=None) -> int:
+    """Read the Basic Settings retention value with the VNext bounds."""
+
+    if value is None:
+        from services.settings_service import get_setting
+        value = get_setting(
+            "sms_task_retention_days",
+            os.environ.get("MC_VNEXT_RETENTION_DAYS", "7"),
+        )
+    try:
+        return max(1, min(3650, int(value)))
+    except (TypeError, ValueError):
+        return 7
+
+
 def mark_config_change(reason: str = "SMPP configuration changed") -> None:
     """Mark a structural control-plane change for a safe restart.
 
@@ -133,6 +148,30 @@ def apply_route_rates(route_configs: dict | None = None) -> dict:
             }
         routes = route_configs if route_configs is not None else _load_routes()
         return value.reload_route_rates(routes)
+
+
+def apply_retention_days(value=None) -> dict:
+    """Push task retention to the idle-only projection maintenance loop."""
+
+    desired = _configured_retention_days(value)
+    with _LOCK:
+        runtime_value = _RUNTIME
+        if runtime_value is None or not getattr(runtime_value, "_started", False):
+            return {
+                "ok": False,
+                "reason": "runtime_inactive",
+                "retention_days": desired,
+            }
+        applier = getattr(runtime_value, "apply_retention_days", None)
+        if not callable(applier):
+            return {
+                "ok": False,
+                "reason": "runtime_control_unavailable",
+                "retention_days": desired,
+            }
+        result = dict(applier(desired) or {})
+    result["retention_days"] = desired
+    return result
 
 
 def run_root() -> Path:
@@ -203,6 +242,7 @@ def start() -> VNextRuntime | None:
         if _RUNTIME is not None and getattr(_RUNTIME, "_started", False):
             return _RUNTIME
         routes = _load_routes()
+        retention_days = _configured_retention_days()
         value = VNextRuntime(
             run_root(), routes,
             worker_count=_env_int("MC_VNEXT_WORKERS", 4, 1, 8),
@@ -211,6 +251,7 @@ def start() -> VNextRuntime | None:
             projection_queue_size=_env_int("MC_VNEXT_PROJECTION_QUEUE", 8192, 128, 100000),
             max_inflight=_env_int("MC_VNEXT_MAX_INFLIGHT", 128, 1, 2048),
             prefetch_per_partition=_env_int("MC_VNEXT_PREFETCH_PER_PARTITION", 64, 1, 512),
+            retention_days=retention_days,
             keep_smpp_binds=_env_bool("MC_VNEXT_KEEP_SMPP_BINDS", True),
             prewarm_smpp_binds=_env_bool("MC_VNEXT_PREWARM_SMPP_BINDS", True),
         )

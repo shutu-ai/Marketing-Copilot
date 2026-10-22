@@ -2,8 +2,24 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 from database import get_database_file, set_database_file
 from services import db_config
+
+
+@pytest.mark.parametrize("ready,expected", [(False, "degraded"), (True, "ok")])
+def test_health_includes_projection_readiness(monkeypatch, ready, expected):
+    from services import vnext_service
+
+    main = importlib.import_module("main")
+    monkeypatch.setattr(main, "read_transaction", lambda *args, **kwargs: None)
+    monkeypatch.setattr(vnext_service, "is_active", lambda: True)
+    monkeypatch.setattr(vnext_service, "capacity_snapshot", lambda: {
+        "supervisor": {"workers": [{"alive": True}]},
+        "projection": {"ready": ready, "alive": True},
+    })
+    assert main.health()["status"] == expected
 
 
 def test_main_startup_owns_vnext_runtime_without_legacy_workers(tmp_path, monkeypatch):

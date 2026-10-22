@@ -109,6 +109,24 @@ async def handle_database_io_error(request: Request, exc: duckdb.IOException):
     )
 
 
+_DUCKDB_CONSTRAINT_ERROR = getattr(duckdb, "ConstraintException", None)
+if _DUCKDB_CONSTRAINT_ERROR is not None:
+    @app.exception_handler(_DUCKDB_CONSTRAINT_ERROR)
+    async def handle_database_constraint_error(request: Request, exc):
+        logger.warning(
+            "Database constraint rejected request=%s method=%s error=%s",
+            request.url.path, request.method, exc,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "操作违反数据关联约束，请先处理关联数据。",
+                "code": "DATABASE_CONSTRAINT",
+                "retryable": False,
+            },
+        )
+
+
 _DUCKDB_ERROR = getattr(duckdb, "Error", None)
 if _DUCKDB_ERROR is not None:
     @app.exception_handler(_DUCKDB_ERROR)
@@ -313,7 +331,10 @@ def health():
                 raise
             logger.warning("Health SMPP status unavailable: %s", exc)
             smpp = _smpp_unavailable_status()
-    return {"status": "ok" if db_ok else "degraded", "service": "Marketing Copilot",
+    projection_ok = not vnext_service.is_active() or bool(
+        (smpp.get("projection") or {}).get("ready")
+    )
+    return {"status": "ok" if db_ok and projection_ok else "degraded", "service": "Marketing Copilot",
             "database": "connected" if db_ok else "disconnected", "smpp": smpp}
 
 
