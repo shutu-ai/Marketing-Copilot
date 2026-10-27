@@ -48,12 +48,11 @@
           <el-upload
             drag
             :auto-upload="false"
-            :limit="1"
             :disabled="uploading || isRunning"
             accept=".tar.gz,.tgz,.tar"
             :on-change="onFileChange"
             :on-remove="onFileRemove"
-            :file-list="fileList"
+            v-model:file-list="fileList"
           >
             <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
             <div class="el-upload__text">{{ $t('update.dropHint') }}</div>
@@ -329,6 +328,7 @@ function stopPolling() {
 function onFileChange(file: UploadFile) {
   const raw = file.raw
   if (!raw) return
+  fileList.value = [file]
   selectedFile.value = raw
   uploadId.value = ''
   precheck.value = null
@@ -337,6 +337,7 @@ function onFileChange(file: UploadFile) {
 }
 
 function onFileRemove() {
+  fileList.value = []
   selectedFile.value = null
   uploadId.value = ''
   precheck.value = null

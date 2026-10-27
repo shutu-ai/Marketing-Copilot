@@ -1,4 +1,4 @@
-import time
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -36,7 +36,7 @@ def recent_uploads(limit: int = Query(5, ge=1, le=20)):
 @router.post("/upload/start")
 def upload_start(data: UploadStart, request: Request):
     try:
-        upload_id = data.upload_id or f"upd-{int(time.time() * 1000)}"
+        upload_id = data.upload_id or f"upd-{uuid.uuid4().hex}"
         meta = update_service.create_upload(upload_id, data.filename, data.size, data.sha256, data.chunks)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

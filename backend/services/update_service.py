@@ -140,6 +140,8 @@ def create_upload(upload_id: str, filename: str, size: int, sha256: str, chunks:
     if size and size > max_size:
         raise ValueError(f"package too large: {size} bytes > {max_size}")
     ud = upload_dir(upload_id)
+    if ud.exists() and any(ud.iterdir()):
+        raise ValueError("upload_id already exists; start a new upload")
     ud.mkdir(parents=True, exist_ok=True)
     meta = {
         "upload_id": upload_id,
