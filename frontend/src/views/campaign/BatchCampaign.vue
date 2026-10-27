@@ -630,7 +630,13 @@ async function openSmsConfig(row: Campaign) {
     let smsCampaignId = res.data?.id
     if (!smsCampaignId && row.sms_template_id) {
       const templates = await smsApi.getAllTemplates()
-      smsCampaignId = templates.data.find((item: any) => item.template_id === row.sms_template_id)?.campaign_id
+      smsCampaignId = templates.data.find((item: any) =>
+        item.template_id === row.sms_template_id
+        && item.marketing_type === 'batch'
+        && Number(item.marketing_campaign_id) === row.id
+        && item.enabled !== 0
+        && item.template_enabled !== 0
+      )?.campaign_id
     }
     await router.push({
       path: smsCampaignId ? `/sms-content/campaign/${smsCampaignId}` : '/sms-content/campaign/new',

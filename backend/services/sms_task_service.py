@@ -596,6 +596,15 @@ def _insert_message_mapping(conn, task_id: int, message_ids) -> None:
     _insert_message_mappings(conn, ((mid, task_id) for mid in (message_ids or [])))
 
 
+def _active_content_campaign(conn, campaign_type: str, campaign_id: int):
+    return conn.execute(
+        """SELECT id FROM campaigns
+           WHERE marketing_type=? AND marketing_campaign_id=? AND enabled=1
+           ORDER BY id DESC LIMIT 1""",
+        (campaign_type, int(campaign_id)),
+    ).fetchone()
+
+
 def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: dict) -> dict:
     """Resolve and cache the campaign's language->template mapping."""
     cache_key = (campaign_type, int(campaign_id))
@@ -612,13 +621,11 @@ def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: 
                 _TEMPLATE_CACHE[cache_key] = (time.monotonic(), value)
         return value
 
+    content_campaign = _active_content_campaign(conn, campaign_type, campaign_id)
     rows = conn.execute(
-        """SELECT t.* FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
-            WHERE c.marketing_type=? AND c.marketing_campaign_id=?
-            AND c.enabled=1 AND t.enabled=1
-            ORDER BY t.id""",
-        (campaign_type, campaign_id),
-    ).fetchall()
+        "SELECT * FROM sms_templates WHERE campaign_id=? AND enabled=1 ORDER BY id",
+        (content_campaign["id"],),
+    ).fetchall() if content_campaign else []
     templates = [dict(r) for r in rows]
     if templates:
         by_lang = {}
@@ -630,26 +637,14 @@ def _resolve_template_map(conn, campaign_type: str, campaign_id: int, campaign: 
                 fallback = by_lang[key]
                 break
         return cache({"by_lang": by_lang, "fallback": fallback, "default": templates[0], "direct": None})
-    selected_template_id = campaign.get("sms_template_id")
     direct = None
-    if selected_template_id:
+    if content_campaign and campaign.get("sms_template_id"):
         selected = conn.execute(
-            "SELECT * FROM sms_templates WHERE id=? AND enabled=1 LIMIT 1", (selected_template_id,),
+            """SELECT * FROM sms_templates
+               WHERE id=? AND campaign_id=? AND enabled=1 LIMIT 1""",
+            (campaign["sms_template_id"], content_campaign["id"]),
         ).fetchone()
         direct = dict(selected) if selected else None
-    if not direct:
-        fallback_campaign = conn.execute(
-            """SELECT id FROM campaigns WHERE marketing_type=? AND marketing_campaign_id=?
-                ORDER BY id LIMIT 1""",
-            (campaign_type, campaign_id),
-        ).fetchone()
-        if fallback_campaign:
-            fallback_template = conn.execute(
-                """SELECT * FROM sms_templates WHERE campaign_id=? AND enabled=1 ORDER BY id LIMIT 1""",
-                (fallback_campaign["id"],),
-            ).fetchone()
-            if fallback_template:
-                direct = dict(fallback_template)
     return cache({"by_lang": {}, "fallback": None, "default": None, "direct": direct})
 
 
@@ -762,66 +757,11 @@ def campaign_is_active(campaign: dict, now: Optional[datetime] = None) -> tuple[
 
 
 def _template_for(conn, campaign_type: str, campaign_id: int, language: str):
-    rows = conn.execute(
-        """SELECT t.* FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
-            WHERE c.marketing_type=? AND c.marketing_campaign_id=?
-            AND c.enabled=1 AND t.enabled=1
-            ORDER BY t.id""",
-        (campaign_type, campaign_id),
-    ).fetchall()
-    templates = [dict(r) for r in rows]
-    if not templates:
-        campaign_table = {"batch": "batch_campaigns", "realtime": "realtime_campaigns"}.get(campaign_type)
-        selected_template_id = None
-        if campaign_table:
-            selected = conn.execute(
-                f"SELECT sms_template_id FROM {campaign_table} WHERE id=?", (campaign_id,)
-            ).fetchone()
-            selected_template_id = selected["sms_template_id"] if selected else None
-        detail_logger.info(
-            "template lookup campaign_type=%s campaign_id=%s selected_template_id=%s",
-            campaign_type, campaign_id, selected_template_id,
-        )
-        if not selected_template_id:
-            # Last resort: look up campaigns table by marketing_campaign_id ignoring enabled flag
-            fallback_campaign = conn.execute(
-                """SELECT id FROM campaigns WHERE marketing_type=? AND marketing_campaign_id=?
-                    ORDER BY id LIMIT 1""",
-                (campaign_type, campaign_id),
-            ).fetchone()
-            if fallback_campaign:
-                fallback_template = conn.execute(
-                    """SELECT t.* FROM sms_templates t
-                        WHERE t.campaign_id=? AND t.enabled=1
-                        ORDER BY t.id LIMIT 1""",
-                    (fallback_campaign["id"],),
-                ).fetchone()
-                if fallback_template:
-                    detail_logger.info("template fallback campaign_type=%s campaign_id=%s template=%s",
-                                       campaign_type, campaign_id, fallback_template["id"])
-                    return dict(fallback_template)
-            detail_logger.info("template missing campaign_type=%s campaign_id=%s language=%s",
-                               campaign_type, campaign_id, language)
-            return None
-        selected_template = conn.execute(
-            """SELECT t.* FROM sms_templates t
-                WHERE t.id=? AND t.enabled=1 LIMIT 1""",
-            (selected_template_id,),
-        ).fetchone()
-        detail_logger.info("template direct campaign_type=%s campaign_id=%s template=%s",
-                           campaign_type, campaign_id, selected_template["id"] if selected_template else None)
-        return dict(selected_template) if selected_template else None
-    wanted = normalize_language_key(language)
-    for item in templates:
-        if normalize_language_key(item.get("language", "")) == wanted:
-            return item
-    for fallback in ("english", "en", "amharic"):
-        for item in templates:
-            if normalize_language_key(item.get("language", "")) == fallback:
-                return item
-    detail_logger.info("template default campaign_type=%s campaign_id=%s template=%s",
-                       campaign_type, campaign_id, templates[0]["id"])
-    return templates[0]
+    campaign = _cached_campaign(conn, campaign_type, campaign_id) or {"id": campaign_id}
+    return _select_template(
+        _resolve_template_map(conn, campaign_type, campaign_id, campaign),
+        language,
+    )
 
 
 def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], source_file: str = "",

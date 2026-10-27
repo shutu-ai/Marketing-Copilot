@@ -80,7 +80,7 @@ def get_campaign_by_marketing(marketing_type: str, marketing_campaign_id: int) -
     row = read_transaction(
         lambda conn: conn.execute(
             """SELECT * FROM campaigns
-               WHERE marketing_type=? AND marketing_campaign_id=?
+               WHERE marketing_type=? AND marketing_campaign_id=? AND enabled=1
                ORDER BY id DESC LIMIT 1""",
             (marketing_type, marketing_campaign_id),
         ).fetchone(),
@@ -89,8 +89,28 @@ def get_campaign_by_marketing(marketing_type: str, marketing_campaign_id: int) -
     return dict(row) if row else None
 
 
+def _ensure_unique_enabled_marketing_campaign(conn, marketing_type: str,
+                                              marketing_campaign_id: int,
+                                              exclude_id: Optional[int] = None,
+                                              enabled: bool = True) -> None:
+    if not enabled or marketing_type not in {"batch", "realtime"} or int(marketing_campaign_id or 0) <= 0:
+        return
+    query = """SELECT id FROM campaigns
+               WHERE marketing_type=? AND marketing_campaign_id=? AND enabled=1"""
+    params = [marketing_type, int(marketing_campaign_id)]
+    if exclude_id is not None:
+        query += " AND id<>?"
+        params.append(int(exclude_id))
+    query += " LIMIT 1"
+    if conn.execute(query, params).fetchone():
+        raise ValueError("An enabled SMS content configuration already exists for this activity")
+
+
 def create_campaign(data: CampaignCreate) -> dict:
     def write(conn):
+        _ensure_unique_enabled_marketing_campaign(
+            conn, data.marketing_type, data.marketing_campaign_id,
+        )
         cursor = conn.execute(
             "INSERT INTO campaigns (name, description, marketing_type, marketing_campaign_id) VALUES (?, ?, ?, ?)",
             (data.name, data.description, data.marketing_type, data.marketing_campaign_id),
@@ -111,6 +131,13 @@ def update_campaign(campaign_id: int, data: CampaignUpdate) -> Optional[dict]:
         existing = conn.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
         if not existing:
             return None
+        _ensure_unique_enabled_marketing_campaign(
+            conn,
+            fields.get("marketing_type", existing["marketing_type"]),
+            fields.get("marketing_campaign_id", existing["marketing_campaign_id"]),
+            exclude_id=campaign_id,
+            enabled=bool(fields.get("enabled", existing["enabled"])),
+        )
         if fields:
             set_clause = ", ".join(f"{k}=?" for k in fields)
             conn.execute(

@@ -53,7 +53,10 @@ def get_campaign(campaign_id: int):
 
 @router.post("/campaigns")
 def create_campaign(data: CampaignCreate):
-    return sms_content_service.create_campaign(data)
+    try:
+        return sms_content_service.create_campaign(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @router.put("/campaigns/{campaign_id}")

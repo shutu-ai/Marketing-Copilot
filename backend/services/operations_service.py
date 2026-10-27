@@ -321,16 +321,24 @@ def validate_campaign(campaign_type: str, campaign: dict) -> list[str]:
         if not (campaign.get("watch_filename_prefix") or "").strip():
             errors.append("realtime watch filename prefix is missing")
     conn = get_connection()
-    template = conn.execute(
-        """SELECT t.id FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
-           WHERE c.marketing_type=? AND c.marketing_campaign_id=? AND c.enabled=1 AND t.enabled=1 LIMIT 1""",
-        (campaign_type, campaign["id"])).fetchone()
-    if not template and campaign.get("sms_template_id"):
+    content_campaign = conn.execute(
+        """SELECT id FROM campaigns
+           WHERE marketing_type=? AND marketing_campaign_id=? AND enabled=1
+           ORDER BY id DESC LIMIT 1""",
+        (campaign_type, campaign["id"]),
+    ).fetchone()
+    template = None
+    if content_campaign:
         template = conn.execute(
-            """SELECT t.id FROM sms_templates t JOIN campaigns c ON c.id=t.campaign_id
-               WHERE t.id=? AND c.enabled=1 AND t.enabled=1 LIMIT 1""",
-            (campaign["sms_template_id"],),
+            "SELECT id FROM sms_templates WHERE campaign_id=? AND enabled=1 ORDER BY id LIMIT 1",
+            (content_campaign["id"],),
         ).fetchone()
+        if not template and campaign.get("sms_template_id"):
+            template = conn.execute(
+                """SELECT id FROM sms_templates
+                   WHERE id=? AND campaign_id=? AND enabled=1 LIMIT 1""",
+                (campaign["sms_template_id"], content_campaign["id"]),
+            ).fetchone()
     if campaign_type in ("realtime", "batch"):
         smpp_id = campaign.get("smpp_config_id")
         if smpp_id:
