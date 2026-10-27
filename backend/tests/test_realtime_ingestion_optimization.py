@@ -128,6 +128,36 @@ def test_whitelist_hash_is_built_once_and_reused(isolated_db):
     conn.close()
 
 
+def test_reupload_of_retired_whitelist_gets_new_version_and_becomes_active(isolated_db):
+    campaign_id, _campaign_dir = _campaign(isolated_db)
+    first_source = isolated_db / "whitelist-v1.csv"
+    first_source.write_text("msisdn,language\n090001,en\n", encoding="utf-8")
+    first = realtime_campaign_service.upload_customer_list(campaign_id, str(first_source), first_source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    first_active = realtime_whitelist_service.active_version(campaign_id)
+    assert first_active and first_active["id"] == first["whitelist_version_id"]
+    old_index_path = Path(first_active["index_path"])
+
+    second_source = isolated_db / "whitelist-v2.csv"
+    second_source.write_text("msisdn,language\n090002,fr\n", encoding="utf-8")
+    second = realtime_campaign_service.upload_customer_list(campaign_id, str(second_source), second_source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    second_active = realtime_whitelist_service.active_version(campaign_id)
+    assert second_active and second_active["id"] == second["whitelist_version_id"]
+    assert realtime_whitelist_service.cleanup_versions(campaign_id)["retired"] == 1
+
+    replay = realtime_campaign_service.upload_customer_list(campaign_id, str(first_source), first_source.name)
+    assert replay["whitelist_version_id"] == first["whitelist_version_id"]
+    assert replay["whitelist_status"] == "building"
+    assert realtime_whitelist_service.build_pending() == 1
+
+    active = realtime_whitelist_service.active_version(campaign_id)
+    assert active and active["id"] == first["whitelist_version_id"]
+    assert active["version_no"] == second_active["version_no"] + 1
+    assert active["normalized_count"] == 1
+    assert not old_index_path.exists()
+
+
 def test_whitelist_source_is_durable_before_build_row_is_published(isolated_db, monkeypatch):
     campaign_id, _campaign_dir = _campaign(isolated_db)
     source = isolated_db / "uploaded-whitelist.csv"

@@ -233,7 +233,11 @@ def get_index_status(campaign: dict) -> dict:
 
 def create_version(campaign_id: int, source_filename: str, source_path: str,
                    source_hash: str) -> tuple[dict, bool]:
+    obsolete_index_path = None
+    recycled_version_no = None
+
     def write(conn):
+        nonlocal obsolete_index_path, recycled_version_no
         existing = conn.execute(
             "SELECT * FROM realtime_whitelist_versions WHERE campaign_id=? AND source_hash=?",
             (campaign_id, source_hash),
@@ -241,10 +245,19 @@ def create_version(campaign_id: int, source_filename: str, source_path: str,
         if existing and existing["status"] in ("building", "ready"):
             return dict(existing), True
         if existing:
+            version_no = conn.execute(
+                "SELECT COALESCE(MAX(version_no),0)+1 AS version_no FROM realtime_whitelist_versions WHERE campaign_id=?",
+                (campaign_id,),
+            ).fetchone()["version_no"]
+            if existing["status"] == "retired":
+                obsolete_index_path = existing["index_path"] or None
+            recycled_version_no = int(version_no)
             conn.execute(
-                """UPDATE realtime_whitelist_versions SET source_filename=?,source_path=?,status='building',
-                   error_detail='',ready_at=NULL,retired_at=NULL WHERE id=?""",
-                (os.path.basename(source_filename), os.path.abspath(source_path), existing["id"]),
+                """UPDATE realtime_whitelist_versions SET version_no=?,source_filename=?,source_path=?,
+                   row_count=0,normalized_count=0,index_path='',status='building',error_detail='',
+                   created_at=CURRENT_TIMESTAMP,ready_at=NULL,retired_at=NULL
+                   WHERE id=?""",
+                (int(version_no), os.path.basename(source_filename), os.path.abspath(source_path), existing["id"]),
             )
             row = conn.execute("SELECT * FROM realtime_whitelist_versions WHERE id=?", (existing["id"],)).fetchone()
             return dict(row), False
@@ -260,7 +273,22 @@ def create_version(campaign_id: int, source_filename: str, source_path: str,
         ).fetchone()
         return dict(row), False
 
-    return write_transaction(write, operation="whitelist.version.create")
+    version, duplicate = write_transaction(write, operation="whitelist.version.create")
+    refreshed = get_version(version["id"]) if recycled_version_no is not None else None
+    if (
+        obsolete_index_path
+        and refreshed
+        and refreshed.get("status") == "building"
+        and int(refreshed.get("version_no") or 0) == int(recycled_version_no)
+        and not refreshed.get("index_path")
+        and obsolete_index_path != version.get("index_path")
+    ):
+        try:
+            if os.path.isfile(obsolete_index_path):
+                os.unlink(obsolete_index_path)
+        except OSError:
+            logger.warning("Unable to remove superseded whitelist index path=%s", obsolete_index_path)
+    return version, duplicate
 
 
 def _set_status(version_id: int, status: str, **fields) -> None:
@@ -697,16 +725,20 @@ def build_version(version_id: int) -> dict:
                          {"campaign_id": version["campaign_id"]})
         _metrics_inc("realtime_whitelist_index_rows", count,
                      {"campaign_id": version["campaign_id"]})
-        logger.info("Realtime whitelist index ready campaign=%s version=%s rows=%s normalized=%s elapsed_ms=%s",
-                    version["campaign_id"], version_id, rows, count, elapsed_ms)
+        logger.info("Realtime whitelist index ready campaign=%s version_id=%s version_no=%s rows=%s normalized=%s elapsed_ms=%s",
+                    version["campaign_id"], version_id, version["version_no"], rows, count, elapsed_ms)
         try:
             requeued = ingestion_job_service.requeue_waiting_whitelist_files(version["campaign_id"])
             if requeued:
-                logger.info("Realtime whitelist ready campaign=%s version=%s waiting_files_requeued=%s",
-                            version["campaign_id"], version_id, requeued)
+                logger.info("Realtime whitelist ready campaign=%s version_id=%s version_no=%s waiting_files_requeued=%s",
+                            version["campaign_id"], version_id, version["version_no"], requeued)
         except Exception:
-            logger.exception("Unable to requeue files after whitelist became ready campaign=%s version=%s",
-                             version["campaign_id"], version_id)
+            logger.exception(
+                "Unable to requeue files after whitelist became ready campaign=%s version_id=%s version_no=%s",
+                version["campaign_id"],
+                version_id,
+                version.get("version_no"),
+            )
         return get_version(version_id) or version
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -714,7 +746,8 @@ def build_version(version_id: int) -> dict:
                          {"campaign_id": version["campaign_id"], "result": "failed"})
         _metrics_inc("realtime_whitelist_index_build_errors_total", labels={"campaign_id": version["campaign_id"]})
         _set_status(version_id, "failed", error_detail=str(exc)[:4000])
-        logger.exception("Realtime whitelist index failed campaign=%s version=%s", version["campaign_id"], version_id)
+        logger.exception("Realtime whitelist index failed campaign=%s version_id=%s version_no=%s",
+                         version["campaign_id"], version_id, version["version_no"])
         raise
     finally:
         if os.path.exists(temp_path):
@@ -951,7 +984,8 @@ def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
         conn.execute("UPDATE realtime_campaigns SET customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                      (original_filename, source_path, source_rows, campaign_id))
     write_transaction(write, operation="whitelist.upload")
-    logger.info("Realtime whitelist queued campaign=%s version=%s file=%s", campaign_id, version["id"], os.path.basename(original_filename))
+    logger.info("Realtime whitelist queued campaign=%s version_id=%s version_no=%s file=%s",
+                campaign_id, version["id"], version["version_no"], os.path.basename(original_filename))
     return {**campaign, "success": True, "whitelist_version_id": version["id"],
             "whitelist_status": "building", "row_count": source_rows, "customer_list_path": source_path,
             "customer_list_filename": original_filename}
