@@ -460,6 +460,7 @@ def _run_maintenance():
         # Only one worker may maintain/build whitelist indexes at a time.
         realtime_whitelist_service.migrate_legacy_versions(limit=1)
         realtime_whitelist_service.repair_active_binding(limit=10)
+        realtime_whitelist_service.repair_active_missing_index(limit=10)
         realtime_whitelist_service.repair_active_failed(limit=1)
         realtime_whitelist_service.build_pending(limit=1)
     finally:
@@ -511,6 +512,7 @@ def start_worker():
         _last_expiry_sweep_date = datetime.now().date()
         _last_inactive_campaign_sweep_at = time.monotonic()
         realtime_whitelist_service.repair_active_binding(limit=10)
+        realtime_whitelist_service.repair_active_missing_index(limit=10)
         realtime_whitelist_service.repair_active_failed(limit=5)
     except Exception:
         logger.exception("Realtime expired-file startup cleanup failed")

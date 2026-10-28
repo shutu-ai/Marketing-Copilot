@@ -396,6 +396,21 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
     return True
 
 
+def _index_is_usable(index_path: str) -> bool:
+    if not index_path or not os.path.isfile(index_path):
+        return False
+    index = None
+    try:
+        index = duckdb.connect(index_path, read_only=True)
+        index.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
+        return True
+    except Exception:
+        return False
+    finally:
+        if index:
+            index.close()
+
+
 def is_transient_database_error(error) -> bool:
     """Return True for short-lived DuckDB concurrency/lock failures.
 
@@ -502,6 +517,36 @@ def repair_active_failed(limit: int = 1) -> int:
     return repaired
 
 
+def repair_active_missing_index(limit: int = 10) -> int:
+    """Queue rebuilds for active versions whose source exists but index is unusable."""
+    with _WHITELIST_FILE_LOCK:
+        rows = read_transaction(
+            lambda conn: conn.execute(
+                """SELECT v.id,v.index_path,v.status,v.source_path,c.customer_list_path
+                   FROM realtime_whitelist_versions v
+                   JOIN realtime_campaigns c ON c.active_whitelist_version_id=v.id
+                   WHERE c.use_whitelist=TRUE AND v.status IN ('ready','failed')
+                   ORDER BY c.id LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall(),
+            operation="whitelist.repair.missing_index_candidates",
+        )
+        repaired = 0
+        for row in rows:
+            if not any(os.path.isfile(row[path] or "") for path in ("source_path", "customer_list_path")):
+                continue
+            if _index_is_usable(row["index_path"]):
+                continue
+            try:
+                if schedule_active_rebuild(row["id"], "active whitelist index missing or unusable"):
+                    repaired += 1
+            except Exception:
+                logger.exception("Unable to queue active whitelist index repair version=%s", row["id"])
+        if repaired:
+            logger.warning("Realtime active whitelist missing-index repairs queued count=%s", repaired)
+        return repaired
+
+
 def _repair_active_binding(limit: int = 10) -> int:
     """Restore a newer ready index as active when the binding is stale.
 
@@ -522,7 +567,7 @@ def _repair_active_binding(limit: int = 10) -> int:
         campaign_id = int(campaign["id"])
         active_id = int(campaign["active_whitelist_version_id"] or 0)
         active = get_version(active_id) if active_id else None
-        if active and active.get("status") == "ready" and os.path.isfile(active.get("index_path") or ""):
+        if active and active.get("status") == "ready" and _index_is_usable(active.get("index_path") or ""):
             continue
         candidates = read_transaction(
             lambda conn: conn.execute(
@@ -536,19 +581,10 @@ def _repair_active_binding(limit: int = 10) -> int:
         candidate = None
         for row in candidates:
             index_path = row["index_path"] or ""
-            if not os.path.isfile(index_path):
+            if not _index_is_usable(index_path):
                 continue
-            probe = None
-            try:
-                probe = duckdb.connect(index_path, read_only=True)
-                probe.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
-                candidate = dict(row)
-                break
-            except Exception:
-                continue
-            finally:
-                if probe:
-                    probe.close()
+            candidate = dict(row)
+            break
         if not candidate:
             continue
         if not active:

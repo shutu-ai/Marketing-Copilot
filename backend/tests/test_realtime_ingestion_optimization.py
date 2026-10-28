@@ -310,6 +310,24 @@ def test_corrupt_active_whitelist_waits_for_repair_without_using_old_version(iso
     assert binding["whitelist_version_id"] == version_two["id"]
 
 
+def test_maintenance_rebuilds_missing_active_whitelist_index(isolated_db):
+    campaign_id, _campaign_dir = _campaign(isolated_db)
+    source = isolated_db / "whitelist.csv"
+    source.write_text("msisdn,language\n25190001,en\n", encoding="utf-8")
+    queued = realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    version = realtime_whitelist_service.active_version(campaign_id)
+    assert version and version["id"] == queued["whitelist_version_id"]
+    Path(version["index_path"]).unlink()
+
+    assert realtime_whitelist_service.repair_active_missing_index(limit=10) == 1
+    assert realtime_whitelist_service.build_pending() == 1
+    repaired = realtime_whitelist_service.active_version(campaign_id)
+    assert repaired and repaired["id"] == version["id"]
+    assert Path(repaired["source_path"]).is_file()
+    assert Path(repaired["index_path"]).is_file()
+
+
 def test_whitelist_cleanup_serializes_with_active_binding_repair(isolated_db, monkeypatch):
     campaign_id, campaign_dir = _campaign(isolated_db)
     source = campaign_dir / "whitelist.csv"
