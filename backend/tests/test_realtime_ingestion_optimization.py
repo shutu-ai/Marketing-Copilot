@@ -129,6 +129,30 @@ def test_whitelist_hash_is_built_once_and_reused(isolated_db):
     conn.close()
 
 
+def test_reupload_rebuilds_ready_version_when_files_are_missing(isolated_db):
+    campaign_id, _campaign_dir = _campaign(isolated_db)
+    source = isolated_db / "whitelist.csv"
+    source.write_text("msisdn,language\n090001,en\n", encoding="utf-8")
+
+    queued = realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    original = realtime_whitelist_service.active_version(campaign_id)
+    assert original and original["id"] == queued["whitelist_version_id"]
+    Path(original["source_path"]).unlink()
+    Path(original["index_path"]).unlink()
+
+    replay = realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert replay["whitelist_status"] == "building"
+    assert replay["whitelist_version_id"] == original["id"]
+    assert realtime_whitelist_service.build_pending() == 1
+
+    repaired = realtime_whitelist_service.active_version(campaign_id)
+    assert repaired and repaired["id"] == original["id"]
+    assert repaired["version_no"] == original["version_no"] + 1
+    assert Path(repaired["source_path"]).is_file()
+    assert Path(repaired["index_path"]).is_file()
+
+
 def test_reupload_of_retired_whitelist_gets_new_version_and_becomes_active(isolated_db):
     campaign_id, _campaign_dir = _campaign(isolated_db)
     first_source = isolated_db / "whitelist-v1.csv"

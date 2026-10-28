@@ -246,13 +246,18 @@ def _create_version(campaign_id: int, source_filename: str, source_path: str,
             (campaign_id, source_hash),
         ).fetchone()
         if existing and existing["status"] in ("building", "ready"):
-            return dict(existing), True
+            files_ready = (
+                os.path.isfile(existing["source_path"] or "")
+                and os.path.isfile(existing["index_path"] or "")
+            )
+            if existing["status"] == "building" or files_ready:
+                return dict(existing), True
         if existing:
             version_no = conn.execute(
                 "SELECT COALESCE(MAX(version_no),0)+1 AS version_no FROM realtime_whitelist_versions WHERE campaign_id=?",
                 (campaign_id,),
             ).fetchone()["version_no"]
-            if existing["status"] == "retired":
+            if existing["status"] in ("retired", "ready"):
                 obsolete_index_path = existing["index_path"] or None
             recycled_version_no = int(version_no)
             conn.execute(
@@ -970,15 +975,20 @@ def _upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
     source_rows = _source_row_count(file_path)
     existing = get_version_by_hash(campaign_id, source_hash)
     if existing and existing["status"] in ("building", "ready"):
-        if existing["status"] == "ready":
-            def write(conn):
-                conn.execute(
-                    "UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (existing["id"], existing["source_filename"], existing["source_path"], existing["row_count"], campaign_id),
-                )
-            write_transaction(write, operation="whitelist.version.activate")
-        return {**campaign, "success": True, "whitelist_version_id": existing["id"],
-                "whitelist_status": existing["status"], "row_count": existing["row_count"]}
+        files_ready = (
+            os.path.isfile(existing["source_path"] or "")
+            and os.path.isfile(existing["index_path"] or "")
+        )
+        if existing["status"] == "building" or files_ready:
+            if existing["status"] == "ready":
+                def write(conn):
+                    conn.execute(
+                        "UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (existing["id"], existing["source_filename"], existing["source_path"], existing["row_count"], campaign_id),
+                    )
+                write_transaction(write, operation="whitelist.version.activate")
+            return {**campaign, "success": True, "whitelist_version_id": existing["id"],
+                    "whitelist_status": existing["status"], "row_count": existing["row_count"]}
     # Materialize the durable source before publishing the ``building`` row.
     # The scheduler can pick a new version immediately after create_version;
     # recording the request's temporary UploadFile path first lets that worker
