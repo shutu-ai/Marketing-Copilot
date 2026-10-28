@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 from typing import Optional
 
@@ -17,6 +18,8 @@ from services import ingestion_job_service, operations_service, sms_task_service
 logger = logging.getLogger(__name__)
 INDEX_DIRNAME = "index"
 BUILD_CHUNK_SIZE = max(1000, int(os.environ.get("MC_REALTIME_WHITELIST_BUILD_CHUNK", "10000")))
+# shortcut: process-local lock, the supported unit runs one uvicorn worker; add an inter-process lock before increasing workers.
+_WHITELIST_FILE_LOCK = threading.RLock()
 
 
 def _build_chunk_size() -> int:
@@ -231,8 +234,8 @@ def get_index_status(campaign: dict) -> dict:
     }
 
 
-def create_version(campaign_id: int, source_filename: str, source_path: str,
-                   source_hash: str) -> tuple[dict, bool]:
+def _create_version(campaign_id: int, source_filename: str, source_path: str,
+                    source_hash: str) -> tuple[dict, bool]:
     obsolete_index_path = None
     recycled_version_no = None
 
@@ -289,6 +292,12 @@ def create_version(campaign_id: int, source_filename: str, source_path: str,
         except OSError:
             logger.warning("Unable to remove superseded whitelist index path=%s", obsolete_index_path)
     return version, duplicate
+
+
+def create_version(campaign_id: int, source_filename: str, source_path: str,
+                   source_hash: str) -> tuple[dict, bool]:
+    with _WHITELIST_FILE_LOCK:
+        return _create_version(campaign_id, source_filename, source_path, source_hash)
 
 
 def _set_status(version_id: int, status: str, **fields) -> None:
@@ -488,7 +497,7 @@ def repair_active_failed(limit: int = 1) -> int:
     return repaired
 
 
-def repair_active_binding(limit: int = 10) -> int:
+def _repair_active_binding(limit: int = 10) -> int:
     """Restore a newer ready index as active when the binding is stale.
 
     A failed version must not hide a newer ready version. This is a binding
@@ -596,6 +605,11 @@ def repair_active_binding(limit: int = 10) -> int:
     return restored
 
 
+def repair_active_binding(limit: int = 10) -> int:
+    with _WHITELIST_FILE_LOCK:
+        return _repair_active_binding(limit)
+
+
 def _configure(conn) -> None:
     try:
         conn.execute("SET memory_limit = ?", (settings_service.get_setting(
@@ -687,39 +701,41 @@ def build_version(version_id: int) -> dict:
             normalized = int(count)
         finally:
             db.close()
-        if os.path.exists(final_path):
-            os.unlink(final_path)
-        os.replace(temp_path, final_path)
-        def write(conn):
-            conn.execute(
-                """UPDATE realtime_whitelist_versions SET status='ready',row_count=?,normalized_count=?,
-                   index_path=?,error_detail='',ready_at=CAST(CURRENT_TIMESTAMP AS VARCHAR) WHERE id=?""",
-                (int(rows), int(count), final_path, version_id),
-            )
-            active_row = conn.execute(
-                """SELECT c.active_whitelist_version_id,v.version_no AS active_version_no
-                   FROM realtime_campaigns c
-                   LEFT JOIN realtime_whitelist_versions v
-                     ON v.id=c.active_whitelist_version_id
-                   WHERE c.id=?""",
-                (version["campaign_id"],),
-            ).fetchone()
-            active_version_no = int(active_row["active_version_no"] or 0) if active_row else 0
-            if not active_row or not active_row["active_whitelist_version_id"] \
-                    or active_version_no <= int(version["version_no"]):
-                conn.execute(
-                    """UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,
-                       customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (version_id, version["source_filename"], version["source_path"], int(rows), version["campaign_id"]),
-                )
-            return True
+        with _WHITELIST_FILE_LOCK:
+            # temp_path is in the same directory, so replace keeps the active
+            # path continuously readable while a rebuild is published.
+            os.replace(temp_path, final_path)
 
-        write_transaction(
-            write,
-            attempts=3,
-            operation="whitelist.version.ready",
-            base_delay=0.1,
-        )
+            def write(conn):
+                conn.execute(
+                    """UPDATE realtime_whitelist_versions SET status='ready',row_count=?,normalized_count=?,
+                       index_path=?,error_detail='',ready_at=CAST(CURRENT_TIMESTAMP AS VARCHAR) WHERE id=?""",
+                    (int(rows), int(count), final_path, version_id),
+                )
+                active_row = conn.execute(
+                    """SELECT c.active_whitelist_version_id,v.version_no AS active_version_no
+                       FROM realtime_campaigns c
+                       LEFT JOIN realtime_whitelist_versions v
+                         ON v.id=c.active_whitelist_version_id
+                       WHERE c.id=?""",
+                    (version["campaign_id"],),
+                ).fetchone()
+                active_version_no = int(active_row["active_version_no"] or 0) if active_row else 0
+                if not active_row or not active_row["active_whitelist_version_id"] \
+                        or active_version_no <= int(version["version_no"]):
+                    conn.execute(
+                        """UPDATE realtime_campaigns SET active_whitelist_version_id=?,customer_list_filename=?,
+                           customer_list_path=?,row_count=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (version_id, version["source_filename"], version["source_path"], int(rows), version["campaign_id"]),
+                    )
+                return True
+
+            write_transaction(
+                write,
+                attempts=3,
+                operation="whitelist.version.ready",
+                base_delay=0.1,
+            )
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _metrics_observe("realtime_whitelist_index_build_seconds", elapsed_ms / 1000.0,
                          {"campaign_id": version["campaign_id"]})
@@ -832,7 +848,7 @@ def migrate_legacy_versions(limit: int = 1) -> int:
     return migrated
 
 
-def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
+def _cleanup_versions(campaign_id: Optional[int] = None) -> dict:
     """Retire and later remove unused version files without breaking bound jobs."""
     try:
         retention_days = max(1, int(settings_service.get_setting(
@@ -932,7 +948,12 @@ def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
     )
 
 
-def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
+def cleanup_versions(campaign_id: Optional[int] = None) -> dict:
+    with _WHITELIST_FILE_LOCK:
+        return _cleanup_versions(campaign_id)
+
+
+def _upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
     row = read_transaction(
         lambda conn: conn.execute(
             "SELECT * FROM realtime_campaigns WHERE id=?", (campaign_id,)
@@ -989,6 +1010,11 @@ def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
     return {**campaign, "success": True, "whitelist_version_id": version["id"],
             "whitelist_status": "building", "row_count": source_rows, "customer_list_path": source_path,
             "customer_list_filename": original_filename}
+
+
+def upload(campaign_id: int, file_path: str, original_filename: str) -> dict:
+    with _WHITELIST_FILE_LOCK:
+        return _upload(campaign_id, file_path, original_filename)
 
 
 def get_version_by_hash(campaign_id: int, source_hash: str) -> Optional[dict]:

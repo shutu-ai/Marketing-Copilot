@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 
 import pytest
@@ -283,6 +284,97 @@ def test_corrupt_active_whitelist_waits_for_repair_without_using_old_version(iso
         conn.close()
     assert failed["status"] == "building"
     assert binding["whitelist_version_id"] == version_two["id"]
+
+
+def test_whitelist_cleanup_serializes_with_active_binding_repair(isolated_db, monkeypatch):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    source = campaign_dir / "whitelist.csv"
+    source.write_text("msisdn,language\n25190001,en\n", encoding="utf-8")
+    queued = realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    version = realtime_whitelist_service.active_version(campaign_id)
+    assert version and version["id"] == queued["whitelist_version_id"]
+    source_path = Path(version["source_path"])
+    index_path = Path(version["index_path"])
+
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE realtime_campaigns SET active_whitelist_version_id=NULL WHERE id=?",
+        (campaign_id,),
+    )
+    conn.execute(
+        """UPDATE realtime_whitelist_versions
+           SET status='retired',retired_at=CAST(CURRENT_TIMESTAMP - INTERVAL '8 days' AS VARCHAR)
+           WHERE id=?""",
+        (version["id"],),
+    )
+    conn.commit()
+    conn.close()
+    assert source_path.is_file() and index_path.is_file()
+
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    cleanup_result = {}
+    repair_result = {}
+    original_remove = realtime_whitelist_service.os.remove
+
+    def blocking_remove(path):
+        if not cleanup_started.is_set():
+            cleanup_started.set()
+            if not release_cleanup.wait(5):
+                raise RuntimeError("test cleanup release timed out")
+        return original_remove(path)
+
+    monkeypatch.setattr(realtime_whitelist_service.os, "remove", blocking_remove)
+
+    def run_cleanup():
+        try:
+            cleanup_result["value"] = realtime_whitelist_service.cleanup_versions(campaign_id)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            cleanup_result["error"] = exc
+
+    def run_repair():
+        try:
+            repair_result["value"] = realtime_whitelist_service.repair_active_binding(limit=10)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            repair_result["error"] = exc
+
+    cleanup_thread = threading.Thread(target=run_cleanup)
+    cleanup_thread.start()
+    assert cleanup_started.wait(5)
+
+    repair_thread = threading.Thread(target=run_repair)
+    repair_thread.start()
+    repair_thread.join(0.2)
+    assert repair_thread.is_alive()
+
+    release_cleanup.set()
+    cleanup_thread.join(5)
+    repair_thread.join(5)
+    assert not cleanup_thread.is_alive()
+    assert not repair_thread.is_alive()
+    assert "error" not in cleanup_result, cleanup_result.get("error")
+    assert "error" not in repair_result, repair_result.get("error")
+    assert cleanup_result["value"]["removed"] == 1
+    assert repair_result["value"] == 0
+    assert not source_path.exists()
+    assert not index_path.exists()
+
+    conn = database.get_connection()
+    try:
+        campaign = conn.execute(
+            "SELECT active_whitelist_version_id FROM realtime_campaigns WHERE id=?",
+            (campaign_id,),
+        ).fetchone()
+        retired = conn.execute(
+            "SELECT source_path,index_path FROM realtime_whitelist_versions WHERE id=?",
+            (version["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert campaign["active_whitelist_version_id"] is None
+    assert retired["source_path"] == ""
+    assert retired["index_path"] == ""
 
 
 def test_online_update_swap_preserves_runtime_configuration_and_data(tmp_path):
