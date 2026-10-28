@@ -81,6 +81,7 @@ PRODUCTION_TOOLS=(
   cutover_vnext_store.py
   maintain_projection.py
   bulk_rebuild_projection.py
+  recover_projection.py
   vnext_stats.py
 )
 mkdir -p "$STAGE/backend/tools"

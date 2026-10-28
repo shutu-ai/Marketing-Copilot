@@ -54,6 +54,47 @@ def _fatal_storage_error(error: Exception) -> bool:
     )
 
 
+def _safe_text(value) -> str:
+    """Keep projection strings valid for DuckDB's UTF-8 VARCHAR storage."""
+    text = str(value or "")
+    return "".join(
+        character
+        for character in text
+        if character in "\t\n\r"
+        or 0x20 <= ord(character) <= 0xD7FF
+        or 0xE000 <= ord(character) <= 0x10FFFF
+    )
+
+
+def _recovery_marker_path(db_path: str | os.PathLike[str]) -> Path:
+    return Path(db_path).resolve().with_name("projection-recovery-required.json")
+
+
+def _write_recovery_marker(db_path: str | os.PathLike[str], error: BaseException) -> None:
+    marker = _recovery_marker_path(db_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "required": True,
+        "created_at": time.time(),
+        "pid": os.getpid(),
+        "db_path": str(Path(db_path).resolve()),
+        "error": f"{type(error).__name__}: {error}",
+        "recovery_command": "python -m tools.recover_projection",
+    }
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, marker)
+
+
+def _read_recovery_marker(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 TASK_INDEX_TABLE = "vnext_task_index"
 
 
@@ -850,16 +891,16 @@ class ProjectionWriter:
 
     @staticmethod
     def _event_row(event: dict) -> tuple:
-        state = str(event.get("state", ""))
+        state = _safe_text(event.get("state", ""))
         return (
-            str(event["event_id"]), int(event["partition_id"]), int(event["ordinal"]),
-            str(event["campaign_type"]), int(event["campaign_id"]), int(event["route_id"]),
-            str(event.get("normalized_msisdn") or ""),
-            str(event.get("language") or ""), state,
+            _safe_text(event["event_id"]), int(event["partition_id"]), int(event["ordinal"]),
+            _safe_text(event["campaign_type"]), int(event["campaign_id"]), int(event["route_id"]),
+            _safe_text(event.get("normalized_msisdn")),
+            _safe_text(event.get("language")), state,
             int(event.get("parts_written", 0)), int(event.get("parts_total", 0)),
-            str(event.get("message") or ""), str(event.get("error") or ""),
+            _safe_text(event.get("message")), _safe_text(event.get("error")),
             float(event.get("created_at") or time.time()),
-            str(event.get("business_day") or ""), float(event.get("expires_at") or 0.0),
+            _safe_text(event.get("business_day")), float(event.get("expires_at") or 0.0),
             int(event.get("queued", 0)), int(event.get("taken", 0)),
             int(event.get("accepted", 0)),
             int(event.get("socket_written", state == "socket_written")),
@@ -873,10 +914,10 @@ class ProjectionWriter:
 
     @staticmethod
     def _logical_task_id(event: dict) -> str:
-        explicit = str(event.get("logical_task_id") or "").strip()
+        explicit = _safe_text(event.get("logical_task_id")).strip()
         if explicit:
             return explicit
-        return str(event.get("event_id") or "").split(":resp:", 1)[0]
+        return _safe_text(event.get("event_id")).split(":resp:", 1)[0]
 
     @classmethod
     def _task_index_row(cls, event: dict) -> tuple:
@@ -885,19 +926,19 @@ class ProjectionWriter:
             cls._logical_task_id(event),
             int(event.get("partition_id") or 0),
             int(event.get("ordinal") or 0),
-            str(event.get("campaign_type") or ""),
+            _safe_text(event.get("campaign_type")),
             int(event.get("campaign_id") or 0),
             int(event.get("route_id") or 0),
-            str(event.get("normalized_msisdn") or ""),
-            str(event.get("language") or ""),
-            str(event.get("campaign_name") or ""),
-            state,
+            _safe_text(event.get("normalized_msisdn")),
+            _safe_text(event.get("language")),
+            _safe_text(event.get("campaign_name")),
+            _safe_text(state),
             int(event.get("parts_written") or 0),
             int(event.get("parts_total") or 0),
-            str(event.get("message") or ""),
-            str(event.get("error") or ""),
+            _safe_text(event.get("message")),
+            _safe_text(event.get("error")),
             float(event.get("created_at") or time.time()),
-            str(event.get("business_day") or ""),
+            _safe_text(event.get("business_day")),
             float(event.get("expires_at") or 0.0),
             float(event.get("event_at") or event.get("created_at") or time.time()),
         )
@@ -2236,6 +2277,8 @@ def _process_main(
         process_status = "error"
         process_last_error = f"{type(exc).__name__}: {exc}"
         with contextlib.suppress(Exception):
+            _write_recovery_marker(db_path, exc)
+        with contextlib.suppress(Exception):
             write_status(force_metrics=True)
         diagnostic(
             phase="exception", status="error",
@@ -2285,6 +2328,7 @@ class ProjectionWriterProcess:
         self.journal_paths = tuple(str(Path(path).resolve()) for path in journal_paths)
         self.offsets_path = self.root / "journal-offsets.json"
         self.diagnostics_root = Path(diagnostics_root).resolve() if diagnostics_root else self.root / "diagnostics"
+        self.recovery_marker_path = self.root / "projection-recovery-required.json"
         self.run_id = str(run_id or self.root.name)
         self._lock = threading.RLock()
         self._started = False
@@ -2295,6 +2339,9 @@ class ProjectionWriterProcess:
         self.ready_event = None
         self.process = None
         self._create_process()
+
+    def recovery_required(self) -> bool:
+        return self.recovery_marker_path.is_file()
 
     def _create_process(self) -> None:
         context = self._mp_context
@@ -2443,6 +2490,8 @@ class ProjectionWriterProcess:
         process = self.process
         exitcode = getattr(process, "exitcode", None)
         alive = bool(process and process.is_alive())
+        recovery_marker = _read_recovery_marker(self.recovery_marker_path) if self.recovery_required() else {}
+        recovery_required = bool(recovery_marker)
         ready = bool(
             process
             and alive
@@ -2468,6 +2517,9 @@ class ProjectionWriterProcess:
                 "staging_mode": self.staging_mode,
                 "reuse_staging": self.reuse_staging,
                 "restart_count": self.restart_count,
+                "recovery_required": recovery_required,
+                "recovery_marker_path": str(self.recovery_marker_path),
+                "recovery_error": str(recovery_marker.get("error") or ""),
             }
         try:
             value = json.loads(self.status_path.read_text(encoding="utf-8"))
@@ -2513,4 +2565,7 @@ class ProjectionWriterProcess:
             "staging_mode": self.staging_mode,
             "reuse_staging": self.reuse_staging,
             "restart_count": self.restart_count,
+            "recovery_required": recovery_required,
+            "recovery_marker_path": str(self.recovery_marker_path),
+            "recovery_error": str(recovery_marker.get("error") or ""),
         }

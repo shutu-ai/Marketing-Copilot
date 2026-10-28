@@ -7,8 +7,8 @@ version, health-checks it, and rolls back on failure. Stdlib only: this
 script must keep working while the backend tree is being replaced.
 
 State is read/written through ``apply.state`` under the update directory.
-The systemd unit should use ``KillMode=process`` so ``systemctl stop`` does
-not signal this detached runner together with the main process.
+In systemd mode this runner is started by a separate oneshot unit, allowing
+the application service to use ``KillMode=control-group`` safely.
 """
 
 import hashlib
@@ -341,7 +341,7 @@ def swap_into_place(state: dict) -> None:
 
 
 def main() -> int:
-    # Never let systemctl stop (KillMode=control-group on older units) kill us.
+    # Keep the runner alive while it swaps the service directories.
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)

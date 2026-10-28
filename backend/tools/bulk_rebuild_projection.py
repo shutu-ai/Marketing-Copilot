@@ -37,6 +37,7 @@ from tools.maintain_projection import (  # noqa: E402
 )
 from vnext.projection_writer import (  # noqa: E402
     ProgressJournal,
+    _safe_text,
     _load_offsets,
     _persist_offsets,
 )
@@ -153,24 +154,24 @@ def _raw_row(event: dict, ingest_seq: int) -> tuple:
     created_at = _float_value(event, "created_at", time.time())
     return (
         int(ingest_seq),
-        str(event.get("event_kind") or ""),
-        str(event.get("event_id") or ""),
+        _safe_text(event.get("event_kind")),
+        _safe_text(event.get("event_id")),
         _logical_task_id(event),
         _int_value(event, "partition_id"),
         _int_value(event, "ordinal"),
-        str(event.get("campaign_type") or ""),
+        _safe_text(event.get("campaign_type")),
         _int_value(event, "campaign_id"),
         _int_value(event, "route_id"),
-        str(event.get("normalized_msisdn") or ""),
-        str(event.get("language") or ""),
-        str(event.get("campaign_name") or ""),
+        _safe_text(event.get("normalized_msisdn")),
+        _safe_text(event.get("language")),
+        _safe_text(event.get("campaign_name")),
         state,
         _int_value(event, "parts_written"),
         _int_value(event, "parts_total"),
-        str(event.get("message") or ""),
-        str(event.get("error") or ""),
+        _safe_text(event.get("message")),
+        _safe_text(event.get("error")),
         created_at,
-        str(event.get("business_day") or ""),
+        _safe_text(event.get("business_day")),
         _float_value(event, "expires_at", 0.0),
         _float_value(event, "event_at", created_at),
         _int_value(event, "queued"),
@@ -192,6 +193,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--seed-projection",
+        type=Path,
+        default=None,
+        help="read historical progress rows from a WAL-free projection base into raw staging",
+    )
     parser.add_argument(
         "--service-unit",
         default=os.environ.get("MC_SERVICE_UNIT", "marketing-copilot.service"),
@@ -232,6 +239,57 @@ def _parse_args() -> argparse.Namespace:
 
 def _sql_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _seed_historical_progress(connection, source_path: Path) -> int:
+    """Load old progress evidence without importing its indexed tables."""
+
+    connection.execute(
+        f"ATTACH {_sql_literal(source_path)} AS seed_projection (READ_ONLY)"
+    )
+    try:
+        count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM seed_projection.vnext_progress_events"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            f"""
+            INSERT INTO {RAW_TABLE}({RAW_COLUMN_SQL})
+            SELECT
+                CAST(ROW_NUMBER() OVER () - 1 AS BIGINT),
+                'progress',
+                replace(COALESCE(event_id, ''), chr(0), ''),
+                split_part(replace(COALESCE(event_id, ''), chr(0), ''), ':resp:', 1),
+                COALESCE(partition_id, 0), COALESCE(ordinal, 0),
+                replace(COALESCE(campaign_type, ''), chr(0), ''),
+                COALESCE(campaign_id, 0), COALESCE(route_id, 0),
+                replace(COALESCE(normalized_msisdn, ''), chr(0), ''),
+                replace(COALESCE(language, ''), chr(0), ''),
+                '',
+                replace(COALESCE(state, ''), chr(0), ''),
+                COALESCE(parts_written, 0), COALESCE(parts_total, 0),
+                replace(COALESCE(message, ''), chr(0), ''),
+                replace(COALESCE(error, ''), chr(0), ''),
+                COALESCE(created_at, 0),
+                replace(COALESCE(business_day, ''), chr(0), ''),
+                COALESCE(expires_at, 0), COALESCE(created_at, 0),
+                CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'socket_written' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'socket_written' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'socket_written' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'write_failed' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'unknown' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'expired' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'submit_sm_resp_success' THEN 1 ELSE 0 END,
+                CASE WHEN state = 'submit_sm_resp_error' THEN 1 ELSE 0 END
+            FROM seed_projection.vnext_progress_events
+            """
+        )
+        return count
+    finally:
+        connection.execute("DETACH seed_projection")
 
 
 def _connect(database: Path, temp_directory: Path, threads: int, memory_limit: str):
@@ -447,6 +505,7 @@ def main() -> int:
     cursor = 0
     ingest_seq = 0
     applied = 0
+    seeded_rows = 0
     started = time.monotonic()
     last_report = started
     connection = None
@@ -462,6 +521,12 @@ def main() -> int:
             str(args.memory_limit),
         )
         _create_raw_table(connection)
+        if args.seed_projection is not None:
+            seed_projection = args.seed_projection.expanduser().resolve()
+            if not seed_projection.is_file():
+                raise FileNotFoundError(seed_projection)
+            seeded_rows = _seed_historical_progress(connection, seed_projection)
+            ingest_seq = seeded_rows
         if args.resume_output:
             ingest_seq = int(
                 connection.execute(
@@ -556,6 +621,7 @@ def main() -> int:
             "before": before,
             "after": after,
             "loaded_rows": applied,
+            "seeded_rows": seeded_rows,
             "counts": counts,
             "task_index_rebuilt": task_index_rebuilt,
             "checkpointed": True,
@@ -573,6 +639,7 @@ def main() -> int:
             "before": before,
             "current": _storage(journals, offsets),
             "loaded_rows": applied,
+            "seeded_rows": seeded_rows,
         }
         _write_state(state_path, result)
         print(json.dumps(result, ensure_ascii=False), file=sys.stderr, flush=True)

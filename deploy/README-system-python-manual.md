@@ -150,9 +150,10 @@ sudo /opt/marketing-copilot-manual/venv/bin/python -m tools.install_systemd_serv
 ```
 
 The tool detects the layout, reuses `run.sh` and `marketing-copilot.env`, sets
-`KillMode=process` (required for online self-updates), installs a polkit rule
-for the service account, flips `MC_UPDATE_MODE=systemd` (with a `.bak` backup),
-and starts/enables the unit. Review first with:
+`KillMode=control-group` with a 90-second stop grace period, installs a
+separate oneshot update-runner unit and projection-recovery unit, installs a
+polkit rule for the service account, flips `MC_UPDATE_MODE=systemd` (with a
+`.bak` backup), and starts/enables the main unit. Review first with:
 
 ```bash
 cd /opt/marketing-copilot-manual/backend
@@ -167,3 +168,32 @@ Useful options: `--user <account>` (default `marketing-copilot`),
 `run.sh` is executed as root, the unit is created (without starting it) using
 the owner of the app directory as the service account. Set
 `MC_SKIP_SYSTEMD_CHECK=1` to disable this check.
+
+If the projection reports `projection-recovery-required.json`, keep the main
+service stopped and run the isolated recovery unit. It builds a fresh,
+unindexed projection from a WAL-free copy of historical progress evidence plus
+immutable progress journals, derives and validates the canonical tables, then
+atomically promotes it while retaining the old projection as a rollback copy.
+It deliberately does not import old indexes or WAL, so malformed task-index
+rows cannot poison the rebuild and historical aggregate counts are retained:
+
+```bash
+sudo systemctl stop marketing-copilot.service
+sudo systemctl start marketing-copilot-projection-recovery.service
+sudo systemctl status marketing-copilot-projection-recovery.service --no-pager
+```
+
+If the recovery unit fails after `bulk-rebuild-state.json` and
+`recovery-state.json` report a validated output, resume only the atomic
+promotion instead of replaying the journals:
+
+```bash
+sudo /opt/marketing-copilot/venv/bin/python -m tools.recover_projection \
+  --service-unit marketing-copilot.service \
+  --root /opt/marketing-copilot/data/vnext \
+  --output-root /opt/marketing-copilot/data/.vnext-recovery-<timestamp> \
+  --promote-existing
+```
+
+The recovery path never opens the SMS spool or SMPP transport and never
+resubmits a message.

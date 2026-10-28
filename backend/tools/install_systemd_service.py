@@ -6,8 +6,10 @@ service otherwise runs in the foreground or under nohup. The generated unit:
 
 * starts uvicorn directly; ``run.sh`` is only the bootstrap/fallback launcher;
 * reads the existing ``marketing-copilot.env`` so paths stay in one place;
-* uses ``KillMode=process`` so the online-update runner survives
-  ``systemctl stop`` during a self-update;
+* uses ``KillMode=control-group`` so all application descendants are stopped
+  and reaped together;
+* installs the online-update runner as a separate oneshot unit, so stopping
+  the application service does not kill the directory-swap process;
 * optionally installs a polkit rule letting the service account manage its own
   unit, and flips ``MC_UPDATE_MODE`` to ``systemd`` in the env file.
 
@@ -39,15 +41,14 @@ WorkingDirectory={working_dir}
 EnvironmentFile={env_file}
 Environment=PYTHONUNBUFFERED=1
 Environment=MC_SERVICE_UNIT={unit_name}
+Environment=MC_UPDATE_RUNNER_UNIT={update_runner_instance}
 Environment=MC_RUN_UNDER_SYSTEMD=1
 ExecStart={exec_start}
 Restart=always
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=90
 KillSignal=SIGTERM
-# Only the main process is signalled on stop so the detached update runner
-# (spawned by the web process) can finish the directory swap before restart.
-KillMode=process
+KillMode=control-group
 UMask=0027
 NoNewPrivileges=true
 ProtectSystem=full
@@ -57,12 +58,58 @@ PrivateTmp=true
 WantedBy=multi-user.target
 """
 
+UPDATE_UNIT_TEMPLATE = """\
+[Unit]
+Description={description} online update runner
+After=network.target
+
+[Service]
+Type=oneshot
+User={user}
+Group={group}
+WorkingDirectory={working_dir}
+EnvironmentFile={env_file}
+Environment=PYTHONUNBUFFERED=1
+Environment=MC_SERVICE_UNIT={unit_name}
+Environment=MC_RUN_UNDER_SYSTEMD=1
+ExecStart={exec_start}
+TimeoutStartSec=0
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+"""
+
+RECOVERY_UNIT_TEMPLATE = """\
+[Unit]
+Description={description} projection recovery
+After=network.target
+
+[Service]
+Type=oneshot
+User={user}
+Group={group}
+WorkingDirectory={working_dir}
+EnvironmentFile={env_file}
+Environment=PYTHONUNBUFFERED=1
+Environment=MC_SERVICE_UNIT={unit_name}
+ExecStart={exec_start}
+TimeoutStartSec=0
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+"""
+
 POLKIT_TEMPLATE = """\
 // Allow {user} to manage its own {unit_name} unit (needed for online updates).
 polkit.addRule(function (action, subject) {{
+  var requestedUnit = action.lookup("unit") || "";
   if (
     action.id === "org.freedesktop.systemd1.manage-units" &&
-    action.lookup("unit") === "{unit_name}" &&
+    (requestedUnit === "{unit_name}" || requestedUnit === "{recovery_unit_name}" || requestedUnit.indexOf("{runner_prefix}") === 0) &&
     subject.user === "{user}"
   ) {{
     return polkit.Result.YES;
@@ -141,7 +188,54 @@ def build_unit(args, root: Path) -> str:
         working_dir=app_root(),
         env_file=args.env_file,
         unit_name=unit_name,
+        update_runner_instance=update_runner_instance(unit_name),
         exec_start=exec_start,
+    )
+
+
+def update_runner_unit(unit_name: str) -> str:
+    stem = unit_name[:-len(".service")] if unit_name.endswith(".service") else unit_name
+    return f"{stem}-update@.service"
+
+
+def update_runner_instance(unit_name: str) -> str:
+    return update_runner_unit(unit_name).replace("@.service", "@apply.service")
+
+
+def update_runner_prefix(unit_name: str) -> str:
+    return update_runner_unit(unit_name).removesuffix(".service")
+
+
+def build_update_unit(args, root: Path) -> str:
+    unit_name = args.service_name if args.service_name.endswith(".service") else args.service_name + ".service"
+    python = quote_exec_start(f"{find_python(root)} -m tools.apply_update")
+    return UPDATE_UNIT_TEMPLATE.format(
+        description=args.description,
+        user=args.user,
+        group=args.group or args.user,
+        working_dir=app_root(),
+        env_file=args.env_file,
+        unit_name=unit_name,
+        exec_start=python,
+    )
+
+
+def recovery_unit_name(unit_name: str) -> str:
+    stem = unit_name[:-len(".service")] if unit_name.endswith(".service") else unit_name
+    return f"{stem}-projection-recovery.service"
+
+
+def build_recovery_unit(args, root: Path) -> str:
+    unit_name = args.service_name if args.service_name.endswith(".service") else args.service_name + ".service"
+    python = quote_exec_start(f"{find_python(root)} -m tools.recover_projection --service-unit {unit_name}")
+    return RECOVERY_UNIT_TEMPLATE.format(
+        description=args.description,
+        user=args.user,
+        group=args.group or args.user,
+        working_dir=app_root(),
+        env_file=args.env_file,
+        unit_name=unit_name,
+        exec_start=python,
     )
 
 
@@ -177,7 +271,15 @@ def install_polkit(user: str, unit_name: str, service_name: str) -> None:
     if not rules_dir.is_dir():
         return
     rule_path = rules_dir / f"60-{service_name}.rules"
-    rule_path.write_text(POLKIT_TEMPLATE.format(user=user, unit_name=unit_name), encoding="utf-8")
+    rule_path.write_text(
+        POLKIT_TEMPLATE.format(
+            user=user,
+            unit_name=unit_name,
+            runner_prefix=update_runner_prefix(unit_name),
+            recovery_unit_name=recovery_unit_name(unit_name),
+        ),
+        encoding="utf-8",
+    )
     os.chmod(rule_path, 0o644)
 
 
@@ -233,12 +335,16 @@ def main() -> int:
     env_file = Path(args.env_file) if args.env_file else root / "marketing-copilot.env"
     args.env_file = str(env_file)
     unit_name = args.service_name if args.service_name.endswith(".service") else args.service_name + ".service"
+    runner_unit_name = update_runner_unit(unit_name)
+    recovery_unit = recovery_unit_name(unit_name)
     if not args.dry_run:
         normalize_env_paths(env_file, root)
     if not env_file.is_file():
         print(f"WARNING: environment file not found: {env_file}", file=sys.stderr)
 
     unit = build_unit(args, root)
+    update_unit = build_update_unit(args, root)
+    recovery_unit_text = build_recovery_unit(args, root)
     if args.dry_run:
         print(unit)
         if env_file.is_file() and args.update_mode:
@@ -257,6 +363,12 @@ def main() -> int:
     unit_path = Path("/etc/systemd/system") / unit_name
     if unit_path.exists() and not args.force:
         raise SystemExit(f"unit already exists: {unit_path} (use --force to overwrite)")
+    update_unit_path = Path("/etc/systemd/system") / runner_unit_name
+    if update_unit_path.exists() and not args.force:
+        raise SystemExit(f"unit already exists: {update_unit_path} (use --force to overwrite)")
+    recovery_unit_path = Path("/etc/systemd/system") / recovery_unit
+    if recovery_unit_path.exists() and not args.force:
+        raise SystemExit(f"unit already exists: {recovery_unit_path} (use --force to overwrite)")
 
     if args.update_mode:
         set_env_value(env_file, "MC_UPDATE_MODE", args.update_mode)
@@ -264,6 +376,10 @@ def main() -> int:
     prepare_dirs(root, args.user)
     unit_path.write_text(unit, encoding="utf-8")
     os.chmod(unit_path, 0o644)
+    update_unit_path.write_text(update_unit, encoding="utf-8")
+    os.chmod(update_unit_path, 0o644)
+    recovery_unit_path.write_text(recovery_unit_text, encoding="utf-8")
+    os.chmod(recovery_unit_path, 0o644)
     if not args.no_polkit:
         install_polkit(args.user, unit_name, args.service_name)
     _run(["systemctl", "daemon-reload"])
@@ -272,6 +388,8 @@ def main() -> int:
     if not args.no_start:
         _run(["systemctl", "start", unit_name])
     print(f"installed {unit_path}")
+    print(f"installed {update_unit_path}")
+    print(f"installed {recovery_unit_path}")
     states = []
     if not args.no_start:
         states.append("started")

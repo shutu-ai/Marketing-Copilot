@@ -11,9 +11,9 @@ permissions, and gives fast rollback from backups kept under the update
 directory.
 
 The web process performs every reversible preparation step (database backup,
-task drain, code backup), then spawns the detached runner
-``backend/tools/apply_update.py`` which stops the service, swaps directories,
-restarts, health-checks and rolls back on failure.
+task drain, code backup), then starts ``backend/tools/apply_update.py``. In
+systemd mode the runner is a separate oneshot unit, so the application unit
+can use ``KillMode=control-group`` without killing the directory swap.
 """
 
 import hashlib
@@ -107,6 +107,15 @@ def update_mode() -> str:
     if os.path.exists("/etc/systemd/system/marketing-copilot.service") or os.path.exists("/run/systemd/system"):
         return "systemd"
     return "manual"
+
+
+def update_runner_unit() -> str:
+    configured = os.environ.get("MC_UPDATE_RUNNER_UNIT", "").strip()
+    if configured:
+        return configured
+    service = os.environ.get("MC_SERVICE_UNIT", "marketing-copilot.service").strip()
+    stem = service[:-len(".service")] if service.endswith(".service") else service
+    return f"{stem}-update@apply.service"
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +603,22 @@ def _spawn_runner() -> None:
     script = app_root() / "tools" / "apply_update.py"
     if not script.is_file():
         raise RuntimeError(f"update runner missing: {script}")
+    if update_mode() == "systemd":
+        unit = update_runner_unit()
+        try:
+            result = subprocess.run(
+                ["systemctl", "start", "--no-block", unit],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"failed to start update runner unit {unit}: {exc}") from exc
+        if result.returncode != 0:
+            detail = ((result.stdout or "") + (result.stderr or "")).strip()
+            raise RuntimeError(f"failed to start update runner unit {unit}: {detail[-500:]}")
+        logger.info("update runner unit started: %s", unit)
+        return
     log_path = ensure_update_dir() / "logs" / f"runner-{datetime.now().strftime('%Y%m%d%H%M%S')}.log"
     env = os.environ.copy()
     env["MC_UPDATE_RUNNER_LOG"] = str(log_path)

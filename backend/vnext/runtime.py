@@ -579,6 +579,15 @@ class VNextRuntime:
                 continue
             try:
                 snapshot = self.projection.snapshot()
+                if snapshot.get("recovery_required"):
+                    self._projection_degraded = True
+                    self._projection_last_error = str(
+                        snapshot.get("recovery_error")
+                        or "projection recovery is required"
+                    )
+                    # A persistent marker is a circuit breaker: reopening the
+                    # same database cannot repair a corrupt WAL.
+                    continue
                 if snapshot.get("ready", False):
                     # A successful start closes the current failure streak.
                     self._projection_restart_failures = 0
@@ -685,7 +694,14 @@ class VNextRuntime:
         self._projection_restart_not_before = 0.0
         self._projection_degraded = False
         self._projection_last_error = ""
-        self.projection.start()
+        if self.projection.recovery_required():
+            self._projection_degraded = True
+            marker = self.projection.snapshot()
+            self._projection_last_error = str(
+                marker.get("recovery_error") or "projection recovery is required"
+            )
+        else:
+            self.projection.start()
         context = {
             "spool_root": str(self.spool_root),
             "credits_root": str(self.credits_root),

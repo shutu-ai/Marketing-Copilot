@@ -14,6 +14,7 @@ from vnext.projection_writer import (
     ProjectionWriterOwnerBusy,
     ProjectionWriterProcess,
     ProgressJournal,
+    _write_recovery_marker,
     _fatal_storage_error,
 )
 
@@ -29,6 +30,19 @@ def event(event_id: str, state: str = "socket_written", ordinal: int = 1) -> dic
         "write_failed": int(state == "write_failed"), "unknown": int(state == "unknown"),
         "created_at": time.time(),
     }
+
+
+def test_projection_recovery_marker_is_a_persistent_circuit_breaker(tmp_path):
+    root = tmp_path / "projection"
+    db_path = root / "vnext-projection.duckdb"
+    _write_recovery_marker(db_path, RuntimeError("corrupt WAL"))
+
+    process = ProjectionWriterProcess(root, journal_paths=[])
+    snapshot = process.snapshot()
+
+    assert process.recovery_required()
+    assert snapshot["recovery_required"] is True
+    assert "corrupt WAL" in snapshot["recovery_error"]
 
 
 def test_failed_commit_restores_accounting_and_retry_is_exactly_once(tmp_path):
