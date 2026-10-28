@@ -856,6 +856,14 @@ def _build_snapshot(
             )
             if projection.get("available") else None
         ),
+        "status": (
+            str(projection.get("status") or "")
+            if projection.get("available") else None
+        ),
+        "last_error": (
+            str(projection.get("last_error") or "")
+            if projection.get("available") else None
+        ),
         "snapshot_age_seconds": projection.get("snapshot_age_seconds"),
     }
     campaign_rows = []
@@ -999,6 +1007,10 @@ def _build_snapshot(
     elif not workers:
         health = "DEGRADED"
     elif not projection.get("available"):
+        health = "DEGRADED"
+    elif not projection_section["caught_up"] or projection_section["status"] in {
+        "degraded", "error",
+    }:
         health = "DEGRADED"
     else:
         health = "OK"

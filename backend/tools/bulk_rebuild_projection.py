@@ -10,6 +10,8 @@ This command is an operator-controlled recovery path.  It reads the immutable
 progress journals while the service is stopped, loads an unindexed staging table
 in bounded transactions, derives the canonical tables once, and builds the
 indexes only after the data is complete.  It never mutates the source journals.
+It never opens the task spool or an SMPP transport, so rebuilding the read model
+cannot authorize a new SMS submission.
 """
 
 from __future__ import annotations

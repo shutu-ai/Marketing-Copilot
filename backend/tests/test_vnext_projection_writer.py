@@ -14,6 +14,7 @@ from vnext.projection_writer import (
     ProjectionWriterOwnerBusy,
     ProjectionWriterProcess,
     ProgressJournal,
+    _fatal_storage_error,
 )
 
 
@@ -118,6 +119,17 @@ def test_checkpoint_failure_does_not_retry_committed_events(tmp_path, monkeypatc
         writer.stop()
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failure while replaying WAL file projection.duckdb.wal",
+        "Invalid unicode (byte sequence mismatch) detected in segment statistics update",
+    ],
+)
+def test_projection_wal_corruption_is_not_retried_on_same_connection(message):
+    assert _fatal_storage_error(RuntimeError(message)) is True
+
+
 @pytest.mark.parametrize("age,pid_matches", [(60, True), (0, False)])
 def test_projection_readiness_rejects_stale_or_previous_child_status(tmp_path, age, pid_matches):
     import json
@@ -141,6 +153,31 @@ def test_projection_readiness_rejects_stale_or_previous_child_status(tmp_path, a
     assert snapshot["alive"] is True
     assert snapshot["ready"] is False
     assert snapshot["status_stale"] is True
+
+
+def test_projection_readiness_rejects_degraded_child_status(tmp_path):
+    import json
+
+    process = ProjectionWriterProcess(tmp_path)
+
+    class LiveProcess:
+        pid = 987654321
+        exitcode = None
+
+        def is_alive(self):
+            return True
+
+    process.process = LiveProcess()
+    process.ready_event.set()
+    process.status_path.write_text(json.dumps({
+        "pid": process.process.pid,
+        "status": "degraded",
+        "last_error": "InvalidInputException: invalid unicode",
+        "status_updated_at": time.time(),
+    }), encoding="utf-8")
+    snapshot = process.snapshot()
+    assert snapshot["status_unhealthy"] is True
+    assert snapshot["ready"] is False
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Linux /proc crash detection")

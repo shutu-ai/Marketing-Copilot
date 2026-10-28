@@ -269,6 +269,27 @@ def test_stats_cli_json_snapshot(tmp_path):
     assert states == {101: "paused", 102: "running"}
 
 
+def test_stats_cli_marks_projection_backlog_as_degraded(tmp_path):
+    root = _fake_runtime_root(tmp_path)
+    status_path = root / "projection" / "projection-writer-status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status.update({
+        "status": "degraded",
+        "last_error": "InvalidInputException: invalid unicode",
+        "journal_backlog_bytes": 1,
+        "journal_pending_events": 1,
+    })
+    _write(status_path, status)
+
+    result = _run_cli("--root", str(root), "--once", "--json")
+
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["projection"]["caught_up"] is False
+    assert value["projection"]["status"] == "degraded"
+    assert value["health"] == "DEGRADED"
+
+
 def test_stats_cli_deduplicates_route_pool_across_workers(tmp_path):
     root = _fake_runtime_root(tmp_path)
     first_status_path = root / "progress" / "worker-0.status.json"

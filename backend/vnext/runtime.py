@@ -587,7 +587,13 @@ class VNextRuntime:
                     self._projection_last_error = ""
                     continue
                 if snapshot.get("alive", False):
-                    if snapshot.get("status_stale") or snapshot.get("core_dumping"):
+                    if snapshot.get("status_unhealthy"):
+                        self._projection_degraded = True
+                        self._projection_last_error = str(
+                            snapshot.get("last_error")
+                            or "projection child reported an unhealthy status"
+                        )
+                    elif snapshot.get("status_stale") or snapshot.get("core_dumping"):
                         self._projection_degraded = True
                         self._projection_last_error = (
                             "projection child is dumping core" if snapshot.get("core_dumping")

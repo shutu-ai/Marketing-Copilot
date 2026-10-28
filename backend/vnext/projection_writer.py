@@ -41,11 +41,15 @@ class ProjectionBackpressure(RuntimeError):
 
 
 def _fatal_storage_error(error: Exception) -> bool:
-    """An invalidated engine cannot recover by retrying on its connection."""
+    """Return whether retrying this writer connection can make progress."""
+    text = str(error).lower()
     return type(error).__name__ in {"FatalException", "InternalException"} or any(
-        message in str(error).lower() for message in (
+        message in text for message in (
             "cannot perform io in in-memory database",
             "database has been invalidated",
+            "failure while replaying wal",
+            "invalid unicode",
+            "segment statistics update",
         )
     )
 
@@ -1812,6 +1816,18 @@ def _process_main(
     retention_last_run_at = 0.0
     retention_last_result: dict = {}
     retention_last_error = ""
+    process_status = "starting"
+    process_last_error = ""
+
+    def mark_degraded(error: BaseException) -> None:
+        nonlocal process_status, process_last_error
+        process_status = "degraded"
+        process_last_error = f"{type(error).__name__}: {error}"
+
+    def mark_running() -> None:
+        nonlocal process_status, process_last_error
+        process_status = "running"
+        process_last_error = ""
 
     def update_retention_days(value) -> bool:
         nonlocal retention_days, retention_last_run_monotonic
@@ -1864,6 +1880,8 @@ def _process_main(
             "journal_backlog_events_estimate": journal_backlog_events_estimate,
         })
         value.update({
+            "status": process_status,
+            "last_error": process_last_error,
             "pid": os.getpid(),
             "ppid": os.getppid(),
             "start_method": start_method,
@@ -1940,7 +1958,9 @@ def _process_main(
                 )
         except Exception as exc:
             if _fatal_storage_error(exc):
+                mark_degraded(exc)
                 raise
+            mark_degraded(exc)
             retention_last_error = f"{type(exc).__name__}: {exc}"
             diagnostic(
                 phase="retention_retry",
@@ -1950,6 +1970,7 @@ def _process_main(
 
     try:
         writer.start()
+        mark_running()
         # Publish a readable readiness snapshot before the first journal
         # quantum.  With a quiet or small batch the loop can otherwise reach
         # its first status tick only after the caller has already finished its
@@ -1965,7 +1986,9 @@ def _process_main(
                         flushed = writer.flush(max_events=len(pending_events))
                     except Exception as exc:
                         if _fatal_storage_error(exc):
+                            mark_degraded(exc)
                             raise
+                        mark_degraded(exc)
                         diagnostic(
                             phase="flush_retry",
                             status="degraded",
@@ -1974,6 +1997,7 @@ def _process_main(
                         time.sleep(writer.retry_seconds)
                         write_status()
                         continue
+                    mark_running()
                     if flushed != len(pending_events):
                         raise RuntimeError("projection writer flushed an incomplete journal batch")
                     if offsets_file:
@@ -2119,13 +2143,17 @@ def _process_main(
                             pass
                         except Exception as exc:
                             if _fatal_storage_error(exc):
+                                mark_degraded(exc)
                                 raise
+                            mark_degraded(exc)
                             diagnostic(
                                 phase="flush_retry",
                                 status="degraded",
                                 extra={"last_error": f"{type(exc).__name__}: {exc}"},
                             )
                             time.sleep(writer.retry_seconds)
+                        else:
+                            mark_running()
                     # The parent's Queue feeder may still be delivering
                     # accepted events. Only the FIFO sentinel/EOF establishes
                     # that IPC input is drained; stop_event alone does not.
@@ -2164,13 +2192,17 @@ def _process_main(
                             pass
                         except Exception as exc:
                             if _fatal_storage_error(exc):
+                                mark_degraded(exc)
                                 raise
+                            mark_degraded(exc)
                             diagnostic(
                                 phase="flush_retry",
                                 status="degraded",
                                 extra={"last_error": f"{type(exc).__name__}: {exc}"},
                             )
                             time.sleep(writer.retry_seconds)
+                        else:
+                            mark_running()
                 diagnostic(
                     phase="event", status="running",
                     progress={"applied": writer.snapshot().get("applied", 0), "queue_depth": len(writer._queue)},
@@ -2183,13 +2215,17 @@ def _process_main(
                     time.sleep(writer.retry_seconds)
                 except Exception as exc:
                     if _fatal_storage_error(exc):
+                        mark_degraded(exc)
                         raise
+                    mark_degraded(exc)
                     diagnostic(
                         phase="flush_retry",
                         status="degraded",
                         extra={"last_error": f"{type(exc).__name__}: {exc}"},
                     )
                     time.sleep(writer.retry_seconds)
+                else:
+                    mark_running()
         maybe_age(force=True)
         write_status(force_metrics=True)
         diagnostic(
@@ -2197,6 +2233,10 @@ def _process_main(
             progress={"applied": writer.snapshot(force_metrics=True).get("applied", 0), "queue_depth": len(writer._queue)},
         )
     except BaseException as exc:
+        process_status = "error"
+        process_last_error = f"{type(exc).__name__}: {exc}"
+        with contextlib.suppress(Exception):
+            write_status(force_metrics=True)
         diagnostic(
             phase="exception", status="error",
             extra={"last_error": f"{type(exc).__name__}: {exc}"},
@@ -2440,6 +2480,9 @@ class ProjectionWriterProcess:
         status_pid_matches = value.get("pid") == getattr(process, "pid", None)
         status_age = max(0.0, time.time() - updated_at)
         status_stale = not status_pid_matches or status_age > 30.0
+        status_unhealthy = str(value.get("status") or "running").lower() not in {
+            "starting", "running",
+        }
         # multiprocessing reports a core-dumping process as alive until the
         # collector finishes. Linux PF_DUMPCORE identifies that interval.
         core_dumping = False
@@ -2450,7 +2493,7 @@ class ProjectionWriterProcess:
                 core_dumping = bool(int(fields[6]) & 0x200)
             except (OSError, ValueError, IndexError):
                 pass
-        ready = ready and not status_stale and not core_dumping
+        ready = ready and not status_stale and not core_dumping and not status_unhealthy
         native_crash = native_crash or core_dumping
         return {
             **value,
@@ -2459,6 +2502,7 @@ class ProjectionWriterProcess:
             "status_stale": status_stale,
             "status_age_seconds": round(status_age, 3),
             "status_pid_matches": status_pid_matches,
+            "status_unhealthy": status_unhealthy,
             "core_dumping": core_dumping,
             "journal_replay": bool(self.journal_paths),
             "pid": getattr(process, "pid", None),
