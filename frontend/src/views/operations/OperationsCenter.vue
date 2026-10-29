@@ -257,7 +257,21 @@ async function bulkAction(action: 'retry' | 'archive') { await ops.bulkFailedTas
 async function runHealthCheck() { await ops.getConfigurationHealth(true); await loadExceptions(); ElMessage.success(i18n.global.t('legacy.xe8c924d5')) }
 async function resolve(id: number) { await ops.resolveException(id); await loadExceptions() }
 async function openTimeline(id: number) { timeline.value = (await ops.getTaskTimeline(id)).data; timelineVisible.value = true }
-async function download(report: string) { const response = await ops.exportReport(report); const url = URL.createObjectURL(response.data); const link = document.createElement('a'); link.href = url; link.download = `marketing-copilot-${report}.csv`; link.click(); URL.revokeObjectURL(url) }
+async function download(report: string) {
+  try {
+    const response = await ops.exportReport(report)
+    const url = URL.createObjectURL(response.data)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `marketing-copilot-${report}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (error: any) {
+    const detail = error.response?.data?.detail
+    const message = typeof detail === 'object' ? detail.message : detail
+    ElMessage.error(message || i18n.global.t('common.connectionFailed'))
+  }
+}
 watch(() => route.query.tab, value => {
   const nextTab = validTabs.includes(String(value)) ? String(value) : 'progress'
   if (nextTab !== activeTab.value) {

@@ -73,36 +73,59 @@ def capacity_status(view: str = Query(default="full")):
             workers = worker_status()
     except Exception:
         workers = worker_status()
-    try:
-        metrics_service.observe_runtime_state(workers['running'], allow_cached=True)
-    except Exception as exc:
-        if not is_database_read_error(exc):
-            raise
-        logger.warning("Capacity metrics refresh skipped because database read failed: %s", exc)
-
-    try:
-        ingestion = ingestion_job_service.status()
-    except Exception as exc:
-        if not is_database_read_error(exc):
-            raise
-        logger.warning("Capacity ingestion status unavailable: %s", exc)
-        ingestion = {"pending": None, "error": "DATABASE_READ_UNAVAILABLE"}
-
-    try:
-        backpressure = backpressure_service.snapshot()
-    except Exception as exc:
-        if not is_database_read_error(exc):
-            raise
-        logger.warning("Capacity backpressure status unavailable: %s", exc)
+    vnext_capacity = vnext_pipeline is not None and view == "capacity"
+    if vnext_capacity:
+        # VNext capacity data is assembled from spool, worker and projection
+        # snapshots. Do not refresh legacy control-table metrics on this hot
+        # polling path; those reads only add DuckDB contention and are not
+        # rendered by the VNext capacity page.
+        ingestion = {
+            "source": "vnext",
+            "chunks": {},
+            "pending": None,
+            "not_applicable": True,
+        }
         backpressure = {
+            "source": "vnext",
             "task_depth": None,
             "chunk_depth": None,
             "write_depth": None,
             "write_depths": {},
             "disk": {},
             "paused": {},
-            "error": "DATABASE_READ_UNAVAILABLE",
+            "not_applicable": True,
         }
+    else:
+        try:
+            metrics_service.observe_runtime_state(workers['running'], allow_cached=True)
+        except Exception as exc:
+            if not is_database_read_error(exc):
+                raise
+            logger.warning("Capacity metrics refresh skipped because database read failed: %s", exc)
+
+        try:
+            ingestion = ingestion_job_service.status()
+        except Exception as exc:
+            if not is_database_read_error(exc):
+                raise
+            logger.warning("Capacity ingestion status unavailable: %s", exc)
+            ingestion = {"pending": None, "error": "DATABASE_READ_UNAVAILABLE"}
+
+        try:
+            backpressure = backpressure_service.snapshot()
+        except Exception as exc:
+            if not is_database_read_error(exc):
+                raise
+            logger.warning("Capacity backpressure status unavailable: %s", exc)
+            backpressure = {
+                "task_depth": None,
+                "chunk_depth": None,
+                "write_depth": None,
+                "write_depths": {},
+                "disk": {},
+                "paused": {},
+                "error": "DATABASE_READ_UNAVAILABLE",
+            }
     try:
         if vnext_pipeline is not None:
             smpp = vnext_service.smpp_stats(vnext_pipeline)

@@ -42,6 +42,11 @@ class ProjectionBackpressure(RuntimeError):
 
 def _fatal_storage_error(error: Exception) -> bool:
     """Return whether retrying this writer connection can make progress."""
+    import sqlite3
+    code = getattr(error, "sqlite_errorcode", 0) & 0xff
+    if code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_IOERR,
+                sqlite3.SQLITE_FULL, sqlite3.SQLITE_READONLY}:
+        return True
     text = str(error).lower()
     return type(error).__name__ in {"FatalException", "InternalException"} or any(
         message in text for message in (
@@ -1303,6 +1308,7 @@ class ProjectionWriter:
         try:
             self._conn.execute("BEGIN TRANSACTION")
             self._apply_batch(batch)
+            self._before_commit()
             commit_started_ns = time.perf_counter_ns()
             self._conn.execute("COMMIT")
             self._metrics["db_commit_ns"] += time.perf_counter_ns() - commit_started_ns
@@ -1335,6 +1341,9 @@ class ProjectionWriter:
             self._checkpoint_retry_at = time.monotonic() + 5.0
         self._metrics["batch_end_to_end_ns"] += time.perf_counter_ns() - batch_started_ns
         return len(batch)
+
+    def _before_commit(self) -> None:
+        """Engine-specific durable metadata in the projection transaction."""
 
     def _checkpoint_if_due(self) -> None:
         """Bound WAL growth without checkpointing a mixed-catalog COMMIT.
@@ -1542,14 +1551,15 @@ class ProjectionWriter:
             self.start()
         if business_day is None:
             query = "SELECT * FROM vnext_projection ORDER BY campaign_type,campaign_id,partition_id,route_id"
-            rows = self._conn.execute(query).fetchall()
+            result = self._conn.execute(query)
         else:
             query = (
                 "SELECT * FROM vnext_projection WHERE business_day=? "
                 "ORDER BY campaign_type,campaign_id,partition_id,route_id"
             )
-            rows = self._conn.execute(query, (str(business_day),)).fetchall()
-        columns = [str(item[0]) for item in self._conn.description]
+            result = self._conn.execute(query, (str(business_day),))
+        rows = result.fetchall()
+        columns = [str(item[0]) for item in result.description]
         return [dict(zip(columns, row)) for row in rows]
 
     def _daily_totals(self) -> list[dict]:
@@ -1570,7 +1580,7 @@ class ProjectionWriter:
         if self._conn is None:
             return []
         try:
-            rows = self._conn.execute(
+            result = self._conn.execute(
                 """SELECT business_day,
                           COALESCE(SUM(queued),0) AS queued,
                           COALESCE(SUM(taken),0) AS taken,
@@ -1587,8 +1597,9 @@ class ProjectionWriter:
                    GROUP BY business_day
                    ORDER BY business_day DESC
                    LIMIT 31"""
-            ).fetchall()
-            columns = [str(item[0]) for item in self._conn.description]
+            )
+            rows = result.fetchall()
+            columns = [str(item[0]) for item in result.description]
             self._daily_totals_cache = [dict(zip(columns, row)) for row in rows]
         except Exception:
             # Status publication is diagnostic/read-only.  A transient schema
@@ -1611,7 +1622,7 @@ class ProjectionWriter:
         if self._conn is None:
             return []
         try:
-            rows = self._conn.execute(
+            result = self._conn.execute(
                 """SELECT business_day, campaign_type, campaign_id,
                           COALESCE(SUM(queued),0) AS queued,
                           COALESCE(SUM(taken),0) AS taken,
@@ -1628,8 +1639,9 @@ class ProjectionWriter:
                    GROUP BY business_day, campaign_type, campaign_id
                    ORDER BY business_day DESC, campaign_type, campaign_id
                    LIMIT 8192"""
-            ).fetchall()
-            columns = [str(item[0]) for item in self._conn.description]
+            )
+            rows = result.fetchall()
+            columns = [str(item[0]) for item in result.description]
             self._campaign_daily_totals_cache = [dict(zip(columns, row)) for row in rows]
         except Exception:
             # A diagnostic snapshot must never interrupt projection writes.
@@ -1816,7 +1828,11 @@ def _process_main(
             "kernel_core_dump_disabled": core_dump_disabled,
         },
     )
-    writer = ProjectionWriter(
+    writer_class = ProjectionWriter
+    if Path(db_path).suffix == ".sqlite3":
+        from .sqlite_projection import SQLiteProjectionWriter
+        writer_class = SQLiteProjectionWriter
+    writer = writer_class(
         db_path,
         batch_size=batch_size,
         flush_interval_seconds=flush_interval_seconds,
@@ -2011,6 +2027,8 @@ def _process_main(
 
     try:
         writer.start()
+        if hasattr(writer, "committed_offsets"):
+            offsets = writer.committed_offsets()
         mark_running()
         # Publish a readable readiness snapshot before the first journal
         # quantum.  With a quiet or small batch the loop can otherwise reach
@@ -2024,6 +2042,8 @@ def _process_main(
             while True:
                 if pending_events:
                     try:
+                        if hasattr(writer, "pending_offsets"):
+                            writer.pending_offsets = dict(pending_offsets)
                         flushed = writer.flush(max_events=len(pending_events))
                     except Exception as exc:
                         if _fatal_storage_error(exc):
@@ -2308,8 +2328,30 @@ class ProjectionWriterProcess:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / db_name
+        sqlite_exists = (self.root / "vnext-projection.sqlite3").exists()
+        engine = os.environ.get("MC_VNEXT_PROJECTION_ENGINE", "sqlite" if sqlite_exists else "duckdb").strip().lower()
+        if engine not in {"duckdb", "sqlite"}:
+            raise ValueError("MC_VNEXT_PROJECTION_ENGINE must be duckdb or sqlite")
+        if sqlite_exists and engine != "sqlite":
+            raise RuntimeError("cannot downgrade a migrated projection: legacy offsets may be stale")
+        if engine == "sqlite":
+            self.db_path = self.root / "vnext-projection.sqlite3"
+            if (self.root / db_name).exists():
+                import sqlite3
+                verified = False
+                if self.db_path.exists():
+                    try:
+                        with contextlib.closing(sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True)) as check:
+                            row = check.execute("SELECT value FROM projection_meta WHERE key='migration_complete'").fetchone()
+                            verified = bool(row and row[0] == "1")
+                    except sqlite3.Error:
+                        pass
+                if not verified:
+                    raise RuntimeError("verified offline projection migration required before enabling sqlite")
         self.owner_lock_path = Path(f"{self.db_path}.owner.lock")
         self.task_index_path = self.root / "vnext-task-index.sqlite3"
+        if engine == "sqlite":
+            self.task_index_path = self.db_path
         self.status_path = self.root / "projection-writer-status.json"
         self.queue_size = max(1, int(queue_size))
         self.batch_size = max(1, int(batch_size))

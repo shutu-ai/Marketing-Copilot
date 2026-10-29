@@ -143,6 +143,16 @@ def _export_rows(report: str):
 def export_report(report: str):
     try:
         rows = _export_rows(report)
+    except vnext_service.TaskIndexUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": exc.code,
+                "reason": exc.reason,
+                "message": "VNext task index is unavailable; rebuild it offline before retrying",
+            },
+            headers={"Retry-After": "30"},
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     output = io.StringIO()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from services import dashboard_service, realtime_campaign_service, vnext_service
 from vnext.spool import DEFAULT_MAX_SPOOL_BYTES, TaskSpool
 
@@ -104,6 +106,7 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
 ):
     import duckdb
     from vnext.projection_writer import ensure_task_index_schema
+    from vnext.task_index import rebuild_from_duckdb
 
     fake = _FakeRuntime(tmp_path)
     db_path = tmp_path / "vnext-projection.duckdb"
@@ -174,10 +177,15 @@ def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_f
         ],
     )
     connection.close()
+    sidecar_path = tmp_path / "vnext-task-index.sqlite3"
+    rebuild_from_duckdb(db_path, sidecar_path)
 
     class Projection:
         def snapshot(self):
-            return {"db_path": str(db_path)}
+            return {
+                "db_path": str(db_path),
+                "task_index_path": str(sidecar_path),
+            }
 
     fake.projection = Projection()
     monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
@@ -432,6 +440,62 @@ def test_vnext_read_models_mark_projection_failure_instead_of_false_complete(tmp
     assert dashboard["degraded_reason"] == "projection_writer_native_crash"
     assert tasks["stats_source"] == "vnext_task_index_unavailable"
     assert tasks["degraded_reason"] == "vnext_task_index_unavailable"
+
+
+def test_vnext_task_reads_never_fallback_to_projection_duckdb(tmp_path, monkeypatch):
+    import duckdb
+
+    fake = _FakeRuntime(tmp_path)
+    projection_path = tmp_path / "vnext-projection.duckdb"
+    sidecar_path = tmp_path / "missing-vnext-task-index.sqlite3"
+
+    class Projection:
+        def snapshot(self):
+            return {
+                "db_path": str(projection_path),
+                "task_index_path": str(sidecar_path),
+                "alive": False,
+                "ready": False,
+                "native_crash": True,
+                "recovery_required": True,
+            }
+
+    fake.projection = Projection()
+    monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
+    duckdb_connect_calls = []
+    monkeypatch.setattr(
+        duckdb,
+        "connect",
+        lambda *args, **kwargs: duckdb_connect_calls.append((args, kwargs)),
+    )
+
+    listed = vnext_service.list_tasks()
+    with pytest.raises(vnext_service.TaskIndexUnavailable) as error:
+        vnext_service.export_tasks()
+
+    assert listed["stats_source"] == "vnext_task_index_unavailable"
+    assert listed["degraded"] is True
+    assert error.value.code == "VNEXT_TASK_INDEX_UNAVAILABLE"
+    assert duckdb_connect_calls == []
+
+
+def test_vnext_task_export_returns_empty_only_for_ready_empty_sidecar(tmp_path, monkeypatch):
+    from vnext.task_index import connect_writer, mark_ready
+
+    fake = _FakeRuntime(tmp_path)
+    sidecar_path = tmp_path / "vnext-task-index.sqlite3"
+    connection = connect_writer(sidecar_path)
+    mark_ready(connection, True)
+    connection.close()
+
+    class Projection:
+        def snapshot(self):
+            return {"task_index_path": str(sidecar_path)}
+
+    fake.projection = Projection()
+    monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
+
+    assert vnext_service.export_tasks() == []
 
 
 def test_vnext_realtime_stats_do_not_query_legacy_task_table(monkeypatch):

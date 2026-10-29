@@ -187,6 +187,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     source_root = Path(args.root).expanduser().resolve()
+    if (source_root / 'projection' / 'vnext-projection.sqlite3').exists():
+        raise RuntimeError('legacy DuckDB maintenance cannot run on a migrated SQLite projection')
     root = (
         Path(args.output_root).expanduser().resolve()
         if args.output_root is not None

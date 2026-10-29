@@ -44,6 +44,8 @@ tar -C "$ROOT/backend" \
   --exclude='db_config.json' --exclude='logs' --exclude='server*.log' \
   --exclude='backups' --exclude='*.log' --exclude='*.bak*' --exclude='*.backup*' \
   --exclude='*.db*' --exclude='*.duckdb*' \
+  --exclude='*.sqlite*' --exclude='*.wal' --exclude='*.lock' \
+  --exclude='venv' --exclude='.venv' \
   --exclude='uploads' --exclude='monitor_dir' --exclude='data' \
   --exclude='.rt-smoke-*' --exclude='.tmp-*' \
   -cf - . | tar -C "$STAGE/backend" -xf -
@@ -82,6 +84,7 @@ PRODUCTION_TOOLS=(
   maintain_projection.py
   bulk_rebuild_projection.py
   recover_projection.py
+  migrate_sqlite_projection.py
   vnext_stats.py
 )
 mkdir -p "$STAGE/backend/tools"
@@ -91,6 +94,7 @@ done
 normalize_text "$ROOT/deploy/marketing-copilot.single-dir.env.example" "$STAGE/marketing-copilot.env.example"
 normalize_text "$ROOT/deploy/run-system-python-manual.sh" "$STAGE/run.sh"
 normalize_text "$ROOT/deploy/README-system-python-manual.md" "$STAGE/README.md"
+normalize_text "$ROOT/Docs/vnext-sqlite-projection-design.md" "$STAGE/SQLITE-PROJECTION.md"
 chmod 0755 "$STAGE/run.sh"
 normalize_text "$ROOT/backend/tools/mcctl.py" "$STAGE/bin/mcctl.py"
 normalize_text "$ROOT/deploy/marketing-copilot-cli" "$STAGE/bin/marketing-copilot-cli"

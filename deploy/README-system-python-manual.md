@@ -197,3 +197,21 @@ sudo /opt/marketing-copilot/venv/bin/python -m tools.recover_projection \
 
 The recovery path never opens the SMS spool or SMPP transport and never
 resubmits a message.
+
+## Optional unified SQLite projection
+
+This package includes the candidate single-transaction SQLite projection.
+Upgrading application files does not migrate an existing DuckDB projection.
+See `SQLITE-PROJECTION.md` for validation limits and the offline migration plan.
+With the service stopped, run from the installed `backend` directory:
+
+```bash
+/opt/marketing-copilot/venv/bin/python -m tools.migrate_sqlite_projection \
+  --root /opt/marketing-copilot/data/vnext/projection
+```
+
+Enable `MC_VNEXT_PROJECTION_ENGINE=sqlite` only after verifying the migration
+and completing workload acceptance. Existing migrated databases are selected
+automatically. Downgrading to the old DuckDB is blocked because its state and
+consumption offsets may be stale. Legacy DuckDB recovery/maintenance commands
+refuse migrated directories; do not delete SQLite files or WAL to bypass this.

@@ -76,6 +76,9 @@ def main() -> int:
     args = _parse_args()
     source_root = args.root.expanduser().resolve()
     source_projection = source_root / "projection"
+    if (source_projection / "vnext-projection.sqlite3").exists():
+        print(json.dumps({"ok": False, "error": "sqlite_projection_requires_sqlite_recovery"}))
+        return 2
     source_db = source_projection / "vnext-projection.duckdb"
     if _service_is_active(str(args.service_unit)):
         print(json.dumps({"ok": False, "error": "service_active", "service_unit": args.service_unit}))

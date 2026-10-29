@@ -46,6 +46,16 @@ VNEXT_METRIC_CONTRACT = {
 }
 
 
+class TaskIndexUnavailable(RuntimeError):
+    """The online task read model is unavailable and must be repaired offline."""
+
+    code = "VNEXT_TASK_INDEX_UNAVAILABLE"
+
+    def __init__(self, reason: str = "vnext_task_index_unavailable"):
+        self.reason = str(reason or "vnext_task_index_unavailable")
+        super().__init__(self.reason)
+
+
 def pipeline_mode() -> str:
     value = str(os.environ.get("MC_PIPELINE_MODE", "vnext") or "vnext").strip().lower()
     return value if value in {"vnext", "legacy", "test"} else "vnext"
@@ -847,33 +857,26 @@ def _projection_task_page(
     The projection writer remains the sole writer.  This connection is
     read-only and is intentionally opened only for the API query, so the
     send workers and their journal path are not involved.  There is no
-    fallback to the old task table or to journal replay: a missing projection
-    store is reported as unavailable and is repaired by the offline cutover
-    command.
+    fallback to DuckDB, the old task table or journal replay: a missing or
+    unavailable sidecar is reported as degraded and is repaired by the
+    offline sidecar rebuild command.
     """
 
     try:
         value = runtime()
         snapshot = value.projection.snapshot()
-        db_path = snapshot.get("db_path")
-        if not db_path:
-            return None
-        # The projection child owns DuckDB exclusively.  The sidecar is the
-        # normal live read path; only stopped-process tools/tests may use the
-        # DuckDB fallback to inspect a projection that is not being written.
-        task_index_path = snapshot.get("task_index_path") or str(
-            default_task_index_path(db_path)
-        )
+        task_index_path = snapshot.get("task_index_path")
+        if not task_index_path:
+            db_path = snapshot.get("db_path")
+            if not db_path:
+                return None
+            task_index_path = str(default_task_index_path(db_path))
         connection = connect_task_index_reader(task_index_path)
-        using_sidecar = connection is not None
-        if using_sidecar and not task_index_is_ready(connection):
+        if connection is None:
+            return None
+        if not task_index_is_ready(connection):
             connection.close()
             return None
-        if connection is None:
-            if bool(snapshot.get("alive")):
-                return None
-            import duckdb
-            connection = duckdb.connect(str(db_path), read_only=True)
         selected_day = str(business_day or "")
         # Keep the unfiltered operations page cheap by defaulting it to the
         # active business day.  A user-supplied filter is an explicit lookup
@@ -920,10 +923,7 @@ def _projection_task_page(
                 params + [max(1, int(page_size)), offset],
             )
             rows = rows_cursor.fetchall()
-            if using_sidecar:
-                return total, [dict(row) for row in rows]
-            columns = [str(item[0]) for item in connection.description]
-            return total, [dict(zip(columns, row)) for row in rows]
+            return total, [dict(row) for row in rows]
         finally:
             connection.close()
     except Exception:
@@ -984,27 +984,23 @@ def list_tasks(page: int = 1, page_size: int = 50, status: str = "", campaign_ty
 
 
 def export_tasks() -> list[dict]:
-    """Export the canonical VNext task index without opening the business DB."""
+    """Export the sidecar task index without opening any DuckDB connection."""
 
     try:
         value = runtime()
         snapshot = value.projection.snapshot() or {}
-        db_path = snapshot.get("db_path")
-        if not db_path:
-            return []
-        task_index_path = snapshot.get("task_index_path") or str(
-            default_task_index_path(db_path)
-        )
+        task_index_path = snapshot.get("task_index_path")
+        if not task_index_path:
+            db_path = snapshot.get("db_path")
+            if not db_path:
+                raise TaskIndexUnavailable()
+            task_index_path = str(default_task_index_path(db_path))
         connection = connect_task_index_reader(task_index_path)
-        if connection is not None:
-            if not task_index_is_ready(connection):
-                connection.close()
-                return []
-        elif bool(snapshot.get("alive")):
-            return []
-        else:
-            import duckdb
-            connection = duckdb.connect(str(db_path), read_only=True)
+        if connection is None:
+            raise TaskIndexUnavailable()
+        if not task_index_is_ready(connection):
+            connection.close()
+            raise TaskIndexUnavailable()
         try:
             rows_cursor = connection.execute(
                 """SELECT event_id,campaign_name,campaign_type,campaign_id,route_id,
@@ -1014,17 +1010,13 @@ def export_tasks() -> list[dict]:
                     ORDER BY created_at DESC,ordinal DESC,event_id DESC"""
             )
             rows = rows_cursor.fetchall()
-            if connection.__class__.__module__.startswith("sqlite3"):
-                return [_task_item_from_event(dict(row)) for row in rows]
-            columns = [str(item[0]) for item in connection.description]
-            return [
-                _task_item_from_event(dict(zip(columns, row)))
-                for row in rows
-            ]
+            return [_task_item_from_event(dict(row)) for row in rows]
         finally:
             connection.close()
-    except Exception:
-        return []
+    except TaskIndexUnavailable:
+        raise
+    except Exception as exc:
+        raise TaskIndexUnavailable("vnext_task_index_read_failed") from exc
 
 
 def task_stats(business_day: str | None = None) -> dict:

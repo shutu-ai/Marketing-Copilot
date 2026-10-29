@@ -49,6 +49,8 @@ def default_task_index_path(projection_db_path: str | Path) -> Path:
     """Return the stable sidecar path for a projection database."""
 
     projection = Path(projection_db_path).resolve()
+    if projection.name == "vnext-projection.sqlite3":
+        return projection
     return projection.with_name("vnext-task-index.sqlite3")
 
 
