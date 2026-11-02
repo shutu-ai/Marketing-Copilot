@@ -174,6 +174,49 @@ def test_realtime_failed_second_chunk_retry_does_not_duplicate_tasks_or_output(i
     output_rows = pd.read_csv(output, dtype=str, encoding="utf-8-sig")
     assert len(output_rows) == 10
     assert output_rows["msisdn"].nunique() == 10
+    assert "language" in output_rows.columns
+    assert "send_time" in output_rows.columns
+
+
+def test_realtime_output_keeps_source_fields_for_new_daily_file(tmp_path):
+    campaign_dir = tmp_path / "wide-output"
+    campaign_dir.mkdir()
+
+    realtime_campaign_service._append_realtime_output(str(campaign_dir), [
+        {
+            "msisdn": "251090000000",
+            "customer_name": "A",
+            "language": "english",
+            "send_time": "2026-11-02 10:00:00+0000",
+        },
+    ])
+
+    output = campaign_dir / "output" / f"{datetime.now():%Y%m%d}.csv"
+    output_rows = pd.read_csv(output, dtype=str, encoding="utf-8-sig")
+    assert list(output_rows.columns) == ["msisdn", "customer_name", "language", "send_time"]
+    assert output_rows.loc[0, "customer_name"] == "A"
+    assert output_rows.loc[0, "language"] == "english"
+
+
+def test_realtime_output_does_not_rewrite_legacy_daily_file(tmp_path):
+    campaign_dir = tmp_path / "legacy-output"
+    output_dir = campaign_dir / "output"
+    output_dir.mkdir(parents=True)
+    output = output_dir / f"{datetime.now():%Y%m%d}.csv"
+    output.write_text(chr(0xFEFF) + "msisdn,send_time\n251090000000,old\n", encoding="utf-8")
+
+    realtime_campaign_service._append_realtime_output(str(campaign_dir), [
+        {
+            "msisdn": "251090000001",
+            "customer_name": "B",
+            "language": "english",
+            "send_time": "new",
+        },
+    ])
+
+    output_rows = pd.read_csv(output, dtype=str, encoding="utf-8-sig")
+    assert list(output_rows.columns) == ["msisdn", "send_time"]
+    assert output_rows["msisdn"].tolist() == ["251090000000", "251090000001"]
 
 
 def test_legacy_whitelist_is_migrated_before_excel_input(isolated_db, monkeypatch):

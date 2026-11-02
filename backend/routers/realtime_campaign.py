@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 
 import tempfile
@@ -290,6 +291,9 @@ def download_sent_record(campaign_id: int, filename: str):
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     safe_name = os.path.basename(filename)
+
+    if not re.fullmatch(r"\d{8}\.csv", safe_name):
+        raise HTTPException(status_code=404, detail="Sent record not found")
 
     path = os.path.join(campaign.get("campaign_dir", ""), "output", safe_name)
 

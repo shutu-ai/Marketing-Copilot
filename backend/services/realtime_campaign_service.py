@@ -96,6 +96,8 @@ _watch_copy_threads = []
 _watch_copy_start_lock = threading.Lock()
 _watch_campaign_cursor = 0
 _sftp_campaign_cursor = 0
+_realtime_output_locks = {}
+_realtime_output_locks_guard = threading.Lock()
 
 
 class WatchFileChanged(RuntimeError):
@@ -1022,17 +1024,53 @@ def get_detail(campaign_id: int) -> Optional[dict]:
     return campaign
 
 
+def _realtime_output_lock(output_path: str) -> threading.Lock:
+    # shortcut: process-local locking covers the in-process worker pool; use an
+    # OS file lock if multiple backend processes write the same campaign dir.
+    key = os.path.normcase(os.path.abspath(output_path))
+    with _realtime_output_locks_guard:
+        return _realtime_output_locks.setdefault(key, threading.Lock())
+
+
+def _output_columns(output_path: str, rows: list[dict]) -> list[str]:
+    columns = list(dict.fromkeys(str(key) for row in rows for key in row.keys()))
+    if "send_time" not in columns:
+        columns.append("send_time")
+    try:
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            return columns
+        with open(output_path, "r", encoding="utf-8-sig", newline="") as handle:
+            existing = next(csv.reader(handle), [])
+    except (OSError, UnicodeError, csv.Error):
+        return columns
+    if existing == ["msisdn", "send_time"]:
+        # Do not rewrite historical/current legacy files; start the wide format
+        # when the next daily file is created.
+        return existing
+    return existing or columns
+
+
 def _append_realtime_output(campaign_dir: str, rows: list[dict]) -> None:
-    """Append only the current matched chunk to today's output file."""
+    """Append matched source fields and send time without rewriting old files."""
     if not campaign_dir or not rows:
         return
     output_dir = os.path.join(campaign_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"{datetime.now():%Y%m%d}.csv")
-    pd.DataFrame(rows, columns=["msisdn", "send_time"]).to_csv(
-        output_path, index=False, mode="a",
-        header=not os.path.isfile(output_path), encoding="utf-8-sig",
-    )
+    with _realtime_output_lock(output_path):
+        try:
+            has_content = os.path.getsize(output_path) > 0
+        except OSError:
+            has_content = False
+        columns = _output_columns(output_path, rows)
+        output_rows = rows
+        if columns == ["msisdn", "send_time"]:
+            output_rows = [{column: row.get(column, "") for column in columns} for row in rows]
+        with open(output_path, "a", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            if not has_content:
+                writer.writerow(columns)
+            writer.writerows([[row.get(column, "") for column in columns] for row in output_rows])
 
 
 def _task_msisdn_for_campaign(value, campaign: dict) -> str:
@@ -1655,8 +1693,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     if not chunk_result.get("success"):
                         raise RuntimeError(chunk_result.get("message", "Unable to enqueue realtime chunk"))
                     created_msisdns = set(chunk_result.get("created_msisdns", []))
+                    output_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
                     _append_realtime_output(campaign.get("campaign_dir", ""), [
-                        {"msisdn": row["msisdn"], "send_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")}
+                        {**row, "send_time": output_time}
                         for row in matched_records
                         if _task_msisdn_for_campaign(row["msisdn"], campaign) in created_msisdns
                     ])
@@ -1774,8 +1813,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     if task_result.get("status") == "stopped":
                         return task_result
             created_msisdns = set(task_result.get("created_msisdns", []))
+            output_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
             _append_realtime_output(campaign.get("campaign_dir", ""), [
-                {"msisdn": record["msisdn"], "send_time": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")}
+                {**record, "send_time": output_time}
                 for record in matched_records
                 if _task_msisdn_for_campaign(record["msisdn"], campaign) in created_msisdns
             ])
@@ -2085,18 +2125,6 @@ def get_realtime_watch_files(
 
 
 def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 50) -> dict:
-    if _vnext_pipeline_active():
-        # VNext deliberately does not maintain the legacy sms_tasks delivery
-        # report.  Avoid replaying that table if an older browser still calls
-        # this hidden endpoint during a rolling frontend update.
-        return {
-            "pipeline": "vnext",
-            "total": 0,
-            "page": page,
-            "page_size": page_size,
-            "items": [],
-        }
-
     campaign = get_one(campaign_id)
     if not campaign:
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
@@ -2107,6 +2135,23 @@ def get_realtime_sent_records(campaign_id: int, page: int = 1, page_size: int = 
             os.path.splitext(fname)[0]
             for fname in os.listdir(output_dir)
             if re.match(r"^\d{8}\.csv$", fname)
+        }
+
+    if _vnext_pipeline_active():
+        # The daily CSV is already produced by the realtime ingestion
+        # projection.  Listing names only keeps this control-plane read out of
+        # the send path and avoids replaying the high-volume legacy task table.
+        records = [{
+            "date": f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}",
+            "filename": f"{date_key}.csv",
+        } for date_key in sorted(output_dates, reverse=True)]
+        offset = max(0, page - 1) * page_size
+        return {
+            "pipeline": "vnext",
+            "total": len(records),
+            "page": page,
+            "page_size": page_size,
+            "items": records[offset:offset + page_size],
         }
 
     rows = read_transaction(

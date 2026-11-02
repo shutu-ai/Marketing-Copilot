@@ -38,14 +38,16 @@ test('realtime campaign detail shows current watch files in its own tab', async 
     }
     if (url.pathname === '/api/realtime-campaigns/7/stats') {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
-        file_count: 1, total_msisdn_sum: 2, total_matched: 1,
+        pipeline: 'vnext', file_count: 1, total_msisdn_sum: 2, total_matched: 1,
       }) })
     }
     if (url.pathname === '/api/realtime-campaigns/7/files') {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ total: 0, items: [] }) })
     }
     if (url.pathname === '/api/realtime-campaigns/7/sent-records') {
-      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ total: 0, items: [] }) })
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        pipeline: 'vnext', total: 1, items: [{ date: '2026-11-01', filename: '20261101.csv' }],
+      }) })
     }
     if (url.pathname === '/api/realtime-campaigns/7/watch-files') {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(watchFiles) })
@@ -55,10 +57,14 @@ test('realtime campaign detail shows current watch files in its own tab', async 
 
   await page.goto('/campaign/realtime/7')
   await expect(page).toHaveURL(/\/campaign\/realtime\/7$/)
+  const sentTab = page.getByRole('tab', { name: 'Sent records' })
+  await expect(sentTab).toBeVisible()
+  await sentTab.click()
+  await expect(page.getByText('20261101.csv')).toBeVisible()
   const watchTab = page.getByRole('tab', { name: 'Current Watch Files' })
   await expect(watchTab).toBeVisible()
   await watchTab.click()
   await expect(page.getByText('Android_20260909120000.csv')).toBeVisible()
-  await expect(page.getByText('Pending', { exact: true })).toBeVisible()
+  await expect(page.locator('.el-table').filter({ hasText: 'Android_20260909120000.csv' }).getByText('Pending', { exact: true })).toBeVisible()
   await page.screenshot({ path: path.join(os.tmpdir(), 'marketing-copilot-realtime-watch-files.png'), fullPage: false })
 })

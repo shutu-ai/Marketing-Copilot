@@ -140,13 +140,13 @@
             />
           </div>
         </el-tab-pane>
-        <el-tab-pane v-if="!isVnext" :label="$t('legacy.xe7502eb1')" name="sent">
+        <el-tab-pane :label="$t('legacy.xe7502eb1')" name="sent">
           <el-table :data="sentRecords" stripe style="width: 100%" v-loading="sentRecordsLoading">
             <el-table-column prop="date" :label="$t('campaign.date')" width="140" />
             <el-table-column prop="filename" :label="$t('legacy.x29139c2a')" min-width="220" />
-            <el-table-column prop="task_count" :label="$t('campaign.taskCreatedUsers')" width="120" />
-            <el-table-column prop="accepted_count" :label="$t('campaign.acceptedUsers')" width="120" />
-            <el-table-column prop="delivered_count" :label="$t('campaign.deliveredUsers')" width="120" />
+            <el-table-column v-if="!isVnext" prop="task_count" :label="$t('campaign.taskCreatedUsers')" width="120" />
+            <el-table-column v-if="!isVnext" prop="accepted_count" :label="$t('campaign.acceptedUsers')" width="120" />
+            <el-table-column v-if="!isVnext" prop="delivered_count" :label="$t('campaign.deliveredUsers')" width="120" />
             <el-table-column :label="$t('legacy.x82623f9e')" width="150" fixed="right">
               <template #default="{ row }">
                 <el-button text type="primary" size="small" @click="downloadSentRecord(row)">
@@ -464,9 +464,7 @@ async function loadDetail() {
   await loadCampaignDetail()
   await loadSmppOptions()
   await loadReceivedData(true)
-  // VNext has no legacy sent-record endpoint; avoid the extra request and
-  // keep the detail page on the received/projection flow.
-  if (!isVnext.value) await loadSentRecords(true)
+  await loadSentRecords(true)
   await loadWatchFiles(true)
 }
 
@@ -485,9 +483,6 @@ onMounted(loadDetail)
 watch(activeTab, (tab) => {
   if (tab === 'sent') void loadSentRecords(true)
   if (tab === 'watch-files') void loadWatchFiles(true)
-})
-watch(isVnext, (enabled) => {
-  if (enabled && activeTab.value === 'sent') activeTab.value = 'received'
 })
 </script>
 

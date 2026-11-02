@@ -69,6 +69,39 @@ def test_realtime_watch_files_are_scoped_to_campaign_and_paginated(isolated_db):
     assert second_page["items"][0]["row_count"] == 1
 
 
+def test_vnext_sent_records_list_daily_files_without_legacy_task_scan(isolated_db, monkeypatch):
+    _campaign_id, campaign_dir = _campaign(isolated_db)
+    output_dir = campaign_dir / "output"
+    output_dir.mkdir()
+    (output_dir / "20261031.csv").write_text(
+        "\ufeffmsisdn,send_time\n251900000001,2026-10-31 10:00:00+0000\n",
+        encoding="utf-8",
+    )
+    (output_dir / "20261101.csv").write_text(
+        "\ufeffmsisdn,send_time\n251900000002,2026-11-01 10:00:00+0000\n",
+        encoding="utf-8",
+    )
+    (output_dir / "not-a-daily-record.csv").write_text("ignored\n", encoding="utf-8")
+
+    monkeypatch.setattr(realtime_campaign_service, "_vnext_pipeline_active", lambda: True)
+    monkeypatch.setattr(
+        realtime_campaign_service,
+        "get_one",
+        lambda _campaign_id: {"campaign_dir": str(campaign_dir)},
+    )
+    monkeypatch.setattr(
+        realtime_campaign_service,
+        "read_transaction",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy task scan")),
+    )
+
+    result = realtime_campaign_service.get_realtime_sent_records(7, page=1, page_size=1)
+
+    assert result["pipeline"] == "vnext"
+    assert result["total"] == 2
+    assert result["items"] == [{"date": "2026-11-01", "filename": "20261101.csv"}]
+
+
 def test_local_watch_ignores_historical_files_and_caches_unchanged_directory(isolated_db, monkeypatch):
     campaign_id, campaign_dir = _campaign(isolated_db)
     watch_dir = isolated_db / "watch"
