@@ -7,7 +7,7 @@ import csv
 import errno
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from database import read_transaction, write_transaction
 from models.batch_campaign import BatchCampaignCreate, BatchCampaignUpdate
 from typing import Optional
@@ -17,7 +17,8 @@ import time
 import uuid
 from services import settings_service
 from services import (sms_task_service, operations_service, campaign_name_service,
-                      ingestion_job_service, backpressure_service, metrics_service)
+                      ingestion_job_service, backpressure_service, metrics_service,
+                      retention_service)
 
 logger = logging.getLogger(__name__)
 OVERDUE_CANCEL_BATCH_SIZE = max(
@@ -615,6 +616,205 @@ def get_prospects(campaign_id: int, search: str = "", field: str = "", value: st
     }
 
 
+def _cleanup_batch_campaign_files(campaign_dir: str, cutoff: float, limit: int = 500) -> int:
+    removed = 0
+    for dirname in ("output", "whitelist"):
+        root = os.path.join(campaign_dir, dirname)
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            if removed >= limit or not entry.is_file() or entry.name == retention_service.CAMPAIGN_MARKER:
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    os.unlink(entry.path)
+                    removed += 1
+            except OSError:
+                logger.debug("Unable to prune batch campaign file=%s", entry.path, exc_info=True)
+    return removed
+
+
+def _finalize_deleting_campaign(campaign_id: int, campaign_dir: str) -> bool:
+    if ingestion_job_service.has_live_leases("batch", campaign_id):
+        return False
+    if campaign_dir and os.path.isdir(campaign_dir):
+        try:
+            shutil.rmtree(campaign_dir)
+        except OSError:
+            logger.warning(
+                "Unable to remove deleting batch campaign directory=%s",
+                campaign_dir,
+                exc_info=True,
+            )
+            return False
+    try:
+        def finalize(conn):
+            ingestion_job_service.delete_campaign_records(conn, "batch", campaign_id)
+            conn.execute(
+                "DELETE FROM batch_campaign_daily_stats WHERE campaign_id=?", (campaign_id,)
+            )
+            conn.execute(
+                "DELETE FROM batch_campaign_batches WHERE campaign_id=?", (campaign_id,)
+            )
+            conn.execute(
+                "DELETE FROM batch_campaign_manifests WHERE campaign_id=?", (campaign_id,)
+            )
+            return bool(conn.execute(
+                "DELETE FROM batch_campaigns WHERE id=? AND status='deleting' RETURNING id",
+                (campaign_id,),
+            ).fetchone())
+
+        deleted = _run_campaign_write(
+            "delete.finalize",
+            finalize,
+        )
+    except Exception:
+        logger.warning("Unable to finalize deleted batch campaign=%s", campaign_id, exc_info=True)
+        return False
+    if deleted:
+        sms_task_service.invalidate_campaign_cache("batch", campaign_id)
+    return bool(deleted)
+
+
+def _finalize_deleting_campaigns(limit: int = 4) -> int:
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT id,campaign_dir FROM batch_campaigns
+               WHERE status='deleting' ORDER BY id LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall(),
+        operation="batch_campaign.delete_pending",
+    )
+    finalized = 0
+    for row in rows:
+        retention_service.ensure_campaign_marker(row["campaign_dir"], "batch", row["id"])
+        if _finalize_deleting_campaign(int(row["id"]), row["campaign_dir"]):
+            finalized += 1
+    return finalized
+
+
+def cleanup_batch_retention() -> dict:
+    """Bound ended batch campaign files without scanning active campaigns."""
+
+    retention_days = settings_service.get_data_retention_days()
+    cutoff = time.time() - retention_days * 86400
+    finalized = _finalize_deleting_campaigns()
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            "SELECT id,status,campaign_dir FROM batch_campaigns WHERE COALESCE(campaign_dir,'')<>''"
+        ).fetchall(),
+        operation="batch.retention.snapshot",
+    )
+    known_paths = set()
+    removed = 0
+    for row in rows:
+        campaign_dir = row["campaign_dir"]
+        known_paths.add(campaign_dir)
+        retention_service.ensure_campaign_marker(campaign_dir, "batch", row["id"])
+        if row["status"] in {"in_progress", "not_started", "paused", "deleting"}:
+            continue
+        removed += _cleanup_batch_campaign_files(campaign_dir, cutoff)
+    orphaned = retention_service.cleanup_orphan_campaign_dirs(
+        _get_batch_base_dir(),
+        "batch",
+        known_paths,
+        retention_days,
+    )
+    cutoff_text = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    ended_statuses = "'in_progress','not_started','paused','deleting'"
+
+    def cleanup_batch_history(conn):
+        manifest_rows = conn.execute(
+            f"""SELECT m.id FROM batch_campaign_manifests m
+                JOIN batch_campaigns c ON c.id=m.campaign_id
+                WHERE m.updated_at < ? AND m.status<>'building'
+                  AND c.status NOT IN ({ended_statuses})
+                ORDER BY m.id LIMIT ?""",
+            (cutoff_text, 1000),
+        ).fetchall()
+        manifest_ids = [int(row["id"]) for row in manifest_rows]
+        batches_removed = 0
+        if manifest_ids:
+            placeholders = ",".join("?" for _ in manifest_ids)
+            manifest_batch_rows = conn.execute(
+                f"SELECT id FROM batch_campaign_batches WHERE manifest_id IN ({placeholders}) ORDER BY id LIMIT ?",
+                [*manifest_ids, 1000],
+            ).fetchall()
+            manifest_batch_ids = [int(row["id"]) for row in manifest_batch_rows]
+            if manifest_batch_ids:
+                batch_placeholders = ",".join("?" for _ in manifest_batch_ids)
+                batches_removed += len(conn.execute(
+                    f"DELETE FROM batch_campaign_batches WHERE id IN ({batch_placeholders}) RETURNING id",
+                    manifest_batch_ids,
+                ).fetchall())
+        old_batch_rows = conn.execute(
+            f"""SELECT b.id FROM batch_campaign_batches b
+                WHERE b.updated_at < ?
+                  AND b.status NOT IN ('pending','processing','queued')
+                ORDER BY b.id LIMIT ?""",
+            (cutoff_text, 1000),
+        ).fetchall()
+        old_batch_ids = [int(row["id"]) for row in old_batch_rows]
+        if old_batch_ids:
+            placeholders = ",".join("?" for _ in old_batch_ids)
+            batches_removed += len(conn.execute(
+                f"DELETE FROM batch_campaign_batches WHERE id IN ({placeholders}) RETURNING id",
+                old_batch_ids,
+            ).fetchall())
+        old_stats_rows = conn.execute(
+            """SELECT d.id FROM batch_campaign_daily_stats d
+                WHERE d.updated_at < ?
+                ORDER BY d.id LIMIT ?""",
+            (cutoff_text, 1000),
+        ).fetchall()
+        old_stats_ids = [int(row["id"]) for row in old_stats_rows]
+        stats_removed = 0
+        if old_stats_ids:
+            placeholders = ",".join("?" for _ in old_stats_ids)
+            stats_removed = len(conn.execute(
+                f"DELETE FROM batch_campaign_daily_stats WHERE id IN ({placeholders}) RETURNING id",
+                old_stats_ids,
+            ).fetchall())
+        manifests_removed = 0
+        if manifest_ids:
+            placeholders = ",".join("?" for _ in manifest_ids)
+            manifests_removed = len(conn.execute(
+                f"""DELETE FROM batch_campaign_manifests m
+                    WHERE m.id IN ({placeholders})
+                      AND NOT EXISTS (
+                        SELECT 1 FROM batch_campaign_batches b WHERE b.manifest_id=m.id
+                      )
+                    RETURNING id""",
+                manifest_ids,
+            ).fetchall())
+        return {
+            "manifests": manifests_removed,
+            "batches": batches_removed,
+            "daily_stats": stats_removed,
+        }
+
+    db_removed = write_transaction(
+        cleanup_batch_history,
+        attempts=3,
+        operation="batch.retention.database_rows",
+        lock_timeout=1.0,
+    )
+    result = {
+        "retention_days": retention_days,
+        "files_removed": removed,
+        "deleting_campaigns_finalized": finalized,
+        "orphan_directories_removed": orphaned,
+        "database_rows_removed": db_removed,
+    }
+    if removed or finalized or orphaned or any(db_removed.values()):
+        logger.info("Batch retention cleanup completed result=%s", result)
+    return result
+
+
 def delete(campaign_id: int) -> bool:
     row = read_transaction(
         lambda conn: conn.execute(
@@ -624,6 +824,7 @@ def delete(campaign_id: int) -> bool:
     )
     if not row:
         return False
+    retention_service.ensure_campaign_marker(row["campaign_dir"], "batch", campaign_id)
 
     # DuckDB's foreign-key checker does not treat a child DELETE as removing
     # the reference until that transaction is committed.  Deleting the child
@@ -657,22 +858,11 @@ def delete(campaign_id: int) -> bool:
     if not _run_campaign_write("delete.children", remove_children):
         return False
 
-    # This must be a new committed transaction; see the FK note above.
-    deleted = _run_campaign_write(
-        "delete.parent",
-        lambda conn: conn.execute(
-            "DELETE FROM batch_campaigns WHERE id=?", (campaign_id,)
-        ).rowcount,
-    )
-    if not deleted:
-        return False
     campaign_dir = dict(row).get("campaign_dir", "")
-    if campaign_dir and os.path.isdir(campaign_dir):
-        try:
-            shutil.rmtree(campaign_dir)
-        except Exception:
-            logger.warning("Unable to remove deleted batch campaign directory=%s", campaign_dir, exc_info=True)
-    sms_task_service.invalidate_campaign_cache("batch", campaign_id)
+    # Finalization is deliberately after the deleting mark. If the process
+    # dies before the directory or parent row is removed, the next retention
+    # pass can see and retry the same campaign safely.
+    _finalize_deleting_campaign(campaign_id, campaign_dir)
     return True
 
 

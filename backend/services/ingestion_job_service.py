@@ -1,12 +1,16 @@
 """Persistent file manifests and resumable ingestion chunk leases."""
 
 import hashlib
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
 from database import read_transaction, write_transaction
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_LEASE_SECONDS = max(30, int(os.environ.get("MC_INGEST_CHUNK_LEASE_SECONDS", "300")))
@@ -150,7 +154,11 @@ def reserve_realtime_capacity(campaign_id: int, filename: str, file_size: int,
     def reserve(conn):
         conn.execute(
             """DELETE FROM realtime_inbox_reservations
-               WHERE TRY_CAST(expires_at AS TIMESTAMPTZ)<=CURRENT_TIMESTAMP"""
+               WHERE token IN (
+                 SELECT token FROM realtime_inbox_reservations
+                 WHERE TRY_CAST(expires_at AS TIMESTAMPTZ)<=CURRENT_TIMESTAMP
+                 ORDER BY expires_at LIMIT 1000
+               )"""
         )
         existing = conn.execute(
             """SELECT id FROM ingestion_files
@@ -716,6 +724,241 @@ def recover_expired_files() -> int:
         ).fetchall()
         return len(rows)
     return write_transaction(write, operation="realtime.ingestion.recover_files")
+
+
+def delete_campaign_records(conn, campaign_type: str, campaign_id: int) -> dict:
+    """Delete all ingestion state owned by a campaign inside its transaction."""
+
+    campaign_type = str(campaign_type)
+    campaign_id = int(campaign_id)
+    conn.execute(
+        """DELETE FROM ingestion_chunks
+           WHERE file_id IN (
+             SELECT id FROM ingestion_files WHERE campaign_type=? AND campaign_id=?
+           )""",
+        (campaign_type, campaign_id),
+    )
+    files = conn.execute(
+        """SELECT filename FROM ingestion_files
+           WHERE campaign_type=? AND campaign_id=?""",
+        (campaign_type, campaign_id),
+    ).fetchall()
+    conn.execute(
+        "DELETE FROM ingestion_files WHERE campaign_type=? AND campaign_id=?",
+        (campaign_type, campaign_id),
+    )
+    conn.execute(
+        "DELETE FROM processed_files WHERE campaign_type=? AND campaign_id=?",
+        (campaign_type, campaign_id),
+    )
+    conn.execute(
+        "DELETE FROM campaign_fairness_state WHERE campaign_type=? AND campaign_id=?",
+        (campaign_type, campaign_id),
+    )
+    conn.execute(
+        "DELETE FROM campaign_capacity_policies WHERE campaign_type=? AND campaign_id=?",
+        (campaign_type, campaign_id),
+    )
+    if campaign_type == "realtime":
+        conn.execute(
+            "DELETE FROM realtime_inbox_reservations WHERE campaign_id=?",
+            (campaign_id,),
+        )
+    return {"files": len(files), "campaign_type": campaign_type, "campaign_id": campaign_id}
+
+
+def has_live_leases(campaign_type: str, campaign_id: int) -> bool:
+    """Return whether a worker still owns a non-expired file/chunk lease."""
+
+    row = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT 1 FROM ingestion_files
+               WHERE campaign_type=? AND campaign_id=?
+                 AND (
+                   (status='processing' AND TRY_CAST(lease_expires_at AS TIMESTAMPTZ)>CURRENT_TIMESTAMP)
+                   OR EXISTS (
+                     SELECT 1 FROM ingestion_chunks c
+                     WHERE c.file_id=ingestion_files.id AND c.status='processing'
+                       AND TRY_CAST(c.lease_expires_at AS TIMESTAMPTZ)>CURRENT_TIMESTAMP
+                   )
+                 ) LIMIT 1""",
+            (str(campaign_type), int(campaign_id)),
+        ).fetchone(),
+        operation="ingestion.retention.live_leases",
+    )
+    return bool(row)
+
+
+def cleanup_retention(retention_days: int | None = None, *, limit: int = 1000) -> dict:
+    """Remove old terminal/orphan ingestion state in bounded transactions.
+
+    Active campaigns keep queued and retryable files. Deleted/deleting
+    campaigns are safe to reclaim once no worker lease remains.
+    """
+
+    from services import settings_service
+
+    days = settings_service.get_data_retention_days(retention_days)
+    batch_limit = max(100, min(10000, int(limit)))
+    cutoff = f"CURRENT_TIMESTAMP - ({days} * INTERVAL '1 day')"
+
+    def write(conn):
+        candidate_rows = conn.execute(
+            f"""SELECT f.id,f.campaign_type,f.campaign_id,f.filename,f.file_path,
+                       CASE WHEN f.campaign_type='realtime' THEN rc.status ELSE bc.status END AS campaign_status
+                FROM ingestion_files f
+                LEFT JOIN realtime_campaigns rc
+                  ON f.campaign_type='realtime' AND rc.id=f.campaign_id
+                LEFT JOIN batch_campaigns bc
+                  ON f.campaign_type='batch' AND bc.id=f.campaign_id
+                WHERE TRY_CAST(f.updated_at AS TIMESTAMPTZ) < {cutoff}
+                  AND (f.status IN ('completed','failed','quarantined') OR
+                       (
+                         (f.campaign_type='realtime' AND NOT EXISTS (
+                           SELECT 1 FROM realtime_campaigns c
+                           WHERE c.id=f.campaign_id
+                             AND c.status IN ('in_progress','not_started','paused')
+                         )) OR
+                         (f.campaign_type='batch' AND NOT EXISTS (
+                           SELECT 1 FROM batch_campaigns c
+                           WHERE c.id=f.campaign_id
+                             AND c.status IN ('in_progress','not_started','paused')
+                         ))
+                       ))
+                  AND (f.status<>'processing' OR f.lease_expires_at IS NULL
+                       OR TRY_CAST(f.lease_expires_at AS TIMESTAMPTZ)<=CURRENT_TIMESTAMP)
+                  AND NOT EXISTS (
+                        SELECT 1 FROM ingestion_chunks live_chunk
+                        WHERE live_chunk.file_id=f.id
+                          AND live_chunk.status='processing'
+                          AND TRY_CAST(live_chunk.lease_expires_at AS TIMESTAMPTZ)>CURRENT_TIMESTAMP
+                  )
+                ORDER BY f.id LIMIT ?""",
+            (batch_limit * 4,),
+        ).fetchall()
+        rows = []
+        for row in candidate_rows:
+            active_campaign = row["campaign_status"] in ("in_progress", "not_started", "paused")
+            if active_campaign and row["file_path"] and os.path.isfile(row["file_path"]):
+                continue
+            rows.append(row)
+            if len(rows) >= batch_limit:
+                break
+        file_ids = [int(row["id"]) for row in rows]
+        deleted_files = 0
+        deleted_chunks = 0
+        if file_ids:
+            placeholders = ",".join("?" for _ in file_ids)
+            deleted_chunks = len(conn.execute(
+                f"DELETE FROM ingestion_chunks WHERE file_id IN ({placeholders}) RETURNING id",
+                file_ids,
+            ).fetchall())
+            conn.execute(
+                f"DELETE FROM ingestion_files WHERE id IN ({placeholders})",
+                file_ids,
+            )
+            deleted_files = len(file_ids)
+            conn.execute("DROP TABLE IF EXISTS _mc_retention_file_keys")
+            conn.execute(
+                """CREATE TEMPORARY TABLE _mc_retention_file_keys(
+                       campaign_type VARCHAR, campaign_id BIGINT, filename VARCHAR
+                   )"""
+            )
+            try:
+                conn.executemany(
+                    "INSERT INTO _mc_retention_file_keys VALUES (?,?,?)",
+                    [(row["campaign_type"], int(row["campaign_id"]), row["filename"]) for row in rows],
+                )
+                conn.execute(
+                    """DELETE FROM processed_files p
+                       WHERE EXISTS (
+                         SELECT 1 FROM _mc_retention_file_keys k
+                         WHERE k.campaign_type=p.campaign_type
+                           AND k.campaign_id=p.campaign_id
+                           AND k.filename=p.filename
+                       )"""
+                )
+            finally:
+                conn.execute("DROP TABLE IF EXISTS _mc_retention_file_keys")
+
+        old_processed_candidates = conn.execute(
+            f"""SELECT p.id,p.file_path,
+                       CASE WHEN p.campaign_type='realtime' THEN rc.status ELSE bc.status END AS campaign_status
+                FROM processed_files p
+                LEFT JOIN realtime_campaigns rc
+                  ON p.campaign_type='realtime' AND rc.id=p.campaign_id
+                LEFT JOIN batch_campaigns bc
+                  ON p.campaign_type='batch' AND bc.id=p.campaign_id
+                WHERE TRY_CAST(COALESCE(p.completed_at,p.detected_at) AS TIMESTAMPTZ) < {cutoff}
+                  AND (
+                    p.status NOT IN ('pending','processing','retrying') OR
+                    (p.campaign_type='realtime' AND NOT EXISTS (
+                       SELECT 1 FROM realtime_campaigns c
+                       WHERE c.id=p.campaign_id
+                         AND c.status IN ('in_progress','not_started','paused')
+                    )) OR
+                    (p.campaign_type='batch' AND NOT EXISTS (
+                       SELECT 1 FROM batch_campaigns c
+                       WHERE c.id=p.campaign_id
+                         AND c.status IN ('in_progress','not_started','paused')
+                    ))
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ingestion_files live_file
+                    WHERE live_file.campaign_type=p.campaign_type
+                      AND live_file.campaign_id=p.campaign_id
+                      AND live_file.filename=p.filename
+                      AND (
+                        (live_file.status='processing' AND TRY_CAST(live_file.lease_expires_at AS TIMESTAMPTZ)>CURRENT_TIMESTAMP)
+                        OR EXISTS (
+                          SELECT 1 FROM ingestion_chunks live_chunk
+                          WHERE live_chunk.file_id=live_file.id
+                            AND live_chunk.status='processing'
+                            AND TRY_CAST(live_chunk.lease_expires_at AS TIMESTAMPTZ)>CURRENT_TIMESTAMP
+                        )
+                      )
+                  )
+                ORDER BY p.id LIMIT ?""",
+            (batch_limit * 4,),
+        ).fetchall()
+        old_processed = [
+            row for row in old_processed_candidates
+            if row["campaign_status"] not in ("in_progress", "not_started", "paused")
+            or not row["file_path"]
+            or not os.path.isfile(row["file_path"])
+        ][:batch_limit]
+        processed_ids = [int(row["id"]) for row in old_processed]
+        if processed_ids:
+            placeholders = ",".join("?" for _ in processed_ids)
+            conn.execute(f"DELETE FROM processed_files WHERE id IN ({placeholders})", processed_ids)
+
+        orphan_chunks = conn.execute(
+            f"""SELECT id FROM ingestion_chunks c
+                WHERE NOT EXISTS (SELECT 1 FROM ingestion_files f WHERE f.id=c.file_id)
+                ORDER BY id LIMIT ?""",
+            (batch_limit,),
+        ).fetchall()
+        orphan_chunk_ids = [int(row["id"]) for row in orphan_chunks]
+        if orphan_chunk_ids:
+            placeholders = ",".join("?" for _ in orphan_chunk_ids)
+            conn.execute(f"DELETE FROM ingestion_chunks WHERE id IN ({placeholders})", orphan_chunk_ids)
+
+        return {
+            "retention_days": days,
+            "ingestion_files": deleted_files,
+            "ingestion_chunks": deleted_chunks + len(orphan_chunk_ids),
+            "processed_files": len(processed_ids),
+        }
+
+    result = write_transaction(
+        write,
+        attempts=3,
+        operation="ingestion.retention.cleanup",
+        lock_timeout=1.0,
+    )
+    if any(result[key] for key in ("ingestion_files", "ingestion_chunks", "processed_files")):
+        logger.info("Ingestion retention cleanup completed result=%s", result)
+    return result
 
 
 def status() -> dict:

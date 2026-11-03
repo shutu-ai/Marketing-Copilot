@@ -452,6 +452,60 @@ def test_whitelist_cleanup_serializes_with_active_binding_repair(isolated_db, mo
     assert retired["index_path"] == ""
 
 
+def test_whitelist_cleanup_preserves_active_build_temp_path(isolated_db):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    index_dir = campaign_dir / "whitelist" / "index"
+    index_dir.mkdir(parents=True)
+    temp_path = index_dir / "whitelist-v000001-live.duckdb"
+    temp_path.write_bytes(b"building")
+    old_time = time.time() - 2 * 86400
+    os.utime(temp_path, (old_time, old_time))
+
+    realtime_whitelist_service._register_active_build(campaign_id, str(temp_path))
+    try:
+        result = realtime_whitelist_service.cleanup_versions(campaign_id)
+    finally:
+        realtime_whitelist_service._unregister_active_build(campaign_id, str(temp_path))
+
+    assert result["orphan_files_removed"] == 0
+    assert temp_path.is_file()
+
+
+def test_whitelist_build_queue_skips_deleting_campaign(isolated_db):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    source = campaign_dir / "whitelist-source.csv"
+    source.write_text("msisdn,language\n25190001,en\n", encoding="utf-8")
+    queued = realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE realtime_campaigns SET status='deleting' WHERE id=?", (campaign_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    assert realtime_whitelist_service.build_pending() == 0
+    assert queued["whitelist_version_id"]
+
+
+def test_realtime_campaign_delete_waits_for_active_whitelist_build(isolated_db, monkeypatch):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    monkeypatch.setattr(
+        realtime_whitelist_service,
+        "has_active_build",
+        lambda _campaign_id: True,
+    )
+    monkeypatch.setattr(
+        realtime_campaign_service.ingestion_job_service,
+        "has_live_leases",
+        lambda *_args: False,
+    )
+
+    assert realtime_campaign_service._finalize_deleting_campaign(
+        campaign_id, str(campaign_dir)
+    ) is False
+    assert campaign_dir.is_dir()
+
+
 def test_online_update_swap_preserves_runtime_configuration_and_data(tmp_path):
     target = tmp_path / "backend"
     new_tree = tmp_path / "payload-backend"

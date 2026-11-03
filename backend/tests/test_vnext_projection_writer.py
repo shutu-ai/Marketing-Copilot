@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from vnext.projection_writer import (
+    DEFAULT_PROJECTION_CHECKPOINT_BYTES,
     ProjectionWriter,
     ProjectionBackpressure,
     ProjectionWriterBusy,
@@ -103,10 +104,10 @@ def test_checkpoint_boundary_recreates_staging_and_survives_reopen(tmp_path):
         assert conn.execute("SELECT SUM(socket_written) FROM vnext_projection").fetchone() == (5,)
 
 
-def test_hot_checkpoint_is_disabled_by_default(monkeypatch, tmp_path):
+def test_hot_checkpoint_is_bounded_by_default(monkeypatch, tmp_path):
     monkeypatch.delenv('MC_VNEXT_PROJECTION_CHECKPOINT_BYTES', raising=False)
     writer = ProjectionWriter(tmp_path / 'no-hot-checkpoint.duckdb')
-    assert writer._checkpoint_bytes == 0
+    assert writer._checkpoint_bytes == DEFAULT_PROJECTION_CHECKPOINT_BYTES
 
 
 def test_hot_checkpoint_can_be_enabled_explicitly(monkeypatch, tmp_path):

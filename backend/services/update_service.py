@@ -732,24 +732,45 @@ def cleanup_staging(max_age_hours: int = 24) -> None:
         for old in backups[:-keep_backups]:
             shutil.rmtree(old, ignore_errors=True)
 
+    # Manual-mode runners write outside systemd's journal.  Keep diagnostic
+    # logs for the same user-configured data window, but never let them grow
+    # without bound when the status endpoint is not visited.
+    try:
+        from services import settings_service
+        log_cutoff = now - settings_service.get_data_retention_days() * 86400
+    except Exception:
+        log_cutoff = now - max(1, int(max_age_hours // 24 or 1)) * 86400
+    logs_root = root / "logs"
+    if logs_root.is_dir():
+        for log_path in logs_root.glob("runner-*.log"):
+            try:
+                if log_path.is_file() and log_path.stat().st_mtime < log_cutoff:
+                    log_path.unlink()
+            except OSError:
+                logger.debug("Unable to prune update runner log=%s", log_path, exc_info=True)
+
 
 # ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
 
-HISTORY_RETENTION_DAYS = 365
-
-
-def prune_history() -> None:
-    """Remove update-history rows older than the one-year retention window."""
+def prune_history(retention_days: int | None = None) -> None:
+    """Remove update-history rows outside the common data retention window."""
     try:
         from database import write_transaction
+        from services import settings_service
+        days = settings_service.get_data_retention_days(retention_days)
 
         write_transaction(
             lambda conn: conn.execute(
-                f"""DELETE FROM update_history
-                   WHERE try_cast(created_at AS TIMESTAMP)
-                         < CURRENT_TIMESTAMP - INTERVAL '{HISTORY_RETENTION_DAYS} days'"""
+                """DELETE FROM update_history
+                   WHERE id IN (
+                     SELECT id FROM update_history
+                     WHERE try_cast(created_at AS TIMESTAMP)
+                           < CURRENT_TIMESTAMP - (? * INTERVAL '1 day')
+                     ORDER BY id LIMIT 2000
+                   )""",
+                (days,),
             ),
             attempts=3,
             operation="update.history.prune",

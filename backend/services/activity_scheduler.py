@@ -200,11 +200,21 @@ def _run():
             if ticks % 20 == 0:
                 _run_stage("recover_expired_chunks", ingestion_job_service.recover_expired_chunks)
                 _run_stage("realtime_retention", realtime_campaign_service.cleanup_realtime_retention)
+                _run_stage("batch_retention", batch_campaign_service.cleanup_batch_retention)
+                _run_stage("ingestion_retention", ingestion_job_service.cleanup_retention)
+                _run_stage(
+                    "realtime_intermediate_cleanup",
+                    realtime_campaign_service.cleanup_realtime_intermediate_files,
+                )
                 from services import realtime_whitelist_service
                 _run_stage("whitelist_cleanup", realtime_whitelist_service.cleanup_versions)
+                from services import retention_service, task_archive_service, update_service
+                _run_stage("history_retention", retention_service.cleanup_history)
+                _run_stage("update_staging_retention", update_service.cleanup_staging)
                 if _vnext_active():
                     # Retry a deferred control message without entering the
                     # VNext send path or restarting its workers.
+                    _run_stage("task_archive_retention", task_archive_service.cleanup_archives)
                     _run_stage("vnext_retention_config", vnext_service.apply_retention_days)
                 else:
                     _run_stage("task_retention", sms_task_service.cleanup_task_retention)

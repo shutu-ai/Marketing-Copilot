@@ -40,6 +40,9 @@ class ProjectionBackpressure(RuntimeError):
     pass
 
 
+DEFAULT_PROJECTION_CHECKPOINT_BYTES = 512 * 1024 * 1024
+
+
 def _fatal_storage_error(error: Exception) -> bool:
     """Return whether retrying this writer connection can make progress."""
     import sqlite3
@@ -666,15 +669,17 @@ class ProjectionWriter:
         self._campaign_daily_totals_cached_at = 0.0
         self._campaign_daily_totals_cache: list[dict] = []
         self._retention_pending_sidecar_ids: set[str] = set()
-        # Keep durable WAL commits in the hot path, but leave checkpointing to
-        # the stopped-service maintenance command by default. Tests and
-        # operators can still opt in explicitly.
+        # Keep durable WAL commits in the hot path, but checkpoint only at a
+        # clean batch boundary once the WAL reaches a bounded size.
         try:
             configured_checkpoint_bytes = int(
-                os.environ.get('MC_VNEXT_PROJECTION_CHECKPOINT_BYTES', '0')
+                os.environ.get(
+                    'MC_VNEXT_PROJECTION_CHECKPOINT_BYTES',
+                    str(DEFAULT_PROJECTION_CHECKPOINT_BYTES),
+                )
             )
         except (TypeError, ValueError):
-            configured_checkpoint_bytes = 0
+            configured_checkpoint_bytes = DEFAULT_PROJECTION_CHECKPOINT_BYTES
         self._checkpoint_bytes = max(0, configured_checkpoint_bytes)
         self._checkpoint_retry_at = 0.0
         self._checkpoint_error = ""
@@ -726,10 +731,9 @@ class ProjectionWriter:
                 # path once the WAL becomes large.
                 self._conn = duckdb.connect(self.db_path)
                 try:
-                    # A very high threshold disables automatic checkpoints
-                    # for the hot writer without using the debug-only
-                    # per-commit switch. Offline maintenance performs
-                    # explicit checkpoints at clean batch boundaries.
+                    # Keep DuckDB's automatic threshold out of mixed hot
+                    # transactions; _checkpoint_if_due performs the bounded
+                    # checkpoint at a clean batch boundary after commit.
                     self._conn.execute("SET wal_autocheckpoint='1TB'")
                 except Exception:
                     # Keep compatibility with older DuckDB builds that do

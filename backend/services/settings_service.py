@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 
 from database import get_connection, read_transaction, write_transaction
@@ -79,6 +80,25 @@ def get_setting(key: str, default: str = "") -> str:
         operation="settings.get",
     )
     return row["value"] if row else default
+
+
+def get_data_retention_days(value: str | int | None = None) -> int:
+    """Return the Basic Settings data-retention window with safe bounds.
+
+    ``sms_task_retention_days`` is the existing user-facing setting.  Keep
+    its key for compatibility while using it as the common retention window
+    for terminal task, ingestion, audit and local archive data.
+    """
+
+    if value is None:
+        value = get_setting(
+            "sms_task_retention_days",
+            os.environ.get("MC_VNEXT_RETENTION_DAYS", "7"),
+        )
+    try:
+        return max(1, min(3650, int(value)))
+    except (TypeError, ValueError):
+        return 7
 
 
 def set_setting(key: str, value: str) -> dict:

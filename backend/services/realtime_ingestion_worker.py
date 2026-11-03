@@ -2,7 +2,6 @@
 
 import logging
 import os
-import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -191,47 +190,8 @@ def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str, worker
 
 
 def _cleanup_orphaned_intermediate_files():
-    """Remove scratch files left behind by a previous worker process."""
-    removed = 0
-    temp_dir = tempfile.gettempdir()
-    try:
-        for filename in os.listdir(temp_dir):
-            if not (filename.startswith("mc-realtime-") and filename.endswith(".duckdb")):
-                continue
-            path = os.path.join(temp_dir, filename)
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-                    removed += 1
-            except OSError as exc:
-                logger.warning("Realtime scratch cleanup failed file=%s error=%s", path, exc)
-    except OSError as exc:
-        logger.warning("Realtime scratch directory scan failed dir=%s error=%s", temp_dir, exc)
-    campaign_dirs = read_transaction(
-        lambda conn: [
-            row["campaign_dir"] for row in conn.execute(
-                "SELECT campaign_dir FROM realtime_campaigns WHERE COALESCE(campaign_dir,'')<>''"
-            ).fetchall()
-        ],
-        operation="realtime.ingestion.scratch_campaign_dirs",
-    )
-    for campaign_dir in campaign_dirs:
-        inbox_dir = os.path.join(campaign_dir, "inbox")
-        try:
-            for filename in os.listdir(inbox_dir):
-                if not (filename.startswith(".sftp-") and filename.endswith(".part")):
-                    continue
-                path = os.path.join(inbox_dir, filename)
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                        removed += 1
-                except OSError as exc:
-                    logger.warning("Realtime SFTP temp cleanup failed file=%s error=%s", path, exc)
-        except OSError:
-            continue
-    if removed:
-        logger.info("Realtime orphaned intermediate files removed count=%s", removed)
+    """Remove only stale, owner-free scratch files."""
+    realtime_campaign_service.cleanup_realtime_intermediate_files()
 
 
 def _mark_retry(job: dict, processed_id, decision, error, retry_count, worker_id: str):

@@ -15,6 +15,8 @@ import time
 import duckdb
 import tempfile
 import threading
+import uuid
+from pathlib import Path
 from database import read_transaction, write_transaction
 from models.realtime_campaign import RealtimeCampaignCreate, RealtimeCampaignUpdate
 from services import settings_service
@@ -93,6 +95,21 @@ _watch_pending_stability = {}
 _watch_copy_queue = queue.Queue(maxsize=WATCH_COPY_QUEUE_SIZE)
 _watch_copy_stop = threading.Event()
 _watch_copy_threads = []
+_REALTIME_SCRATCH_ROOT = Path(
+    os.environ.get(
+        "MC_REALTIME_SCRATCH_ROOT",
+        os.path.join(tempfile.gettempdir(), "marketing-copilot-realtime"),
+    )
+)
+_REALTIME_PROCESS_SCRATCH_DIR = _REALTIME_SCRATCH_ROOT / (
+    f"run-{os.getpid()}-{uuid.uuid4().hex}"
+)
+try:
+    _REALTIME_SCRATCH_STALE_SECONDS = max(
+        3600, int(os.environ.get("MC_REALTIME_SCRATCH_STALE_SECONDS", "86400"))
+    )
+except (TypeError, ValueError):
+    _REALTIME_SCRATCH_STALE_SECONDS = 86400
 _watch_copy_start_lock = threading.Lock()
 _watch_campaign_cursor = 0
 _sftp_campaign_cursor = 0
@@ -461,6 +478,105 @@ def _ensure_campaign_dir(campaign: dict) -> str:
     return os.path.join(base, dirname)
 
 
+def realtime_scratch_dir() -> str:
+    """Return a private scratch directory for this process/run."""
+
+    _REALTIME_PROCESS_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    marker = _REALTIME_PROCESS_SCRATCH_DIR / ".owner"
+    if not marker.exists():
+        marker.write_text(str(os.getpid()), encoding="ascii")
+    return str(_REALTIME_PROCESS_SCRATCH_DIR)
+
+
+def _process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def cleanup_realtime_intermediate_files() -> dict:
+    """Clean only stale scratch files not owned by a live process."""
+
+    root = _REALTIME_SCRATCH_ROOT
+    current = Path(realtime_scratch_dir()).resolve()
+    removed_scratch = 0
+    if root.is_dir():
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir() or entry.resolve() == current:
+                continue
+            marker = entry / ".owner"
+            try:
+                age = time.time() - entry.stat().st_mtime
+                pid = int(marker.read_text(encoding="ascii").strip()) if marker.is_file() else 0
+                if age < _REALTIME_SCRATCH_STALE_SECONDS or _process_is_running(pid):
+                    continue
+                shutil.rmtree(entry)
+                removed_scratch += 1
+            except (OSError, ValueError):
+                logger.warning("Realtime private scratch cleanup failed path=%s", entry, exc_info=True)
+
+    # Remove files created by older releases only after a long grace period;
+    # the current release never shares this global namespace with live work.
+    removed_legacy = 0
+    legacy_root = Path(tempfile.gettempdir())
+    try:
+        legacy_entries = list(legacy_root.glob("mc-realtime-*.duckdb"))
+    except OSError:
+        legacy_entries = []
+    for path in legacy_entries:
+        try:
+            if time.time() - path.stat().st_mtime < _REALTIME_SCRATCH_STALE_SECONDS:
+                continue
+            path.unlink()
+            removed_legacy += 1
+        except OSError:
+            logger.debug("Unable to remove legacy realtime scratch=%s", path, exc_info=True)
+
+    removed_parts = 0
+    campaigns = read_transaction(
+        lambda conn: [
+            row["campaign_dir"] for row in conn.execute(
+                "SELECT campaign_dir FROM realtime_campaigns WHERE COALESCE(campaign_dir,'')<>''"
+            ).fetchall()
+        ],
+        operation="realtime.ingestion.scratch_campaign_dirs",
+    )
+    for campaign_dir in campaigns:
+        inbox_dir = Path(str(campaign_dir)) / "inbox"
+        if not inbox_dir.is_dir():
+            continue
+        try:
+            entries = list(inbox_dir.glob(".sftp-*.part"))
+        except OSError:
+            entries = []
+        for path in entries:
+            try:
+                if time.time() - path.stat().st_mtime < _REALTIME_SCRATCH_STALE_SECONDS:
+                    continue
+                path.unlink()
+                removed_parts += 1
+            except OSError:
+                logger.debug("Unable to remove stale SFTP part=%s", path, exc_info=True)
+    result = {
+        "private_scratch": removed_scratch,
+        "legacy_scratch": removed_legacy,
+        "sftp_parts": removed_parts,
+    }
+    if any(result.values()):
+        logger.info("Realtime intermediate cleanup completed result=%s", result)
+    return result
+
+
 def _fmt_days(days: Optional[list]) -> str:
     return json.dumps(days, ensure_ascii=False) if days else "[]"
 
@@ -748,6 +864,69 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
     return result
 
 
+def _finalize_deleting_campaign(campaign_id: int, campaign_dir: str) -> bool:
+    if ingestion_job_service.has_live_leases("realtime", campaign_id):
+        return False
+    if realtime_whitelist_service.has_active_build(campaign_id):
+        logger.info(
+            "Deferring realtime campaign deletion while whitelist index builds campaign=%s",
+            campaign_id,
+        )
+        return False
+    if campaign_dir and os.path.isdir(campaign_dir):
+        try:
+            shutil.rmtree(campaign_dir)
+        except OSError:
+            logger.warning(
+                "Unable to remove deleting realtime campaign directory=%s",
+                campaign_dir,
+                exc_info=True,
+            )
+            return False
+    try:
+        def finalize(conn):
+            ingestion_job_service.delete_campaign_records(conn, "realtime", campaign_id)
+            conn.execute(
+                "DELETE FROM realtime_campaign_files WHERE campaign_id=?", (campaign_id,)
+            )
+            conn.execute(
+                "DELETE FROM realtime_whitelist_versions WHERE campaign_id=?", (campaign_id,)
+            )
+            return bool(conn.execute(
+                "DELETE FROM realtime_campaigns WHERE id=? AND status='deleting' RETURNING id",
+                (campaign_id,),
+            ).fetchone())
+
+        deleted = _run_campaign_write(
+            "delete.finalize",
+            finalize,
+        )
+    except Exception:
+        logger.warning("Unable to finalize deleted realtime campaign=%s", campaign_id, exc_info=True)
+        return False
+    if deleted:
+        sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
+    return bool(deleted)
+
+
+def _finalize_deleting_campaigns(limit: int = 4) -> int:
+    rows = read_transaction(
+        lambda conn: conn.execute(
+            """SELECT id,campaign_dir FROM realtime_campaigns
+               WHERE status='deleting' ORDER BY id LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall(),
+        operation="realtime_campaign.delete_pending",
+    )
+    finalized = 0
+    for row in rows:
+        from services import retention_service
+        retention_service.ensure_campaign_marker(row["campaign_dir"], "realtime", row["id"])
+        if _finalize_deleting_campaign(int(row["id"]), row["campaign_dir"]):
+            finalized += 1
+    return finalized
+
+
 def delete(campaign_id: int) -> bool:
     row = read_transaction(
         lambda conn: conn.execute(
@@ -757,20 +936,21 @@ def delete(campaign_id: int) -> bool:
     )
     if not row:
         return False
-    _run_campaign_write(
-        "delete",
-        lambda conn: (
-            conn.execute("DELETE FROM realtime_campaign_files WHERE campaign_id=?", (campaign_id,)),
-            conn.execute("DELETE FROM realtime_campaigns WHERE id=?", (campaign_id,)),
-        ),
-    )
     campaign_dir = dict(row).get("campaign_dir", "")
-    if campaign_dir and os.path.isdir(campaign_dir):
-        try:
-            shutil.rmtree(campaign_dir)
-        except Exception:
-            logger.warning("Unable to remove deleted realtime campaign directory=%s", campaign_dir, exc_info=True)
-    sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
+    from services import retention_service
+    retention_service.ensure_campaign_marker(campaign_dir, "realtime", campaign_id)
+    marked = _run_campaign_write(
+        "delete.mark",
+        lambda conn: bool(conn.execute(
+            "UPDATE realtime_campaigns SET status='deleting',updated_at=CURRENT_TIMESTAMP WHERE id=? RETURNING id",
+            (campaign_id,),
+        ).fetchone()),
+    )
+    if not marked:
+        return False
+    # Finalization is retried by the periodic retention pass if a live worker
+    # or filesystem failure prevents immediate removal.
+    _finalize_deleting_campaign(campaign_id, campaign_dir)
     return True
 
 
@@ -1632,7 +1812,9 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
         matched_row_count = 0
         task_result = {"success": True, "created": 0, "duplicate": 0,
                        "excluded": 0, "invalid": 0, "no_template": 0}
-        unique_fd, unique_path = tempfile.mkstemp(prefix="mc-realtime-", suffix=".duckdb")
+        unique_fd, unique_path = tempfile.mkstemp(
+            prefix="unique-", suffix=".duckdb", dir=realtime_scratch_dir()
+        )
         os.close(unique_fd)
         os.unlink(unique_path)
         unique_conn = duckdb.connect(unique_path)
@@ -3313,10 +3495,12 @@ def cleanup_realtime_retention():
     output_retention_days = max(1, int(settings_service.get_setting("realtime_output_retention_days", os.environ.get("MC_REALTIME_OUTPUT_RETENTION_DAYS", "30"))))
     input_cutoff_ts = (datetime.now() - timedelta(days=input_retention_days)).timestamp()
     output_cutoff_ts = (datetime.now() - timedelta(days=output_retention_days)).timestamp()
+    data_retention_days = settings_service.get_data_retention_days()
+    finalized = _finalize_deleting_campaigns()
 
     def read_retention_snapshot(conn):
         rows = conn.execute(
-            "SELECT id, campaign_dir FROM realtime_campaigns WHERE campaign_dir<>''"
+            "SELECT id, status, campaign_dir FROM realtime_campaigns WHERE campaign_dir<>''"
         ).fetchall()
         protected_paths = {
             os.path.abspath(row["file_path"])
@@ -3335,14 +3519,26 @@ def cleanup_realtime_retention():
         operation="realtime.retention.snapshot",
     )
     deleted = 0
+    try:
+        file_limit = max(100, min(5000, int(os.environ.get("MC_RETENTION_FILE_DELETE_BATCH", "500"))))
+    except (TypeError, ValueError):
+        file_limit = 500
+    known_paths = set()
     for row in rows:
+        if deleted >= file_limit:
+            break
         campaign_dir = row["campaign_dir"]
+        known_paths.add(campaign_dir)
+        from services import retention_service
+        retention_service.ensure_campaign_marker(campaign_dir, "realtime", row["id"])
         for dirname in ("inbox", "received", "duplicates", "quarantine", "output"):
             cutoff_ts = output_cutoff_ts if dirname == "output" else input_cutoff_ts
             path = os.path.join(campaign_dir, dirname)
             if not os.path.isdir(path):
                 continue
             for fname in os.listdir(path):
+                if deleted >= file_limit:
+                    break
                 file_path = os.path.join(path, fname)
                 if not os.path.isfile(file_path):
                     continue
@@ -3354,16 +3550,35 @@ def cleanup_realtime_retention():
                         deleted += 1
                 except OSError:
                     pass
-    db_cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
-    write_transaction(
+    db_cutoff = (datetime.now() - timedelta(days=data_retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+    db_removed = write_transaction(
         lambda conn: conn.execute(
-            "DELETE FROM realtime_campaign_files WHERE created_at < ?", (db_cutoff,)
-        ),
+            """DELETE FROM realtime_campaign_files
+               WHERE id IN (
+                 SELECT id FROM realtime_campaign_files
+                 WHERE created_at < ? ORDER BY id LIMIT 2000
+               ) RETURNING id""",
+            (db_cutoff,),
+        ).fetchall(),
         attempts=3,
         operation="realtime.retention.database_rows",
         lock_timeout=1.0,
     )
-    logger.info(
-        "Realtime file retention cleanup completed input_retention_days=%s output_retention_days=%s deleted=%s",
-        input_retention_days, output_retention_days, deleted,
+    from services import retention_service
+    orphaned = retention_service.cleanup_orphan_campaign_dirs(
+        _get_base_dir(), "realtime", known_paths, data_retention_days,
     )
+    result = {
+        "input_retention_days": input_retention_days,
+        "output_retention_days": output_retention_days,
+        "data_retention_days": data_retention_days,
+        "files_removed": deleted,
+        "database_rows_removed": len(db_removed or []),
+        "deleting_campaigns_finalized": finalized,
+        "orphan_directories_removed": orphaned,
+    }
+    logger.info(
+        "Realtime file retention cleanup completed result=%s",
+        result,
+    )
+    return result

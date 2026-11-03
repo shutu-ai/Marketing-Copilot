@@ -20,6 +20,44 @@ INDEX_DIRNAME = "index"
 BUILD_CHUNK_SIZE = max(1000, int(os.environ.get("MC_REALTIME_WHITELIST_BUILD_CHUNK", "10000")))
 # shortcut: process-local lock, the supported unit runs one uvicorn worker; add an inter-process lock before increasing workers.
 _WHITELIST_FILE_LOCK = threading.RLock()
+_ACTIVE_WHITELIST_BUILD_PATHS: dict[int, set[str]] = {}
+
+
+def _canonical_file_path(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _register_active_build(campaign_id: int, temp_path: str) -> None:
+    with _WHITELIST_FILE_LOCK:
+        _ACTIVE_WHITELIST_BUILD_PATHS.setdefault(int(campaign_id), set()).add(
+            _canonical_file_path(temp_path)
+        )
+
+
+def _unregister_active_build(campaign_id: int, temp_path: str) -> None:
+    with _WHITELIST_FILE_LOCK:
+        paths = _ACTIVE_WHITELIST_BUILD_PATHS.get(int(campaign_id))
+        if not paths:
+            return
+        paths.discard(_canonical_file_path(temp_path))
+        if not paths:
+            _ACTIVE_WHITELIST_BUILD_PATHS.pop(int(campaign_id), None)
+
+
+def has_active_build(campaign_id: int) -> bool:
+    with _WHITELIST_FILE_LOCK:
+        return bool(_ACTIVE_WHITELIST_BUILD_PATHS.get(int(campaign_id)))
+
+
+def _active_build_paths(campaign_id: Optional[int] = None) -> set[str]:
+    with _WHITELIST_FILE_LOCK:
+        if campaign_id is not None:
+            return set(_ACTIVE_WHITELIST_BUILD_PATHS.get(int(campaign_id), set()))
+        return {
+            path
+            for paths in _ACTIVE_WHITELIST_BUILD_PATHS.values()
+            for path in paths
+        }
 
 
 def _build_chunk_size() -> int:
@@ -681,22 +719,36 @@ def build_version(version_id: int) -> dict:
         raise FileNotFoundError(message)
     campaign_row = read_transaction(
         lambda conn: conn.execute(
-            "SELECT campaign_dir FROM realtime_campaigns WHERE id=?",
+            "SELECT campaign_dir,status FROM realtime_campaigns WHERE id=?",
             (version["campaign_id"],),
         ).fetchone(),
         operation="whitelist.build.campaign_dir",
     )
-    campaign_dir = campaign_row["campaign_dir"] if campaign_row else ""
+    if not campaign_row:
+        raise ValueError("realtime campaign not found")
+    if campaign_row["status"] == "deleting":
+        raise RuntimeError("realtime campaign is being deleted")
+    campaign_dir = campaign_row["campaign_dir"]
     index_dir = os.path.join(campaign_dir, "whitelist", INDEX_DIRNAME)
     os.makedirs(index_dir, exist_ok=True)
     final_path = os.path.join(index_dir, f"whitelist-v{int(version['version_no']):06d}.duckdb")
     fd, temp_path = tempfile.mkstemp(prefix=f"whitelist-v{version['version_no']:06d}-", suffix=".duckdb", dir=index_dir)
     os.close(fd)
-    os.unlink(temp_path)
+    _register_active_build(version["campaign_id"], temp_path)
     started = time.monotonic()
     timeout_seconds = _build_timeout_seconds()
     rows = normalized = 0
     try:
+        current_campaign = read_transaction(
+            lambda conn: conn.execute(
+                "SELECT status FROM realtime_campaigns WHERE id=?",
+                (version["campaign_id"],),
+            ).fetchone(),
+            operation="whitelist.build.status",
+        )
+        if not current_campaign or current_campaign["status"] == "deleting":
+            raise RuntimeError("realtime campaign is being deleted")
+        os.unlink(temp_path)
         db = duckdb.connect(temp_path)
         try:
             _configure(db)
@@ -807,6 +859,7 @@ def build_version(version_id: int) -> dict:
                          version["campaign_id"], version_id, version["version_no"])
         raise
     finally:
+        _unregister_active_build(version["campaign_id"], temp_path)
         if os.path.exists(temp_path):
             try:
                 os.unlink(temp_path)
@@ -817,7 +870,10 @@ def build_version(version_id: int) -> dict:
 def build_pending(limit: int = 1) -> int:
     rows = read_transaction(
         lambda conn: conn.execute(
-            "SELECT id FROM realtime_whitelist_versions WHERE status='building' ORDER BY created_at,id LIMIT ?",
+            """SELECT v.id FROM realtime_whitelist_versions v
+               JOIN realtime_campaigns c ON c.id=v.campaign_id
+               WHERE v.status='building' AND COALESCE(c.status,'')<>'deleting'
+               ORDER BY v.created_at,v.id LIMIT ?""",
             (max(1, limit),),
         ).fetchall(),
         operation="whitelist.build.pending",
@@ -887,6 +943,68 @@ def migrate_legacy_versions(limit: int = 1) -> int:
         except Exception:
             logger.exception("Realtime legacy whitelist migration failed campaign=%s", row["id"])
     return migrated
+
+
+def _cleanup_orphan_files(campaign_id: Optional[int], retention_days: int) -> int:
+    """Remove unreferenced whitelist files only inside known campaign roots."""
+
+    def snapshot(conn):
+        where = "WHERE COALESCE(c.campaign_dir,'')<>''"
+        params = []
+        if campaign_id:
+            where += " AND c.id=?"
+            params.append(int(campaign_id))
+        return conn.execute(
+            f"""SELECT c.id,c.campaign_dir,v.index_path,v.source_path
+                FROM realtime_campaigns c
+                LEFT JOIN realtime_whitelist_versions v ON v.campaign_id=c.id
+                {where}""",
+            params,
+        ).fetchall()
+
+    rows = read_transaction(snapshot, operation="whitelist.cleanup.orphan_snapshot")
+    known_by_campaign = {}
+    for row in rows:
+        item = known_by_campaign.setdefault(int(row["id"]), {
+            "campaign_dir": row["campaign_dir"], "paths": set(),
+        })
+        for column in ("index_path", "source_path"):
+            value = str(row[column] or "")
+            if value:
+                item["paths"].add(os.path.normcase(os.path.abspath(value)))
+
+    cutoff = time.time() - max(1, int(retention_days)) * 86400
+    build_grace = max(3600, _build_timeout_seconds() + 600)
+    active_build_paths = _active_build_paths(campaign_id)
+    removed = 0
+    for item in known_by_campaign.values():
+        campaign_dir = str(item["campaign_dir"] or "")
+        for dirname in (INDEX_DIRNAME, "sources"):
+            directory = os.path.join(campaign_dir, "whitelist", dirname)
+            if not os.path.isdir(directory):
+                continue
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                if removed >= 100 or not entry.is_file(follow_symlinks=False):
+                    continue
+                path = os.path.normcase(os.path.abspath(entry.path))
+                if path in item["paths"] or path in active_build_paths:
+                    continue
+                try:
+                    age = time.time() - entry.stat(follow_symlinks=False).st_mtime
+                    if dirname == INDEX_DIRNAME:
+                        old_enough = age >= build_grace
+                    else:
+                        old_enough = entry.stat(follow_symlinks=False).st_mtime < cutoff
+                    if old_enough:
+                        os.unlink(entry.path)
+                        removed += 1
+                except OSError:
+                    logger.debug("Unable to remove orphan whitelist file=%s", entry.path, exc_info=True)
+    return removed
 
 
 def _cleanup_versions(campaign_id: Optional[int] = None) -> dict:
@@ -982,11 +1100,16 @@ def _cleanup_versions(campaign_id: Optional[int] = None) -> dict:
             removed += 1
         return {"retired": retired, "removed": removed}
 
-    return write_transaction(
+    result = write_transaction(
         finalize,
         attempts=3,
         operation="whitelist.cleanup.finalize",
     )
+    result["orphan_files_removed"] = _cleanup_orphan_files(
+        campaign_id,
+        max(retention_days, settings_service.get_data_retention_days()),
+    )
+    return result
 
 
 def cleanup_versions(campaign_id: Optional[int] = None) -> dict:

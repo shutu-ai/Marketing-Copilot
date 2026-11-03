@@ -2956,9 +2956,7 @@ def _find_task_by_message_id(conn, message_id: str,
 
 
 def cleanup_task_retention() -> int:
-    retention_days = max(1, int(settings_service.get_setting(
-        "sms_task_retention_days", os.environ.get("MC_VNEXT_RETENTION_DAYS", "7")
-    )))
+    retention_days = settings_service.get_data_retention_days()
     cleanup_batch = max(1000, min(20000, int(os.environ.get("MC_TASK_CLEANUP_BATCH", "5000"))))
     from datetime import timedelta
     cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -2967,7 +2965,8 @@ def cleanup_task_retention() -> int:
     if archive_enabled:
         from services import task_archive_service
         archived_count = task_archive_service.archive_terminal_tasks(cutoff, cleanup_batch)["archived"]
-    active = "('queued','sending','retrying','submitted','accepted')"
+        task_archive_service.cleanup_archives(retention_days, limit=cleanup_batch)
+    active = "('queued','sending','retrying','submitted')"
     def cleanup(conn):
         rows = [] if archive_enabled else conn.execute(
             f"""SELECT id FROM sms_tasks
@@ -2977,11 +2976,8 @@ def cleanup_task_retention() -> int:
         ).fetchall()
         ids = [row["id"] for row in rows]
         if ids:
-            placeholders = ",".join("?" for _ in ids)
-            conn.execute(f"DELETE FROM sms_task_message_ids WHERE task_id IN ({placeholders})", ids)
-            conn.execute(f"DELETE FROM delivery_receipts WHERE task_id IN ({placeholders})", ids)
-            conn.execute(f"DELETE FROM task_events WHERE task_id IN ({placeholders})", ids)
-            conn.execute(f"DELETE FROM sms_tasks WHERE id IN ({placeholders})", ids)
+            from services import task_archive_service
+            task_archive_service.delete_task_artifacts(conn, ids)
         old_event_rows = conn.execute(
             "SELECT id FROM task_event_batches WHERE created_at < ? ORDER BY id LIMIT ?",
             (cutoff, cleanup_batch),
