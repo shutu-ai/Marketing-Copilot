@@ -1,0 +1,13 @@
+{
+  "canonical_markdown":"../Solution_Final.md",
+  "canonical_markdown_sha256":"b55c9061789e91845969b91dc0c3ab781668d9636837f539c35c5461b8aca17e",
+  "claims":[
+    {"id":"CLM-001","kind":"STATUS","statement":"Design only; no implemented or deployed performance claims.","markdown_anchor":"状态：工程设计，待实现与验收。","required_in_final":true,"evidence_ids":["EVD-006"],"requirement_ids":["REQ-005"]},
+    {"id":"CLM-002","kind":"CONSTRAINT","statement":"Expired unfinished and orphan payload may be dropped under user business policy.","markdown_anchor":"不跨窗口补发","required_in_final":true,"evidence_ids":["EVD-003","EVD-007"],"requirement_ids":["REQ-001"]},
+    {"id":"CLM-003","kind":"NUMERIC","statement":"Manifest budget contains missing data, so it is not the physical payload size.","markdown_anchor":"1,081,269,808 bytes","required_in_final":true,"evidence_ids":["EVD-002"],"requirement_ids":["REQ-003"]},
+    {"id":"CLM-004","kind":"NUMERIC","statement":"Current-day orphan records require current-window classification.","markdown_anchor":"93 条属 11-03","required_in_final":true,"evidence_ids":["EVD-003"],"requirement_ids":["REQ-001","REQ-003"]},
+    {"id":"CLM-005","kind":"CONSTRAINT","statement":"Payload and total storage budgets differ.","markdown_anchor":"payload admission budget 与全部受管存储总预算","required_in_final":true,"evidence_ids":["EVD-005"],"requirement_ids":["REQ-004"]},
+    {"id":"CLM-006","kind":"UNKNOWN","statement":"Workload sizing and deployed source identity require verification before rollout.","markdown_anchor":"Q-003 峰值窗口序列化量和目标硬件 GC 实测","required_in_final":true,"evidence_ids":[],"requirement_ids":["REQ-005","REQ-006"]},
+    {"id":"CLM-007","kind":"CONSTRAINT","statement":"Existing stop-time cleanup is insufficient for long-running operations.","markdown_anchor":"缺少可靠的常态回收闭环","required_in_final":true,"evidence_ids":["EVD-006"],"requirement_ids":["REQ-002"]}
+  ]
+}

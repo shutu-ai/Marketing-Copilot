@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import multiprocessing
 import os
@@ -26,6 +27,9 @@ from .route_credits import RouteCreditBroker
 from .spool import DEFAULT_MAX_SPOOL_BYTES, TaskSpool
 from .supervisor import WorkerSupervisor
 from .worker import ShardWorker
+
+
+logger = logging.getLogger(__name__)
 
 
 def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, context: dict) -> None:
@@ -121,6 +125,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         busy = busy or int(progress.get("pending_durability", 0) or 0) > 0
         payload = {
             "worker_id": int(worker_id),
+            "run_id": run_id,
             # ``active`` describes real protocol/progress work, not the fact
             # that the idle polling loop is currently running one pass.
             "active": busy,
@@ -394,6 +399,9 @@ class VNextRuntime:
             max_bytes=self.max_spool_bytes,
             clock=self.clock,
         )
+        # Repair stale manifest byte counters before admitting new work.  This
+        # is the startup compensation for a prior crash or interrupted GC.
+        self.spool.reconcile_capacity(persist=True)
         self.ingress_credit = StageCredit(
             "ingress",
             limit_items=max(1024, min(1_000_000, self.max_spool_bytes // 1024)),
@@ -505,6 +513,22 @@ class VNextRuntime:
         self._projection_last_error = ""
         self._daily_epoch_stop = threading.Event()
         self._daily_epoch_thread: threading.Thread | None = None
+        try:
+            self.spool_gc_interval_seconds = max(
+                5.0,
+                min(
+                    3600.0,
+                    float(os.environ.get("MC_VNEXT_SPOOL_GC_INTERVAL_SECONDS", "60")),
+                ),
+            )
+        except (TypeError, ValueError):
+            self.spool_gc_interval_seconds = 60.0
+        self._spool_gc_lock = threading.Lock()
+        self._spool_gc_last_at = 0.0
+        self._spool_gc_last_result: dict = {
+            "state": "not_run",
+            "interval_seconds": self.spool_gc_interval_seconds,
+        }
         write_process_metadata(
             self.diagnostics_root,
             "runtime-parent",
@@ -519,10 +543,74 @@ class VNextRuntime:
 
         return self.spool.rollover_if_needed()
 
+    def _workers_heartbeat_ready_for_gc(self) -> bool:
+        """Require a current-run heartbeat before unlinking expired segments."""
+
+        if not self._started or self.supervisor is None:
+            return True
+        workers = [
+            item for item in self._worker_progress()
+            if str(item.get("run_id") or "") == self.run_id
+        ]
+        if len(workers) < max(1, int(self.worker_count)):
+            return False
+        freshness = max(5.0, self.status_interval_seconds * 4.0)
+        now = time.time()
+        for item in workers:
+            if now - float(item.get("updated_at") or 0.0) > freshness:
+                return False
+        return True
+
+    def _run_spool_gc(self, *, force: bool = False, trigger: str = "interval") -> dict:
+        now = time.monotonic()
+        if not force and now - self._spool_gc_last_at < self.spool_gc_interval_seconds:
+            return dict(self._spool_gc_last_result)
+        if not self._workers_heartbeat_ready_for_gc():
+            result = {
+                "state": "waiting_for_workers",
+                "trigger": trigger,
+                "at": time.time(),
+            }
+            self._spool_gc_last_result = result
+            return dict(result)
+        if not self._spool_gc_lock.acquire(blocking=False):
+            return dict(self._spool_gc_last_result)
+        try:
+            # Expiry fencing makes old payloads safe; an open Windows handle
+            # simply causes this bounded batch to retry on the next tick.
+            # shortcut: 32 segments per maintenance tick, increase only if GC lag is observed.
+            results = self.spool.cleanup_closed_days(
+                max_segments=None if force else 32,
+            )
+            self._spool_gc_last_at = now
+            result = {
+                "state": "completed",
+                "trigger": trigger,
+                "at": time.time(),
+                "results": results,
+            }
+            self._spool_gc_last_result = result
+            return dict(result)
+        except Exception as exc:
+            result = {
+                "state": "error",
+                "trigger": trigger,
+                "at": time.time(),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self._spool_gc_last_result = result
+            logger.exception("VNext spool cleanup failed")
+            return dict(result)
+        finally:
+            self._spool_gc_lock.release()
+
     def _daily_epoch_loop(self) -> None:
         while not self._daily_epoch_stop.wait(0.25):
             try:
-                self.rollover_if_needed()
+                transition = self.rollover_if_needed()
+                self._run_spool_gc(
+                    trigger="rollover" if transition.get("changed") else "interval",
+                )
             except (OSError, RuntimeError, ValueError):
                 # The next tick retries; a delayed maintenance tick cannot
                 # reopen an old socket because workers check the spool fence.
@@ -686,6 +774,9 @@ class VNextRuntime:
             return
         self.progress_root.mkdir(parents=True, exist_ok=True)
         self.rollover_if_needed()
+        # Bound startup work; the resident loop continues the same plan in the
+        # background without holding up ingress for every historical segment.
+        self._run_spool_gc(trigger="startup")
         with self._control_lock:
             self._load_control_state()
             if not self.control_state_path.exists():
@@ -869,6 +960,7 @@ class VNextRuntime:
             "supervisor": self.supervisor.status() if self.supervisor else None,
             "projection": self.projection.snapshot(),
             "worker_progress": self._worker_progress(),
+            "spool_gc": dict(self._spool_gc_last_result),
             "daily_epoch": {
                 "business_day": spool.get("business_day") or self.spool.current_business_day,
                 "business_epoch": int(spool.get("business_epoch") or self.spool.business_epoch),
@@ -932,6 +1024,7 @@ class VNextRuntime:
     def stop(self) -> None:
         if self.supervisor:
             self.supervisor.stop()
+            self.supervisor = None
         if self._started:
             self._daily_epoch_stop.set()
             daily_thread = self._daily_epoch_thread
@@ -950,11 +1043,7 @@ class VNextRuntime:
             # Reclamation is deliberately after worker shutdown.  Closed-day
             # evidence remains in journals/projection; only old spool payloads
             # are eligible for deletion.
-            try:
-                self.spool.cleanup_closed_days()
-            except (OSError, RuntimeError, ValueError):
-                pass
-        self.supervisor = None
+            self._run_spool_gc(force=True, trigger="shutdown")
         self._started = False
         self.started_at = 0.0
         write_process_metadata(
@@ -1088,6 +1177,7 @@ class VNextRuntime:
             "projection_restart_cooldown_seconds": float(
                 self._projection_restart_cooldown_seconds
             ),
+            "spool_gc": dict(self._spool_gc_last_result),
         }
 
     def _idle_snapshot(self) -> dict:

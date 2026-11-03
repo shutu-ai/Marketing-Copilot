@@ -1,0 +1,10 @@
+{
+  "requirements": [
+    {"id":"REQ-001","text":"关窗后不补发，过期未完成及孤立payload可回收","priority":"P0","scope":"PROPOSED_TARGET","source_material_ids":["MAT-001"],"evidence_ids":["EVD-003","EVD-007"],"requirement_type":"BUSINESS","acceptance_intent":"TST-001/002/003：最终写前截止；开放窗口保留；unknown不重发"},
+    {"id":"REQ-002","text":"持续回收并在日终与启动时补偿","priority":"P0","scope":"PROPOSED_TARGET","source_material_ids":["MAT-001","MAT-002"],"evidence_ids":["EVD-001","EVD-006"],"requirement_type":"FUNCTIONAL","acceptance_intent":"TST-004/005/006：无需每日重启，历史占用有界"},
+    {"id":"REQ-003","text":"文件、manifest、索引、游标与计数一致且崩溃可恢复","priority":"P0","scope":"PROPOSED_TARGET","source_material_ids":["MAT-001","MAT-002"],"evidence_ids":["EVD-002","EVD-004","EVD-008","EVD-009"],"requirement_type":"DATA","acceptance_intent":"TST-007/008/009：幂等恢复、不复用编号、不产生可发送的拒绝残片"},
+    {"id":"REQ-004","text":"所有受管存储与恢复元数据有界","priority":"P0","scope":"PROPOSED_TARGET","source_material_ids":["MAT-001"],"evidence_ids":["EVD-005"],"requirement_type":"NFR","acceptance_intent":"TST-010/011：索引页复用、journal安全回收、总磁盘保护"},
+    {"id":"REQ-005","text":"维持发送吞吐、延迟、匹配速度与多活动公平性","priority":"P0","scope":"PROPOSED_TARGET","source_material_ids":["MAT-001","MAT-003"],"evidence_ids":["EVD-008"],"requirement_type":"NFR","acceptance_intent":"TST-012/013：原生Linux同负载AB/BA通过约定门禁；当前未测试"},
+    {"id":"REQ-006","text":"容量风险提前告警并自动补偿","priority":"P0","scope":"PROPOSED_TARGET","source_material_ids":["MAT-001"],"evidence_ids":["EVD-001","EVD-006"],"requirement_type":"OPERABILITY","acceptance_intent":"TST-005/014：真实告警路由、故障恢复、背压自动解除"}
+  ]
+}

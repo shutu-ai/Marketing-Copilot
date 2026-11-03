@@ -1,0 +1,13 @@
+{
+  "evidence": [
+    {"id":"EVD-001","material_id":"MAT-001","location":"2026-11-03 session SSH snapshot: sms env/log/manifest","statement":"Hard spool limit 4294967296 bytes; manifest total_bytes 4294864997; capacity errors observed.","evidence_state":"CONFIRMED"},
+    {"id":"EVD-002","material_id":"MAT-001","location":"2026-11-03 session SSH manifest/filesystem reconciliation","statement":"Manifest lists 4000791 records and 5118 segments; all 1264 segments for 2026-10-21 missing physically, accounting for 1081269808 manifest bytes.","evidence_state":"CONFIRMED","notes":"Cause not established; snapshot is not current telemetry."},
+    {"id":"EVD-003","material_id":"MAT-001","location":"2026-11-03 session bounded orphan scan","statement":"167 unlisted files, 303984 bytes, 279 parseable records: 186 for 2026-11-02 and 93 for 2026-11-03.","evidence_state":"CONFIRMED"},
+    {"id":"EVD-004","material_id":"MAT-001","location":"2026-11-03 session SQLite read-only counts","statement":"Recovery index contains 4001007 records including 123 for 2026-11-02, inconsistent with manifest.","evidence_state":"CONFIRMED"},
+    {"id":"EVD-005","material_id":"MAT-001","location":"2026-11-03 session filesystem size scan","statement":"Recovery index 1178554368 bytes; WAL 336179672 bytes.","evidence_state":"CONFIRMED"},
+    {"id":"EVD-006","material_id":"MAT-002","location":"backend/vnext/runtime.py:517,932; backend/vnext/spool.py:474,1320","statement":"Rollover closes day without deletion; runtime stop calls cleanup_closed_days and suppresses selected errors. Reclaim does not require pending=0.","evidence_state":"CONFIRMED","notes":"Local source only; deployed package hashes unverified."},
+    {"id":"EVD-007","material_id":"MAT-002","location":"backend/vnext/ingress.py:89; backend/services/vnext_service.py:435; backend/services/activity_scheduler.py:183","statement":"Default expiry is midnight; production enqueue does not pass campaign window expiry; VNext scheduler skips legacy finalize.","evidence_state":"CONFIRMED"},
+    {"id":"EVD-008","material_id":"MAT-002","location":"backend/vnext/spool.py:_active_segment,reclaim_business_day,_open_recovery_index","statement":"Segment naming uses len(entries)+1; reclaim removes files before index/manifest updates; index definition lacks segment_path index.","evidence_state":"CONFIRMED"},
+    {"id":"EVD-009","material_id":"MAT-002","location":"backend/vnext/spool.py:1122-1162","statement":"append_many checks capacity per record and persists manifest/index after the append loop, leaving a possible partial-batch failure boundary.","evidence_state":"CONFIRMED","notes":"Relationship to observed orphan files is an inference, not established root-cause proof."}
+  ]
+}

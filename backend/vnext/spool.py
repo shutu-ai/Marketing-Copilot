@@ -210,6 +210,7 @@ class TaskSpool:
         self._taken_dir = self.root / "taken"
         self._recovery_index_path = self.root / "recovery-index.sqlite3"
         self._manifest = self._load_manifest()
+        self._persisted_total_bytes = int(self._manifest.get("total_bytes", 0) or 0)
         self._cursors = self._load_cursors()
         self._taken_pending = self._load_taken()
         # The historical implementation rebuilt this dictionary by decoding
@@ -242,6 +243,7 @@ class TaskSpool:
         self._manifest.setdefault("closed_days", {})
         self._manifest.setdefault("daily_records", {})
         self._manifest.setdefault("daily_bytes", {})
+        self._manifest.setdefault("next_segment_id", {})
         self._recover_index()
         if timezone_changed:
             # Existing records retain their original business-day labels; the
@@ -280,6 +282,8 @@ class TaskSpool:
             );
             CREATE INDEX IF NOT EXISTS idx_spool_recovery_partition_ordinal
                 ON spool_recovery_records(partition_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_spool_recovery_segment_path
+                ON spool_recovery_records(segment_path);
             CREATE TABLE IF NOT EXISTS spool_recovery_segments (
                 segment_path TEXT PRIMARY KEY,
                 size INTEGER NOT NULL DEFAULT 0,
@@ -574,7 +578,7 @@ class TaskSpool:
                     self._rollover_locked(today)
             return (
                 bool(record.business_day)
-                and record.business_day == self.current_business_day
+                and record.business_day <= self.current_business_day
                 and not record.is_expired(self._now() if now is None else now)
             )
 
@@ -697,6 +701,11 @@ class TaskSpool:
                     for entries in self._manifest.get("segments", {}).values()
                     for entry in entries
                 )
+            # A crash can leave JSONL bytes without a manifest commit, while a
+            # prior deletion can leave the manifest larger than physical data.
+            # Reconcile the in-memory admission counter now; the parent runtime
+            # persists this correction during startup.
+            self._manifest["total_bytes"] = self._disk_bytes()
             self._manifest_signature = self._file_signature(self._manifest_path)
 
     def _scan_segment(self, path: Path, *, start: int = 0) -> list[tuple]:
@@ -894,6 +903,29 @@ class TaskSpool:
                 pass
         return total
 
+    def reconcile_capacity(self, *, persist: bool = False) -> dict:
+        """Reconcile the maintained byte counter with physical JSONL files.
+
+        This is intentionally a startup/maintenance operation.  The append hot
+        path continues to use the maintained manifest counter and never walks
+        all partition directories for every record.
+        """
+
+        with self._lock:
+            physical_bytes = self._disk_bytes()
+            previous_bytes = int(self._manifest.get("total_bytes", 0) or 0)
+            changed = previous_bytes != physical_bytes
+            if changed:
+                self._manifest["total_bytes"] = int(physical_bytes)
+            if persist and self._persisted_total_bytes != physical_bytes:
+                self._persist_manifest()
+                self._manifest_signature = self._file_signature(self._manifest_path)
+            return {
+                "changed": changed,
+                "previous_bytes": previous_bytes,
+                "physical_bytes": int(physical_bytes),
+            }
+
     def _refresh_lightweight_cursor_state(self) -> None:
         """Refresh only changed cursor/taken JSON, never segment contents."""
 
@@ -948,15 +980,25 @@ class TaskSpool:
             self._lightweight_manifest_signature = manifest_signature
             self._refresh_lightweight_cursor_state()
             current_day = str(manifest.get("current_business_day") or self.current_business_day)
+            now = self._now()
             pending_by_partition = {}
+            pending_by_day: dict[str, int] = {}
             for partition in range(self.virtual_partition_count):
                 key = str(partition)
                 cursor = int(self._lightweight_cursors.get(key, 0))
                 taken = self._lightweight_taken_pending.get(key, set())
                 pending = 0
                 for entry in manifest.get("segments", {}).get(key, []):
-                    if str(entry.get("business_day") or "") != current_day:
+                    entry_day = str(entry.get("business_day") or "")
+                    if not entry_day or entry_day > current_day:
                         continue
+                    if entry_day != current_day:
+                        try:
+                            max_expires_at = float(entry.get("max_expires_at", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            max_expires_at = 0.0
+                        if max_expires_at <= now:
+                            continue
                     records = int(entry.get("records", 0) or 0)
                     first = int(entry.get("first_ordinal", 0) or 0)
                     last = int(entry.get("last_ordinal", first + records - 1) or 0)
@@ -964,21 +1006,30 @@ class TaskSpool:
                     taken_in_segment = sum(
                         1 for ordinal in taken if first <= int(ordinal) <= last
                     )
-                    pending += max(0, records - consumed - taken_in_segment)
+                    entry_pending = max(0, records - consumed - taken_in_segment)
+                    pending += entry_pending
+                    pending_by_day[entry_day] = pending_by_day.get(entry_day, 0) + entry_pending
                 pending_by_partition[key] = pending
+            pending_by_day.setdefault(current_day, 0)
             return {
                 "schema_version": SPOOL_SCHEMA_VERSION,
                 "virtual_partition_count": self.virtual_partition_count,
                 "total_records": int(manifest.get("total_records", 0) or 0),
                 "total_bytes": int(manifest.get("total_bytes", 0) or 0),
+                "max_bytes": self.max_bytes,
+                "remaining_bytes": max(
+                    0, self.max_bytes - int(manifest.get("total_bytes", 0) or 0)
+                ),
+                "usage_ratio": min(
+                    1.0,
+                    float(manifest.get("total_bytes", 0) or 0) / max(1, self.max_bytes),
+                ),
                 "business_day": current_day,
                 "business_epoch": int(manifest.get("business_epoch", 1) or 1),
                 "business_timezone": str(manifest.get("business_timezone") or self.clock.timezone_name),
                 "pending_records": sum(pending_by_partition.values()),
                 "pending_by_partition": pending_by_partition,
-                "pending_by_business_day": {
-                    current_day: sum(pending_by_partition.values()),
-                },
+                "pending_by_business_day": pending_by_day,
                 "cursors": dict(self._lightweight_cursors),
                 "taken_pending": {
                     key: sorted(value)
@@ -993,6 +1044,7 @@ class TaskSpool:
     def _persist_manifest(self) -> None:
         self._manifest["updated_at"] = time.time()
         _atomic_write_json(self._manifest_path, self._manifest)
+        self._persisted_total_bytes = int(self._manifest.get("total_bytes", 0) or 0)
 
     def _persist_cursors(self, partition_id: int | None = None) -> None:
         if partition_id is None:
@@ -1022,14 +1074,76 @@ class TaskSpool:
                     and int(current["records"]) < self.segment_max_records
                     and int(current["bytes"]) + encoded_size <= self.segment_max_bytes):
                 return current, self._segment_path(partition_id, str(current["filename"]))
-        filename = f"segment-{len(entries) + 1:08d}.jsonl"
+        next_segment_id = int(self._manifest.setdefault("next_segment_id", {}).get(key, 1) or 1)
+        # Segment ids are never derived from the number of live manifest rows:
+        # reclaimed rows and crash leftovers must not make a future append reuse
+        # a path that a reader or recovery plan still knows.
+        for candidate in entries:
+            try:
+                next_segment_id = max(
+                    next_segment_id,
+                    int(str(candidate.get("filename", "")).removeprefix("segment-").removesuffix(".jsonl")) + 1,
+                )
+            except (TypeError, ValueError):
+                continue
+        directory = self.root / f"partition-{int(partition_id):04d}"
+        while (directory / f"segment-{next_segment_id:08d}.jsonl").exists():
+            next_segment_id += 1
+        filename = f"segment-{next_segment_id:08d}.jsonl"
+        self._manifest.setdefault("next_segment_id", {})[key] = next_segment_id + 1
         current = {
             "filename": filename, "records": 0, "bytes": 0,
             "first_ordinal": 0, "last_ordinal": 0,
+            "min_expires_at": 0.0, "max_expires_at": 0.0,
             "business_day": business_day,
         }
         entries.append(current)
         return current, self._segment_path(partition_id, filename)
+
+    def _preflight_batch(self, records: list[SpoolRecord]) -> list[SpoolRecord]:
+        """Assign ordinals and check the whole batch before opening a file."""
+
+        next_ordinals = {
+            str(key): int(value or 1)
+            for key, value in self._manifest.get("next_ordinal", {}).items()
+        }
+        planned_by_event: dict[str, SpoolRecord] = {}
+        prepared: list[SpoolRecord] = []
+        projected_bytes = int(self._manifest.get("total_bytes", 0) or 0)
+        for record in records:
+            event_id = str(record.event_id)
+            if event_id in planned_by_event:
+                prepared.append(planned_by_event[event_id])
+                continue
+            if self._contains_event(event_id):
+                existing = self._existing_record(record)
+                planned_by_event[event_id] = existing
+                prepared.append(existing)
+                continue
+            partition_id = int(record.partition_id)
+            if not 0 <= partition_id < self.virtual_partition_count:
+                raise ValueError("record partition_id out of range")
+            key = str(partition_id)
+            next_ordinal = int(next_ordinals.get(key, 1) or 1)
+            ordinal = int(record.ordinal)
+            if ordinal <= 0:
+                ordinal = next_ordinal
+            elif ordinal < next_ordinal:
+                raise SpoolError("record ordinal must be monotonic within a partition")
+            item = replace(record, ordinal=ordinal).with_crc()
+            encoded = (
+                json.dumps(item.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+            projected_bytes += len(encoded)
+            if projected_bytes > self.max_bytes:
+                raise SpoolCapacityError(
+                    f"spool byte budget exhausted: {projected_bytes}>{self.max_bytes}"
+                )
+            next_ordinals[key] = ordinal + 1
+            planned_by_event[event_id] = item
+            prepared.append(item)
+        return prepared
 
     def _append_locked(
         self,
@@ -1075,6 +1189,13 @@ class TaskSpool:
         entry["bytes"] = int(entry["bytes"]) + len(encoded)
         entry["first_ordinal"] = int(entry["first_ordinal"] or record.ordinal)
         entry["last_ordinal"] = int(record.ordinal)
+        expires_at = float(record.expires_at or 0.0)
+        if expires_at > 0:
+            current_min = float(entry.get("min_expires_at", 0.0) or 0.0)
+            entry["min_expires_at"] = expires_at if not current_min else min(current_min, expires_at)
+            entry["max_expires_at"] = max(
+                float(entry.get("max_expires_at", 0.0) or 0.0), expires_at,
+            )
         self._manifest["next_ordinal"][str(partition_id)] = int(record.ordinal) + 1
         self._manifest["total_records"] = int(self._manifest.get("total_records", 0)) + 1
         self._manifest["total_bytes"] = projected
@@ -1140,6 +1261,7 @@ class TaskSpool:
                     if self._contains_event(record.event_id)
                     else self._normalize_for_append(record)
                 )
+            prepared = self._preflight_batch(prepared)
             handles: dict[Path, object] = {}
             recovery_rows: list[tuple] = []
             appended: list[SpoolRecord] = []
@@ -1187,13 +1309,21 @@ class TaskSpool:
             effective_cursor = self.cursor(partition)
         taken_pending = self._taken_pending.get(str(partition), set())
         entries = list(self._manifest["segments"].get(str(partition), []))
+        now = self._now()
         for entry in entries:
             entry_day = str(entry.get("business_day") or "")
-            # The worker can only dispatch the current business day.  Skip
-            # closed-day segments before opening them; the daily reclamation
-            # path remains responsible for deleting them after the fence.
-            if entry_day and entry_day != current_day:
+            if not entry_day or entry_day > current_day:
                 continue
+            # A cross-midnight campaign may retain an old-day record until its
+            # explicit window expiry.  New segments carry a max expiry so an
+            # already-dead historical segment is skipped without decoding it.
+            if entry_day and entry_day != current_day:
+                try:
+                    max_expires_at = float(entry.get("max_expires_at", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    max_expires_at = 0.0
+                if max_expires_at <= now:
+                    continue
             # Segment metadata is maintained by append/recovery.  A complete
             # segment whose last ordinal is at or before the cursor cannot
             # contain a dispatchable record, so do not decode its JSONL rows
@@ -1218,8 +1348,10 @@ class TaskSpool:
                         raise SpoolCorruptionError(f"invalid record in {path}: {exc}") from exc
                     # A missing business day is deliberately fail-closed: it
                     # may be inspected for recovery, but it is never sent.
-                    if (record.business_day == current_day
+                    if (record.business_day
+                            and record.business_day <= current_day
                             and record.ordinal > effective_cursor
+                            and not record.is_expired(now)
                             and record.ordinal not in taken_pending):
                         yield record
 
@@ -1256,13 +1388,24 @@ class TaskSpool:
             pending_by_partition = {}
             pending_by_day: dict[str, int] = {}
             expired = 0
+            now = self._now()
+            current_pending_total = 0
             for partition in range(self.virtual_partition_count):
                 cursor = self.cursor(partition)
                 pending = 0
+                current_pending = 0
                 taken = self._taken_pending.get(str(partition), set())
                 for entry in self._manifest.get("segments", {}).get(str(partition), []):
-                    if str(entry.get("business_day") or "") != self.current_business_day:
+                    entry_day = str(entry.get("business_day") or "")
+                    if not entry_day or entry_day > self.current_business_day:
                         continue
+                    if entry_day != self.current_business_day:
+                        try:
+                            max_expires_at = float(entry.get("max_expires_at", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            max_expires_at = 0.0
+                        if max_expires_at <= now:
+                            continue
                     records = int(entry.get("records", 0) or 0)
                     first = int(entry.get("first_ordinal", 0) or 0)
                     last = int(entry.get("last_ordinal", first + records - 1) or 0)
@@ -1270,34 +1413,52 @@ class TaskSpool:
                     taken_in_segment = sum(
                         1 for ordinal in taken if first <= int(ordinal) <= last
                     )
-                    pending += max(0, records - consumed - taken_in_segment)
+                    entry_pending = max(0, records - consumed - taken_in_segment)
+                    pending += entry_pending
+                    pending_by_day[entry_day] = pending_by_day.get(entry_day, 0) + entry_pending
+                    if entry_day == self.current_business_day:
+                        current_pending += entry_pending
                 # A changed/tampered segment is rescanned only when its
                 # persisted signature changes.  Use that bounded cache for
                 # exact expiry/legacy-day checks when available; otherwise the
                 # manifest metadata is the no-scan startup contract.
                 for record in self._event_index.values():
-                    if record.partition_id == partition and record.business_day == self.current_business_day:
-                        if record.is_expired(self._now()):
+                    if record.partition_id == partition and record.business_day <= self.current_business_day:
+                        if record.is_expired(now):
                             expired += 1
                 if self._event_ids and len(self._event_ids) <= len(self._event_index):
                     pending = sum(
                         1
                         for record in self._event_index.values()
                         if record.partition_id == partition
+                        and record.business_day <= self.current_business_day
+                        and not record.is_expired(now)
+                        and int(record.ordinal) > cursor
+                        and int(record.ordinal) not in taken
+                    )
+                    current_pending = sum(
+                        1
+                        for record in self._event_index.values()
+                        if record.partition_id == partition
                         and record.business_day == self.current_business_day
+                        and not record.is_expired(now)
                         and int(record.ordinal) > cursor
                         and int(record.ordinal) not in taken
                     )
                 pending_by_partition[str(partition)] = pending
-            for day, records in (self._manifest.get("daily_records", {}) or {}).items():
+                current_pending_total += current_pending
+            pending_by_day[self.current_business_day] = current_pending_total
+            for day in (self._manifest.get("daily_records", {}) or {}):
                 pending_by_day.setdefault(str(day), 0)
-                if str(day) == self.current_business_day:
-                    pending_by_day[str(day)] = sum(pending_by_partition.values())
+            total_bytes = self._disk_bytes()
             return {
                 "schema_version": SPOOL_SCHEMA_VERSION,
                 "virtual_partition_count": self.virtual_partition_count,
                 "total_records": int(self._manifest.get("total_records", 0) or 0),
-                "total_bytes": self._disk_bytes(),
+                "total_bytes": total_bytes,
+                "max_bytes": self.max_bytes,
+                "remaining_bytes": max(0, self.max_bytes - total_bytes),
+                "usage_ratio": min(1.0, total_bytes / max(1, self.max_bytes)),
                 "business_day": self.current_business_day,
                 "business_epoch": self.business_epoch,
                 "business_timezone": self.clock.timezone_name,
@@ -1317,118 +1478,354 @@ class TaskSpool:
                 },
             }
 
-    def reclaim_business_day(self, business_day: str, *, force: bool = False) -> dict:
-        """Remove only fully attributable, closed-day segment files.
+    def reclaim_business_day(
+        self, business_day: str, *, force: bool = False,
+        max_segments: int | None = 32,
+    ) -> dict:
+        """Reclaim a closed day in small, restartable batches.
 
-        The method is intentionally explicit.  Runtime rollover fences old
-        admissions first; callers should invoke reclamation after workers have
-        stopped or otherwise released their old-epoch references.  Segments
-        containing an unattributed V1 record are retained rather than guessed
-        into a new day.
+        The manifest is first persisted with a ``RETIRING`` plan.  Physical
+        deletion and the recovery-index update are then repeated safely on the
+        next run if the process stops between those steps.  Unknown or mixed
+        files remain retained; a directory TTL is not proof that their window
+        expired.
         """
 
         day = normalize_business_day(business_day)
         with self._lock:
-            self.refresh()
+            self.refresh(scan_segments=False)
             if day == self.current_business_day:
                 return {"business_day": day, "reclaimed": False, "reason": "current_day"}
-            closed = self._manifest.setdefault("closed_days", {}).get(day)
-            if not closed and not force:
-                return {"business_day": day, "reclaimed": False, "reason": "not_closed"}
-            removed_records = 0
-            removed_bytes = 0
-            retained_segments = 0
-            removed_paths: list[Path] = []
-            for partition in range(self.virtual_partition_count):
-                key = str(partition)
-                entries = list(self._manifest["segments"].get(key, []))
-                retained = []
-                for entry in entries:
-                    entry_day = str(entry.get("business_day") or "")
-                    path = self._segment_path(partition, str(entry["filename"]))
-                    removable = entry_day == day
-                    if not removable and not entry_day:
-                        # Legacy entries have no trustworthy day metadata.
-                        # Scan only this candidate and remove it iff every
-                        # complete record explicitly belongs to the closed day.
-                        candidate_records = []
-                        try:
-                            with path.open("rb") as handle:
-                                for raw in handle:
-                                    if not raw.endswith(b"\n"):
-                                        removable = False
-                                        break
-                                    item = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
-                                    candidate_records.append(item)
-                            removable = bool(candidate_records) and all(
-                                item.business_day == day for item in candidate_records
-                            )
-                        except (OSError, ValueError, UnicodeError, SpoolError):
-                            removable = False
-                    if removable:
-                        try:
-                            size = int(path.stat().st_size)
-                        except OSError:
-                            size = 0
-                        try:
-                            path.unlink()
-                        except FileNotFoundError:
-                            pass
-                        removed_paths.append(path)
-                        removed_records += int(entry.get("records", 0) or 0)
-                        removed_bytes += size
-                    else:
-                        retained.append(entry)
-                        retained_segments += 1
-                self._manifest["segments"][key] = retained
-                directory = self.root / f"partition-{partition:04d}"
-                try:
-                    directory.rmdir()
-                except OSError:
-                    pass
-            if removed_records:
-                self._event_index = {
-                    key: item for key, item in self._event_index.items()
-                    if item.business_day != day
+            closed_days = self._manifest.setdefault("closed_days", {})
+            closed = closed_days.get(day)
+            if not closed:
+                if not force:
+                    return {"business_day": day, "reclaimed": False, "reason": "not_closed"}
+                closed = {"state": "closed", "closed_at": self._now()}
+                closed_days[day] = closed
+
+            limit = None if max_segments is None else max(0, int(max_segments))
+            if limit == 0:
+                return {
+                    "business_day": day, "reclaimed": False,
+                    "reclaimed_records": 0, "reclaimed_bytes": 0,
+                    "reclaimed_segments": 0, "reason": "batch_limit",
                 }
-                if removed_paths:
-                    removed_event_ids = self._recovery_index.execute(
-                        "SELECT event_id FROM spool_recovery_records WHERE segment_path IN ({})".format(
-                            ",".join("?" for _ in removed_paths)
-                        ),
-                        [str(path.resolve()) for path in removed_paths],
-                    ).fetchall()
-                    self._event_ids.difference_update(
-                        str(row[0]) for row in removed_event_ids
-                    )
-                    self._delete_recovery_segments(removed_paths)
-                self._manifest["total_records"] = max(
-                    0,
-                    int(self._manifest.get("total_records", 0) or 0) - removed_records,
+
+            def safe_path(path: Path) -> Path | None:
+                try:
+                    resolved = path.resolve()
+                except (OSError, RuntimeError):
+                    return None
+                if resolved.parent.parent != self.root or resolved.suffix != ".jsonl":
+                    return None
+                return resolved
+
+            def proof_for_orphan(path: Path) -> tuple[int, bool, float] | None:
+                """Return (record_count, complete_file, max_expiry) for one file."""
+
+                count = 0
+                complete = True
+                max_expiry = 0.0
+                try:
+                    with path.open("rb") as handle:
+                        for raw in handle:
+                            if not raw.endswith(b"\n"):
+                                complete = False
+                                break
+                            item = SpoolRecord.from_dict(json.loads(raw.decode("utf-8")))
+                            if item.business_day != day:
+                                return None
+                            count += 1
+                            max_expiry = max(max_expiry, float(item.expires_at or 0.0))
+                except (OSError, ValueError, UnicodeError, SpoolError):
+                    return None
+                if count <= 0:
+                    return None
+                if not complete:
+                    try:
+                        if float(path.stat().st_mtime) > float(closed.get("closed_at") or 0):
+                            return None
+                    except OSError:
+                        return None
+                return count, complete, max_expiry
+
+            def indexed_max_expiry(path_text: str) -> float | None:
+                # Legacy manifest segments can be multi-GB; use the sidecar
+                # aggregate before falling back to full parsing.
+                try:
+                    row = self._recovery_index.execute(
+                        "SELECT MAX(expires_at) FROM spool_recovery_records WHERE segment_path=?",
+                        (path_text,),
+                    ).fetchone()
+                    if not row or row[0] is None:
+                        return None
+                    return float(row[0])
+                except sqlite3.Error:
+                    return None
+
+            def legacy_max_expiry(path: Path, path_text: str) -> float | None:
+                indexed = indexed_max_expiry(path_text)
+                if indexed is not None:
+                    return indexed
+                proof = proof_for_orphan(path)
+                return proof[2] if proof is not None else None
+
+            entries_by_path: dict[str, tuple[int, int]] = {}
+            manifest_entries_by_path: dict[str, dict] = {}
+            manifest_paths: set[str] = set()
+            orphan_paths: set[str] = set()
+            deferred_active = False
+            for partition in range(self.virtual_partition_count):
+                for entry in self._manifest["segments"].get(str(partition), []):
+                    path = safe_path(self._segment_path(partition, str(entry.get("filename") or "")))
+                    if path is None:
+                        self._add_recovery_issue("unsafe segment path during reclaim")
+                        continue
+                    path_text = str(path)
+                    manifest_paths.add(path_text)
+                    manifest_entries_by_path[path_text] = entry
+                    entry_day = str(entry.get("business_day") or "")
+                    if entry_day == day:
+                        try:
+                            max_expiry = float(entry.get("max_expires_at", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            max_expiry = 0.0
+                        if "max_expires_at" not in entry:
+                            if path.exists():
+                                max_expiry = legacy_max_expiry(path, path_text)
+                                if max_expiry is None:
+                                    orphan_paths.add(path_text)
+                                    continue
+                                # Cache the recovered evidence so the next
+                                # maintenance pass does not rescan the file.
+                                entry["max_expires_at"] = max_expiry
+                        if max_expiry > self._now():
+                            deferred_active = True
+                        if max_expiry <= self._now():
+                            entries_by_path[path_text] = (
+                                int(entry.get("records", 0) or 0), 0,
+                            )
+                    elif not entry_day and path.exists():
+                        proof = proof_for_orphan(path)
+                        if proof and proof[2] <= self._now():
+                            entries_by_path[path_text] = (
+                                int(entry.get("records", 0) or 0), 0,
+                            )
+                        elif proof:
+                            deferred_active = True
+                        else:
+                            orphan_paths.add(path_text)
+
+            for partition in range(self.virtual_partition_count):
+                directory = self.root / f"partition-{partition:04d}"
+                for path in directory.glob("segment-*.jsonl"):
+                    safe = safe_path(path)
+                    if safe is None or str(safe) in manifest_paths or path.is_symlink():
+                        continue
+                    proof = proof_for_orphan(safe)
+                    if proof and proof[2] <= self._now():
+                        entries_by_path[str(safe)] = (0, proof[0])
+                    elif proof:
+                        deferred_active = True
+                    elif proof is None:
+                        # Only an old, unparseable/ mixed orphan belongs to
+                        # this closed-day investigation.  A new-day orphan in
+                        # the same directory must not block old-day GC.
+                        try:
+                            if float(safe.stat().st_mtime) <= float(closed.get("closed_at") or 0):
+                                orphan_paths.add(str(safe))
+                        except OSError:
+                            continue
+
+            plan = dict(closed.get("reclaim_plan") or {})
+            planned_paths = []
+            for value in plan.get("paths") or []:
+                safe = safe_path(Path(str(value)))
+                if safe is None:
+                    continue
+                path_text = str(safe)
+                entry = manifest_entries_by_path.get(path_text)
+                if entry is not None:
+                    try:
+                        max_expiry = float(entry.get("max_expires_at", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        max_expiry = 0.0
+                    if max_expiry > self._now():
+                        deferred_active = True
+                        continue
+                    if "max_expires_at" not in entry:
+                        if safe.exists():
+                            max_expiry = legacy_max_expiry(safe, path_text)
+                        else:
+                            max_expiry = 0.0
+                        if max_expiry is None:
+                            orphan_paths.add(path_text)
+                            continue
+                        if max_expiry > self._now():
+                            deferred_active = True
+                            continue
+                elif safe.exists():
+                    proof = proof_for_orphan(safe)
+                    if proof is not None and proof[2] > self._now():
+                        deferred_active = True
+                        continue
+                    if proof is None:
+                        orphan_paths.add(path_text)
+                        continue
+                if path_text not in planned_paths:
+                    planned_paths.append(path_text)
+            for path_text in entries_by_path:
+                if path_text not in planned_paths:
+                    planned_paths.append(path_text)
+            if not planned_paths:
+                reclaim_state = (
+                    "BLOCKED_ACTIVE_WINDOW" if deferred_active
+                    else "BLOCKED_UNKNOWN" if orphan_paths else "DONE"
                 )
-                self._manifest["total_bytes"] = self._disk_bytes()
-                closed = self._manifest.setdefault("closed_days", {}).setdefault(day, {})
-                closed.update({
-                    "state": "reclaimed",
-                    "reclaimed_records": removed_records,
-                    "reclaimed_bytes": removed_bytes,
-                })
-                self._rebuild_daily_metadata()
+                closed["reclaim_state"] = reclaim_state
+                closed["state"] = "closed" if reclaim_state != "DONE" else "reclaimed"
+                closed["last_reclaim_at"] = time.time()
                 self._persist_manifest()
                 self._manifest_signature = self._file_signature(self._manifest_path)
+                return {
+                    "business_day": day, "reclaimed": False,
+                    "reclaimed_records": 0, "reclaimed_bytes": 0,
+                    "reclaimed_segments": 0,
+                    "retained_segments": sum(
+                        len(value) for value in self._manifest["segments"].values()
+                    ),
+                    "reason": (
+                        "blocked_active_window" if reclaim_state == "BLOCKED_ACTIVE_WINDOW"
+                        else "blocked_unknown" if reclaim_state == "BLOCKED_UNKNOWN"
+                        else "unattributed_or_empty"
+                    ),
+                }
+
+            # Persist the complete known plan, not just this batch, so a crash
+            # cannot make an already identified orphan disappear from cleanup.
+            closed["reclaim_plan"] = {
+                "state": "RETIRING",
+                "paths": planned_paths,
+                "planned_at": float(plan.get("planned_at") or time.time()),
+            }
+            closed["reclaim_state"] = "RETIRING"
+            self._persist_manifest()
+            self._manifest_signature = self._file_signature(self._manifest_path)
+
+            selected_paths = planned_paths if limit is None else planned_paths[:limit]
+            removed_paths: list[Path] = []
+            removed_bytes = 0
+            orphan_records = 0
+            failed_paths: list[str] = []
+            for path_text in selected_paths:
+                path = Path(path_text)
+                try:
+                    size = int(path.stat().st_size)
+                except OSError:
+                    size = 0
+                try:
+                    path.unlink()
+                    removed_paths.append(path)
+                    removed_bytes += size
+                    orphan_records += int(entries_by_path.get(path_text, (0, 0))[1])
+                except FileNotFoundError:
+                    removed_paths.append(path)
+                except OSError as exc:
+                    failed_paths.append(f"{path.name}: {exc}")
+
+            removed_text = {str(path.resolve()) for path in removed_paths}
+            removed_manifest_records = 0
+            if removed_text:
+                for partition in range(self.virtual_partition_count):
+                    retained = []
+                    for entry in self._manifest["segments"].get(str(partition), []):
+                        path = safe_path(self._segment_path(partition, str(entry.get("filename") or "")))
+                        if path is not None and str(path) in removed_text:
+                            removed_manifest_records += int(entry.get("records", 0) or 0)
+                        else:
+                            retained.append(entry)
+                    self._manifest["segments"][str(partition)] = retained
+
+                removed_event_ids = []
+                for path in removed_paths:
+                    removed_event_ids.extend(
+                        row[0] for row in self._recovery_index.execute(
+                            "SELECT event_id FROM spool_recovery_records WHERE segment_path=?",
+                            (str(path.resolve()),),
+                        ).fetchall()
+                    )
+                self._event_ids.difference_update(str(value) for value in removed_event_ids)
+                for event_id in removed_event_ids:
+                    self._event_index.pop(str(event_id), None)
+                self._delete_recovery_segments(removed_paths)
+                for path in removed_paths:
+                    self._segment_offsets.pop(path, None)
+                    self._segment_signatures.pop(path, None)
+
+                self._manifest["total_records"] = max(
+                    0,
+                    int(self._manifest.get("total_records", 0) or 0) - removed_manifest_records,
+                )
+                self._manifest["total_bytes"] = self._disk_bytes()
+                self._rebuild_daily_metadata()
+
+            remaining_paths = [path for path in planned_paths if path not in removed_text]
+            reclaim_state = (
+                "RETIRING" if remaining_paths or failed_paths
+                else "BLOCKED_ACTIVE_WINDOW" if deferred_active
+                else "BLOCKED_UNKNOWN" if orphan_paths
+                else "DONE"
+            )
+            closed["reclaim_plan"] = {
+                "state": reclaim_state if reclaim_state == "RETIRING" else "DONE",
+                "paths": remaining_paths,
+                "completed_at": time.time() if reclaim_state == "DONE" else 0.0,
+            }
+            closed["reclaim_state"] = reclaim_state
+            closed["state"] = "closed" if reclaim_state != "DONE" else "reclaimed"
+            closed["reclaimed_records"] = int(closed.get("reclaimed_records", 0) or 0) + removed_manifest_records + orphan_records
+            closed["reclaimed_bytes"] = int(closed.get("reclaimed_bytes", 0) or 0) + removed_bytes
+            closed["last_reclaim_at"] = time.time()
+            if failed_paths:
+                closed["last_reclaim_error"] = "; ".join(failed_paths[:8])
+            else:
+                closed.pop("last_reclaim_error", None)
+            self._persist_manifest()
+            self._manifest_signature = self._file_signature(self._manifest_path)
             return {
                 "business_day": day,
-                "reclaimed": bool(removed_records),
-                "reclaimed_records": removed_records,
+                "reclaimed": bool(removed_manifest_records or orphan_records),
+                "reclaimed_records": removed_manifest_records + orphan_records,
                 "reclaimed_bytes": removed_bytes,
-                "retained_segments": retained_segments,
-                "reason": "complete" if removed_records else "unattributed_or_empty",
+                "reclaimed_segments": len(removed_paths),
+                "retained_segments": sum(
+                    len(value) for value in self._manifest["segments"].values()
+                ),
+                "reason": "cleanup_error" if failed_paths else (
+                    "partial" if remaining_paths else
+                    "blocked_active_window" if deferred_active else
+                    "blocked_unknown" if orphan_paths else "complete"
+                ),
             }
 
-    def cleanup_closed_days(self, *, force: bool = False) -> list[dict]:
+    def cleanup_closed_days(
+        self, *, force: bool = False, max_segments: int | None = 32,
+    ) -> list[dict]:
         with self._lock:
             days = list(self._manifest.get("closed_days", {}))
-        return [self.reclaim_business_day(day, force=force) for day in days]
+        results = []
+        remaining = None if max_segments is None else max(0, int(max_segments))
+        for day in days:
+            if remaining == 0:
+                break
+            result = self.reclaim_business_day(
+                day, force=force, max_segments=remaining,
+            )
+            results.append(result)
+            if remaining is not None:
+                remaining -= int(result.get("reclaimed_segments", 0) or 0)
+        return results
 
     def recovery_report(self) -> dict:
         return {

@@ -431,6 +431,9 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
     # Campaign-level fields are constant for a source chunk.  A template
     # source address is retained in the spool record when present.
     source_addr = next((item for _row, item in accepted_rows if item), "")
+    # Keep the durable spool fence at the campaign window end when one is
+    # configured; otherwise ingress falls back to the business-day cutoff.
+    window_expiry = sms_task_service._fast_campaign_window_deadline(campaign)
     try:
         ingress = value.enqueue_chunk(
             ingress_rows, campaign_type=campaign_type, campaign_id=int(campaign["id"]),
@@ -438,6 +441,7 @@ def enqueue_rows(campaign_type: str, campaign: dict, rows: Iterable[dict], sourc
             source_id=stable_source, payload_ref=str(source_file or stable_source),
             row_ordinal_start=int(row_ordinal_start), flash_sms=bool(campaign.get("flash_sms")),
             source_addr=source_addr, campaign_name=str(campaign.get("name") or ""),
+            expires_at=window_expiry,
         )
     except SpoolCapacityError as exc:
         result.update(success=False, status="pressure", message=str(exc))

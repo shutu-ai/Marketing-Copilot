@@ -1,0 +1,9 @@
+{
+  "project_stage": "DISCOVERY",
+  "orientation": "ENGINEERING",
+  "interaction_mode": "AUTO",
+  "primary_domain": "software_system",
+  "secondary_domains": [],
+  "output_mode": "md",
+  "notes": "Design-only delivery based on session production snapshots and local source. Runtime implementation, deployment and performance acceptance are not completed. Formal engineering package gates are not claimed."
+}

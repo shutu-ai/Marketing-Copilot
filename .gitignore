@@ -3,6 +3,7 @@
 .codegraph/
 .omo/
 .codex/
+.skill_workshop/
 .vscode/
 
 # Python

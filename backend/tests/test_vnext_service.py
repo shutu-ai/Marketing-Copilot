@@ -101,6 +101,35 @@ def test_service_adapter_renders_templates_and_preserves_vnext_fields(tmp_path, 
     assert records[0].source_addr == "SRC"
 
 
+def test_service_adapter_persists_campaign_window_expiry(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    fake = _FakeRuntime(tmp_path)
+    monkeypatch.setattr(vnext_service, "_RUNTIME", fake)
+    monkeypatch.setattr(vnext_service, "_template_map", lambda *_args: {
+        "by_lang": {"english": {"content": "Hi {msisdn}", "source_addr": "SRC"}},
+        "fallback": None, "default": None, "direct": None,
+    })
+    monkeypatch.setattr(vnext_service, "_excluded", lambda _values: set())
+    result = vnext_service.enqueue_rows(
+        "batch",
+        {
+            "id": 12, "status": "in_progress", "smpp_config_id": 7,
+            "phone_prefix": "251", "end_time": "2099-01-01T00:00:00+00:00",
+        },
+        [{"msisdn": "0900000001", "language": "english"}],
+        source_file="customers.csv",
+    )
+
+    assert result["created"] == 1
+    stored = next(
+        item
+        for partition in range(16)
+        for item in fake.spool.iter_from(partition)
+    )
+    assert stored.expires_at == datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp()
+
+
 def test_vnext_task_list_reads_bounded_projection_pages_and_backfills_response_fields(
     tmp_path, monkeypatch
 ):
