@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 
 from database import read_transaction
@@ -20,6 +21,7 @@ _maintenance_thread = None
 _claim_lock = threading.Lock()
 _maintenance_lock = threading.Lock()
 _campaign_cursor = 0
+_campaign_inflight = Counter()
 _last_expiry_sweep_date = None
 _last_inactive_campaign_sweep_at = 0.0
 _INACTIVE_CAMPAIGN_SWEEP_INTERVAL_SECONDS = 5.0
@@ -243,17 +245,23 @@ def _claim_realtime_file(worker_id: str):
     """
     global _campaign_cursor
     with _claim_lock:
+        if sum(_campaign_inflight.values()) >= _configured_worker_count():
+            return None
         campaign_ids = ingestion_job_service.pending_campaign_ids("realtime")
         if not campaign_ids:
             return None
         start = _campaign_cursor % len(campaign_ids)
-        for offset in range(len(campaign_ids)):
-            position = (start + offset) % len(campaign_ids)
+        positions = [(start + offset) % len(campaign_ids) for offset in range(len(campaign_ids))]
+        # One base slot per backlogged campaign; remaining slots are lent to
+        # the least busy campaign and reclaimed when the file completes.
+        positions.sort(key=lambda pos: _campaign_inflight.get(campaign_ids[pos], 0))
+        for position in positions:
             campaign_id = campaign_ids[position]
             job = ingestion_job_service.claim_file(
                 "realtime", worker_id, campaign_id=campaign_id,
             )
             if job:
+                _campaign_inflight[campaign_id] += 1
                 _campaign_cursor = (position + 1) % len(campaign_ids)
                 return job
         # Another local caller may have claimed the candidates between the
@@ -270,17 +278,25 @@ def process_once(worker_id: str) -> bool:
     job = _claim_realtime_file(worker_id)
     if not job:
         return False
-    with realtime_ingestion_state.FileLease(job["id"], job.get("lease_token", "")):
-        try:
-            return _process_claimed_file(job, worker_id)
-        except realtime_ingestion_state.LeaseLost:
-            logger.warning("Realtime file ownership lost file_id=%s worker_id=%s", job["id"], worker_id)
-            return True
-        except Exception:
-            # If even the terminal/retry transaction failed, retain the input.
-            # Stop renewing this lease; runtime maintenance will recover it.
-            logger.exception("Realtime file recovery deferred until lease expiry file_id=%s", job["id"])
-            return True
+    try:
+        with realtime_ingestion_state.FileLease(job["id"], job.get("lease_token", "")):
+            try:
+                return _process_claimed_file(job, worker_id)
+            except realtime_ingestion_state.LeaseLost:
+                logger.warning("Realtime file ownership lost file_id=%s worker_id=%s", job["id"], worker_id)
+                return True
+            except Exception:
+                # If even the terminal/retry transaction failed, retain the input.
+                # Stop renewing this lease; runtime maintenance will recover it.
+                logger.exception("Realtime file recovery deferred until lease expiry file_id=%s", job["id"])
+                return True
+    finally:
+        with _claim_lock:
+            campaign_id = int(job["campaign_id"])
+            if _campaign_inflight.get(campaign_id, 0) > 0:
+                _campaign_inflight[campaign_id] -= 1
+                if not _campaign_inflight[campaign_id]:
+                    del _campaign_inflight[campaign_id]
 
 
 def _process_claimed_file(job, worker_id):
@@ -515,9 +531,13 @@ def stop_worker():
 
 def worker_status() -> dict:
     running = [thread for thread in _threads if thread.is_alive()]
+    with _claim_lock:
+        campaign_inflight = dict(_campaign_inflight)
     return {
         "running": len(running),
         "configured": _configured_worker_count(),
         "worker_ids": [thread.name for thread in running],
+        "campaign_inflight": campaign_inflight,
+        "campaign_base_slots": 1,
         "maintenance_alive": bool(_maintenance_thread and _maintenance_thread.is_alive()),
     }

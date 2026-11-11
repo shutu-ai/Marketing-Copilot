@@ -564,10 +564,13 @@ def test_realtime_file_claims_round_robin_across_campaigns(isolated_db):
             ingestion_job_service.register_file("realtime", campaign_id, source.name, str(source))
 
     realtime_ingestion_worker._campaign_cursor = 0
-    claimed = [
-        realtime_ingestion_worker._claim_realtime_file(f"worker-{index}")
-        for index in range(4)
-    ]
+    try:
+        claimed = [
+            realtime_ingestion_worker._claim_realtime_file(f"worker-{index}")
+            for index in range(4)
+        ]
+    finally:
+        realtime_ingestion_worker._campaign_inflight.clear()
 
     assert [item["campaign_id"] for item in claimed] == [
         first_campaign, second_campaign, first_campaign, second_campaign,
