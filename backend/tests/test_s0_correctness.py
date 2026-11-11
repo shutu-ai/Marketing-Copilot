@@ -257,6 +257,7 @@ def test_direct_control_entry_closes_reliable_socket(s0_db, entry):
     task = tasks.claim_next_tasks(1)[0]
     assert tasks.record_send_intent(task, 1, 1, 1)
     if entry == "realtime_window_update":
+        assert service.update(cid, model(status="paused"))
         update = model(end_time="2000-01-01 00:00:00")
     else:
         update = model(status="paused")

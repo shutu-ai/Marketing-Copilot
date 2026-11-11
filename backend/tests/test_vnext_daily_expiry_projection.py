@@ -4,11 +4,14 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import time
+from dataclasses import replace
 
 from vnext.business_day import BusinessClock
 from vnext.ingress import IngressRouter
 from vnext.pressure import StageCredit
 from vnext.projection_writer import ProjectionWriter
+from vnext.projection_writer import ProgressJournal
+from vnext.progress import ProgressPersistence
 from vnext.spool import SpoolRecord, TaskSpool
 from vnext.worker import ShardWorker
 from vnext.smpp_transport import SocketWriteResult
@@ -112,6 +115,18 @@ def test_legacy_record_without_business_day_is_fail_closed_after_restart(tmp_pat
     assert recovered.status()["pending_records"] == 0
 
 
+def test_realtime_deadline_cannot_extend_beyond_business_day(tmp_path):
+    wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    clock = BusinessClock(wall, "UTC")
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000, clock=clock)
+    record = replace(_record("realtime"), campaign_type="realtime",
+                     expires_at=(wall.value + timedelta(hours=2)).timestamp())
+    stored, _ = spool.append(record)
+    assert stored.expires_at == clock.cutoff("2026-10-17")
+    wall.advance(seconds=1)
+    assert not spool.is_record_current(stored)
+
+
 def test_worker_expiry_checkpoint_is_durable_and_never_calls_transport(tmp_path):
     wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
     spool = TaskSpool(
@@ -143,6 +158,88 @@ def test_worker_expiry_checkpoint_is_durable_and_never_calls_transport(tmp_path)
         clock=BusinessClock(wall, "UTC"),
     )
     assert list(reopened.iter_from(0)) == []
+
+
+def test_paused_campaign_expired_record_is_settled_without_sending(tmp_path):
+    wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000,
+                      clock=BusinessClock(wall, "UTC"))
+    spool.append(_record("paused"))
+    wall.advance(seconds=1)
+    events = []
+    worker = ShardWorker(0, (0,), spool, {1: {"route_id": 1}},
+                         transport_factory=lambda *_: (_ for _ in ()).throw(AssertionError("sent")),
+                         progress_sink=events.append)
+    worker._paused_campaigns.add(("batch", 7))
+    asyncio.run(worker.run_until_idle())
+    assert [event["state"] for event in events] == ["expired"]
+    assert spool.cursor(0) == 1
+
+
+def test_worker_reports_applied_control_version(tmp_path):
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000)
+    state = {"version": 12, "campaigns": [{"campaign_type": "realtime", "campaign_id": 6, "state": "cancelled"}]}
+    worker = ShardWorker(0, (0,), spool, {}, control_loader=lambda: state)
+    assert worker.snapshot()["applied_control_version"] == -1
+    worker.refresh_campaign_states(force=True)
+    assert worker.snapshot()["applied_control_version"] == 12
+    assert ("realtime", 6) in worker._cancelled_campaigns
+
+
+def test_expiry_waits_for_durable_journal_before_checkpoint(tmp_path, monkeypatch):
+    import threading
+
+    wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000,
+                      clock=BusinessClock(wall, "UTC"))
+    spool.append(_record("durable"))
+    wall.advance(seconds=1)
+    journal = ProgressJournal(tmp_path / "progress.jsonl", max_bytes=1_000_000)
+    store = ProgressPersistence(journal, flush_interval_seconds=0.01)
+    entered, release = threading.Event(), threading.Event()
+    append = journal.append_many
+
+    def slow_append(events):
+        entered.set()
+        assert release.wait(5)
+        append(events)
+
+    monkeypatch.setattr(journal, "append_many", slow_append)
+    store.start()
+    worker = ShardWorker(0, (0,), spool, {1: {"route_id": 1}}, progress_store=store)
+
+    async def run():
+        task = asyncio.create_task(worker.run_until_idle())
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert spool.cursor(0) == 0
+        release.set()
+        await task
+
+    try:
+        asyncio.run(run())
+        assert spool.cursor(0) == 1
+        assert json.loads(journal.path.read_text().splitlines()[0])["state"] == "expired"
+    finally:
+        release.set()
+        store.close()
+
+
+def test_expiry_rejected_by_journal_does_not_advance_cursor(tmp_path, monkeypatch):
+    wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000,
+                      clock=BusinessClock(wall, "UTC"))
+    spool.append(_record("rejected"))
+    wall.advance(seconds=1)
+    journal = ProgressJournal(tmp_path / "progress.jsonl", max_bytes=1_000_000)
+    store = ProgressPersistence(journal)
+    store.start()
+    monkeypatch.setattr(store, "submit", lambda *_: False)
+    worker = ShardWorker(0, (0,), spool, {1: {"route_id": 1}}, progress_store=store)
+    try:
+        asyncio.run(worker.run_until_idle())
+        assert spool.cursor(0) == 0
+    finally:
+        store.close()
 
 
 def test_worker_finishes_a_multipart_send_started_before_cutoff(tmp_path):
@@ -179,6 +276,28 @@ def test_worker_finishes_a_multipart_send_started_before_cutoff(tmp_path):
     assert events[0]["state"] == "socket_written"
     assert events[0]["parts_written"] == 3
     assert spool.status()["pending_records"] == 0
+
+
+def test_worker_finishes_started_multipart_when_campaign_stops(tmp_path):
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000)
+    spool.append(_record("stopping", message="x" * 300, parts=3))
+    events = []
+
+    class Transport:
+        async def send_task(self, **kwargs):
+            gate = kwargs["before_write"]
+            assert gate(0)
+            worker.set_campaign_state("batch", 7, "cancelled")
+            assert not gate(0)
+            assert gate(1)
+            assert gate(2)
+            return SocketWriteResult("socket_written", 3, 3)
+
+    worker = ShardWorker(0, (0,), spool, {1: {"route_id": 1}},
+                         transport_factory=lambda *_: Transport(), progress_sink=events.append)
+    asyncio.run(worker.run_until_idle())
+    assert events[0]["state"] == "socket_written"
+    assert events[0]["parts_written"] == 3
 
 
 def test_stage_credit_release_before_wait_is_not_lost():

@@ -559,6 +559,8 @@ class TaskSpool:
                 f"record business_day={business_day} is not current day={current}"
             )
         expires_at = float(record.expires_at or self.clock.cutoff(business_day))
+        if record.campaign_type == "realtime":
+            expires_at = min(expires_at, self.clock.cutoff(business_day))
         if expires_at <= self._now():
             raise SpoolExpiredError(f"business day {business_day} has expired")
         return replace(record, business_day=business_day, expires_at=expires_at)
@@ -579,6 +581,7 @@ class TaskSpool:
             return (
                 bool(record.business_day)
                 and record.business_day <= self.current_business_day
+                and (record.campaign_type != "realtime" or record.business_day == today)
                 and not record.is_expired(self._now() if now is None else now)
             )
 

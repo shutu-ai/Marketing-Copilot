@@ -5,6 +5,49 @@ import threading
 import pytest
 
 from services import realtime_ingestion_worker as worker
+from services import realtime_campaign_service as campaigns
+from datetime import datetime
+
+
+def test_expired_cleanup_only_removes_inbox_copy(tmp_path):
+    watch = tmp_path / "watch"
+    inbox = tmp_path / "campaign" / "inbox"
+    watch.mkdir()
+    inbox.mkdir(parents=True)
+    source = watch / "input.csv"
+    copy = inbox / "input.csv"
+    source.write_text("source")
+    copy.write_text("copy")
+    assert not worker._remove_inbox_copy(str(source), str(inbox.parent), str(watch))
+    assert source.exists()
+    assert worker._remove_inbox_copy(str(copy), str(inbox.parent), str(watch))
+    assert not copy.exists()
+    assert source.exists()
+    assert not worker._remove_inbox_copy(str(source), str(tmp_path), str(tmp_path))
+
+
+def test_different_drive_paths_do_not_block_inbox(tmp_path, monkeypatch):
+    inbox = tmp_path / "campaign" / "inbox"
+    inbox.mkdir(parents=True)
+    copy = inbox / "input.csv"
+    copy.write_text("copy")
+    monkeypatch.setattr(worker.os.path, "commonpath", lambda _: (_ for _ in ()).throw(ValueError("different drives")))
+    assert worker._remove_inbox_copy(str(copy), str(inbox.parent), "other-drive")
+    monkeypatch.setattr(campaigns, "cleanup_closed_window_ingestion_files", lambda: None)
+    monkeypatch.setattr(campaigns, "_daily_window_ended", lambda _: False)
+    calls = []
+    def read(_fn, *, operation):
+        calls.append(operation)
+        return [{"id": 1, "campaign_dir": str(inbox.parent), "watch_dir": "other-drive"}] if len(calls) == 1 else []
+    monkeypatch.setattr(campaigns, "read_transaction", read)
+    campaigns.process_realtime_inboxes()
+    assert "realtime.inbox.processing_files" in calls
+
+
+def test_campaign_lifecycle_end_closes_window_before_daily_cutoff():
+    campaign = {"end_time": "2026-11-11 12:00:00", "send_start_time": "08:00", "send_end_time": "18:00"}
+    assert not campaigns._daily_window_ended(campaign, datetime(2026, 11, 11, 11, 59))
+    assert campaigns._daily_window_ended(campaign, datetime(2026, 11, 11, 12, 0))
 
 
 @pytest.fixture

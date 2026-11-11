@@ -248,7 +248,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
 
     control_signature = None
 
-    def load_controls() -> list[dict] | None:
+    def load_controls() -> dict | None:
         nonlocal control_signature
         state_path = Path(context["control_state_path"])
         try:
@@ -258,7 +258,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 return None
             state = json.loads(state_path.read_text(encoding="utf-8"))
             control_signature = signature
-            return list(state.get("campaigns", []))
+            return state
         except (OSError, ValueError, TypeError):
             return None
 
@@ -642,6 +642,7 @@ class VNextRuntime:
         self._started = False
         self.started_at = 0.0
         self._control_state: dict[tuple[str, int], str] = {}
+        self._control_generations: dict[tuple[str, int], int] = {}
         self._control_version = 0
         self._control_lock = threading.RLock()
         self._projection_watchdog_stop = threading.Event()
@@ -1068,12 +1069,17 @@ class VNextRuntime:
         except (OSError, ValueError, TypeError):
             return {"schema_version": 1, "version": 0, "campaigns": []}
         controls = {}
+        generations = {}
         for item in value.get("campaigns", []):
             try:
-                controls[(str(item["campaign_type"]), int(item["campaign_id"]))] = str(item["state"])
+                key = (str(item["campaign_type"]), int(item["campaign_id"]))
+                controls[key] = str(item["state"])
+                if "generation" in item:
+                    generations[key] = int(item["generation"])
             except (KeyError, TypeError, ValueError):
                 continue
         self._control_state = controls
+        self._control_generations = generations
         self._control_version = int(value.get("version", 0) or 0)
         return value
 
@@ -1083,7 +1089,8 @@ class VNextRuntime:
             "version": int(self._control_version),
             "updated_at": time.time(),
             "campaigns": [
-                {"campaign_type": key[0], "campaign_id": key[1], "state": value}
+                {"campaign_type": key[0], "campaign_id": key[1], "state": value,
+                 **({"generation": self._control_generations[key]} if key in self._control_generations else {})}
                 for key, value in sorted(self._control_state.items())
             ],
         }
@@ -1655,12 +1662,71 @@ class VNextRuntime:
                 pass
         return result
 
-    def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str) -> None:
+    def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str, generation: int | None = None) -> None:
         with self._control_lock:
             self._load_control_state()
-            self._control_state[(str(campaign_type), int(campaign_id))] = str(state)
+            key = (str(campaign_type), int(campaign_id))
+            if generation is not None and int(generation) < self._control_generations.get(key, -1):
+                return
+            self._control_state[key] = str(state)
+            if generation is not None:
+                self._control_generations[key] = int(generation)
             self._control_version += 1
             self._persist_control_state()
+
+    def reconcile_realtime_controls(self, campaigns: list[dict]) -> None:
+        """Publish database state before spawning workers after a restart."""
+        with self._control_lock:
+            self._load_control_state()
+            changed = False
+            for campaign in campaigns:
+                key = ("realtime", int(campaign["id"]))
+                status = str(campaign.get("status") or "")
+                state = "running" if status == "in_progress" else "paused" if status in {"not_started", "paused"} else "cancelled"
+                generation = int(campaign.get("dispatch_generation") or 0)
+                if self._control_state.get(key) != state or self._control_generations.get(key) != generation:
+                    self._control_state[key] = state
+                    self._control_generations[key] = generation
+                    changed = True
+            if changed:
+                self._control_version += 1
+                self._persist_control_state()
+
+    def campaign_stop_confirmation(self, campaign_type: str, campaign_id: int, generation: int | None = None) -> dict:
+        key = (str(campaign_type), int(campaign_id))
+        with self._control_lock:
+            self._load_control_state()
+            revision = self._control_version
+            state = self._control_state.get(key)
+            published_generation = self._control_generations.get(key)
+        if (not self._started or self.supervisor is None or state != "cancelled"
+                or (generation is not None and published_generation != int(generation))):
+            return {"confirmed": False, "reason": "stop_not_published"}
+        workers = {int(item["worker_id"]): item for item in self.supervisor.status().get("workers", [])}
+        reports = {int(item["worker_id"]): item for item in self._worker_progress()
+                   if item.get("run_id") == self.run_id}
+        waiting = []
+        now = time.time()
+        for worker_id in range(self.worker_count):
+            process = workers.get(worker_id) or {}
+            report = reports.get(worker_id) or {}
+            snapshot = report.get("snapshot") or {}
+            progress = snapshot.get("progress") or {}
+            current = (process.get("alive") and process.get("pid") == report.get("process_pid")
+                       and now - float(report.get("updated_at") or 0) < max(5.0, self.status_interval_seconds * 4))
+            def has_campaign(items):
+                return any(str(item.get("campaign_type")) == key[0]
+                           and int(item.get("campaign_id") or 0) == key[1]
+                           for item in items)
+            if (not current or int(snapshot.get("applied_control_version", -1)) < revision
+                    or int(snapshot.get("idle_after_control_version", -1)) < revision
+                    or not snapshot.get("healthy", False)
+                    or "campaign_inflight" not in snapshot
+                    or "pending_events_by_campaign" not in progress
+                    or has_campaign(snapshot.get("campaign_inflight") or [])
+                    or has_campaign(progress.get("pending_events_by_campaign") or [])):
+                waiting.append(worker_id)
+        return {"confirmed": not waiting, "revision": revision, "waiting_workers": waiting}
 
     def status(self) -> dict:
         with self._control_lock:

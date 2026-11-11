@@ -10,6 +10,7 @@ import pytest
 import database
 from services import realtime_campaign_service as campaigns
 from services import sms_task_service, sms_write_buffer
+from models.realtime_campaign import RealtimeCampaignUpdate
 from services.smpp_gateway import (
     _SmppConnection, SmppPartialSubmitError, SmppSubmissionNotAllowedError,
 )
@@ -124,6 +125,40 @@ def _insert_realtime_campaign(tmp_path, end_time="23:59", start_time="00:00") ->
     (tmp_path / "campaign" / "inbox").mkdir(parents=True)
     (tmp_path / "watch").mkdir(parents=True)
     return int(row["id"])
+
+
+def test_running_campaign_cannot_change_schedule_even_when_stopping(isolated_db):
+    campaign_id = _insert_realtime_campaign(isolated_db, end_time="18:00")
+    for change in (
+        RealtimeCampaignUpdate(send_end_time="19:00"),
+        RealtimeCampaignUpdate(status="ended", send_end_time="19:00"),
+    ):
+        with pytest.raises(ValueError, match="Stop the campaign"):
+            campaigns.update(campaign_id, change)
+    current = campaigns.get_one(campaign_id)
+    assert current["status"] == "in_progress"
+    assert current["send_end_time"] == "18:00"
+
+
+def test_stopped_campaign_schedule_waits_for_all_workers(isolated_db, monkeypatch):
+    from services import vnext_service
+    campaign_id = _insert_realtime_campaign(isolated_db, end_time="18:00")
+    database.write_transaction(lambda conn: conn.execute(
+        "UPDATE realtime_campaigns SET status='ended' WHERE id=?", (campaign_id,)),
+        operation="test.stop")
+    class Runtime:
+        confirmed = False
+        def campaign_stop_confirmation(self, campaign_type, campaign_id, generation):
+            return {"confirmed": self.confirmed}
+    runtime = Runtime()
+    monkeypatch.setattr(vnext_service, "is_active", lambda: True)
+    monkeypatch.setattr(vnext_service, "runtime", lambda: runtime)
+    monkeypatch.setattr(vnext_service, "set_campaign_state", lambda *_args: None)
+    change = RealtimeCampaignUpdate(send_end_time="19:00")
+    with pytest.raises(ValueError, match="not yet confirmed"):
+        campaigns.update(campaign_id, change)
+    runtime.confirmed = True
+    assert campaigns.update(campaign_id, change)["send_end_time"] == "19:00"
 
 
 def test_finalizer_preserves_authorized_send_for_late_response(isolated_db, monkeypatch):

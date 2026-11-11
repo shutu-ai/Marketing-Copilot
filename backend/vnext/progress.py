@@ -238,6 +238,7 @@ class ProgressPersistence:
         self._pending_items = 0
         self._pending_bytes = 0
         self._pending_by_campaign: dict[tuple[str, int], Counter] = {}
+        self._pending_events_by_campaign: Counter = Counter()
         self._oldest_pending_at: float | None = None
         self._next_token = 1
         self._writer_batches = 0
@@ -413,6 +414,7 @@ class ProgressPersistence:
                     self._failure_reason = reason
                     return False
             self._pending_items += 1
+            self._pending_events_by_campaign[_campaign_key(event)] += 1
             self._pending_bytes += item_bytes
             if self._oldest_pending_at is None:
                 self._oldest_pending_at = time.monotonic()
@@ -525,6 +527,10 @@ class ProgressPersistence:
                 self._pending_items = max(0, self._pending_items - len(events))
                 self._pending_bytes = max(0, self._pending_bytes - batch_bytes)
                 for event in events:
+                    event_key = _campaign_key(event)
+                    self._pending_events_by_campaign[event_key] -= 1
+                    if self._pending_events_by_campaign[event_key] <= 0:
+                        self._pending_events_by_campaign.pop(event_key, None)
                     kind = _pending_response_kind(event)
                     if kind:
                         key = _campaign_key(event)
@@ -872,6 +878,10 @@ class ProgressPersistence:
                 if self._oldest_pending_at is not None else 0.0
             )
             return {
+                "pending_events_by_campaign": [
+                    {"campaign_type": key[0], "campaign_id": key[1], "count": int(count)}
+                    for key, count in self._pending_events_by_campaign.items() if count
+                ],
                 "enabled": True,
                 "name": self.name,
                 "accepting": bool(self._accepting),

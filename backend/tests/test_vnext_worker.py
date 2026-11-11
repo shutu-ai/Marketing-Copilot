@@ -36,6 +36,17 @@ class FakeTransport:
         return {"route_id": self.config["route_id"]}
 
 
+def test_stop_not_confirmed_with_unscanned_records_behind_paused_campaign(tmp_path):
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000)
+    spool.append_many([_record("paused", 1, 1, 1, 0), _record("cancelled", 2, 2, 1, 0)])
+    worker = ShardWorker(0, (0,), spool, {}, prefetch_per_partition=1)
+    worker.set_campaign_state("batch", 1, "paused")
+    worker.set_campaign_state("batch", 2, "cancelled")
+    worker._applied_control_version = 3
+    result = asyncio.run(worker.run_until_idle())
+    assert result["idle_after_control_version"] < 3
+
+
 def test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path):
     return asyncio.run(_test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import threading
 import time
@@ -94,6 +95,10 @@ class ShardWorker:
         self.control_loader = control_loader
         self.journal_admission = journal_admission
         self.progress_store = progress_store
+        self._expiry_waiters = {}
+        self._expiry_waiters_lock = threading.Lock()
+        if self.progress_store is not None:
+            self.progress_store.add_durability_listener(self._expiry_durable)
         self.max_inflight = max(1, int(max_inflight))
         self.prefetch_per_partition = max(1, int(prefetch_per_partition))
         self.metrics = metrics or VNextMetrics()
@@ -104,6 +109,8 @@ class ShardWorker:
         self._transports: dict[str, list[object]] = {}
         self._transports_lock = threading.Lock()
         self._campaign_lock = threading.Lock()
+        self._active_by_campaign: Counter = Counter()
+        self._campaign_reservations: dict[tuple[str, int], list[ProgressReservation]] = defaultdict(list)
         self._transport_creation_locks: dict[str, asyncio.Lock] = {}
         self._transport_cursor: dict[str, int] = {}
         self._number_locks: dict[str, asyncio.Lock] = {}
@@ -118,6 +125,8 @@ class ShardWorker:
         self._control_counters = Counter()
         self._group_cursor = 0
         self._last_control_refresh = 0.0
+        self._applied_control_version = -1
+        self._idle_after_control_version = -1
         self._inflight = 0
         self._active_by_route: Counter[str] = Counter()
         self._route_reconfigure_pending: set[str] = set()
@@ -160,6 +169,10 @@ class ShardWorker:
         values = self.control_loader()
         if values is None:
             return
+        version = None
+        if isinstance(values, dict):
+            version = int(values.get("version", 0))
+            values = values.get("campaigns", [])
         self._paused_campaigns.clear()
         self._cancelled_campaigns.clear()
         for item in values:
@@ -167,6 +180,8 @@ class ShardWorker:
                 self.set_campaign_state(item["campaign_type"], int(item["campaign_id"]), item["state"])
             except (KeyError, TypeError, ValueError):
                 continue
+        if version is not None:
+            self._applied_control_version = version
 
     def apply_route_rates(self, route_rates: dict) -> dict:
         """Update safe route rate settings without recreating SMPP binds."""
@@ -360,7 +375,8 @@ class ShardWorker:
     def _eligible(self, record: SpoolRecord) -> bool:
         self.refresh_campaign_states()
         key = (record.campaign_type, record.campaign_id)
-        return key in self._cancelled_campaigns or key not in self._paused_campaigns
+        return (key in self._cancelled_campaigns or key not in self._paused_campaigns
+                or not self.spool.is_record_current(record))
 
     async def _transport(self, route_id: int):
         key = str(int(route_id))
@@ -679,28 +695,51 @@ class ShardWorker:
     async def _expire(
         self, record: SpoolRecord, reason: str,
         reservation: ProgressReservation | None = None,
-    ) -> None:
-        try:
-            self.spool.expire_record(record)
-        except Exception as exc:
-            await self._emit(WorkerProgress(
-                record.event_id, record.partition_id, record.ordinal,
-                record.campaign_type, record.campaign_id, record.route_id,
-                record.normalized_msisdn, "write_failed", 0, record.part_count_hint,
-                f"expiry checkpoint failed: {type(exc).__name__}: {exc}",
-                created_at=record.created_at, message=record.message,
-                business_day=record.business_day, expires_at=record.expires_at,
-                language=record.language,
-            ), reservation=reservation)
-            return
-        await self._emit(WorkerProgress(
+        state: str = "expired",
+    ) -> bool:
+        progress = WorkerProgress(
             record.event_id, record.partition_id, record.ordinal,
             record.campaign_type, record.campaign_id, record.route_id,
-            record.normalized_msisdn, "expired", 0, record.part_count_hint,
+            record.normalized_msisdn, state, 0, record.part_count_hint,
             reason, created_at=record.created_at, message=record.message,
             business_day=record.business_day, expires_at=record.expires_at,
             language=record.language,
-        ), reservation=reservation)
+        )
+        waiter = None
+        created = False
+        if self.progress_store is not None:
+            with self._expiry_waiters_lock:
+                waiter = self._expiry_waiters.get(record.event_id)
+                if waiter is None:
+                    waiter = concurrent.futures.Future()
+                    self._expiry_waiters[record.event_id] = waiter
+                    created = True
+        if self.progress_store is None or created:
+            if not await self._emit_result(progress, reservation=reservation):
+                if waiter is not None:
+                    with self._expiry_waiters_lock:
+                        self._expiry_waiters.pop(record.event_id, None)
+                return False
+        if self.progress_store is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(waiter)), timeout=10.0)
+            except asyncio.TimeoutError:
+                return False
+        self.spool.expire_record(record)
+        if waiter is not None:
+            with self._expiry_waiters_lock:
+                if self._expiry_waiters.get(record.event_id) is waiter:
+                    self._expiry_waiters.pop(record.event_id, None)
+        return True
+
+    def _expiry_durable(self, events: list[dict]) -> None:
+        with self._expiry_waiters_lock:
+            for event in events:
+                if event.get("state") not in {"expired", "cancelled"}:
+                    continue
+                waiter = self._expiry_waiters.get(event.get("event_id"))
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(True)
 
     @staticmethod
     def _progress_templates(
@@ -751,7 +790,8 @@ class ShardWorker:
     async def _process(self, record: SpoolRecord) -> SpoolRecord | None:
         self.refresh_campaign_states(force=True)
         key = (record.campaign_type, record.campaign_id)
-        if key in self._paused_campaigns and key not in self._cancelled_campaigns:
+        if (key in self._paused_campaigns and key not in self._cancelled_campaigns
+                and self.spool.is_record_current(record)):
             # Do not checkpoint a record that became paused while it was in a
             # bounded prefetch buffer.  The next polling cycle will discover
             # it again from the durable spool.
@@ -767,8 +807,9 @@ class ShardWorker:
                     # Do not advance an expired record's cursor when its
                     # terminal event cannot enter the durable journal.
                     return record
-            await self._expire(record, "business day cutoff reached before dispatch")
-            return None
+            return None if await self._expire(record, "business day cutoff reached before dispatch") else record
+        if key in self._cancelled_campaigns:
+            return None if await self._expire(record, "campaign cancelled", state="cancelled") else record
         # Binding is a connection-lifecycle operation, not a dispatch fence.
         # Acquire a physical route slot before advancing the durable cursor so
         # a worker that is waiting behind pool_size can never lose a record.
@@ -787,11 +828,13 @@ class ShardWorker:
                 # durable cursor on the next pass.
                 return record
         if not self.spool.is_record_current(record):
-            await self._expire(record, "business day cutoff reached after bind")
-            return None
+            return None if await self._expire(record, "business day cutoff reached after bind") else record
         parts_total = count_parts(record.message)
         try:
             reservation = self._reserve_for_record(record, parts_total)
+            if reservation is not None:
+                with self._campaign_lock:
+                    self._campaign_reservations[key].append(reservation)
             self._last_admission_block = ""
         except ProgressPersistenceBlocked as exc:
             # Fail closed before dispatch_taken: no socket write without a
@@ -809,23 +852,10 @@ class ShardWorker:
                 reservation.release_unwritten(reservation.slots_open)
             return None
         if key in self._cancelled_campaigns:
-            try:
-                self.spool.expire_record(record)
-            except Exception:
-                pass
-            await self._emit_result(
-                WorkerProgress(
-                    record.event_id, record.partition_id, record.ordinal,
-                    record.campaign_type, record.campaign_id, record.route_id,
-                    record.normalized_msisdn, "cancelled", 0, parts_total,
-                    "campaign cancelled", message=record.message,
-                    language=record.language,
-                ),
-                reservation=reservation,
-            )
+            settled = await self._expire(record, "campaign cancelled", reservation, state="cancelled")
             if reservation is not None:
                 reservation.release_unwritten(reservation.slots_open)
-            return None
+            return None if settled else record
         # Persist dispatch_taken before any socket call.  A crash after this
         # point is intentionally at-most-once-after-dispatch.
         try:
@@ -866,14 +896,8 @@ class ShardWorker:
 
                     current = self.spool.is_record_current(record)
                     self.refresh_campaign_states()
-                    if key in self._cancelled_campaigns:
-                        return False
-                    if (
-                        key in self._paused_campaigns
-                        and key not in self._cancelled_campaigns
-                    ):
-                        return False
-                    if current:
+                    stopped = key in self._cancelled_campaigns or key in self._paused_campaigns
+                    if current and not stopped:
                         return True
                     if int(parts_written or 0) <= 0:
                         return False
@@ -1077,13 +1101,16 @@ class ShardWorker:
         iterators, buffers, counts, exhausted, group_order, fill = self._seed_buffers()
         pending: set[asyncio.Task] = set()
         pending_routes: dict[asyncio.Task, str] = {}
+        pending_campaigns: dict[asyncio.Task, tuple[str, int]] = {}
         blocked_groups: set[tuple[int, str, int, int]] = set()
         processed = 0
+        control_requested = False
         fill()
         self._active_by_route.clear()
         try:
             while not self._stop.is_set() and (group_order or pending) and (max_tasks is None or processed < int(max_tasks)):
                 if control_handler is not None and control_handler():
+                    control_requested = True
                     break
                 fill()
                 eligible_group = None
@@ -1108,6 +1135,10 @@ class ShardWorker:
                     counts[record.partition_id] -= 1
                     task = asyncio.create_task(self._process(record))
                     pending.add(task)
+                    campaign_key = (record.campaign_type, record.campaign_id)
+                    pending_campaigns[task] = campaign_key
+                    with self._campaign_lock:
+                        self._active_by_campaign[campaign_key] += 1
                     route_key = str(record.route_id)
                     pending_routes[task] = route_key
                     self._active_by_route[route_key] += 1
@@ -1118,6 +1149,11 @@ class ShardWorker:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     self._inflight = len(pending)
                     for task in done:
+                        campaign_key = pending_campaigns.pop(task)
+                        with self._campaign_lock:
+                            self._active_by_campaign[campaign_key] -= 1
+                            if not self._active_by_campaign[campaign_key]:
+                                del self._active_by_campaign[campaign_key]
                         route_key = pending_routes.pop(task, "")
                         if route_key:
                             self._active_by_route[route_key] = max(
@@ -1143,7 +1179,19 @@ class ShardWorker:
                     break
             if pending:
                 await asyncio.gather(*pending)
+            if (not self._stop.is_set() and not control_requested
+                    and len(exhausted) == len(self.partitions)
+                    and not any(queue and (group[1], group[2]) in self._cancelled_campaigns
+                                for group, queue in buffers.items())):
+                self._idle_after_control_version = self._applied_control_version
+            else:
+                self._idle_after_control_version = -1
         finally:
+            with self._campaign_lock:
+                for campaign_key in pending_campaigns.values():
+                    self._active_by_campaign[campaign_key] -= 1
+                    if not self._active_by_campaign[campaign_key]:
+                        del self._active_by_campaign[campaign_key]
             self._inflight = 0
             self._active_by_route.clear()
             if close_transports:
@@ -1162,6 +1210,7 @@ class ShardWorker:
             for transport in transports
             if hasattr(transport, "snapshot")
         ]
+        control_snapshot = self._control_snapshot()
         progress = (
             self.progress_store.snapshot()
             if self.progress_store is not None
@@ -1226,14 +1275,30 @@ class ShardWorker:
                 key: self._route_inflight_limit(int(key)) for key in self.route_configs
             },
             "route_reconfigure_pending": sorted(self._route_reconfigure_pending),
-            **self._control_snapshot(),
+            **control_snapshot,
             "healthy": healthy,
             "transports": transport_snapshots,
         }
 
     def _control_snapshot(self) -> dict:
         with self._campaign_lock:
+            reservations = {}
+            for key, values in list(self._campaign_reservations.items()):
+                remaining = [value for value in values if value.slots_open]
+                if remaining:
+                    self._campaign_reservations[key] = remaining
+                    reservations[key] = len(remaining)
+                else:
+                    del self._campaign_reservations[key]
             return {
+                "applied_control_version": self._applied_control_version,
+                "idle_after_control_version": self._idle_after_control_version,
+                "campaign_inflight": [
+                    {"campaign_type": key[0], "campaign_id": key[1],
+                     "active": int(self._active_by_campaign.get(key, 0)),
+                     "reservations": int(reservations.get(key, 0))}
+                    for key in self._active_by_campaign.keys() | reservations.keys()
+                ],
                 "checkpoint_count": int(self._checkpoint_count),
                 "control_counters": {
                     name: int(self._control_counters.get(name, 0))

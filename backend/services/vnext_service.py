@@ -285,6 +285,11 @@ def start() -> VNextRuntime | None:
             keep_smpp_binds=_env_bool("MC_VNEXT_KEEP_SMPP_BINDS", True),
             prewarm_smpp_binds=_env_bool("MC_VNEXT_PREWARM_SMPP_BINDS", True),
         )
+        campaigns = read_transaction(
+            lambda conn: [dict(row) for row in conn.execute("SELECT id,status,dispatch_generation FROM realtime_campaigns").fetchall()],
+            operation="vnext.start.realtime_controls",
+        )
+        value.reconcile_realtime_controls(campaigns)
         value.start()
         _RUNTIME = value
         _CONFIG_RESTART_REQUIRED = False
@@ -1455,7 +1460,7 @@ def status() -> dict:
     return result
 
 
-def set_campaign_state(campaign_type: str, campaign_id: int, state: str) -> dict:
+def set_campaign_state(campaign_type: str, campaign_id: int, state: str, generation: int | None = None) -> dict:
     value = runtime()
     normalized = str(state).strip().lower()
     if normalized not in {"running", "in_progress", "not_started", "paused", "cancelled", "ended", "cancel", "stopped", "pause", "resume"}:
@@ -1466,7 +1471,10 @@ def set_campaign_state(campaign_type: str, campaign_id: int, state: str) -> dict
         normalized = "paused"
     else:
         normalized = "cancelled"
-    value.set_campaign_state(campaign_type, int(campaign_id), normalized)
+    if generation is None:
+        value.set_campaign_state(campaign_type, int(campaign_id), normalized)
+    else:
+        value.set_campaign_state(campaign_type, int(campaign_id), normalized, generation)
     return {"success": True, "pipeline": "vnext", "campaign_type": campaign_type,
             "campaign_id": int(campaign_id), "state": normalized}
 

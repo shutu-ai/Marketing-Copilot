@@ -796,6 +796,17 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             if not smpp:
                 raise ValueError("Associated SMPP configuration is missing or disabled")
         current_dict = dict(current)
+        schedule_fields = {"end_time", "send_start_time", "send_end_time", "send_days"}
+        schedule_changed = any(fields[key] != current_dict.get(key) for key in schedule_fields.intersection(fields))
+        if current_dict.get("status") == "in_progress":
+            if schedule_changed:
+                raise ValueError("Stop the campaign and wait for it to finish before changing its schedule")
+        if current_dict.get("status") == "ended" and schedule_changed and vnext_active:
+            if not vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(current_dict.get("dispatch_generation") or 0)).get("confirmed"):
+                raise ValueError("Campaign stop is not yet confirmed by all workers; retry after in-flight work completes")
+        if current_dict.get("status") == "ended" and fields.get("status") == "in_progress":
+            if vnext_active and not vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(current_dict.get("dispatch_generation") or 0)).get("confirmed"):
+                raise ValueError("Campaign stop is not yet confirmed by all workers; retry after in-flight work completes")
         status_changed = any(fields[key] != current_dict.get(key) for key in control_fields.intersection(fields))
         next_generation = int(current_dict.get("dispatch_generation") or 0)
         if status_changed:
@@ -837,7 +848,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         if status_update and updated:
             if vnext_active:
                 vnext_service.set_campaign_state(
-                    "realtime", campaign_id, updated.get("status", ""),
+                    "realtime", campaign_id, updated.get("status", ""), int(updated.get("dispatch_generation") or 0),
                 )
             else:
                 fast_send_service.publish_campaign_state(
@@ -857,6 +868,8 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             logger.debug("Unable to invalidate live realtime SMPP queues", exc_info=True)
     sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
     result = _enrich(updated)
+    if vnext_active and updated.get("status") == "ended":
+        result["stop_confirmation"] = vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(updated.get("dispatch_generation") or 0))
     if data.use_custom_directory is not None:
         os.makedirs(os.path.join(result["campaign_dir"], "whitelist"), exist_ok=True)
         os.makedirs(os.path.join(result["campaign_dir"], "received"), exist_ok=True)
@@ -2731,6 +2744,14 @@ def _watch_scan_due(campaign: dict, watch_dir: str, now: datetime, force: bool =
 def _daily_window_ended(campaign: dict, now: Optional[datetime] = None) -> bool:
     """Return whether the current local calendar day has passed its send window."""
     now = now or datetime.now()
+    end_time = str(campaign.get("end_time") or "").strip()
+    if end_time:
+        try:
+            business_now = sms_task_service._business_now(now)
+            if business_now >= sms_task_service._parse_business_datetime(end_time, business_now.tzinfo):
+                return True
+        except (TypeError, ValueError):
+            pass
     current = now.strftime("%H:%M")
     start = (campaign.get("send_start_time") or "")[:5]
     end = (campaign.get("send_end_time") or "")[:5]
@@ -2774,7 +2795,7 @@ def finalize_daily_tasks(now: Optional[datetime] = None) -> int:
 
         def finalize(conn):
             campaigns = conn.execute(
-                "SELECT id,status,send_start_time,send_end_time,send_days FROM realtime_campaigns"
+                "SELECT id,status,end_time,send_start_time,send_end_time,send_days FROM realtime_campaigns"
             ).fetchall()
             due_campaigns = []
             started_campaigns = []
@@ -2961,7 +2982,7 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
     now = now or datetime.now()
     campaigns = read_transaction(
         lambda conn: conn.execute(
-            """SELECT id,send_start_time,send_end_time,campaign_dir
+            """SELECT id,end_time,send_start_time,send_end_time,campaign_dir,watch_dir
                FROM realtime_campaigns WHERE campaign_dir<>''"""
         ).fetchall(),
         operation="realtime.ingestion.closed_window_campaigns",
@@ -3000,8 +3021,8 @@ def cleanup_closed_window_ingestion_files(now: Optional[datetime] = None,
         for job in expired_jobs:
             try:
                 path = job.get("file_path", "")
-                if path and os.path.isfile(path):
-                    os.remove(path)
+                from services.realtime_ingestion_worker import _remove_inbox_copy
+                _remove_inbox_copy(path, campaign.get("campaign_dir", ""), campaign.get("watch_dir", ""))
             except OSError as exc:
                 logger.warning(
                     "Realtime expired file deletion failed campaign=%s file=%s error=%s",
@@ -3377,6 +3398,14 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
         if not campaign_dir:
             continue
         inbox_dir = os.path.join(campaign_dir, "inbox")
+        watch_dir = campaign.get("watch_dir") or ""
+        if watch_dir:
+            try:
+                if os.path.commonpath((os.path.realpath(inbox_dir), os.path.realpath(watch_dir))) == os.path.realpath(watch_dir):
+                    logger.warning("Realtime inbox overlaps watch directory campaign=%s", campaign["id"])
+                    continue
+            except ValueError:
+                pass  # Different Windows drives cannot overlap.
         if _daily_window_ended(campaign):
             continue
         if not os.path.isdir(inbox_dir):
@@ -3392,7 +3421,7 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
         processing_files = {item["filename"] for item in processing_rows}
         for fname in sorted(os.listdir(inbox_dir)):
             src = os.path.join(inbox_dir, fname)
-            if not os.path.isfile(src):
+            if os.path.islink(src) or not os.path.isfile(src):
                 continue
             ext = os.path.splitext(fname)[1].lower()
             if ext not in (".csv", ".txt", ".xlsx", ".xls"):
@@ -3405,7 +3434,9 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
                     # Let its pre-processing expiry check finish the job.
                     continue
                 try:
-                    os.remove(src)
+                    from services.realtime_ingestion_worker import _remove_inbox_copy
+                    if not _remove_inbox_copy(src, campaign_dir, campaign.get("watch_dir", "")):
+                        continue
                     logger.info(
                         "Realtime expired inbox file deleted campaign=%s file=%s",
                         campaign["id"], fname,
@@ -3421,7 +3452,9 @@ def process_realtime_inboxes(campaign_id: Optional[int] = None):
                 if fname in processing_files:
                     continue
                 try:
-                    os.remove(src)
+                    from services.realtime_ingestion_worker import _remove_inbox_copy
+                    if not _remove_inbox_copy(src, campaign_dir, campaign.get("watch_dir", "")):
+                        continue
                     logger.info(
                         "Realtime closed-window inbox file deleted campaign=%s file=%s",
                         campaign["id"], fname,

@@ -773,8 +773,12 @@ async function handleStart(row: Campaign) {
 
 async function handleEnd(row: Campaign) {
   try {
-    await api.updateRealtimeCampaign(row.id, { status: 'ended' })
-    ElMessage.success(i18n.global.t('legacy.x82977854'))
+    const response = await api.updateRealtimeCampaign(row.id, { status: 'ended' })
+    if (response.data?.stop_confirmation && !response.data.stop_confirmation.confirmed) {
+      ElMessage.warning(t('campaign.stopPending'))
+    } else {
+      ElMessage.success(i18n.global.t('legacy.x82977854'))
+    }
     await fetchList()
   } catch (e: any) {
     ElMessage.error(e.response?.data?.detail || i18n.global.t('legacy.x5fa802be'))

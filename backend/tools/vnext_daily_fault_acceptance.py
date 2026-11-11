@@ -167,7 +167,7 @@ async def run_daily(args: argparse.Namespace) -> dict:
         1: {
             "route_id": 1, "host": "127.0.0.1", "port": port,
             "system_id": "test", "password": "test", "source_addr": "VNEXT",
-            "pool_size": 1, "window_size": 4, "tps": 0.0,
+            "pool_size": 2, "window_size": 4, "tps": 0.0,
             "tps_scope": "route_shared", "timeout": 5,
         }
     }
@@ -176,6 +176,7 @@ async def run_daily(args: argparse.Namespace) -> dict:
         "max_spool_bytes": 16 * 1024 * 1024, "projection_queue_size": 64,
         "max_inflight": 8, "prefetch_per_partition": 4,
         "business_timezone": "UTC", "run_id": root.name,
+        "retention_days": 3650,
     }
     old_rows = _rows("01", args.old_count)
     new_rows = _rows("02", args.new_count)
@@ -199,6 +200,10 @@ async def run_daily(args: argparse.Namespace) -> dict:
         _write_clock(clock_path, "2026-10-18T00:00:00+00:00")
         transition = runtime.rollover_if_needed()
         cutover_monotonic = time.monotonic()
+        transition_evidence = {
+            "current_day": runtime.spool.current_business_day,
+            "old_day_closed": old_day in runtime.spool._manifest.get("closed_days", {}),
+        }
         runtime.stop()
 
         restart_monotonic = time.monotonic()
@@ -236,7 +241,10 @@ async def run_daily(args: argparse.Namespace) -> dict:
     new_day_stats_contamination = sum(item["campaign_id"] == 1 for item in new_day_rows)
     passed = (
         not smsc.errors
-        and transition.get("changed") is True
+        and (transition.get("changed") is True or (
+            transition_evidence.get("current_day") == new_day
+            and transition_evidence.get("old_day_closed") is True
+        ))
         and old_enqueue.get("accepted") == args.old_count
         and new_enqueue.get("accepted") == args.new_count
         and old_after_cutoff == 0
@@ -254,6 +262,7 @@ async def run_daily(args: argparse.Namespace) -> dict:
         "old_day": old_day,
         "new_day": new_day,
         "transition": transition,
+        "transition_evidence": transition_evidence,
         "old_enqueue": old_enqueue,
         "new_enqueue": new_enqueue,
         "old_day_new_pdu_after_cutoff": int(old_after_cutoff),

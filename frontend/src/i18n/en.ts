@@ -272,6 +272,7 @@ export default {
     flashSms: 'Flash SMS',
     flashSmsTip: 'When enabled, messages are sent as Class 0 flash SMS and displayed immediately on supported handsets.',
     inProgressSmppOnly: 'While a campaign is running, only the associated SMPP can be changed; pending SMS tasks will switch to the new SMPP after saving.',
+    stopPending: 'Stop requested. Waiting for workers and in-flight messages to finish before changing the schedule or restarting.',
     scheduleReady: 'Schedule configured',
     scheduleMissing: 'Set campaign dates and daily send window',
     startBlocked: 'Campaign is not ready to start',

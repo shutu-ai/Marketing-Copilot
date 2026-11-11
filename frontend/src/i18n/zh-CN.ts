@@ -277,6 +277,7 @@ export default {
     flashSms: '闪信',
     flashSmsTip: '启用后将按 Class 0 闪信格式发送，支持的手机将立即显示。',
     inProgressSmppOnly: '活动运行中仅可修改关联的SMPP；保存后该活动待发送的短信将改用新的SMPP发送。',
+    stopPending: '停止指令已发送，正在等待工作进程和在途短信收尾；确认完成后才能修改时间或重新启动。',
     scheduleReady: '发送计划已设置',
     scheduleMissing: '请设置活动日期和每日发送时段',
     startBlocked: '活动尚未满足启动条件',

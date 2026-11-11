@@ -578,6 +578,9 @@ def test_worker_does_not_checkpoint_when_progress_persistence_is_blocked(tmp_pat
         sent: list[dict] = []
 
         class BlockedProgressStore:
+            def add_durability_listener(self, callback):
+                pass
+
             def snapshot(self):
                 return {
                     "accepting": False,

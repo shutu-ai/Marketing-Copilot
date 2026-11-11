@@ -32,6 +32,7 @@ export interface RealtimeCampaign {
   send_end_time: string
   send_days: string[]
   status: string
+  stop_confirmation?: { confirmed: boolean; reason?: string; waiting_workers?: number[] }
   customer_list_filename: string
   customer_list_path: string
   row_count: number

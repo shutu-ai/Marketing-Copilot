@@ -35,6 +35,26 @@ def _configured_worker_count() -> int:
         return 4
 
 
+def _remove_inbox_copy(path: str, campaign_dir: str, watch_dir: str = "") -> bool:
+    """Delete only a regular work copy directly inside this campaign's inbox."""
+    if not path or not campaign_dir:
+        return False
+    inbox = os.path.realpath(os.path.join(campaign_dir, "inbox"))
+    if watch_dir:
+        watched = os.path.realpath(watch_dir)
+        try:
+            if os.path.commonpath((inbox, watched)) == watched:
+                return False
+        except ValueError:
+            pass  # Different Windows drives cannot overlap.
+    if os.path.realpath(os.path.dirname(path)) != inbox or os.path.islink(path):
+        return False
+    if os.path.isfile(path):
+        os.remove(path)
+        return True
+    return False
+
+
 def _processed_id(campaign_id: int, filename: str):
     try:
         row = read_transaction(
@@ -61,7 +81,7 @@ def _discard_expired_queued_files(include_processing: bool = False):
     rows = read_transaction(
         lambda conn: conn.execute(
             """SELECT f.id, f.campaign_id, f.filename, f.file_path,
-                      c.campaign_dir, c.watch_filename_prefix
+                      c.campaign_dir, c.watch_dir, c.watch_filename_prefix
                FROM ingestion_files f
                JOIN realtime_campaigns c ON c.id=f.campaign_id
                WHERE f.campaign_type='realtime' AND f.status IN """ + active_statuses
@@ -98,8 +118,7 @@ def _discard_expired_queued_files(include_processing: bool = False):
     for job in discarded_jobs:
         try:
             path = job.get("file_path", "")
-            if path and os.path.isfile(path):
-                os.remove(path)
+            _remove_inbox_copy(path, job.get("campaign_dir", ""), job.get("watch_dir", ""))
         except OSError as exc:
             logger.warning(
                 "Realtime expired queued file deletion failed campaign=%s file=%s error=%s",
@@ -112,7 +131,7 @@ def _discard_inactive_campaign_files() -> None:
     """Batch-cancel queued files whose campaign was disabled or removed."""
     rows = read_transaction(
         lambda conn: conn.execute(
-            """SELECT f.id,f.campaign_id,f.filename,f.file_path,
+            """SELECT f.id,f.campaign_id,f.filename,f.file_path,c.campaign_dir,c.watch_dir,
                       c.id AS matched_campaign_id
                FROM ingestion_files f
                LEFT JOIN realtime_campaigns c ON c.id=f.campaign_id
@@ -150,8 +169,7 @@ def _discard_inactive_campaign_files() -> None:
     for job in discarded_jobs:
         try:
             path = job.get("file_path", "")
-            if path and os.path.isfile(path):
-                os.remove(path)
+            _remove_inbox_copy(path, job.get("campaign_dir", ""), job.get("watch_dir", ""))
         except OSError as exc:
             logger.warning(
                 "Realtime inactive campaign file deletion failed campaign=%s file=%s error=%s",
@@ -177,8 +195,7 @@ def _discard_claimed_expired_file(job: dict, campaign: dict, reason: str, worker
             )
     file_path = job.get("file_path", "")
     try:
-        if file_path and os.path.isfile(file_path):
-            os.remove(file_path)
+        _remove_inbox_copy(file_path, campaign.get("campaign_dir", ""), campaign.get("watch_dir", ""))
     except OSError as exc:
         logger.warning(
             "Realtime expired file deletion failed campaign=%s file=%s error=%s",
