@@ -1283,8 +1283,10 @@ class TaskSpool:
                 for handle in handles.values():
                     handle.close()
 
-    def iter_from(self, partition_id: int, cursor: int = 0) -> Iterator[SpoolRecord]:
-        """Yield valid records after an ordinal cursor in append order."""
+    def iter_from(
+        self, partition_id: int, cursor: int = 0, *, include_expired: bool = False,
+    ) -> Iterator[SpoolRecord]:
+        """Yield records after a cursor, optionally including expiry settlements."""
 
         partition = int(partition_id)
         if not 0 <= partition < self.virtual_partition_count:
@@ -1314,10 +1316,9 @@ class TaskSpool:
             entry_day = str(entry.get("business_day") or "")
             if not entry_day or entry_day > current_day:
                 continue
-            # A cross-midnight campaign may retain an old-day record until its
-            # explicit window expiry.  New segments carry a max expiry so an
-            # already-dead historical segment is skipped without decoding it.
-            if entry_day and entry_day != current_day:
+            # Ordinary readers skip already-dead historical segments without
+            # decoding them; workers opt into expiry settlement below.
+            if not include_expired and entry_day and entry_day != current_day:
                 try:
                     max_expires_at = float(entry.get("max_expires_at", 0.0) or 0.0)
                 except (TypeError, ValueError):
@@ -1351,7 +1352,7 @@ class TaskSpool:
                     if (record.business_day
                             and record.business_day <= current_day
                             and record.ordinal > effective_cursor
-                            and not record.is_expired(now)
+                            and (include_expired or not record.is_expired(now))
                             and record.ordinal not in taken_pending):
                         yield record
 

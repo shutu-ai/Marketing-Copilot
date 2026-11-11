@@ -32,6 +32,13 @@ from .worker import ShardWorker
 logger = logging.getLogger(__name__)
 
 
+def _restartable_progress_failure(snapshot: dict) -> bool:
+    """Return whether a blocked worker can be recycled without redispatch."""
+
+    progress = snapshot.get("progress") or {}
+    return False
+
+
 def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, context: dict) -> None:
     set_parent_death_signal()
     diagnostic_root = str(context.get("diagnostics_root") or "")
@@ -107,7 +114,12 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         profiler=profiler,
     )
     worker_ref = {"value": None}
-    status_state = {"active": False, "draining": False}
+    status_state = {
+        "active": False,
+        "draining": False,
+        "phase": "starting",
+        "loop_heartbeat_at": 0.0,
+    }
     status_lock = threading.Lock()
     status_stop = threading.Event()
 
@@ -125,11 +137,15 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         busy = busy or int(progress.get("pending_durability", 0) or 0) > 0
         payload = {
             "worker_id": int(worker_id),
+            "process_pid": int(os.getpid()),
             "run_id": run_id,
             # ``active`` describes real protocol/progress work, not the fact
             # that the idle polling loop is currently running one pass.
             "active": busy,
             "updated_at": time.time(),
+            "phase": str(status_state.get("phase") or ""),
+            "loop_heartbeat_at": float(status_state.get("loop_heartbeat_at") or 0.0),
+            "recovery_policy": "checkpoint_before_socket_drop_uncertain",
             "snapshot": snapshot,
         }
         temporary = worker_status_path.with_name(f".{worker_status_path.name}.{os.getpid()}.tmp")
@@ -272,6 +288,8 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             while True:
                 if handle_control():
                     return
+                status_state["loop_heartbeat_at"] = time.time()
+                status_state["phase"] = "maintenance"
                 worker.refresh_campaign_states(force=True)
                 # A long-lived bind must recover even while the spool is
                 # empty; otherwise a dropped idle socket would remain absent
@@ -279,13 +297,33 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 await worker.maintain_transports()
                 before = worker.snapshot()["counters"].get("taken", 0)
                 status_state["active"] = True
+                status_state["phase"] = "dispatch"
                 publish_status(True)
-                await worker.run_until_idle(
+                worker_snapshot = await worker.run_until_idle(
                     close_transports=False,
                     control_handler=handle_control,
                 )
                 if stop_requested:
                     return
+                if _restartable_progress_failure(worker_snapshot):
+                    progress = worker_snapshot.get("progress") or {}
+                    diagnostic(
+                        phase="progress_failure_restart",
+                        status="degraded",
+                        extra={
+                            "reason": str(
+                                progress.get("blocked_reason")
+                                or "progress persistence stopped accepting work"
+                            ),
+                            "writer_errors": int(progress.get("writer_errors", 0) or 0),
+                        },
+                    )
+                    # The spool cursor was fenced before socket I/O.  Recycle
+                    # the worker and drop the uncertain terminal result so the
+                    # next worker can continue with later records.
+                    worker.stop()
+                    return
+                status_state["phase"] = "transport_drain"
                 drain = await worker.drain_transports()
                 if not drain.get("drained"):
                     diagnostic(
@@ -301,6 +339,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 if not bool(context.get("keep_smpp_binds", True)):
                     await worker.close_transports()
                 status_state["draining"] = True
+                status_state["phase"] = "progress_drain"
                 progress_drain = await worker.drain_progress(timeout=30.0)
                 status_state["draining"] = False
                 if not progress_drain.get("drained"):
@@ -318,12 +357,14 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                     )
                 worker.release_reader_caches()
                 status_state["active"] = False
+                status_state["phase"] = "idle"
                 publish_status(False)
                 after = worker.snapshot()["counters"].get("taken", 0)
                 if after == before:
                     await asyncio.sleep(idle_poll_interval)
         finally:
             status_state["active"] = False
+            status_state["phase"] = "stopping"
             await worker.close_transports()
             status_state["draining"] = True
             await worker.drain_progress(timeout=30.0)
@@ -513,6 +554,17 @@ class VNextRuntime:
         self._projection_last_error = ""
         self._daily_epoch_stop = threading.Event()
         self._daily_epoch_thread: threading.Thread | None = None
+        self._worker_watchdog_lock = threading.Lock()
+        self._worker_watchdog_state: dict[str, dict] = {}
+        self._worker_watchdog_last_check = 0.0
+        self._worker_watchdog_last_restart: dict[int, float] = {}
+        self._worker_watchdog_restart_cooldown_seconds = 60.0
+        self._worker_watchdog_status_timeout_seconds = max(
+            5.0, self.status_interval_seconds * 4.0
+        )
+        self._worker_watchdog_loop_timeout_seconds = max(
+            30.0, self.status_interval_seconds * 30.0
+        )
         try:
             self.spool_gc_interval_seconds = max(
                 5.0,
@@ -614,7 +666,187 @@ class VNextRuntime:
             except (OSError, RuntimeError, ValueError):
                 # The next tick retries; a delayed maintenance tick cannot
                 # reopen an old socket because workers check the spool fence.
+                pass
+            try:
+                self._run_worker_watchdog()
+            except Exception:
+                # A monitoring failure must not stop the daily fence/GC loop.
+                logger.exception("VNext worker watchdog failed")
+
+    def _set_worker_watchdog_state(
+        self, worker_id: int, state: str, reason: str, **details,
+    ) -> None:
+        key = str(int(worker_id))
+        payload = {
+            "worker_id": int(worker_id),
+            "state": str(state),
+            "reason": str(reason),
+            "updated_at": time.time(),
+            **details,
+        }
+        with self._worker_watchdog_lock:
+            previous = dict(self._worker_watchdog_state.get(key) or {})
+            self._worker_watchdog_state[key] = payload
+        if (
+            previous.get("state") == payload["state"]
+            and previous.get("reason") == payload["reason"]
+        ):
+            return
+        status = "degraded" if state in {"blocked", "restart_failed", "stale"} else "running"
+        write_process_metadata(
+            self.diagnostics_root,
+            f"worker-watchdog-{int(worker_id)}",
+            run_id=self.run_id,
+            start_method=self.start_method,
+            phase="worker_watchdog",
+            status=status,
+            progress={"worker_id": int(worker_id)},
+            extra={"state": str(state), "reason": str(reason), **details},
+        )
+        if state in {"blocked", "restart_failed"}:
+            logger.warning(
+                "VNext worker watchdog worker=%s state=%s reason=%s",
+                worker_id, state, reason,
+            )
+
+    def _watchdog_restart_worker(self, worker_id: int, reason: str) -> None:
+        now = time.monotonic()
+        last = self._worker_watchdog_last_restart.get(int(worker_id), 0.0)
+        if now - last < self._worker_watchdog_restart_cooldown_seconds:
+            self._set_worker_watchdog_state(
+                worker_id,
+                "restart_cooldown",
+                reason,
+                retry_after_seconds=round(
+                    self._worker_watchdog_restart_cooldown_seconds - (now - last), 3
+                ),
+            )
+            return
+        if self.supervisor is None:
+            self._set_worker_watchdog_state(worker_id, "stale", "supervisor_unavailable")
+            return
+        try:
+            self.supervisor.restart_worker(int(worker_id))
+        except Exception as exc:
+            self._worker_watchdog_last_restart[int(worker_id)] = now
+            self._set_worker_watchdog_state(
+                worker_id,
+                "restart_failed",
+                reason,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        self._worker_watchdog_last_restart[int(worker_id)] = now
+        self._set_worker_watchdog_state(
+            worker_id, "restarted", reason,
+        )
+
+    def _run_worker_watchdog(self) -> None:
+        """Detect live workers whose main loop stopped advancing.
+
+        A fresh heartbeat alone is insufficient: the child heartbeat thread
+        can survive while the async dispatch loop is stuck.  The VNext send
+        fence makes recycling at-most-once: the current task is abandoned and
+        later records continue without redispatching a checkpointed task.
+        """
+
+        if not self._started or self.supervisor is None:
+            return
+        now = time.monotonic()
+        if now - self._worker_watchdog_last_check < 1.0:
+            return
+        self._worker_watchdog_last_check = now
+        supervisor = self.supervisor.status()
+        live = {
+            int(item["worker_id"]): item
+            for item in supervisor.get("workers", [])
+            if isinstance(item, dict) and "worker_id" in item
+        }
+        statuses = {}
+        for item in self._worker_progress():
+            try:
+                statuses[int(item["worker_id"])] = item
+            except (KeyError, TypeError, ValueError):
                 continue
+        wall_now = time.time()
+        for worker_id in range(self.worker_count):
+            process = live.get(worker_id)
+            if not process or not bool(process.get("alive")):
+                self._set_worker_watchdog_state(
+                    worker_id, "process_restart_pending", "supervisor_owns_process_restart",
+                )
+                continue
+            item = statuses.get(worker_id)
+            if not item or str(item.get("run_id") or "") != self.run_id:
+                self._set_worker_watchdog_state(
+                    worker_id, "status_missing", "current_run_status_not_available",
+                )
+                continue
+            status_pid = int(item.get("process_pid") or 0)
+            process_pid = int(process.get("pid") or 0)
+            if not status_pid or not process_pid or status_pid != process_pid:
+                self._set_worker_watchdog_state(
+                    worker_id, "status_missing", "worker_status_belongs_to_another_process",
+                )
+                continue
+            snapshot = item.get("snapshot") or {}
+            progress = snapshot.get("progress") or {}
+            phase = str(item.get("phase") or "")
+            recovery_supported = str(item.get("recovery_policy") or "") == (
+                "checkpoint_before_socket_drop_uncertain"
+            )
+            status_age = max(0.0, wall_now - float(item.get("updated_at") or wall_now))
+            loop_at = float(item.get("loop_heartbeat_at") or 0.0)
+            loop_age = max(0.0, wall_now - loop_at) if loop_at else None
+
+            progress_failure = bool(
+                not bool(progress.get("accepting", True))
+                or int(progress.get("writer_errors", 0) or 0) > 0
+                or int(progress.get("unresolved_events", 0) or 0) > 0
+                or int(snapshot.get("progress_lost_events", 0) or 0) > 0
+            )
+            if progress_failure:
+                self._set_worker_watchdog_state(
+                    worker_id, "blocked", "progress_persistence_requires_reconciliation",
+                    status_age_seconds=round(status_age, 3),
+                )
+                continue
+
+            if status_age > self._worker_watchdog_status_timeout_seconds:
+                if recovery_supported:
+                    self._watchdog_restart_worker(
+                        worker_id, "worker_status_heartbeat_stale_drop_current_task",
+                    )
+                else:
+                    self._set_worker_watchdog_state(
+                        worker_id,
+                        "stale",
+                        "worker_status_predates_safe_drop_recovery_policy",
+                        status_age_seconds=round(status_age, 3),
+                    )
+                continue
+
+            if phase in {"idle", "maintenance"} and loop_age is not None and loop_age > self._worker_watchdog_loop_timeout_seconds:
+                if recovery_supported:
+                    self._watchdog_restart_worker(
+                        worker_id, "worker_main_loop_stalled_drop_current_task",
+                    )
+                else:
+                    self._set_worker_watchdog_state(
+                        worker_id,
+                        "blocked",
+                        "worker_status_predates_safe_drop_recovery_policy",
+                        loop_age_seconds=round(loop_age, 3),
+                    )
+                continue
+
+            self._set_worker_watchdog_state(
+                worker_id,
+                "healthy" if recovery_supported else "unmonitored",
+                "heartbeat_and_main_loop_advancing" if recovery_supported else phase or "watchdog_policy_missing",
+                status_age_seconds=round(status_age, 3),
+                loop_age_seconds=round(loop_age, 3) if loop_age is not None else None,
+            )
 
     def _load_control_state(self) -> dict:
         if not self.control_state_path.exists():
@@ -785,6 +1017,10 @@ class VNextRuntime:
         self._projection_restart_not_before = 0.0
         self._projection_degraded = False
         self._projection_last_error = ""
+        self._worker_watchdog_last_check = 0.0
+        self._worker_watchdog_last_restart.clear()
+        with self._worker_watchdog_lock:
+            self._worker_watchdog_state.clear()
         if self.projection.recovery_required():
             self._projection_degraded = True
             marker = self.projection.snapshot()
@@ -942,6 +1178,12 @@ class VNextRuntime:
                 continue
         return values
 
+    def _worker_watchdog_snapshot(self) -> dict[str, dict]:
+        with self._worker_watchdog_lock:
+            return {
+                key: dict(value) for key, value in self._worker_watchdog_state.items()
+            }
+
     def capacity_snapshot(self) -> dict:
         """Return the bounded read-only snapshot needed by capacity monitoring.
 
@@ -960,6 +1202,7 @@ class VNextRuntime:
             "supervisor": self.supervisor.status() if self.supervisor else None,
             "projection": self.projection.snapshot(),
             "worker_progress": self._worker_progress(),
+            "worker_watchdog": self._worker_watchdog_snapshot(),
             "spool_gc": dict(self._spool_gc_last_result),
             "daily_epoch": {
                 "business_day": spool.get("business_day") or self.spool.current_business_day,
@@ -1022,15 +1265,18 @@ class VNextRuntime:
         }
 
     def stop(self) -> None:
-        if self.supervisor:
-            self.supervisor.stop()
-            self.supervisor = None
         if self._started:
+            # Stop maintenance first so the watchdog cannot race a supervisor
+            # shutdown and launch a replacement while the parent is stopping.
             self._daily_epoch_stop.set()
             daily_thread = self._daily_epoch_thread
             self._daily_epoch_thread = None
             if daily_thread and daily_thread.is_alive() and daily_thread is not threading.current_thread():
                 daily_thread.join(timeout=1.0)
+        if self.supervisor:
+            self.supervisor.stop()
+            self.supervisor = None
+        if self._started:
             self._projection_watchdog_stop.set()
             watchdog = self._projection_watchdog_thread
             self._projection_watchdog_thread = None
@@ -1147,6 +1393,7 @@ class VNextRuntime:
             "supervisor": self.supervisor.status() if self.supervisor else None,
             "projection": self.projection.snapshot(),
             "worker_progress": self._worker_progress(),
+            "worker_watchdog": self._worker_watchdog_snapshot(),
             "journal": {"retained_bytes": journal_bytes, "paths": journal_paths},
             "daily_epoch": {
                 "business_day": self.spool.current_business_day,

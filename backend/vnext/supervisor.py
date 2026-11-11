@@ -159,12 +159,14 @@ class WorkerSupervisor:
         self._run_id = str(run_id or self.root.name)
         self._handles: dict[int, WorkerHandle] = {}
         self._handles_lock = threading.RLock()
+        self._restart_lock = threading.Lock()
         self._owner_prefix = f"supervisor-{os.getpid()}-{uuid.uuid4().hex[:10]}"
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
         self._restart_count = 0
         self._restart_failures: dict[int, int] = {}
         self._restart_not_before: dict[int, float] = {}
+        self._worker_started_at: dict[int, float] = {}
         self._last_exitcodes: dict[int, int | None] = {}
 
     def _context(self):
@@ -195,6 +197,7 @@ class WorkerSupervisor:
             daemon=True,
         )
         process.start()
+        self._worker_started_at[int(worker_id)] = time.monotonic()
         child.close()
         write_process_metadata(
             self._diagnostics_root,
@@ -237,19 +240,35 @@ class WorkerSupervisor:
             for worker_id in dead:
                 if self._monitor_stop.is_set():
                     return
-                if time.monotonic() < self._restart_not_before.get(worker_id, 0.0):
+                now = time.monotonic()
+                if now < self._restart_not_before.get(worker_id, 0.0):
                     continue
+                short_lived = (
+                    worker_id in self._worker_started_at
+                    and now - self._worker_started_at[worker_id] < 30.0
+                )
                 try:
-                    self.restart_worker(worker_id)
+                    with self._restart_lock:
+                        with self._handles_lock:
+                            current = self._handles.get(worker_id)
+                            if current is not None and current.process.is_alive():
+                                continue
+                        self._restart_worker(worker_id)
                     self._restart_count += 1
-                    self._restart_failures[worker_id] = 0
-                    self._restart_not_before.pop(worker_id, None)
+                    if short_lived:
+                        failures = self._restart_failures.get(worker_id, 0) + 1
+                        self._restart_failures[worker_id] = failures
+                        delay = min(60.0, 0.25 * (2 ** min(failures - 1, 8)))
+                        self._restart_not_before[worker_id] = time.monotonic() + delay
+                    else:
+                        self._restart_failures[worker_id] = 0
+                        self._restart_not_before.pop(worker_id, None)
                 except Exception:
                     # A lease or process failure is retried with a bounded
                     # backoff; no second owner is launched on failure.
                     failures = self._restart_failures.get(worker_id, 0) + 1
                     self._restart_failures[worker_id] = failures
-                    delay = min(5.0, 0.25 * (2 ** min(failures - 1, 5)))
+                    delay = min(60.0, 0.25 * (2 ** min(failures - 1, 8)))
                     self._restart_not_before[worker_id] = time.monotonic() + delay
                     continue
 
@@ -287,6 +306,7 @@ class WorkerSupervisor:
                 except Exception:
                     pass
             self._last_exitcodes[handle.worker_id] = getattr(handle.process, "exitcode", None)
+            self._worker_started_at.pop(int(handle.worker_id), None)
             write_process_metadata(
                 self._diagnostics_root,
                 f"worker-{handle.worker_id}",
@@ -305,6 +325,10 @@ class WorkerSupervisor:
                 pass
 
     def restart_worker(self, worker_id: int, timeout: float = 5.0) -> WorkerHandle:
+        with self._restart_lock:
+            return self._restart_worker(worker_id, timeout)
+
+    def _restart_worker(self, worker_id: int, timeout: float = 5.0) -> WorkerHandle:
         worker = int(worker_id)
         with self._handles_lock:
             if self._monitor_stop.is_set() and worker not in self._handles:
@@ -381,9 +405,12 @@ class WorkerSupervisor:
         }
 
     def status(self) -> dict:
-        with self._handles_lock:
-            handles = list(self._handles.values())
-            restart_count = self._restart_count
+        # Do not expose the transient gap between removing the old owner and
+        # publishing the replacement during a watchdog restart.
+        with self._restart_lock:
+            with self._handles_lock:
+                handles = list(self._handles.values())
+                restart_count = self._restart_count
         return {
             "map_revision": self.map.map_revision,
             "worker_count": self.map.worker_count,

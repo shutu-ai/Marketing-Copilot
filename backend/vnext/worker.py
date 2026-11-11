@@ -588,6 +588,16 @@ class ShardWorker:
             # it again from the durable spool.
             return None
         if not self.spool.is_record_current(record):
+            if self.progress_store is not None:
+                progress = self.progress_store.snapshot()
+                if not bool(progress.get("accepting", True)):
+                    self._last_admission_block = str(
+                        progress.get("blocked_reason")
+                        or "progress persistence is not accepting new work"
+                    )
+                    # Do not advance an expired record's cursor when its
+                    # terminal event cannot enter the durable journal.
+                    return record
             await self._expire(record, "business day cutoff reached before dispatch")
             return None
         # Binding is a connection-lifecycle operation, not a dispatch fence.
@@ -671,9 +681,21 @@ class ShardWorker:
         lock = self._number_locks.setdefault(record.normalized_msisdn, asyncio.Lock())
         async with lock:
             try:
-                def before_write() -> bool:
-                    if not self.spool.is_record_current(record):
-                        return False
+                cutoff_grace_deadline = 0.0
+                try:
+                    # shortcut: a bounded 5s maximum grace, make configurable
+                    # only if measured multipart sends need a longer window.
+                    cutoff_grace_seconds = max(
+                        0.5,
+                        min(5.0, float(getattr(transport, "timeout", 5.0) or 5.0)),
+                    )
+                except (TypeError, ValueError):
+                    cutoff_grace_seconds = 5.0
+
+                def before_write(parts_written: int = 0) -> bool:
+                    nonlocal cutoff_grace_deadline
+
+                    current = self.spool.is_record_current(record)
                     self.refresh_campaign_states()
                     if key in self._cancelled_campaigns:
                         return False
@@ -682,7 +704,13 @@ class ShardWorker:
                         and key not in self._cancelled_campaigns
                     ):
                         return False
-                    return True
+                    if current:
+                        return True
+                    if int(parts_written or 0) <= 0:
+                        return False
+                    if cutoff_grace_deadline <= 0.0:
+                        cutoff_grace_deadline = time.monotonic() + cutoff_grace_seconds
+                    return time.monotonic() <= cutoff_grace_deadline
 
                 kwargs = {
                     "destination_addr": record.normalized_msisdn,
@@ -752,7 +780,12 @@ class ShardWorker:
         return None
 
     def _seed_buffers(self):
-        iterators = {partition: iter(self.spool.iter_from(partition, self.spool.cursor(partition))) for partition in self.partitions}
+        iterators = {
+            partition: iter(self.spool.iter_from(
+                partition, self.spool.cursor(partition), include_expired=True,
+            ))
+            for partition in self.partitions
+        }
         buffers: dict[tuple[int, str, int, int], deque[SpoolRecord]] = defaultdict(deque)
         counts: dict[int, int] = defaultdict(int)
         exhausted: set[int] = set()

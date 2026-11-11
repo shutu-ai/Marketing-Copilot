@@ -25,7 +25,10 @@ class FakeWallClock:
         self.value += timedelta(**kwargs)
 
 
-def _record(event_id: str, *, day: str = "", ordinal: int = 0, partition: int = 0):
+def _record(
+    event_id: str, *, day: str = "", ordinal: int = 0, partition: int = 0,
+    message: str | None = None, parts: int = 1,
+):
     return SpoolRecord(
         schema_version=1,
         event_id=event_id,
@@ -37,8 +40,8 @@ def _record(event_id: str, *, day: str = "", ordinal: int = 0, partition: int = 
         route_id=1,
         normalized_msisdn="251900000001",
         payload_ref="synthetic",
-        message=event_id,
-        part_count_hint=1,
+        message=event_id if message is None else message,
+        part_count_hint=parts,
         source_id="synthetic",
         created_at=1.0,
         business_day=day,
@@ -67,6 +70,9 @@ def test_business_day_namespace_fences_old_records_and_reclaims_closed_segments(
     assert transition["changed"] is True
     assert spool.current_business_day == "2026-10-18"
     assert list(spool.iter_from(0)) == []
+    assert [item.event_id for item in spool.iter_from(0, include_expired=True)] == [
+        old_record.event_id
+    ]
     assert spool.is_record_current(old_record) is False
 
     second = ingress.enqueue_chunk(
@@ -127,15 +133,52 @@ def test_worker_expiry_checkpoint_is_durable_and_never_calls_transport(tmp_path)
         progress_sink=lambda event: events.append(event),
     )
     events = []
-    asyncio.run(worker._process(stored))
+    snapshot = asyncio.run(worker.run_until_idle())
     assert sent == []
     assert events[0]["state"] == "expired"
+    assert snapshot["counters"]["expired"] == 1
     assert spool.status()["pending_records"] == 0
     reopened = TaskSpool(
         tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000,
         clock=BusinessClock(wall, "UTC"),
     )
     assert list(reopened.iter_from(0)) == []
+
+
+def test_worker_finishes_a_multipart_send_started_before_cutoff(tmp_path):
+    wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    spool = TaskSpool(
+        tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000,
+        clock=BusinessClock(wall, "UTC"),
+    )
+    stored, _ = spool.append(_record("partial", message="x" * 300, parts=3))
+    sent = []
+    events = []
+
+    class Transport:
+        async def send_task(self, **kwargs):
+            before_write = kwargs["before_write"]
+            assert before_write(0) is True
+            wall.advance(seconds=1)
+            assert before_write(1) is True
+            assert before_write(2) is True
+            sent.append(True)
+            return SocketWriteResult("socket_written", 3, 3)
+
+        async def close(self):
+            return None
+
+    worker = ShardWorker(
+        0, (0,), spool, {1: {"route_id": 1}},
+        transport_factory=lambda *_args: Transport(),
+        progress_sink=events.append,
+    )
+    asyncio.run(worker.run_until_idle())
+
+    assert sent == [True]
+    assert events[0]["state"] == "socket_written"
+    assert events[0]["parts_written"] == 3
+    assert spool.status()["pending_records"] == 0
 
 
 def test_stage_credit_release_before_wait_is_not_lost():

@@ -15,6 +15,7 @@ from vnext.smpp_transport import (
     AsyncSmppTransport,
     build_submit_sm,
     build_bind,
+    count_parts,
     read_pdu,
 )
 from tools.smsc_simulator import parse_submit_sm
@@ -134,6 +135,43 @@ async def _test_async_transport_reports_socket_written_without_waiting_for_respo
         assert transport.snapshot()["socket_written_parts_1m"] == 100
         assert transport.snapshot()["response_success_1m"] == 100
         assert transport.snapshot()["window_inflight"] == 0
+    finally:
+        await transport.close()
+        server.close()
+        await server.wait_closed()
+
+
+def test_async_transport_passes_written_part_count_to_admission_check():
+    return asyncio.run(_test_async_transport_passes_written_part_count_to_admission_check())
+
+
+async def _test_async_transport_passes_written_part_count_to_admission_check():
+    server, _received = await _loopback_server()
+    port = server.sockets[0].getsockname()[1]
+    transport = AsyncSmppTransport({
+        "route_id": 1, "host": "127.0.0.1", "port": port,
+        "system_id": "test", "password": "test", "source_addr": "VNEXT",
+        "window_size": 4, "tps": 0,
+    })
+    observed = []
+
+    def before_write(parts_written):
+        observed.append(int(parts_written))
+        return True
+
+    try:
+        message = "x" * 300
+        result = await transport.send_task(
+            destination_addr="251900000001", message=message,
+            before_write=before_write,
+        )
+        parts = count_parts(message)
+        assert result.state == "socket_written"
+        assert result.parts_total == parts
+        assert len(observed) == parts * 3
+        assert observed[::3] == list(range(parts))
+        assert observed[1::3] == list(range(parts))
+        assert observed[2::3] == list(range(parts))
     finally:
         await transport.close()
         server.close()

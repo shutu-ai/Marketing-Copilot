@@ -570,6 +570,40 @@ async def _test_worker_defers_before_checkpoint_when_progress_budget_is_exhauste
         await worker.close_progress(timeout=5)
 
 
+def test_worker_does_not_checkpoint_when_progress_persistence_is_blocked(tmp_path):
+    async def scenario():
+        spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=1_000_000)
+        stored, _ = spool.append(_record("blocked-persistence", 1, 1))
+        spool.is_record_current = lambda _record: False
+        sent: list[dict] = []
+
+        class BlockedProgressStore:
+            def snapshot(self):
+                return {
+                    "accepting": False,
+                    "blocked_reason": "injected persistence failure",
+                }
+
+            def campaign_snapshot(self):
+                return []
+
+        worker = ShardWorker(
+            0, (0,), spool, {1: {"route_id": 1}},
+            transport_factory=lambda config, credits: _ReservedFakeTransport(
+                config, credits, sent
+            ),
+            progress_store=BlockedProgressStore(),
+        )
+        result = await worker._process(stored)
+        assert result is stored
+        assert sent == []
+        assert spool.cursor(0) == 0
+        assert spool.status()["pending_records"] == 1
+        assert worker.snapshot()["admission_blocked_reason"] == "injected persistence failure"
+
+    asyncio.run(scenario())
+
+
 def test_worker_resumes_automatically_after_progress_backpressure_releases(tmp_path):
     return asyncio.run(
         _test_worker_resumes_automatically_after_progress_backpressure_releases(

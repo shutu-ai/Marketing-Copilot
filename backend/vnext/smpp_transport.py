@@ -294,11 +294,11 @@ class AsyncSmppTransport:
             "tps_scope": self.tps_scope,
         }
 
-    async def _admission_allowed(self, callback) -> bool:
+    async def _admission_allowed(self, callback, parts_written: int = 0) -> bool:
         if callback is None:
             return True
         try:
-            value = callback()
+            value = callback(int(parts_written))
             if inspect.isawaitable(value):
                 value = await value
             return bool(value)
@@ -542,7 +542,7 @@ class AsyncSmppTransport:
 
     async def send_task(self, *, destination_addr: str, message: str, flash_sms: bool = False,
                         reference: int = 1, source_addr: str | None = None,
-                        before_write: Callable[[], bool | Awaitable[bool]] | None = None,
+                        before_write: Callable[[int], bool | Awaitable[bool]] | None = None,
                         progress_context: dict | None = None,
                         progress_reservation: object | None = None) -> SocketWriteResult:
         parts, _coding = _split_text(message)
@@ -567,7 +567,7 @@ class AsyncSmppTransport:
             )
             if self.profiler:
                 self.profiler.observe_ns("tps_credit_wait", time.perf_counter_ns() - credit_started_ns)
-            if not await self._admission_allowed(before_write):
+            if not await self._admission_allowed(before_write, written):
                 if before_write is not None:
                     state = "unknown" if written else "expired"
                     return SocketWriteResult(
@@ -587,7 +587,7 @@ class AsyncSmppTransport:
                 return SocketWriteResult("write_failed", written, len(parts), self.last_error)
             if self.profiler:
                 self.profiler.observe_ns("response_window_wait", time.perf_counter_ns() - window_started_ns)
-            if not await self._admission_allowed(before_write):
+            if not await self._admission_allowed(before_write, written):
                 if before_write is not None:
                     self._window.release()
                     state = "unknown" if written else "expired"
@@ -625,7 +625,7 @@ class AsyncSmppTransport:
             try:
                 assert self.writer is not None
                 async with self._write_lock:
-                    if not await self._admission_allowed(before_write):
+                    if not await self._admission_allowed(before_write, written):
                         if before_write is not None:
                             self._pending.pop(sequence, None)
                             self._window.release()
