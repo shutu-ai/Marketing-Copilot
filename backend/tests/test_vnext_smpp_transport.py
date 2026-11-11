@@ -141,6 +141,46 @@ async def _test_async_transport_reports_socket_written_without_waiting_for_respo
         await server.wait_closed()
 
 
+def test_transport_close_invalidates_connect_in_progress():
+    return asyncio.run(_test_transport_close_invalidates_connect_in_progress())
+
+
+async def _test_transport_close_invalidates_connect_in_progress():
+    class Lease:
+        slot = 1
+
+        def __init__(self):
+            self.released = 0
+
+        def release(self):
+            self.released += 1
+
+    class Credits:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.lease = Lease()
+
+        async def acquire_bind(self, *_args, **_kwargs):
+            self.entered.set()
+            await self.release.wait()
+            return self.lease
+
+    credits = Credits()
+    transport = AsyncSmppTransport(
+        {"route_id": 1, "host": "127.0.0.1", "port": 1},
+        credits=credits,
+    )
+    task = asyncio.create_task(transport.connect())
+    await asyncio.wait_for(credits.entered.wait(), timeout=1)
+    await transport.close()
+    credits.release.set()
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(task, timeout=1)
+    assert not transport.connected
+    assert credits.lease.released == 1
+
+
 def test_async_transport_passes_written_part_count_to_admission_check():
     return asyncio.run(_test_async_transport_passes_written_part_count_to_admission_check())
 

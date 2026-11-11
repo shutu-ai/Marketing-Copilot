@@ -23,7 +23,7 @@ export interface SmppConfig {
   created_at: string
   updated_at: string
   restart_required?: boolean
-  effective_state?: 'applied' | 'pending_restart' | 'next_start'
+  effective_state?: 'applied' | 'pending' | 'error' | 'pending_restart' | 'next_start'
   hot_applied?: boolean
 }
 

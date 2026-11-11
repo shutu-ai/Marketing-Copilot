@@ -174,6 +174,8 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         "draining": False,
         "phase": "starting",
         "loop_heartbeat_at": 0.0,
+        "route_target_revision": int(context.get("route_revision", {}).get("value", 0)),
+        "route_applied_revision": int(context.get("route_revision", {}).get("value", 0)),
     }
     status_lock = threading.Lock()
     status_stop = threading.Event()
@@ -200,6 +202,9 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             "updated_at": time.time(),
             "phase": str(status_state.get("phase") or ""),
             "loop_heartbeat_at": float(status_state.get("loop_heartbeat_at") or 0.0),
+            "route_target_revision": status_state["route_target_revision"],
+            "route_applied_revision": status_state["route_applied_revision"],
+            "route_reload_error": str(getattr(current, "_route_reconfigure_error", "") or ""),
             "recovery_policy": "checkpoint_before_socket_drop_uncertain",
             "snapshot": snapshot,
         }
@@ -293,12 +298,13 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     async def run() -> None:
         stop_requested = False
 
-        def handle_control() -> bool:
+        def handle_control(*, heartbeat: bool = True) -> bool:
             nonlocal stop_requested
             # This callback runs on the async dispatch loop, so it proves the
             # loop is advancing without turning the status thread into a fake
             # liveness signal.
-            status_state["loop_heartbeat_at"] = time.time()
+            if heartbeat:
+                status_state["loop_heartbeat_at"] = time.time()
             while control.poll():
                 message = control.recv()
                 if message == "stop":
@@ -317,6 +323,24 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                             "updated_routes": len(result.get("updated_routes") or []),
                             "updated_transports": int(
                                 result.get("updated_transports", 0) or 0
+                            ),
+                        },
+                    )
+                if (
+                    isinstance(message, dict)
+                    and message.get("type") == "reload_route_configs"
+                ):
+                    result = worker.apply_route_configs(message.get("routes") or {})
+                    status_state["route_target_revision"] = int(message.get("revision", 0))
+                    worker.schedule_route_reconfigure()
+                    diagnostic(
+                        phase="smpp_config_reload",
+                        status="running",
+                        progress={
+                            "updated_routes": len(result.get("updated_routes") or []),
+                            "removed_routes": len(result.get("removed_routes") or []),
+                            "reconfigure_routes": len(
+                                result.get("reconfigure_routes") or []
                             ),
                         },
                     )
@@ -346,6 +370,20 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             daemon=True,
         )
         heartbeat.start()
+        async def control_pump() -> None:
+            # Keep configuration changes responsive while dispatch is waiting
+            # on a route-local connect/window future.
+            while not stop_requested:
+                if handle_control(heartbeat=False):
+                    return
+                worker.schedule_route_reconfigure()
+                if not worker._route_reconfigure_pending:
+                    status_state["route_applied_revision"] = status_state["route_target_revision"]
+                await asyncio.sleep(0.1)
+
+        control_task = asyncio.create_task(
+            control_pump(), name=f"mc-vnext-worker-{int(worker_id)}-control",
+        )
         try:
             prewarm_route_ids = tuple(context.get("prewarm_route_ids") or ())
             if prewarm_route_ids:
@@ -443,6 +481,14 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 if after == before:
                     await asyncio.sleep(idle_poll_interval)
         finally:
+            control_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await control_task
+            reconfigure_task = worker._route_reconfigure_task
+            if reconfigure_task is not None:
+                reconfigure_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await reconfigure_task
             status_state["active"] = False
             status_state["phase"] = "stopping"
             await worker.close_transports()
@@ -533,6 +579,8 @@ class VNextRuntime:
         self.ingress = IngressRouter(self.spool, ingress_credit=self.ingress_credit)
         self.route_configs = {str(key): dict(value) for key, value in route_configs.items()}
         self._route_config_lock = threading.RLock()
+        self._route_revision = {"value": 0}
+        self._route_revision_at = 0.0
         self.worker_count = max(1, min(32, int(worker_count)))
         self.keep_smpp_binds = bool(keep_smpp_binds)
         self.prewarm_smpp_binds = bool(prewarm_smpp_binds)
@@ -1204,6 +1252,7 @@ class VNextRuntime:
             "business_timezone": self.clock.timezone_name,
             "test_clock_file": self.test_clock_file,
             "route_configs": self.route_configs,
+            "route_revision": self._route_revision,
             "worker_count": self.worker_count,
             "max_inflight": self.max_inflight,
             "prefetch_per_partition": self.prefetch_per_partition,
@@ -1266,6 +1315,96 @@ class VNextRuntime:
             "ok": applied,
             "reason": "applied" if applied else "projection_control_deferred",
         }
+
+    def reload_route_configs(self, route_configs: dict[int | str, dict]) -> dict:
+        """Hot-apply the complete SMSC route set to every live worker."""
+
+        with self._route_config_lock:
+            if not self._started or self.supervisor is None:
+                return {
+                    "ok": False,
+                    "reason": "runtime_inactive",
+                    "updated_routes": [],
+                }
+            desired: dict[str, dict] = {}
+            for raw_route_id, original in (route_configs or {}).items():
+                if not isinstance(original, dict):
+                    return {
+                        "ok": False,
+                        "reason": "invalid_route_config",
+                        "updated_routes": [],
+                    }
+                key = str(raw_route_id)
+                config = dict(original)
+                try:
+                    route_id = int(config.get("route_id", key))
+                    pool_size = max(1, int(config.get("pool_size", 1) or 1))
+                except (TypeError, ValueError):
+                    return {
+                        "ok": False,
+                        "reason": f"invalid_route_id:{key}",
+                        "updated_routes": [],
+                    }
+                config["route_id"] = route_id
+                config["tps_scope"] = "per_bind"
+                config["_worker_bind_target"] = max(
+                    1, math.ceil(pool_size / self.worker_count),
+                )
+                desired[key] = config
+
+            previous = dict(self.route_configs)
+            with getattr(self.supervisor, "_restart_lock", contextlib.nullcontext()):
+                self.route_configs.clear()
+                self.route_configs.update(desired)
+                self._route_revision["value"] += 1
+                self._route_revision_at = time.time()
+                broadcast = self.supervisor.broadcast({
+                    "type": "reload_route_configs",
+                    "revision": self._route_revision["value"],
+                    "routes": desired,
+                })
+            failed = broadcast.get("failed_worker_ids") or []
+            if failed:
+                return {
+                    "ok": False,
+                    "reason": "worker_broadcast_failed",
+                    "updated_routes": sorted(desired),
+                    "added_routes": sorted(set(desired) - set(previous)),
+                    "removed_routes": sorted(set(previous) - set(desired)),
+                    "sent_worker_ids": broadcast.get("sent_worker_ids") or [],
+                    "failed_worker_ids": failed,
+                }
+            return {
+                "ok": True,
+                "reason": "activation_pending",
+                "updated_routes": sorted(desired),
+                "added_routes": sorted(set(desired) - set(previous)),
+                "removed_routes": sorted(set(previous) - set(desired)),
+                "sent_worker_ids": broadcast.get("sent_worker_ids") or [],
+                "failed_worker_ids": [],
+            }
+
+    def route_config_activation(self) -> dict:
+        revision = int(self._route_revision["value"])
+        if not revision:
+            return {"state": "applied", "revision": 0, "workers": []}
+        live = {int(w["worker_id"]): w for w in self.supervisor.status().get("workers", [])}
+        reports = {int(w["worker_id"]): w for w in self._worker_progress() if str(w.get("run_id") or "") == self.run_id}
+        waiting = []
+        failures = []
+        now = time.time()
+        for worker_id in range(self.worker_count):
+            process = live.get(worker_id) or {}
+            report = reports.get(worker_id) or {}
+            current = (process.get("alive") and process.get("pid") == report.get("process_pid")
+                       and now - float(report.get("updated_at") or 0) < max(5.0, self.status_interval_seconds * 4))
+            if not current or int(report.get("route_applied_revision") or 0) != revision:
+                waiting.append(worker_id)
+                error = str(report.get("route_reload_error") or "") if current and int(report.get("route_target_revision") or 0) == revision else ""
+                if error:
+                    failures.append({"worker_id": worker_id, "error": error})
+        state = "error" if failures or (waiting and now - self._route_revision_at > 120) else "pending" if waiting else "applied"
+        return {"state": state, "revision": revision, "workers": waiting, "errors": failures}
 
     def reload_route_rates(self, route_configs: dict[int | str, dict]) -> dict:
         """Apply only TPS settings to live workers without closing SMPP binds."""

@@ -11,6 +11,12 @@ def list_configs():
     return smpp_service.get_all_configs()
 
 
+@router.get("/config-state")
+def config_state():
+    from services import vnext_service
+    return vnext_service.config_state()
+
+
 @router.get("/configs/{config_id}")
 def get_config(config_id: int):
     config = smpp_service.get_config(config_id)

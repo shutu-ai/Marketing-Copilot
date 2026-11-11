@@ -200,12 +200,14 @@ class AsyncSmppTransport:
         self._reader_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._window = asyncio.Semaphore(self.window_size)
         self._pending: dict[int, _Pending] = {}
         self._sequence = 1
         self._connected = False
         self._closing = False
+        self._lifecycle_generation = 0
         self._bind_lease: RouteBindLease | None = None
         self.bind_slot: int | None = None
         self._bind_started_monotonic: float | None = None
@@ -347,30 +349,50 @@ class AsyncSmppTransport:
         async with self._connect_lock:
             if self.connected:
                 return
+            generation = self._lifecycle_generation
             try:
                 wait = self._reconnect_not_before - time.monotonic()
                 if wait > 0:
                     await asyncio.sleep(wait)
-                self._bind_lease = await self.credits.acquire_bind(
+                if generation != self._lifecycle_generation or self._closing:
+                    raise ConnectionError("SMPP transport was closed while reconnecting")
+                bind_lease = await self.credits.acquire_bind(
                     self.route_id, self.pool_size,
                     timeout=max(self.timeout, self.reconnect_max_seconds, 30.0),
                 )
+                if generation != self._lifecycle_generation or self._closing:
+                    bind_lease.release()
+                    raise ConnectionError("SMPP transport was closed while acquiring bind")
+                self._bind_lease = bind_lease
                 self.bind_slot = self._bind_lease.slot
                 self.last_bind_slot = self.bind_slot
                 self.bind_acquired_count += 1
                 self._bind_started_monotonic = time.monotonic()
-                self.reader, self.writer = await asyncio.wait_for(
+                reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(self.host, self.port), timeout=self.timeout
                 )
+                if generation != self._lifecycle_generation or self._closing:
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+                    self._release_bind_lease()
+                    raise ConnectionError("SMPP transport was closed while opening socket")
+                self.reader, self.writer = reader, writer
                 sequence = 1
                 async with self._write_lock:
-                    self.writer.write(build_bind(
+                    if generation != self._lifecycle_generation or self._closing:
+                        raise ConnectionError("SMPP transport was closed before bind")
+                    writer.write(build_bind(
                         sequence, self.system_id, self.password, bind_type=self.bind_type,
                     ))
-                    await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+                    await asyncio.wait_for(writer.drain(), timeout=self.timeout)
+                if generation != self._lifecycle_generation or self._closing:
+                    raise ConnectionError("SMPP transport was closed during bind")
                 command_id, status, response_sequence, _ = await asyncio.wait_for(
-                    read_pdu(self.reader), timeout=self.timeout
+                    read_pdu(reader), timeout=self.timeout
                 )
+                if generation != self._lifecycle_generation or self._closing:
+                    raise ConnectionError("SMPP transport was closed after bind")
                 bind_command = {
                     "receiver": BIND_RECEIVER,
                     "transmitter": BIND_TRANSMITTER,
@@ -587,6 +609,12 @@ class AsyncSmppTransport:
                 return SocketWriteResult("write_failed", written, len(parts), self.last_error)
             if self.profiler:
                 self.profiler.observe_ns("response_window_wait", time.perf_counter_ns() - window_started_ns)
+            if not self.connected or self.writer is None:
+                self._window.release()
+                self.write_failures += 1
+                self.last_error = "SMPP transport was reconfigured before socket write"
+                state = "unknown" if written else "write_failed"
+                return SocketWriteResult(state, written, len(parts), self.last_error)
             if not await self._admission_allowed(before_write, written):
                 if before_write is not None:
                     self._window.release()
@@ -639,10 +667,23 @@ class AsyncSmppTransport:
                                 state, written, len(parts),
                                 "business day cutoff reached immediately before socket write",
                             )
+                    if not self.connected or self.writer is None:
+                        self._pending.pop(sequence, None)
+                        self._window.release()
+                        release_claim = getattr(
+                            progress_reservation, "release_claim", None
+                        )
+                        if release_claim:
+                            release_claim()
+                        self.write_failures += 1
+                        self.last_error = "SMPP transport was reconfigured before socket write"
+                        state = "unknown" if written else "write_failed"
+                        return SocketWriteResult(state, written, len(parts), self.last_error)
+                    writer = self.writer
                     socket_started_ns = time.perf_counter_ns()
                     try:
-                        self.writer.write(packet)
-                        await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+                        writer.write(packet)
+                        await asyncio.wait_for(writer.drain(), timeout=self.timeout)
                     finally:
                         if self.profiler:
                             self.profiler.observe_ns(
@@ -676,37 +717,40 @@ class AsyncSmppTransport:
         return SocketWriteResult("socket_written", written, len(parts))
 
     async def close(self) -> None:
-        self._closing = True
-        self._connected = False
-        heartbeat = self._heartbeat_task
-        self._heartbeat_task = None
-        if heartbeat and heartbeat is not asyncio.current_task():
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await heartbeat
-        task = self._reader_task
-        self._reader_task = None
-        if task and task is not asyncio.current_task():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        if self.writer and not self.writer.is_closing():
-            try:
-                async with self._write_lock:
-                    self.writer.write(HEADER.pack(16, UNBIND, 0, self._next_sequence()))
-                    await self.writer.drain()
-            except Exception:
-                pass
-            self.writer.close()
-            with contextlib.suppress(Exception):
-                await self.writer.wait_closed()
-        pending = list(self._pending.values())
-        self._pending.clear()
-        await self._mark_pending_unknown(pending, "transport closed before response drain")
-        self.reader = None
-        self.writer = None
-        self._release_bind_lease()
-        self._closing = False
+        async with self._close_lock:
+            self._lifecycle_generation += 1
+            self._closing = True
+            self._connected = False
+            heartbeat = self._heartbeat_task
+            self._heartbeat_task = None
+            if heartbeat and heartbeat is not asyncio.current_task():
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat
+            task = self._reader_task
+            self._reader_task = None
+            if task and task is not asyncio.current_task():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            if self.writer and not self.writer.is_closing():
+                try:
+                    async with self._write_lock:
+                        if self.writer and not self.writer.is_closing():
+                            self.writer.write(HEADER.pack(16, UNBIND, 0, self._next_sequence()))
+                            await self.writer.drain()
+                except Exception:
+                    pass
+                self.writer.close()
+                with contextlib.suppress(Exception):
+                    await self.writer.wait_closed()
+            pending = list(self._pending.values())
+            self._pending.clear()
+            await self._mark_pending_unknown(pending, "transport closed before response drain")
+            self.reader = None
+            self.writer = None
+            self._release_bind_lease()
+            self._closing = False
 
     def _release_bind_lease(self) -> None:
         lease = self._bind_lease

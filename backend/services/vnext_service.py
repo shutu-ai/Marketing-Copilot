@@ -72,11 +72,15 @@ def config_state() -> dict:
     with _LOCK:
         active = _RUNTIME is not None and bool(getattr(_RUNTIME, "_started", False))
         pending = bool(_CONFIG_RESTART_REQUIRED)
+        value = _RUNTIME
     if not active:
         return {
             "restart_required": False,
             "effective_state": "next_start",
         }
+    activation = value.route_config_activation() if hasattr(value, "route_config_activation") else {"state": "applied"}
+    if not pending and activation.get("state") in {"pending", "error"}:
+        return {"restart_required": False, "effective_state": activation["state"], "activation": activation}
     return {
         "restart_required": pending,
         "effective_state": "pending_restart" if pending else "applied",
@@ -131,18 +135,34 @@ def _configured_retention_days(value=None) -> int:
 
 
 def mark_config_change(reason: str = "SMPP configuration changed") -> None:
-    """Mark a structural control-plane change for a safe restart.
-
-    Endpoint, credential, bind-pool, window and protocol settings remain
-    restart-bound.  The safe rate settings use ``apply_route_rates`` instead
-    and do not call this function.
-    """
+    """Mark a configuration change that was not activated by live workers."""
 
     global _CONFIG_RESTART_REQUIRED, _CONFIG_CHANGE_AT, _CONFIG_CHANGE_REASON
     with _LOCK:
         _CONFIG_RESTART_REQUIRED = True
         _CONFIG_CHANGE_AT = time.time()
         _CONFIG_CHANGE_REASON = str(reason or "SMPP configuration changed")
+
+
+def apply_route_configs(route_configs: dict | None = None) -> dict:
+    """Push the complete persisted SMSC route set to live workers."""
+
+    global _CONFIG_RESTART_REQUIRED, _CONFIG_CHANGE_AT, _CONFIG_CHANGE_REASON
+    with _LOCK:
+        value = _RUNTIME
+        if value is None or not getattr(value, "_started", False):
+            return {
+                "ok": False,
+                "reason": "runtime_inactive",
+                "updated_routes": [],
+            }
+        routes = route_configs if route_configs is not None else _load_routes()
+        result = value.reload_route_configs(routes)
+        if result.get("ok"):
+            _CONFIG_RESTART_REQUIRED = False
+            _CONFIG_CHANGE_AT = 0.0
+            _CONFIG_CHANGE_REASON = ""
+        return result
 
 
 def apply_route_rates(route_configs: dict | None = None) -> dict:

@@ -311,6 +311,8 @@ export default {
     updateSuccess: 'SMPP config updated',
     deleteSuccess: 'SMPP config deleted',
     restartRequired: 'SMPP changes are saved and will take effect after a safe VNext restart.',
+    activationPending: 'SMSC settings saved; waiting for workers to complete the change.',
+    activationError: 'SMSC configuration activation failed or timed out; check connections and workers.',
   },
   smsContent: {
     title: 'SMS Content Config',

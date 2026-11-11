@@ -316,6 +316,8 @@ export default {
     updateSuccess: '更新SMPP配置成功',
     deleteSuccess: '删除SMPP配置成功',
     restartRequired: 'SMPP配置已保存，VNext将在安全重启后生效。',
+    activationPending: '短信中心配置已保存，正在等待工作进程完成切换。',
+    activationError: '短信中心配置切换异常或超时，请检查连接和工作进程状态。',
   },
   smsContent: {
     title: '短信内容配置',

@@ -12,7 +12,6 @@ _STATS_CACHE = None
 _STATS_CACHE_AT = 0.0
 _STATS_CACHE_TTL = 2.0
 _STATS_CACHE_LOCK = threading.Lock()
-_HOT_APPLY_FIELDS = frozenset({"tps", "tps_scope"})
 
 
 def _validate_tps_scope(scope: str | None) -> None:
@@ -97,6 +96,32 @@ def _get_config_row(config_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _apply_live_configs() -> bool:
+    """Activate the persisted route set when VNext is already running."""
+
+    try:
+        from services import vnext_service
+        if not vnext_service.is_active():
+            return False
+        result = vnext_service.apply_route_configs()
+        if result.get("ok"):
+            return result.get("reason") != "activation_pending"
+        vnext_service.mark_config_change(
+            "SMPP configuration hot-apply failed; safe restart required"
+        )
+    except Exception:
+        logger.exception("Unable to hot-apply SMPP configuration")
+        try:
+            from services import vnext_service
+            if vnext_service.is_active():
+                vnext_service.mark_config_change(
+                    "SMPP configuration hot-apply failed; safe restart required"
+                )
+        except Exception:
+            logger.debug("Unable to mark failed SMPP hot-apply", exc_info=True)
+    return False
+
+
 def create_config(data: SmppConfigCreate) -> dict:
     _validate_tps_scope(data.tps_scope)
     def write(conn):
@@ -114,8 +139,16 @@ def create_config(data: SmppConfigCreate) -> dict:
         return dict(conn.execute("SELECT * FROM smpp_configs WHERE id=?", (cursor.lastrowid,)).fetchone())
 
     row = write_transaction(write, operation="smpp.config.create")
-    _invalidate_gateway_config_cache()
-    return _config_response(row)
+    try:
+        from services import vnext_service
+        active = vnext_service.is_active()
+    except Exception:
+        active = False
+    _invalidate_gateway_config_cache(mark_restart=not active)
+    hot_applied = _apply_live_configs() if active else False
+    response = _config_response(row)
+    response["hot_applied"] = hot_applied
+    return response
 
 
 def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
@@ -162,31 +195,13 @@ def update_config(config_id: int, data: SmppConfigUpdate) -> Optional[dict]:
     if not changed_fields:
         return _config_response(row)
 
-    hot_apply = (
-        changed_fields.issubset(_HOT_APPLY_FIELDS)
-        and int(row.get("enabled", 0) or 0) == 1
-    )
-    _invalidate_gateway_config_cache(mark_restart=not hot_apply)
-    hot_applied = False
-    if hot_apply:
-        try:
-            from services import vnext_service
-            result = vnext_service.apply_route_rates()
-            hot_applied = bool(result.get("ok"))
-            if vnext_service.is_active() and not hot_applied:
-                vnext_service.mark_config_change(
-                    "SMPP rate hot-apply failed; safe restart required"
-                )
-        except Exception:
-            logger.exception("Unable to hot-apply SMPP rate configuration")
-            try:
-                from services import vnext_service
-                if vnext_service.is_active():
-                    vnext_service.mark_config_change(
-                        "SMPP rate hot-apply failed; safe restart required"
-                    )
-            except Exception:
-                logger.debug("Unable to mark failed SMPP rate hot-apply", exc_info=True)
+    try:
+        from services import vnext_service
+        active = vnext_service.is_active()
+    except Exception:
+        active = False
+    _invalidate_gateway_config_cache(mark_restart=not active)
+    hot_applied = _apply_live_configs() if active else False
     response = _config_response(row)
     response["hot_applied"] = hot_applied
     return response
@@ -201,7 +216,14 @@ def delete_config(config_id: int) -> bool:
         return True
 
     deleted = write_transaction(write, operation="smpp.config.delete")
-    _invalidate_gateway_config_cache()
+    try:
+        from services import vnext_service
+        active = vnext_service.is_active()
+    except Exception:
+        active = False
+    _invalidate_gateway_config_cache(mark_restart=not active)
+    if deleted and active:
+        _apply_live_configs()
     return deleted
 
 

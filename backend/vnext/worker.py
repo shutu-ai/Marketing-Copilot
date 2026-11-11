@@ -23,6 +23,14 @@ from .smpp_transport import AsyncSmppTransport, SocketWriteResult, count_parts
 from .spool import SpoolRecord, TaskSpool
 
 
+_ROUTE_RECONNECT_FIELDS = frozenset({
+    "host", "port", "system_id", "password", "source_addr", "bind_type",
+    "address_ton", "address_npi", "data_coding", "pool_size", "window_size",
+    "enquire_interval", "timeout", "reconnect_max_seconds",
+    "delivery_receipt_mode", "_worker_bind_target",
+})
+
+
 @dataclass(frozen=True)
 class WorkerProgress:
     event_id: str
@@ -111,6 +119,12 @@ class ShardWorker:
         self._group_cursor = 0
         self._last_control_refresh = 0.0
         self._inflight = 0
+        self._active_by_route: Counter[str] = Counter()
+        self._route_reconfigure_pending: set[str] = set()
+        self._route_reconfigure_task: asyncio.Task | None = None
+        self._route_reconfigure_generation: Counter[str] = Counter()
+        self._route_reconfigure_error = ""
+        self._route_rebind_required: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -187,6 +201,161 @@ class ShardWorker:
             "updated_routes": sorted(set(updated_routes)),
             "updated_transports": int(updated_transports),
         }
+
+    def apply_route_configs(self, route_configs: dict) -> dict:
+        """Apply a complete route snapshot without restarting other routes."""
+
+        incoming: dict[str, dict] = {}
+        for raw_key, original in (route_configs or {}).items():
+            if not isinstance(original, dict):
+                continue
+            key = str(raw_key)
+            config = dict(original)
+            config.setdefault("route_id", int(config.get("route_id", key)))
+            config["_worker_bind_target"] = max(
+                1,
+                int(
+                    config.get(
+                        "_worker_bind_target",
+                        config.get("pool_size", 1),
+                    ) or 1
+                ),
+            )
+            incoming[key] = config
+
+        previous = self.route_configs
+        reconnect_routes: set[str] = set()
+        rate_updates: dict[str, dict] = {}
+        for key in set(previous) | set(incoming):
+            old = previous.get(key)
+            new = incoming.get(key)
+            if old is None or new is None:
+                if old is not None:
+                    reconnect_routes.add(key)
+                continue
+            if any(old.get(field) != new.get(field) for field in _ROUTE_RECONNECT_FIELDS):
+                reconnect_routes.add(key)
+            if (
+                old.get("tps") != new.get("tps")
+                or old.get("tps_scope") != new.get("tps_scope")
+            ):
+                rate_updates[key] = new
+
+        self.route_configs = incoming
+        for key, config in rate_updates.items():
+            try:
+                tps = max(0.0, float(config.get("tps", 0.0) or 0.0))
+                scope = str(config.get("tps_scope", "per_bind"))
+            except (TypeError, ValueError):
+                continue
+            with self._transports_lock:
+                transports = list(self._transports.get(key, ()))
+            for transport in transports:
+                updater = getattr(transport, "update_rate_limit", None)
+                if updater is not None:
+                    updater(tps, scope)
+
+        self._route_reconfigure_pending.update(reconnect_routes)
+        for key in reconnect_routes:
+            self._route_reconfigure_generation[key] += 1
+        return {
+            "updated_routes": sorted(incoming),
+            "removed_routes": sorted(set(previous) - set(incoming)),
+            "reconfigure_routes": sorted(reconnect_routes),
+            "updated_transports": sum(
+                len(self._transports.get(key, ())) for key in rate_updates
+            ),
+        }
+
+    def schedule_route_reconfigure(self) -> None:
+        """Start the route-local drain/rebind task from the event-loop thread."""
+
+        if not self._route_reconfigure_pending:
+            return
+        if self._route_reconfigure_task and not self._route_reconfigure_task.done():
+            return
+        self._route_reconfigure_task = asyncio.create_task(
+            self._reconfigure_routes(), name=f"vnext-worker-{self.worker_id}-route-reconfigure",
+        )
+
+    async def _close_route_transports(self, route_key: str) -> None:
+        with self._transports_lock:
+            transports = list(self._transports.pop(route_key, ()))
+            self._transport_cursor.pop(route_key, None)
+        for transport in transports:
+            close = getattr(transport, "close", None)
+            if close:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+
+    async def _reconfigure_routes(self) -> None:
+        try:
+            while self._route_reconfigure_pending:
+                routes = set(self._route_reconfigure_pending)
+                deadline = time.monotonic() + 30.0
+                while (
+                    any(self._active_by_route.get(route, 0) for route in routes)
+                    and time.monotonic() < deadline
+                ):
+                    await asyncio.sleep(0.01)
+                while time.monotonic() < deadline:
+                    with self._transports_lock:
+                        transports = [item for route in routes for item in self._transports.get(route, ())]
+                    snapshots = [item.inflight_snapshot() for item in transports if hasattr(item, "inflight_snapshot")]
+                    if not any(int(item.get("window_inflight", 0) or 0) or int(item.get("response_callback_pending", 0) or 0) for item in snapshots):
+                        break
+                    await asyncio.sleep(0.01)
+                for route in routes:
+                    generation = self._route_reconfigure_generation[route]
+                    with self._transports_lock:
+                        was_connected = any(bool(getattr(item, "connected", False)) for item in self._transports.get(route, ()))
+                    if was_connected:
+                        self._route_rebind_required.add(route)
+                    # A timed-out send is closed at-most-once; its durable
+                    # progress path records the resulting unknown/write state.
+                    await self._close_route_transports(route)
+                    if route in self._route_rebind_required and route in self.route_configs:
+                        try:
+                            transport = await self._transport(int(route))
+                            await transport.connect()
+                            self._route_reconfigure_error = ""
+                        except Exception as exc:
+                            self._route_reconfigure_error = f"route {route}: {type(exc).__name__}: {exc}"
+                            await asyncio.sleep(1.0)
+                            continue
+                    if generation == self._route_reconfigure_generation[route]:
+                        self._route_reconfigure_pending.discard(route)
+                        self._route_rebind_required.discard(route)
+        except Exception as exc:
+            self._route_reconfigure_error = f"reconfigure failed: {type(exc).__name__}: {exc}"
+        finally:
+            self._route_reconfigure_task = None
+
+    async def wait_route_reconfigure(self) -> None:
+        self.schedule_route_reconfigure()
+        task = self._route_reconfigure_task
+        if task is not None:
+            await task
+
+    def _route_inflight_limit(self, route_id: int) -> int:
+        config = self.route_configs.get(str(int(route_id)))
+        if not config:
+            return self.max_inflight
+        try:
+            binds = max(
+                1,
+                int(
+                    config.get(
+                        "_worker_bind_target",
+                        config.get("pool_size", 1),
+                    ) or 1
+                ),
+            )
+            window = max(1, int(config.get("window_size", 1) or 1))
+        except (TypeError, ValueError):
+            return self.max_inflight
+        return max(1, min(self.max_inflight, binds * window))
 
     def _eligible(self, record: SpoolRecord) -> bool:
         self.refresh_campaign_states()
@@ -907,29 +1076,41 @@ class ShardWorker:
                              control_handler: Callable[[], bool] | None = None) -> dict:
         iterators, buffers, counts, exhausted, group_order, fill = self._seed_buffers()
         pending: set[asyncio.Task] = set()
-        blocked_partitions: set[int] = set()
+        pending_routes: dict[asyncio.Task, str] = {}
+        blocked_groups: set[tuple[int, str, int, int]] = set()
         processed = 0
         fill()
+        self._active_by_route.clear()
         try:
             while not self._stop.is_set() and (group_order or pending) and (max_tasks is None or processed < int(max_tasks)):
                 if control_handler is not None and control_handler():
                     break
-                for partition in blocked_partitions:
-                    exhausted.add(partition)
                 fill()
                 eligible_group = None
                 for offset in range(len(group_order)):
                     index = (self._group_cursor + offset) % len(group_order)
                     group = group_order[index]
                     queue = buffers[group]
-                    if queue and group[0] not in blocked_partitions and self._eligible(queue[0]):
+                    route_key = str(group[3])
+                    if (
+                        queue
+                        and group not in blocked_groups
+                        and queue[0].ordinal <= self.spool.cursor(group[0]) + max(256, self.max_inflight + self.prefetch_per_partition)
+                        and route_key not in self._route_reconfigure_pending
+                        and self._active_by_route[route_key] < self._route_inflight_limit(group[3])
+                        and self._eligible(queue[0])
+                    ):
                         eligible_group = group
                         self._group_cursor = (index + 1) % len(group_order)
                         break
                 if eligible_group is not None and len(pending) < self.max_inflight:
                     record = buffers[eligible_group].popleft()
                     counts[record.partition_id] -= 1
-                    pending.add(asyncio.create_task(self._process(record)))
+                    task = asyncio.create_task(self._process(record))
+                    pending.add(task)
+                    route_key = str(record.route_id)
+                    pending_routes[task] = route_key
+                    self._active_by_route[route_key] += 1
                     self._inflight = len(pending)
                     processed += 1
                     continue
@@ -937,6 +1118,11 @@ class ShardWorker:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     self._inflight = len(pending)
                     for task in done:
+                        route_key = pending_routes.pop(task, "")
+                        if route_key:
+                            self._active_by_route[route_key] = max(
+                                0, self._active_by_route[route_key] - 1,
+                            )
                         deferred = task.result()
                         if deferred is not None:
                             group = (
@@ -945,7 +1131,7 @@ class ShardWorker:
                             )
                             buffers[group].appendleft(deferred)
                             counts[deferred.partition_id] += 1
-                            blocked_partitions.add(deferred.partition_id)
+                            blocked_groups.add(group)
                     continue
                 if all(not buffers[group] for group in group_order):
                     fill()
@@ -959,6 +1145,7 @@ class ShardWorker:
                 await asyncio.gather(*pending)
         finally:
             self._inflight = 0
+            self._active_by_route.clear()
             if close_transports:
                 await self.close_transports()
         return self.snapshot()
@@ -1032,6 +1219,13 @@ class ShardWorker:
             "progress_lost_events": int(self._progress_lost_events),
             "last_progress_error": str(self._last_progress_error),
             "admission_blocked_reason": str(self._last_admission_block),
+            "route_inflight": {
+                key: int(value) for key, value in self._active_by_route.items() if value
+            },
+            "route_inflight_limits": {
+                key: self._route_inflight_limit(int(key)) for key in self.route_configs
+            },
+            "route_reconfigure_pending": sorted(self._route_reconfigure_pending),
             **self._control_snapshot(),
             "healthy": healthy,
             "transports": transport_snapshots,

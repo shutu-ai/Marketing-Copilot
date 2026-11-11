@@ -5,6 +5,10 @@ export function getSmppConfigs() {
   return api.get<SmppConfig[]>('/smpp/configs')
 }
 
+export function getSmppConfigState() {
+  return api.get<Pick<SmppConfig, 'effective_state' | 'restart_required'>>('/smpp/config-state')
+}
+
 export function getSmppConfig(id: number) {
   return api.get<SmppConfig>(`/smpp/configs/${id}`)
 }

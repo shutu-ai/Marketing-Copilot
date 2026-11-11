@@ -75,7 +75,7 @@ class SmppConfigResponse(BaseModel):
     created_at: str
     updated_at: str
     restart_required: bool = False
-    effective_state: Literal['applied', 'pending_restart', 'next_start'] = 'next_start'
+    effective_state: Literal['applied', 'pending', 'error', 'pending_restart', 'next_start'] = 'next_start'
     hot_applied: bool = False
 
 

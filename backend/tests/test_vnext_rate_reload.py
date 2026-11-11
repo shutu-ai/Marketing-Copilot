@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 from models.smpp import SmppConfigUpdate
 from services import smpp_service
@@ -95,7 +96,7 @@ class _BroadcastSupervisor:
         return {"sent_worker_ids": [0, 1], "failed_worker_ids": []}
 
 
-def test_runtime_reload_route_rates_broadcasts_without_restarting(tmp_path):
+def test_runtime_reload_route_rates_broadcasts_without_restarting():
     runtime = VNextRuntime.__new__(VNextRuntime)
     runtime._started = True
     runtime.supervisor = _BroadcastSupervisor()
@@ -115,6 +116,119 @@ def test_runtime_reload_route_rates_broadcasts_without_restarting(tmp_path):
         "type": "reload_route_rates",
         "routes": {"2": {"route_id": 2, "tps": 200.0, "tps_scope": "per_bind"}},
     }]
+
+
+def test_runtime_reload_route_configs_broadcasts_full_route_without_service_restart():
+    runtime = VNextRuntime.__new__(VNextRuntime)
+    runtime._started = True
+    runtime.supervisor = _BroadcastSupervisor()
+    runtime.route_configs = {
+        "2": {
+            "route_id": 2, "host": "old.example", "pool_size": 2,
+            "window_size": 10, "tps": 100, "tps_scope": "per_bind",
+        }
+    }
+    runtime._route_config_lock = threading.RLock()
+    runtime.worker_count = 4
+    runtime._route_revision = {"value": 0}
+    restart_context_routes = runtime.route_configs
+
+    result = runtime.reload_route_configs({
+        "2": {
+            "route_id": 2, "host": "new.example", "pool_size": 4,
+            "window_size": 60, "tps": 200, "tps_scope": "per_bind",
+        }
+    })
+
+    assert result["ok"] is True
+    assert result["reason"] == "activation_pending"
+    assert runtime.route_configs["2"]["host"] == "new.example"
+    assert restart_context_routes["2"]["host"] == "new.example"
+    assert runtime.supervisor.messages == [{
+        "type": "reload_route_configs",
+        "revision": 1,
+        "routes": {
+            "2": {
+                "route_id": 2, "host": "new.example", "pool_size": 4,
+                "window_size": 60, "tps": 200, "tps_scope": "per_bind",
+                "_worker_bind_target": 1,
+            }
+        },
+    }]
+
+
+def test_worker_full_route_reload_marks_structural_changes_for_rebind(tmp_path):
+    worker = ShardWorker(
+        0, (0,), TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000),
+        {2: {"route_id": 2, "host": "old.example", "tps": 100, "tps_scope": "per_bind"}},
+    )
+
+    result = worker.apply_route_configs({
+        "2": {
+            "route_id": 2, "host": "new.example", "pool_size": 1,
+            "window_size": 30, "tps": 200, "tps_scope": "per_bind",
+        }
+    })
+
+    assert result["reconfigure_routes"] == ["2"]
+    assert worker.route_configs["2"]["host"] == "new.example"
+    assert worker._route_reconfigure_pending == {"2"}
+
+
+def test_route_activation_requires_current_process_and_revision():
+    runtime = VNextRuntime.__new__(VNextRuntime)
+    runtime._route_revision = {"value": 2}
+    runtime._route_revision_at = time.time()
+    runtime.worker_count = 2
+    runtime.status_interval_seconds = 1
+    runtime.run_id = "run"
+    class Supervisor:
+        def status(self):
+            return {"workers": [
+                {"worker_id": 0, "pid": 10, "alive": True},
+                {"worker_id": 1, "pid": 20, "alive": True},
+            ]}
+    runtime.supervisor = Supervisor()
+    reports = [
+        {"worker_id": 0, "process_pid": 10, "run_id": "run", "updated_at": time.time(), "route_applied_revision": 2},
+        {"worker_id": 1, "process_pid": 19, "run_id": "run", "updated_at": time.time(), "route_applied_revision": 2},
+    ]
+    runtime._worker_progress = lambda: reports
+    assert runtime.route_config_activation()["state"] == "pending"
+    reports[1]["process_pid"] = 20
+    reports[1]["route_applied_revision"] = 1
+    assert runtime.route_config_activation()["state"] == "pending"
+    reports[1]["route_applied_revision"] = 2
+    assert runtime.route_config_activation()["state"] == "applied"
+
+
+def test_reconfigure_retries_failed_bind_before_acknowledging():
+    async def exercise():
+        attempts = []
+        class Transport:
+            def __init__(self, config, _credits):
+                self.config = config
+                self.connected = False
+            async def connect(self):
+                attempts.append(self.config["host"])
+                if len(attempts) == 1:
+                    raise ConnectionError("bind failed")
+                self.connected = True
+            async def close(self):
+                self.connected = False
+        worker = ShardWorker(0, (), None, {2: {"route_id": 2, "host": "old"}}, transport_factory=Transport)
+        old = await worker._transport(2)
+        old.connected = True
+        worker.apply_route_configs({2: {"route_id": 2, "host": "new"}})
+        worker.schedule_route_reconfigure()
+        await asyncio.sleep(0.1)
+        assert worker._route_reconfigure_pending == {"2"}
+        assert "bind failed" in worker._route_reconfigure_error
+        await asyncio.wait_for(worker.wait_route_reconfigure(), timeout=3)
+        assert attempts == ["new", "new"]
+        assert not worker._route_reconfigure_pending
+        await worker.close_transports()
+    asyncio.run(exercise())
 
 
 def test_smpp_rate_only_update_is_reported_as_hot_applied(monkeypatch):
@@ -157,7 +271,7 @@ def test_smpp_rate_only_update_is_reported_as_hot_applied(monkeypatch):
         lambda **kwargs: marked.append(kwargs),
     )
     monkeypatch.setattr(vnext_service, "is_active", lambda: True)
-    monkeypatch.setattr(vnext_service, "apply_route_rates", lambda: {"ok": True})
+    monkeypatch.setattr(vnext_service, "apply_route_configs", lambda: {"ok": True})
     monkeypatch.setattr(
         vnext_service,
         "config_state",
@@ -227,7 +341,7 @@ def test_smpp_web_full_form_only_tps_change_is_hot_applied(monkeypatch):
         lambda **kwargs: marked.append(kwargs),
     )
     monkeypatch.setattr(vnext_service, "is_active", lambda: True)
-    monkeypatch.setattr(vnext_service, "apply_route_rates", lambda: {"ok": True})
+    monkeypatch.setattr(vnext_service, "apply_route_configs", lambda: {"ok": True})
     monkeypatch.setattr(
         vnext_service,
         "config_state",

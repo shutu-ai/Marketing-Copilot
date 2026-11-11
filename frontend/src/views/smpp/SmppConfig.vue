@@ -8,6 +8,10 @@
       :title="$t('smpp.restartRequired')"
       class="restart-alert"
     />
+    <el-alert v-if="activationState === 'pending' || activationState === 'error'"
+      :type="activationState === 'error' ? 'error' : 'info'" :closable="false" show-icon
+      :title="$t(activationState === 'error' ? 'smpp.activationError' : 'smpp.activationPending')"
+      class="restart-alert" />
     <div class="page-header">
       <h2>{{ $t('smpp.title') }}</h2>
       <el-button type="primary" @click="openDialog()">
@@ -194,10 +198,11 @@
 
 <script setup lang="ts">
 import i18n from '@/i18n'
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useSmppStore } from '@/stores/smpp'
 import type { SmppConfig, SmppConfigForm } from '@/types/smpp'
+import { getSmppConfigState } from '@/api/smpp'
 import StatusTag from '@/components/StatusTag.vue'
 
 withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
@@ -214,8 +219,31 @@ const defaultForm: SmppConfigForm = {
 }
 const form = ref<SmppConfigForm>({ ...defaultForm })
 const restartRequired = ref(false)
+const activationState = ref<SmppConfig['effective_state']>()
+let activationTimer: ReturnType<typeof setInterval> | undefined
 
-onMounted(() => store.fetchConfigs())
+function syncRestartState(response?: Partial<SmppConfig>) {
+  if (!response) return
+  activationState.value = response.effective_state
+  if (response.effective_state) {
+    restartRequired.value = response.effective_state === 'pending_restart'
+  } else if (response.hot_applied === true) {
+    restartRequired.value = false
+  } else if (typeof response.restart_required === 'boolean') {
+    restartRequired.value = response.restart_required
+  }
+}
+
+async function refreshActivation() {
+  try { syncRestartState((await getSmppConfigState()).data) } catch { /* retain last known state */ }
+}
+
+onMounted(() => {
+  store.fetchConfigs()
+  refreshActivation()
+  activationTimer = setInterval(refreshActivation, 2000)
+})
+onBeforeUnmount(() => { if (activationTimer) clearInterval(activationTimer) })
 
 function openDialog(row?: SmppConfig) {
   if (row) {
@@ -241,7 +269,7 @@ async function handleDelete(id: number) {
   try {
     await ElMessageBox.confirm(i18n.global.t('legacy.xb28efaa0'), i18n.global.t('legacy.x02d9819d'))
     const response = await store.removeConfig(id)
-    restartRequired.value = Boolean(response?.restart_required) || restartRequired.value
+    syncRestartState(response)
     ElMessage.success(i18n.global.t('legacy.x0007d170'))
   } catch {}
 }
@@ -250,11 +278,11 @@ async function handleSave() {
   try {
     if (editingId.value) {
       const response = await store.editConfig(editingId.value, form.value)
-      restartRequired.value = Boolean((response as any)?.restart_required) || restartRequired.value
+      syncRestartState(response)
       ElMessage.success(i18n.global.t('legacy.x55aa6366'))
     } else {
       const response = await store.addConfig(form.value)
-      restartRequired.value = Boolean((response as any)?.restart_required) || restartRequired.value
+      syncRestartState(response)
       ElMessage.success(i18n.global.t('legacy.xa5bfd70d'))
     }
     dialogVisible.value = false
