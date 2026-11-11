@@ -97,9 +97,8 @@ class PartitionAssignment:
 class PartitionMap:
     """Versioned logical-shard to worker assignment.
 
-    A map is immutable for a running deployment.  ``rebalance`` is an explicit
-    operation and requires the caller to prove that all partitions are safe to
-    move; it never silently changes the number of virtual partitions.
+    A map stays stable during normal dispatch.  ``rebalance`` and ``reassign``
+    are explicit operations and never silently change virtual partition count.
     """
 
     def __init__(self, path: Path, payload: dict):
@@ -231,4 +230,36 @@ class PartitionMap:
         self._payload["updated_at"] = time.time()
         self._validate(self._payload)
         self.save()
+        return self
+
+    def reassign(self, assignments: dict[int, int]) -> "PartitionMap":
+        """Move selected partitions after their current owners have stopped."""
+
+        payload = json.loads(json.dumps(self._payload))
+        changed = False
+        for raw_partition, raw_worker in assignments.items():
+            partition = int(raw_partition)
+            worker = int(raw_worker)
+            if not 0 <= partition < int(payload["virtual_partition_count"]):
+                raise PartitionMapError("partition assignment out of range")
+            if not 0 <= worker < int(payload["worker_count"]):
+                raise PartitionMapError("partition assignment worker out of range")
+            item = payload["assignments"][str(partition)]
+            if int(item["worker_id"]) == worker:
+                continue
+            item["worker_id"] = worker
+            item["owner_epoch"] = int(item["owner_epoch"]) + 1
+            changed = True
+        if not changed:
+            return self
+        payload["map_revision"] = int(payload["map_revision"]) + 1
+        payload["updated_at"] = time.time()
+        candidate = self._validate(payload)
+        previous = self._payload
+        self._payload = candidate
+        try:
+            self.save()
+        except Exception:
+            self._payload = previous
+            raise
         return self

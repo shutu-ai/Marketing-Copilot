@@ -119,3 +119,18 @@ async def _test_worker_stop_prevents_new_dispatch_at_shutdown_boundary(tmp_path)
     assert snapshot["counters"].get("socket_written", 0) == 0
     assert spool.status()["pending_records"] == 1
     await worker.close_transports()
+
+
+def test_new_partition_owner_refreshes_out_of_order_checkpoints(tmp_path):
+    root = tmp_path / "spool"
+    original = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    original.append_many([_record(str(i), i, 1, 1, 0) for i in range(1, 5)])
+    successor = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+
+    original.checkpoint(0, 2)
+    original.checkpoint(0, 4)
+
+    assert [record.ordinal for record in successor.iter_from(0)] == [1, 3]
+    successor.checkpoint(0, 1)
+    successor.checkpoint(0, 3)
+    assert successor.cursor(0) == 4

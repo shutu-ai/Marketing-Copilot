@@ -272,23 +272,25 @@ class WorkerSupervisor:
                     self._restart_not_before[worker_id] = time.monotonic() + delay
                     continue
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 150.0) -> None:
         self._monitor_stop.set()
         monitor = self._monitor_thread
         self._monitor_thread = None
         if monitor and monitor.is_alive() and monitor is not threading.current_thread():
             monitor.join(timeout=1.0)
-        with self._handles_lock:
-            handles = list(self._handles.values())
-            self._handles.clear()
+        with self._restart_lock:
+            with self._handles_lock:
+                handles = list(self._handles.values())
+                self._handles.clear()
         for handle in handles:
             try:
                 handle.control.send("stop")
             except (EOFError, OSError):
                 pass
+        deadline = time.monotonic() + max(0.0, float(timeout))
         for handle in handles:
             try:
-                handle.process.join(timeout=max(0.0, float(timeout)))
+                handle.process.join(timeout=max(0.0, deadline - time.monotonic()))
             except Exception:
                 pass
             if getattr(handle.process, "is_alive", lambda: False)():
@@ -327,6 +329,103 @@ class WorkerSupervisor:
     def restart_worker(self, worker_id: int, timeout: float = 5.0) -> WorkerHandle:
         with self._restart_lock:
             return self._restart_worker(worker_id, timeout)
+
+    def reassign_partitions(
+        self, assignments: dict[int, int], *, timeout: float = 15.0,
+    ) -> dict:
+        """Gracefully stop affected owners, then publish a new owner map."""
+
+        requested = {int(partition): int(worker) for partition, worker in assignments.items()}
+        if not requested:
+            return {"ok": True, "changed": False, "moved": {}}
+        with self._restart_lock:
+            if self._monitor_stop.is_set():
+                return {"ok": False, "changed": False, "reason": "supervisor_stopping", "moved": {}}
+            current = {
+                partition: self.map.assignment(partition).worker_id
+                for partition in requested
+            }
+            moved = {
+                partition: worker
+                for partition, worker in requested.items()
+                if current[partition] != worker
+            }
+            if not moved:
+                return {"ok": True, "changed": False, "moved": {}}
+            affected = {
+                current[partition] for partition in moved
+            } | {requested[partition] for partition in moved}
+            with self._handles_lock:
+                handles = {
+                    worker_id: self._handles.get(worker_id)
+                    for worker_id in affected
+                }
+            if any(handle is None for handle in handles.values()):
+                return {
+                    "ok": False, "changed": False,
+                    "reason": "affected_worker_handle_missing",
+                    "moved": moved,
+                }
+
+            for handle in handles.values():
+                try:
+                    handle.control.send("stop")
+                except (EOFError, OSError, BrokenPipeError):
+                    pass
+            deadline = time.monotonic() + max(1.0, float(timeout))
+            for handle in handles.values():
+                remaining = max(0.0, deadline - time.monotonic())
+                handle.process.join(timeout=remaining)
+            if any(getattr(handle.process, "is_alive", lambda: False)() for handle in handles.values()):
+                return {
+                    "ok": False, "changed": False,
+                    "reason": "affected_worker_drain_timeout",
+                    "moved": moved,
+                }
+
+            if self._monitor_stop.is_set():
+                return {"ok": False, "changed": False, "reason": "supervisor_stopping", "moved": moved}
+
+            with self._handles_lock:
+                for worker_id, handle in handles.items():
+                    if self._handles.get(worker_id) is handle:
+                        self._handles.pop(worker_id, None)
+            for handle in handles.values():
+                self._last_exitcodes[handle.worker_id] = getattr(handle.process, "exitcode", None)
+                self._worker_started_at.pop(int(handle.worker_id), None)
+                for lease in handle.leases:
+                    self.leases.release(lease)
+                try:
+                    handle.control.close()
+                except (OSError, ValueError):
+                    pass
+
+            self.map.reassign(moved)
+            launched: list[int] = []
+            try:
+                for worker_id in sorted(affected):
+                    with self._handles_lock:
+                        self._handles[worker_id] = self._launch(worker_id)
+                    launched.append(worker_id)
+            except Exception:
+                for worker_id in launched:
+                    with self._handles_lock:
+                        handle = self._handles.pop(worker_id, None)
+                    if handle is None:
+                        continue
+                    try:
+                        handle.process.terminate()
+                    except Exception:
+                        pass
+                    for lease in handle.leases:
+                        self.leases.release(lease)
+                raise
+            self.assert_no_dual_owners()
+            return {
+                "ok": True, "changed": True,
+                "moved": moved, "affected_workers": sorted(affected),
+                "map_revision": self.map.map_revision,
+            }
 
     def _restart_worker(self, worker_id: int, timeout: float = 5.0) -> WorkerHandle:
         worker = int(worker_id)

@@ -46,7 +46,7 @@ Environment=MC_RUN_UNDER_SYSTEMD=1
 ExecStart={exec_start}
 Restart=always
 RestartSec=5
-TimeoutStopSec=90
+TimeoutStopSec=240
 KillSignal=SIGTERM
 KillMode=control-group
 UMask=0027

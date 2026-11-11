@@ -39,6 +39,61 @@ def _restartable_progress_failure(snapshot: dict) -> bool:
     return False
 
 
+def _plan_partition_rebalance(
+    assignments: dict[int, int], pending_by_partition: dict[int | str, int],
+    worker_count: int,
+) -> dict[int, int]:
+    """Return a small, hysteretic owner change for materially skewed load."""
+
+    count = max(1, int(worker_count))
+    if count < 2:
+        return {}
+    owners = {int(partition): int(worker) for partition, worker in assignments.items()}
+    pending = {
+        int(partition): max(0, int(value or 0))
+        for partition, value in pending_by_partition.items()
+    }
+    loads = [0] * count
+    for partition, worker in owners.items():
+        if 0 <= worker < count:
+            loads[worker] += pending.get(partition, 0)
+    total = sum(loads)
+    if total < max(256, count * 64):
+        return {}
+    average = total / count
+    if max(loads) <= max(1024, average * 1.5):
+        return {}
+
+    # Keep one maintenance pass local to two workers; moving every target at
+    # once would restart the whole pool just to correct one hot owner.
+    source = max(range(count), key=loads.__getitem__)
+    target = min(range(count), key=loads.__getitem__)
+    if source == target:
+        return {}
+    if loads[source] <= max(1024, average * 1.2):
+        return {}
+    if loads[source] - loads[target] < max(512, average * 0.25):
+        return {}
+    candidates = [
+        partition for partition, worker in owners.items()
+        if worker == source and pending.get(partition, 0) > 0
+    ]
+    # An indivisible single hot shard cannot be balanced safely; leaving it
+    # put avoids moving the same shard between workers on every pass.
+    if len(candidates) < 2:
+        return {}
+    desired = max(1.0, min(loads[source] - average, average - loads[target]))
+    partition = min(
+        candidates,
+        key=lambda item: (
+            abs(pending.get(item, 0) - desired),
+            -pending.get(item, 0),
+            item,
+        ),
+    )
+    return {partition: target}
+
+
 def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, context: dict) -> None:
     set_parent_death_signal()
     diagnostic_root = str(context.get("diagnostics_root") or "")
@@ -240,6 +295,10 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
 
         def handle_control() -> bool:
             nonlocal stop_requested
+            # This callback runs on the async dispatch loop, so it proves the
+            # loop is advancing without turning the status thread into a fake
+            # liveness signal.
+            status_state["loop_heartbeat_at"] = time.time()
             while control.poll():
                 message = control.recv()
                 if message == "stop":
@@ -262,6 +321,24 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                         },
                     )
             return stop_requested
+
+        async def drain_before_exit() -> None:
+            status_state["active"] = False
+            status_state["phase"] = "transport_drain"
+            drain = await worker.drain_transports()
+            if not drain.get("drained"):
+                diagnostic(
+                    phase="response_drain_timeout",
+                    status="degraded",
+                    extra={
+                        "pending": int(drain.get("pending", 0) or 0),
+                        "callback_pending": int(
+                            drain.get("callback_pending", 0) or 0
+                        ),
+                    },
+                )
+            # Closing resolves outstanding responses before the final journal drain.
+            await worker.close_transports()
 
         heartbeat = threading.Thread(
             target=status_heartbeat,
@@ -287,6 +364,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                         )
             while True:
                 if handle_control():
+                    await drain_before_exit()
                     return
                 status_state["loop_heartbeat_at"] = time.time()
                 status_state["phase"] = "maintenance"
@@ -304,6 +382,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                     control_handler=handle_control,
                 )
                 if stop_requested:
+                    await drain_before_exit()
                     return
                 if _restartable_progress_failure(worker_snapshot):
                     progress = worker_snapshot.get("progress") or {}
@@ -322,6 +401,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                     # the worker and drop the uncertain terminal result so the
                     # next worker can continue with later records.
                     worker.stop()
+                    await drain_before_exit()
                     return
                 status_state["phase"] = "transport_drain"
                 drain = await worker.drain_transports()
@@ -565,6 +645,12 @@ class VNextRuntime:
         self._worker_watchdog_loop_timeout_seconds = max(
             30.0, self.status_interval_seconds * 30.0
         )
+        self._partition_rebalance_last_at = 0.0
+        self._partition_rebalance_cooldown_seconds = 30.0
+        self._partition_rebalance_warmup_seconds = 30.0
+        self._partition_rebalance_state: dict = {
+            "state": "idle", "moved": {}, "updated_at": 0.0,
+        }
         try:
             self.spool_gc_interval_seconds = max(
                 5.0,
@@ -672,6 +758,12 @@ class VNextRuntime:
             except Exception:
                 # A monitoring failure must not stop the daily fence/GC loop.
                 logger.exception("VNext worker watchdog failed")
+            try:
+                self._run_partition_rebalancer()
+            except Exception:
+                # Rebalancing is an optimization; a failed pass must never
+                # stop the business-day fence or worker watchdog.
+                logger.exception("VNext partition rebalancer failed")
 
     def _set_worker_watchdog_state(
         self, worker_id: int, state: str, reason: str, **details,
@@ -847,6 +939,78 @@ class VNextRuntime:
                 status_age_seconds=round(status_age, 3),
                 loop_age_seconds=round(loop_age, 3) if loop_age is not None else None,
             )
+
+    def _run_partition_rebalancer(self) -> None:
+        """Move whole virtual partitions when worker backlog is materially skewed."""
+
+        if not self._started or self.supervisor is None or self.worker_count < 2:
+            return
+        now = time.monotonic()
+        if time.time() - self.started_at < self._partition_rebalance_warmup_seconds:
+            return
+        if now - self._partition_rebalance_last_at < self._partition_rebalance_cooldown_seconds:
+            return
+        self._partition_rebalance_last_at = now
+        try:
+            spool = self.spool.lightweight_snapshot()
+            supervisor = self.supervisor.status()
+            assignments = {
+                partition: self.supervisor.map.assignment(partition).worker_id
+                for partition in range(self.virtual_partition_count)
+            }
+            plan = _plan_partition_rebalance(
+                assignments,
+                spool.get("pending_by_partition") or {},
+                self.worker_count,
+            )
+            if not plan:
+                return
+            affected = {
+                assignments[partition] for partition in plan
+            } | {plan[partition] for partition in plan}
+            live = {
+                int(item.get("worker_id")): item
+                for item in supervisor.get("workers", [])
+                if isinstance(item, dict) and item.get("worker_id") is not None
+            }
+            statuses = {
+                int(item.get("worker_id")): item
+                for item in self._worker_progress()
+                if isinstance(item, dict) and item.get("worker_id") is not None
+            }
+            freshness = max(5.0, self.status_interval_seconds * 4.0)
+            wall_now = time.time()
+            for worker_id in affected:
+                process = live.get(worker_id) or {}
+                item = statuses.get(worker_id) or {}
+                progress = (item.get("snapshot") or {}).get("progress") or {}
+                if not bool(process.get("alive")):
+                    return
+                if wall_now - float(item.get("updated_at") or 0.0) > freshness:
+                    return
+                if (
+                    not bool(progress.get("accepting", True))
+                    or int(progress.get("writer_errors", 0) or 0) > 0
+                    or int(progress.get("unresolved_events", 0) or 0) > 0
+                ):
+                    return
+            result = self.supervisor.reassign_partitions(plan, timeout=15.0)
+            self._partition_rebalance_state = {
+                "state": "rebalanced" if result.get("ok") else "deferred",
+                "reason": str(result.get("reason") or ""),
+                "moved": {str(key): int(value) for key, value in plan.items()},
+                "updated_at": time.time(),
+            }
+            if result.get("ok") and result.get("changed"):
+                logger.info(
+                    "VNext partition rebalance moved %s partitions: %s",
+                    len(plan), result.get("moved") or {},
+                )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._partition_rebalance_state = {
+                "state": "error", "moved": {}, "updated_at": time.time(),
+            }
+            logger.exception("VNext partition rebalance failed")
 
     def _load_control_state(self) -> dict:
         if not self.control_state_path.exists():
@@ -1203,6 +1367,7 @@ class VNextRuntime:
             "projection": self.projection.snapshot(),
             "worker_progress": self._worker_progress(),
             "worker_watchdog": self._worker_watchdog_snapshot(),
+            "partition_rebalance": dict(self._partition_rebalance_state),
             "spool_gc": dict(self._spool_gc_last_result),
             "daily_epoch": {
                 "business_day": spool.get("business_day") or self.spool.current_business_day,

@@ -11,6 +11,7 @@ from vnext.partition import (
     partition_for_msisdn,
 )
 from vnext.supervisor import OwnerConflict, OwnerLeaseStore
+from vnext.runtime import _plan_partition_rebalance
 
 
 def test_normalize_msisdn_uses_one_canonical_country_code():
@@ -53,3 +54,21 @@ def test_owner_lease_rejects_dual_owner_and_increments_epoch(tmp_path):
     assert store.release(first)
     second = store.acquire(3, "worker-b", map_revision=1, requested_epoch=1)
     assert second["owner_epoch"] > first["owner_epoch"]
+
+
+def test_partition_rebalance_plan_moves_skewed_pending_load_to_idle_workers():
+    assignments = {partition: partition % 4 for partition in range(16)}
+    pending = {partition: (1200 if partition % 4 == 1 else 0) for partition in range(16)}
+
+    plan = _plan_partition_rebalance(assignments, pending, 4)
+
+    assert len(plan) == 1
+    assert all(assignments[partition] == 1 for partition in plan)
+    assert set(plan.values()) <= {0, 2, 3}
+
+
+def test_partition_rebalance_does_not_chase_one_indivisible_hot_shard():
+    assignments = {partition: partition % 4 for partition in range(16)}
+    pending = {1: 20_000}
+
+    assert _plan_partition_rebalance(assignments, pending, 4) == {}
