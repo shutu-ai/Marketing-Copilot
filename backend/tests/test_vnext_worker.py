@@ -47,6 +47,27 @@ def test_stop_not_confirmed_with_unscanned_records_behind_paused_campaign(tmp_pa
     assert result["idle_after_control_version"] < 3
 
 
+def test_old_campaign_generation_is_settled_without_send_after_restart(tmp_path):
+    spool = TaskSpool(tmp_path / "spool", virtual_partition_count=1, max_bytes=100_000)
+    spool.append(_record("old", 1, 6, 1, 0))
+    progress = []
+    worker = ShardWorker(
+        0, (0,), spool, {1: {"route_id": 1}},
+        progress_sink=progress.append,
+        control_loader=lambda: {
+            "version": 2,
+            "campaigns": [{
+                "campaign_type": "batch", "campaign_id": 6,
+                "state": "running", "generation": 2,
+            }],
+        },
+    )
+    result = asyncio.run(worker.run_until_idle())
+    assert spool.cursor(0) == 1
+    assert [item["state"] for item in progress] == ["cancelled"]
+    assert result["campaign_generations"] == {"batch:6": 2}
+
+
 def test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path):
     return asyncio.run(_test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path))
 

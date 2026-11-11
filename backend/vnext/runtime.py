@@ -1712,6 +1712,8 @@ class VNextRuntime:
             report = reports.get(worker_id) or {}
             snapshot = report.get("snapshot") or {}
             progress = snapshot.get("progress") or {}
+            applied_generations = snapshot.get("campaign_generations") or {}
+            applied_generation = applied_generations.get(f"{key[0]}:{key[1]}")
             current = (process.get("alive") and process.get("pid") == report.get("process_pid")
                        and now - float(report.get("updated_at") or 0) < max(5.0, self.status_interval_seconds * 4))
             def has_campaign(items):
@@ -1719,7 +1721,9 @@ class VNextRuntime:
                            and int(item.get("campaign_id") or 0) == key[1]
                            for item in items)
             if (not current or int(snapshot.get("applied_control_version", -1)) < revision
-                    or int(snapshot.get("idle_after_control_version", -1)) < revision
+                    or (published_generation is not None
+                        and (applied_generation is None
+                             or int(applied_generation) < int(published_generation)))
                     or not snapshot.get("healthy", False)
                     or "campaign_inflight" not in snapshot
                     or "pending_events_by_campaign" not in progress

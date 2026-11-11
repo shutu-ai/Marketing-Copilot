@@ -106,6 +106,7 @@ class ShardWorker:
         self._stop = asyncio.Event()
         self._paused_campaigns: set[tuple[str, int]] = set()
         self._cancelled_campaigns: set[tuple[str, int]] = set()
+        self._campaign_generations: dict[tuple[str, int], int] = {}
         self._transports: dict[str, list[object]] = {}
         self._transports_lock = threading.Lock()
         self._campaign_lock = threading.Lock()
@@ -138,10 +139,13 @@ class ShardWorker:
     def stop(self) -> None:
         self._stop.set()
 
-    def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str) -> None:
+    def set_campaign_state(self, campaign_type: str, campaign_id: int, state: str,
+                           generation: int | None = None) -> None:
         key = (str(campaign_type), int(campaign_id))
         normalized = str(state).lower()
         with self._campaign_lock:
+            if generation is not None:
+                self._campaign_generations[key] = int(generation)
             was_paused = key in self._paused_campaigns
             was_cancelled = key in self._cancelled_campaigns
             if normalized in {"pause", "paused"}:
@@ -173,11 +177,17 @@ class ShardWorker:
         if isinstance(values, dict):
             version = int(values.get("version", 0))
             values = values.get("campaigns", [])
-        self._paused_campaigns.clear()
-        self._cancelled_campaigns.clear()
+        with self._campaign_lock:
+            self._paused_campaigns.clear()
+            self._cancelled_campaigns.clear()
+            self._campaign_generations.clear()
         for item in values:
             try:
-                self.set_campaign_state(item["campaign_type"], int(item["campaign_id"]), item["state"])
+                generation = item.get("generation")
+                self.set_campaign_state(
+                    item["campaign_type"], int(item["campaign_id"]), item["state"],
+                    None if generation is None else int(generation),
+                )
             except (KeyError, TypeError, ValueError):
                 continue
         if version is not None:
@@ -375,8 +385,15 @@ class ShardWorker:
     def _eligible(self, record: SpoolRecord) -> bool:
         self.refresh_campaign_states()
         key = (record.campaign_type, record.campaign_id)
-        return (key in self._cancelled_campaigns or key not in self._paused_campaigns
+        return (self._is_stale_generation(record)
+                or key in self._cancelled_campaigns or key not in self._paused_campaigns
                 or not self.spool.is_record_current(record))
+
+    def _is_stale_generation(self, record: SpoolRecord) -> bool:
+        key = (record.campaign_type, record.campaign_id)
+        with self._campaign_lock:
+            generation = self._campaign_generations.get(key)
+        return generation is not None and int(record.campaign_generation) < int(generation)
 
     async def _transport(self, route_id: int):
         key = str(int(route_id))
@@ -790,6 +807,10 @@ class ShardWorker:
     async def _process(self, record: SpoolRecord) -> SpoolRecord | None:
         self.refresh_campaign_states(force=True)
         key = (record.campaign_type, record.campaign_id)
+        if self._is_stale_generation(record):
+            return None if await self._expire(
+                record, "campaign generation superseded", state="cancelled",
+            ) else record
         if (key in self._paused_campaigns and key not in self._cancelled_campaigns
                 and self.spool.is_record_current(record)):
             # Do not checkpoint a record that became paused while it was in a
@@ -827,6 +848,10 @@ class ShardWorker:
                 # blocks this partition for this pass and retries it from the
                 # durable cursor on the next pass.
                 return record
+        if self._is_stale_generation(record):
+            return None if await self._expire(
+                record, "campaign generation superseded", state="cancelled",
+            ) else record
         if not self.spool.is_record_current(record):
             return None if await self._expire(record, "business day cutoff reached after bind") else record
         parts_total = count_parts(record.message)
@@ -851,7 +876,7 @@ class ShardWorker:
             if reservation is not None:
                 reservation.release_unwritten(reservation.slots_open)
             return None
-        if key in self._cancelled_campaigns:
+        if key in self._cancelled_campaigns or self._is_stale_generation(record):
             settled = await self._expire(record, "campaign cancelled", reservation, state="cancelled")
             if reservation is not None:
                 reservation.release_unwritten(reservation.slots_open)
@@ -896,7 +921,11 @@ class ShardWorker:
 
                     current = self.spool.is_record_current(record)
                     self.refresh_campaign_states()
-                    stopped = key in self._cancelled_campaigns or key in self._paused_campaigns
+                    stopped = (
+                        key in self._cancelled_campaigns
+                        or key in self._paused_campaigns
+                        or self._is_stale_generation(record)
+                    )
                     if current and not stopped:
                         return True
                     if int(parts_written or 0) <= 0:
@@ -1293,6 +1322,10 @@ class ShardWorker:
             return {
                 "applied_control_version": self._applied_control_version,
                 "idle_after_control_version": self._idle_after_control_version,
+                "campaign_generations": {
+                    f"{key[0]}:{key[1]}": int(value)
+                    for key, value in self._campaign_generations.items()
+                },
                 "campaign_inflight": [
                     {"campaign_type": key[0], "campaign_id": key[1],
                      "active": int(self._active_by_campaign.get(key, 0)),

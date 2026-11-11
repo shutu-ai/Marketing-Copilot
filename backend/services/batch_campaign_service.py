@@ -551,6 +551,7 @@ def update(campaign_id: int, data: BatchCampaignUpdate) -> Optional[dict]:
             if vnext_active:
                 vnext_service.set_campaign_state(
                     "batch", campaign_id, updated_campaign.get("status", ""),
+                    int(updated_campaign.get("dispatch_generation") or 0),
                 )
             else:
                 fast_send_service.publish_campaign_state(

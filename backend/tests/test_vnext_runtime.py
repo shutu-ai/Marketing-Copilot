@@ -33,13 +33,15 @@ def test_campaign_stop_confirmation_requires_current_worker_and_durable_drain(tm
     runtime._started = True
     runtime._control_state = {("realtime", 6): "cancelled"}
     runtime._control_version = 4
+    runtime._control_generations = {("realtime", 6): 4}
     runtime._load_control_state = lambda: None
     class Supervisor:
         def status(self):
             return {"workers": [{"worker_id": 0, "alive": True, "pid": 123}]}
     runtime.supervisor = Supervisor()
     snapshot = {"applied_control_version": 4, "healthy": True, "campaign_inflight": [],
-                "idle_after_control_version": 4,
+                "idle_after_control_version": -1,
+                "campaign_generations": {"realtime:6": 4},
                 "progress": {"pending_events_by_campaign": []}}
     report = {"worker_id": 0, "process_pid": 123, "run_id": runtime.run_id,
               "updated_at": time.time(), "snapshot": snapshot}
@@ -51,12 +53,9 @@ def test_campaign_stop_confirmation_requires_current_worker_and_durable_drain(tm
     snapshot["progress"]["pending_events_by_campaign"] = [{"campaign_type": "realtime", "campaign_id": 6, "count": 1}]
     assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
     snapshot["progress"]["pending_events_by_campaign"] = []
-    snapshot["applied_control_version"] = 3
+    snapshot["campaign_generations"]["realtime:6"] = 3
     assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
-    snapshot["applied_control_version"] = 4
-    snapshot["idle_after_control_version"] = 3
-    assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
-    snapshot["idle_after_control_version"] = 4
+    snapshot["campaign_generations"]["realtime:6"] = 4
     report["process_pid"] = 999
     assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
 

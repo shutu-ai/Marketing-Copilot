@@ -195,6 +195,27 @@ def test_batch_running_flash_is_immutable_and_ended_flash_is_editable(isolated_d
     assert _task_snapshot("batch", ended) == before
 
 
+def test_batch_status_update_publishes_dispatch_generation_to_vnext(isolated_db, monkeypatch):
+    from services import vnext_service
+
+    smpp_id = _insert_smpp("batch-generation-smpp")
+    campaign_id = _insert_activity("batch", "in_progress", smpp_id)
+    calls = []
+    monkeypatch.setattr(vnext_service, "is_active", lambda: True)
+    monkeypatch.setattr(
+        vnext_service,
+        "set_campaign_state",
+        lambda *args: calls.append(args),
+    )
+
+    updated = batch_campaign_service.update(
+        campaign_id, BatchCampaignUpdate(status="paused")
+    )
+
+    assert updated["dispatch_generation"] == 1
+    assert calls == [("batch", campaign_id, "paused", 1)]
+
+
 def test_create_defaults_and_copy_preserves_flash_flag(isolated_db, monkeypatch, tmp_path):
     batch_root = tmp_path / "batch-root"
     realtime_root = tmp_path / "realtime-root"
