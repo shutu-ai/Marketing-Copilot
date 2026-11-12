@@ -1088,6 +1088,15 @@ class ShardWorker:
         if release:
             release()
 
+    def refresh_spool_state(self) -> None:
+        """Reload durable cursor/taken state after parent maintenance."""
+
+        # The parent can reconcile a retired-day gap while this long-lived
+        # worker is paused.  Refresh only owned partitions; segment contents
+        # are still deferred to the normal iterator path.
+        for partition in self.partitions:
+            self.spool.refresh(partition_id=partition, scan_segments=False)
+
     async def drain_transports(self, timeout: float | None = None) -> dict:
         """Wait for the bounded response window before releasing bind leases.
 

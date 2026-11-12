@@ -69,6 +69,27 @@ def test_old_campaign_generation_is_settled_without_send_after_restart(tmp_path)
     assert result["campaign_generations"] == {"batch:6": 2}
 
 
+def test_worker_refreshes_durable_spool_state_after_parent_maintenance(tmp_path):
+    root = tmp_path / "spool"
+    writer = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    writer.append_many([_record("first", 1, 1, 1, 0), _record("second", 2, 1, 1, 0)])
+    reader = TaskSpool(root, virtual_partition_count=1, max_bytes=100_000)
+    worker = ShardWorker(0, (0,), reader, {})
+
+    writer.checkpoint(0, 2)
+    assert reader.cursor(0) == 0
+
+    worker.refresh_spool_state()
+
+    assert reader.cursor(0) == 0
+    assert reader._taken_pending["0"] == {2}
+
+    writer.checkpoint(0, 1)
+    worker.refresh_spool_state()
+    assert reader.cursor(0) == 2
+    assert reader._taken_pending["0"] == set()
+
+
 def test_cancelled_records_cross_spool_gap_only_to_bounded_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(spool_module, "MAX_TAKEN_PENDING", 2)
     spool = TaskSpool(

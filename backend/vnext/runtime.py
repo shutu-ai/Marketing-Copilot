@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 SPOOL_MAINTENANCE_TIMEOUT_SECONDS = 5.0
 SPOOL_GAP_RETRY_BACKOFF_SECONDS = 300.0
+SPOOL_GAP_RECOVERY_BATCH_SIZE = 4096
 
 
 def _restartable_progress_failure(snapshot: dict) -> bool:
@@ -315,10 +316,14 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         stop_requested = False
         maintenance_request_id = ""
         maintenance_sync_at = 0.0
+        spool_state_refresh_required = False
 
         def set_maintenance_request(request_id: str) -> None:
-            nonlocal maintenance_request_id
+            nonlocal maintenance_request_id, spool_state_refresh_required
+            previous = maintenance_request_id
             maintenance_request_id = str(request_id or "")
+            if previous and not maintenance_request_id:
+                spool_state_refresh_required = True
             status_state["spool_maintenance"] = bool(maintenance_request_id)
             status_state["spool_maintenance_id"] = maintenance_request_id
 
@@ -463,6 +468,9 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                     publish_status(False)
                     await asyncio.sleep(min(0.1, idle_poll_interval))
                     continue
+                if spool_state_refresh_required:
+                    worker.refresh_spool_state()
+                    spool_state_refresh_required = False
                 status_state["loop_heartbeat_at"] = time.time()
                 status_state["phase"] = "maintenance"
                 worker.refresh_campaign_states(force=True)
@@ -996,20 +1004,38 @@ class VNextRuntime:
                     # Reconcile task-index rows before reclaiming old payloads.
                     # The cursor-gap pass is protected by the worker fence and
                     # never runs on the dispatch hot path.
-                    recovery = self._recover_expired_spool_gaps()
+                    if gap_snapshot.get("ranges"):
+                        recovery = self._recover_expired_spool_gaps(gap_snapshot)
+                    else:
+                        recovery = self._recover_expired_spool_gaps()
                     cursor_gaps = {
                         "state": "blocked",
                         "reason": "recovery_not_complete",
                     }
-                    if recovery.get("state") in {"completed", "not_needed"}:
+                    if recovery.get("state") == "partial":
+                        # A bounded batch must not trigger the long failure
+                        # backoff; the next normal GC interval continues from
+                        # the durable cursor without keeping workers fenced.
+                        cursor_gaps = {
+                            "state": "partial",
+                            "reason": "recovery_batch_limit",
+                            "partitions": gap_partitions,
+                        }
+                        self._spool_gap_retry_signature = ()
+                        self._spool_gap_retry_not_before = 0.0
+                        self._spool_gap_blocked_signature = ()
+                    elif recovery.get("state") in {"completed", "not_needed"}:
                         cursor_gaps = self.spool.reconcile_closed_day_gaps()
-                    if recovery.get("state") not in {"completed", "not_needed"}:
+                    if recovery.get("state") not in {"completed", "not_needed", "partial"}:
                         self._spool_gap_retry_signature = gap_signature
                         self._spool_gap_retry_not_before = (
                             time.monotonic() + SPOOL_GAP_RETRY_BACKOFF_SECONDS
                         )
                         self._spool_gap_blocked_signature = ()
-                    elif cursor_gaps.get("state") in {"partial", "blocked"}:
+                    elif (
+                        recovery.get("state") != "partial"
+                        and cursor_gaps.get("state") in {"partial", "blocked"}
+                    ):
                         self._spool_gap_blocked_signature = gap_signature
                         self._spool_gap_retry_signature = ()
                         self._spool_gap_retry_not_before = 0.0
@@ -1061,7 +1087,7 @@ class VNextRuntime:
                 self._leave_spool_maintenance(maintenance_request_id)
             self._spool_gc_lock.release()
 
-    def _recover_expired_spool_gaps(self) -> dict:
+    def _recover_expired_spool_gaps(self, gap_snapshot: dict | None = None) -> dict:
         """Settle legacy, already-reclaimed old records without redispatching."""
 
         closed_days = self.spool.closed_business_days()
@@ -1089,82 +1115,114 @@ class VNextRuntime:
                     "error": f"{type(exc).__name__}: {exc}", "recovered": 0,
                 }
             now = float(self.clock.timestamp())
+            ranges = []
+            for item in (gap_snapshot or {}).get("ranges") or ():
+                try:
+                    partition = int(item["partition_id"])
+                    start = int(item["start_ordinal"])
+                    end = int(item["end_ordinal"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if 0 <= partition < self.spool.virtual_partition_count and start <= end:
+                    ranges.append((partition, start, end))
+            filters = [
+                "state='queued'",
+                "business_day < ?",
+                "expires_at > 0",
+                "expires_at <= ?",
+            ]
+            parameters: list[object] = [self.spool.current_business_day, now]
+            closed_day_values = sorted(str(day) for day in closed_days)
+            if closed_day_values:
+                placeholders = ",".join("?" for _ in closed_day_values)
+                filters.append(f"business_day IN ({placeholders})")
+                parameters.extend(closed_day_values)
+            if ranges:
+                range_filters = []
+                for partition, start, end in ranges:
+                    range_filters.append(
+                        "(partition_id = ? AND ordinal BETWEEN ? AND ?)"
+                    )
+                    parameters.extend((partition, start, end))
+                filters.append("(" + " OR ".join(range_filters) + ")")
+            filters_sql = " AND ".join(filters)
             rows = connection.execute(
                 f"""SELECT event_id,partition_id,ordinal,campaign_type,campaign_id,
                            route_id,normalized_msisdn,language,parts_total,message,
                            created_at,business_day,expires_at
                       FROM {TASK_INDEX_TABLE}
-                     WHERE state='queued' AND business_day < ?
-                       AND expires_at > 0 AND expires_at <= ?
-                     ORDER BY partition_id,ordinal,event_id""",
-                (self.spool.current_business_day, now),
+                     WHERE {filters_sql}
+                     ORDER BY partition_id,ordinal,event_id
+                     LIMIT ?""",
+                (*parameters, SPOOL_GAP_RECOVERY_BATCH_SIZE + 1),
             )
             recovered = 0
             retained = 0
-            while True:
-                batch = rows.fetchmany(4096)
-                if not batch:
-                    break
-                missing = []
-                for row in batch:
-                    business_day = str(row[11] or "")
-                    if business_day not in closed_days:
-                        retained += 1
-                        continue
-                    present = self.spool.contains_event(str(row[0] or ""))
-                    if present is None:
-                        return {
-                            "state": "blocked", "reason": "spool_recovery_index_unavailable",
-                            "recovered": recovered, "retained": retained,
-                        }
-                    if present:
-                        retained += 1
-                        continue
-                    missing.append(row)
-                if not missing:
+            selected = rows.fetchmany(SPOOL_GAP_RECOVERY_BATCH_SIZE + 1)
+            has_more = len(selected) > SPOOL_GAP_RECOVERY_BATCH_SIZE
+            batch = selected[:SPOOL_GAP_RECOVERY_BATCH_SIZE]
+            missing = []
+            for row in batch:
+                business_day = str(row[11] or "")
+                if business_day not in closed_days:
+                    retained += 1
                     continue
-                events = []
-                for row in missing:
-                    event_id = str(row[0] or "")
-                    if event_id in recovered_event_ids:
-                        continue
-                    events.append({
-                        "event_id": event_id,
-                        "partition_id": int(row[1] or 0),
-                        "ordinal": int(row[2] or 0),
-                        "campaign_type": str(row[3] or ""),
-                        "campaign_id": int(row[4] or 0),
-                        "route_id": int(row[5] or 0),
-                        "normalized_msisdn": str(row[6] or ""),
-                        "language": str(row[7] or ""),
-                        "state": "expired",
-                        "parts_written": 0,
-                        "parts_total": int(row[8] or 0),
-                        "message": str(row[9] or ""),
-                        "error": "expired after legacy spool reclamation",
-                        "created_at": float(row[10] or 0.0),
-                        "business_day": str(row[11] or ""),
-                        "expires_at": float(row[12] or 0.0),
-                        "event_at": time.time(),
-                        "taken": 1,
-                        "accepted": 1,
-                        "socket_written": 0,
-                        "write_failed": 0,
-                        "unknown": 0,
-                        "response_success": 0,
-                        "response_error": 0,
-                        "expired": 1,
-                    })
-                if events:
-                    journal.append_many(events)
-                    recovered_event_ids.update(str(event["event_id"]) for event in events)
-                # The journal fsync above is the recovery transaction's
-                # durable boundary.  Replays are idempotent by event_id.
-                self.spool.checkpoint_many(
-                    (int(row[1] or 0), int(row[2] or 0)) for row in missing
-                )
-                recovered += len(missing)
-            return {"state": "completed", "recovered": recovered, "retained": retained}
+                present = self.spool.contains_event(str(row[0] or ""))
+                if present is None:
+                    return {
+                        "state": "blocked", "reason": "spool_recovery_index_unavailable",
+                        "recovered": recovered, "retained": retained,
+                    }
+                if present:
+                    retained += 1
+                    continue
+                missing.append(row)
+            events = []
+            for row in missing:
+                event_id = str(row[0] or "")
+                if event_id in recovered_event_ids:
+                    continue
+                events.append({
+                    "event_id": event_id,
+                    "partition_id": int(row[1] or 0),
+                    "ordinal": int(row[2] or 0),
+                    "campaign_type": str(row[3] or ""),
+                    "campaign_id": int(row[4] or 0),
+                    "route_id": int(row[5] or 0),
+                    "normalized_msisdn": str(row[6] or ""),
+                    "language": str(row[7] or ""),
+                    "state": "expired",
+                    "parts_written": 0,
+                    "parts_total": int(row[8] or 0),
+                    "message": str(row[9] or ""),
+                    "error": "expired after legacy spool reclamation",
+                    "created_at": float(row[10] or 0.0),
+                    "business_day": str(row[11] or ""),
+                    "expires_at": float(row[12] or 0.0),
+                    "event_at": time.time(),
+                    "taken": 1,
+                    "accepted": 1,
+                    "socket_written": 0,
+                    "write_failed": 0,
+                    "unknown": 0,
+                    "response_success": 0,
+                    "response_error": 0,
+                    "expired": 1,
+                })
+            if events:
+                journal.append_many(events)
+                recovered_event_ids.update(str(event["event_id"]) for event in events)
+            # The journal fsync above is the recovery transaction's durable
+            # boundary. Replays are idempotent by event_id.
+            self.spool.checkpoint_many(
+                (int(row[1] or 0), int(row[2] or 0)) for row in missing
+            )
+            recovered += len(missing)
+            return {
+                "state": "partial" if has_more else "completed",
+                "recovered": recovered,
+                "retained": retained,
+            }
         except Exception as exc:
             logger.exception("VNext expired spool-gap recovery failed")
             return {

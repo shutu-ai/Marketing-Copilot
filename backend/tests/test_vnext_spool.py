@@ -179,6 +179,9 @@ def test_reconcile_closed_day_gap_does_not_block_current_day(tmp_path):
 
     snapshot = spool.closed_day_gap_snapshot()
     assert snapshot["partitions"] == [0]
+    assert snapshot["ranges"] == [{
+        "partition_id": 0, "start_ordinal": 1, "end_ordinal": old2.ordinal,
+    }]
     result = spool.reconcile_closed_day_gaps()
 
     assert result["state"] == "completed"
@@ -211,6 +214,119 @@ def test_reconcile_expired_manifest_entry_with_missing_payload(tmp_path):
     assert result["state"] == "completed"
     assert spool.cursor(0) == old.ordinal
     assert [item.event_id for item in spool.iter_from(0)] == [current.event_id]
+
+
+def test_reconcile_gap_jumps_cursor_over_stale_taken_pending(tmp_path):
+    wall = _WallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    root = tmp_path / "stale-taken-gap"
+    spool = TaskSpool(
+        root, virtual_partition_count=1, segment_max_records=1,
+        max_bytes=100_000, clock=BusinessClock(wall, "UTC"),
+    )
+    old, _ = spool.append(record("old-1", partition=0))
+    old2, _ = spool.append(record("old-2", partition=0))
+    wall.value += timedelta(seconds=2)
+    assert spool.rollover_if_needed()["changed"] is True
+    current, _ = spool.append(record("current", partition=0))
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    old_entries = [
+        entry for entry in manifest["segments"]["0"]
+        if entry.get("business_day") == old.business_day
+    ]
+    for entry in old_entries:
+        (root / "partition-0000" / entry["filename"]).unlink()
+    manifest["segments"]["0"] = [
+        entry for entry in manifest["segments"]["0"]
+        if entry.get("business_day") != old.business_day
+    ]
+    manifest["total_records"] -= len(old_entries)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Crash leftovers exactly like the 2026-10-29 incident: the taken file
+    # still lists ordinals of already-reclaimed closed-day records next to a
+    # live out-of-order current-day one.
+    taken_path = root / "taken" / "partition-0000.json"
+    taken_path.parent.mkdir(parents=True, exist_ok=True)
+    taken_path.write_text(
+        json.dumps({
+            "partition_id": 0,
+            "taken": [old.ordinal, old2.ordinal, current.ordinal + 2],
+        }),
+        encoding="utf-8",
+    )
+
+    result = spool.reconcile_closed_day_gaps()
+
+    assert result["state"] == "completed"
+    assert result["recovered_partitions"] == [0]
+    assert spool.cursor(0) == old2.ordinal
+    # Stale entries at or below the jumped target are dropped; the live
+    # out-of-order ordinal ahead of the target survives.
+    assert spool._taken_pending["0"] == {current.ordinal + 2}
+    assert spool.dispatch_window_open(0, current.ordinal) is True
+    assert [item.event_id for item in spool.iter_from(0)] == [current.event_id]
+
+
+def test_reconcile_contains_cursor_persist_failure_per_partition(tmp_path, monkeypatch):
+    wall = _WallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    root = tmp_path / "persist-failure"
+    spool = TaskSpool(
+        root, virtual_partition_count=2, segment_max_records=1,
+        max_bytes=100_000, clock=BusinessClock(wall, "UTC"),
+    )
+    old_by_partition = {}
+    for partition in (0, 1):
+        first, _ = spool.append(record(f"old-{partition}", partition=partition))
+        old_by_partition[partition] = first
+    wall.value += timedelta(seconds=2)
+    assert spool.rollover_if_needed()["changed"] is True
+    for partition in (0, 1):
+        spool.append(record(f"current-{partition}", partition=partition))
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    for partition in (0, 1):
+        old_day = old_by_partition[partition].business_day
+        for entry in manifest["segments"][str(partition)]:
+            if entry.get("business_day") == old_day:
+                (root / f"partition-{partition:04d}" / entry["filename"]).unlink()
+        manifest["segments"][str(partition)] = [
+            entry for entry in manifest["segments"][str(partition)]
+            if entry.get("business_day") != old_day
+        ]
+    manifest["total_records"] -= 2
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Partition 0 also carries a stale taken ordinal from the reclaimed day,
+    # so the rollback path must restore both the cursor and the pending set.
+    taken_path = root / "taken" / "partition-0000.json"
+    taken_path.parent.mkdir(parents=True, exist_ok=True)
+    taken_path.write_text(
+        json.dumps({
+            "partition_id": 0,
+            "taken": [old_by_partition[0].ordinal],
+        }),
+        encoding="utf-8",
+    )
+
+    real_persist = spool._persist_cursors
+
+    def failing_persist(partition_id):
+        if int(partition_id) == 0:
+            raise OSError("simulated cursor write failure")
+        real_persist(partition_id)
+
+    monkeypatch.setattr(spool, "_persist_cursors", failing_persist)
+
+    result = spool.reconcile_closed_day_gaps()
+
+    assert result["state"] == "partial"
+    assert result["recovered_partitions"] == [1]
+    assert result["blocked_partitions"]["0"].startswith("cursor_persist_failed")
+    # Partition 0 rolls back to its exact pre-jump state for the next cycle.
+    assert spool.cursor(0) == 0
+    assert spool._taken_pending["0"] == {old_by_partition[0].ordinal}
+    assert spool.cursor(1) == old_by_partition[1].ordinal
 
 
 def test_dispatch_window_stops_crossing_a_large_unresolved_gap(tmp_path, monkeypatch):

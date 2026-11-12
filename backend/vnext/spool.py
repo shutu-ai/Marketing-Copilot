@@ -1468,6 +1468,7 @@ class TaskSpool:
 
             current_day = self.current_business_day
             partitions: list[int] = []
+            ranges: list[dict[str, int]] = []
             signature: list[tuple] = []
             for partition in range(self.virtual_partition_count):
                 entries = self._manifest.get("segments", {}).get(str(partition), [])
@@ -1543,12 +1544,18 @@ class TaskSpool:
                     except OSError:
                         orphan_signature.append((path.name, "unreadable"))
                 partitions.append(partition)
+                ranges.append({
+                    "partition_id": partition,
+                    "start_ordinal": start,
+                    "end_ordinal": target,
+                })
                 signature.append((
                     partition, cursor, first_current,
                     tuple(missing_entries), tuple(sorted(orphan_signature)),
                 ))
             return {
                 "partitions": partitions,
+                "ranges": ranges,
                 "signature": tuple(signature),
                 "current_business_day": current_day,
             }
@@ -1667,15 +1674,32 @@ class TaskSpool:
                     continue
 
                 pending = self._taken_pending.setdefault(str(partition), set())
-                pending.difference_update(
-                    value for value in pending if int(value) <= target
-                )
+                # Materialize the stale set first: difference_update over a
+                # generator that iterates the same set raises
+                # ``RuntimeError: Set changed size during iteration`` on the
+                # first discarded ordinal, which aborted reconciliation for
+                # every remaining partition.
+                stale = {value for value in pending if int(value) <= target}
+                removed = set(stale)
+                pending.difference_update(stale)
                 new_cursor = target
                 while new_cursor + 1 in pending:
                     new_cursor += 1
                     pending.remove(new_cursor)
-                self._cursors[str(partition)] = new_cursor
-                self._persist_cursors(partition)
+                    removed.add(new_cursor)
+                try:
+                    self._cursors[str(partition)] = new_cursor
+                    self._persist_cursors(partition)
+                except (OSError, SpoolError) as exc:
+                    # Restore the exact pre-jump in-memory state so the next
+                    # cycle retries this partition; one failed cursor write
+                    # must not abort the remaining partitions.
+                    pending.update(removed)
+                    self._cursors[str(partition)] = current_cursor
+                    blocked_partitions[str(partition)] = (
+                        f"cursor_persist_failed: {exc}"
+                    )
+                    continue
                 recovered_partitions.append(partition)
                 recovered_records += max(0, new_cursor - current_cursor)
 

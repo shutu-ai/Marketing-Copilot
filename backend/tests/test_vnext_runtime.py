@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+from vnext.task_index import connect_writer, mark_ready, upsert_rows
 from vnext.runtime import VNextRuntime, _restartable_progress_failure
 
 
@@ -342,3 +343,66 @@ def test_spool_gc_does_not_repeat_fence_for_unchanged_structural_gap(tmp_path):
     assert runtime._spool_gap_recovery_last_result["cursor_gaps"]["reason"] == (
         "gap_evidence_unchanged"
     )
+
+
+def test_spool_gc_bounded_recovery_does_not_enter_failure_backoff(tmp_path):
+    runtime = VNextRuntime(
+        tmp_path / "gc-partial", {1: {"route_id": 1}},
+        worker_count=1, virtual_partition_count=1,
+    )
+    runtime._started = True
+    runtime.supervisor = object()
+    runtime._workers_heartbeat_ready_for_gc = lambda: True
+    runtime.spool.closed_day_gap_snapshot = lambda: {
+        "partitions": [0], "ranges": [{
+            "partition_id": 0, "start_ordinal": 1, "end_ordinal": 5000,
+        }], "signature": ((0, 1, 5000),),
+    }
+    runtime.spool.cleanup_closed_days = lambda **kwargs: []
+    runtime._enter_spool_maintenance = lambda: "request-1"
+    runtime._leave_spool_maintenance = lambda request_id: None
+    runtime._recover_expired_spool_gaps = lambda snapshot=None: {
+        "state": "partial", "recovered": 4096,
+    }
+
+    result = runtime._run_spool_gc()
+
+    assert result["state"] == "completed"
+    assert runtime._spool_gap_recovery_last_result["state"] == "partial"
+    assert runtime._spool_gap_retry_signature == ()
+    assert runtime._spool_gap_blocked_signature == ()
+
+
+def test_expired_gap_recovery_uses_only_the_reported_ranges(tmp_path):
+    runtime = VNextRuntime(
+        tmp_path / "gc-range", {1: {"route_id": 1}},
+        worker_count=1, virtual_partition_count=1,
+    )
+    old_day = "2000-01-01"
+    runtime.spool.closed_business_days = lambda: {old_day}
+    runtime.spool.contains_event = lambda event_id: False
+    checkpointed = []
+    runtime.spool.checkpoint_many = lambda values: checkpointed.extend(values)
+    index_path = tmp_path / "task-index.sqlite3"
+    connection = connect_writer(index_path)
+    rows = [
+        (
+            "in-gap", 0, 2, "batch", 1, 1, "2519000000002", "", "", "queued",
+            0, 1, "message", "", 1.0, old_day, 1.0, 1.0,
+        ),
+        (
+            "outside-gap", 0, 100, "batch", 1, 1, "2519000000100", "", "", "queued",
+            0, 1, "message", "", 1.0, old_day, 1.0, 1.0,
+        ),
+    ]
+    upsert_rows(connection, rows)
+    mark_ready(connection)
+    connection.close()
+    runtime.projection.task_index_path = index_path
+
+    result = runtime._recover_expired_spool_gaps({
+        "ranges": [{"partition_id": 0, "start_ordinal": 1, "end_ordinal": 10}],
+    })
+
+    assert result == {"state": "completed", "recovered": 1, "retained": 0}
+    assert checkpointed == [(0, 2)]
