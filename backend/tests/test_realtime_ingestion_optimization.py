@@ -287,7 +287,10 @@ def test_vectorized_whitelist_build_preserves_first_language(isolated_db):
     assert realtime_whitelist_service.build_pending() == 1
     version = realtime_whitelist_service.active_version(campaign_id)
     assert version and version["row_count"] == 4 and version["normalized_count"] == 2
-    index = duckdb.connect(version["index_path"], read_only=True)
+    index = duckdb.connect(
+        version["index_path"], read_only=True,
+        config=realtime_whitelist_service.whitelist_index_connect_config(),
+    )
     try:
         rows = index.execute(
             "SELECT msisdn,language FROM whitelist_msisdns ORDER BY msisdn"
@@ -295,6 +298,35 @@ def test_vectorized_whitelist_build_preserves_first_language(isolated_db):
     finally:
         index.close()
     assert rows == [("90001", "first"), ("90002", "fr")]
+
+
+def test_shared_whitelist_index_opener_keeps_one_warm_handle(isolated_db):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    source = campaign_dir / "warm-list.csv"
+    source.write_text(
+        "msisdn,language\n090001,en\n090002,fr\n", encoding="utf-8",
+    )
+    realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    version = realtime_whitelist_service.active_version(campaign_id)
+    path = version["index_path"]
+    registry = realtime_whitelist_service._warm_whitelist_index_connections
+    # The publish itself invalidated any warm handle for the new file.
+    assert path not in registry
+    first = realtime_campaign_service._open_whitelist_index(path)
+    second = realtime_campaign_service._open_whitelist_index(path)
+    try:
+        assert first.execute("SELECT COUNT(*) FROM whitelist_msisdns").fetchone()[0] == 2
+        assert second.execute(
+            "SELECT language FROM whitelist_msisdns WHERE msisdn='90002'"
+        ).fetchone()[0] == "fr"
+    finally:
+        first.close()
+        second.close()
+    # One warm handle per path outlives the per-file connections.
+    assert path in registry
+    realtime_whitelist_service.invalidate_warm_index(path)
+    assert path not in registry
 
 
 def test_corrupt_active_whitelist_waits_for_repair_without_using_old_version(isolated_db):

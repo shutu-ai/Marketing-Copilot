@@ -238,6 +238,24 @@ def _run_mcctl(*args: str, env=None):
     )
 
 
+def _rename_with_retry(source: Path, target: Path) -> None:
+    """Rename right after writing files, tolerating transient Windows locks.
+
+    Real-time AV scanning can hold a handle on freshly written files for a
+    few hundred milliseconds; the rename then fails with WinError 5 even
+    though nothing in the test still has the directory open.  A short retry
+    absorbs the transient lock without changing what is asserted.
+    """
+    for attempt in range(5):
+        try:
+            source.rename(target)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+
+
 def test_stats_cli_json_snapshot(tmp_path):
     root = _fake_runtime_root(tmp_path)
     result = _run_cli("--root", str(root), "--once", "--json")
@@ -346,7 +364,7 @@ def test_mcctl_stats_subcommand_delegates_to_read_only_observer(tmp_path):
 def test_mcctl_stats_uses_default_state_dir_when_root_is_omitted(tmp_path):
     root = _fake_runtime_root(tmp_path)
     default_root = root.parent / "vnext"
-    root.rename(default_root)
+    _rename_with_retry(root, default_root)
 
     env = os.environ.copy()
     env.pop("MC_VNEXT_RUN_ROOT", None)
@@ -363,7 +381,7 @@ def test_mcctl_stats_uses_default_state_dir_when_root_is_omitted(tmp_path):
 def test_mcctl_stats_falls_back_from_missing_configured_root(tmp_path):
     root = _fake_runtime_root(tmp_path)
     default_root = root.parent / "vnext"
-    root.rename(default_root)
+    _rename_with_retry(root, default_root)
 
     env = os.environ.copy()
     env.pop("MC_ENV_FILE", None)

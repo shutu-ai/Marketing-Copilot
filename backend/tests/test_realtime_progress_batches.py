@@ -184,7 +184,7 @@ def test_chunk_bulk_dedup_keeps_first_row_and_cross_chunk_counts(whitelist):
         conn.close()
 
 
-def test_completed_chunks_replay_after_archive_commit_failure_without_reenqueue(job, monkeypatch):
+def test_missing_input_fails_terminally_after_archive_commit_without_reenqueue(job, monkeypatch):
     monkeypatch.setattr(campaigns, "_realtime_chunk_size", lambda: 2)
     calls = []
     def enqueue(*args, **kwargs):
@@ -199,14 +199,14 @@ def test_completed_chunks_replay_after_archive_commit_failure_without_reenqueue(
     assert (job["directory"] / "received" / job["filename"]).exists()
     assert len(calls) == 2 and calls[0]["language"] == "first"
     monkeypatch.setattr(state, "transition", original)
+    # Crash replay is intentionally unsupported: the retry finds no inbox copy
+    # and must fail terminally without re-enqueuing the archived chunks.
     result = campaigns.receive_file(job["campaign_id"], str(job["path"]), job["filename"], job["id"], worker_id="test-worker", lease_token=job["lease_token"])
-    assert result["success"] and result["task_result"]["created"] == 2
-    assert result["total_msisdn"] == 2
+    assert not result["success"]
+    assert result["error_class"] == "INVALID_INPUT"
+    assert result["retryable"] is False
     assert len(calls) == 2
-    file, processed = rows(job)
-    assert file["status"] == processed["status"] == "completed"
-    with pytest.raises(state.LeaseLost):
-        state.Progress(job["id"], job["processed_id"], job["lease_token"])("matching")
+    assert (job["directory"] / "received" / job["filename"]).exists()
 
 
 def test_failed_recovery_write_does_not_kill_worker_or_quarantine_input(job, monkeypatch):

@@ -58,11 +58,15 @@ def test_ingestion_retention_removes_terminal_state_but_keeps_active_source(isol
            VALUES ('batch',2,'active.csv',?,'completed',?,?,?) RETURNING id""",
         (str(active_source), old, old, old),
     ).fetchone()["id"]
+    # Production processed_files rows always carry file_path (operations_service
+    # and realtime_ingestion_state both populate it).  Retention keeps an active
+    # campaign's row only while that source file still exists, so the row must
+    # point at the active source for the keep-branch to be exercised.
     conn.execute(
         """INSERT INTO processed_files
-           (campaign_type,campaign_id,filename,file_hash,status,detected_at,completed_at)
-           VALUES ('batch',2,'active.csv','active','completed',?,?)""",
-        (old, old),
+           (campaign_type,campaign_id,filename,file_hash,file_path,status,detected_at,completed_at)
+           VALUES ('batch',2,'active.csv','active',?,'completed',?,?)""",
+        (str(active_source), old, old),
     )
     conn.commit()
     conn.close()

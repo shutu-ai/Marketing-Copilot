@@ -29,7 +29,7 @@ def test_systemd_stops_app_children_and_isolates_update_runner():
     recovery_unit = install_systemd_service.build_recovery_unit(args, root)
 
     assert "KillMode=control-group" in app_unit
-    assert "TimeoutStopSec=90" in app_unit
+    assert "TimeoutStopSec=240" in app_unit
     assert "MC_UPDATE_RUNNER_UNIT=marketing-copilot-update@apply.service" in app_unit
     assert "KillMode=process" not in app_unit
     assert "Type=oneshot" in runner_unit

@@ -565,8 +565,12 @@ def test_projection_process_flushes_low_rate_event_before_batch_size(tmp_path):
 
 
 def test_projection_process_materializes_task_index_batch_without_journals(tmp_path):
+    # The writer child's idle retention sweep starts pre-expired and would age
+    # out these fixed historical business_day rows under the default 7-day
+    # window before the assertion reads them back.  Pin a decade-long window.
     process = ProjectionWriterProcess(
         tmp_path / "task-index-batch", batch_size=16, flush_interval_seconds=0.05,
+        retention_days=3650,
     )
     process.start()
     try:

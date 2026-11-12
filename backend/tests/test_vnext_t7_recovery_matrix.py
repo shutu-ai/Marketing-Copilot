@@ -290,7 +290,13 @@ def test_t7_9_cross_day_cursor_and_writer_restart_do_not_redispatch_or_double_co
     old_event = _projection_event("projection-old", "2026-10-17")
     new_event = _projection_event("projection-new", "2026-10-18")
     journal.append(old_event)
-    process = ProjectionWriterProcess(tmp_path / "projection", batch_size=2, journal_paths=[journal.path])
+    # The writer child's idle retention sweep starts pre-expired and would age
+    # out the replayed rows (fixed 2026-10-xx business days) under the default
+    # 7-day window before the final assertions read them back.
+    process = ProjectionWriterProcess(
+        tmp_path / "projection", batch_size=2, journal_paths=[journal.path],
+        retention_days=3650,
+    )
     process.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and process.snapshot().get("applied", 0) < 1:
