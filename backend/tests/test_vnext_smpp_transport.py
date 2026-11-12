@@ -131,6 +131,10 @@ async def _test_async_transport_reports_socket_written_without_waiting_for_respo
         assert sum(result.parts_written for result in results) == 100
         await asyncio.sleep(0.1)
         assert len(received) == 100
+        first = parse_submit_sm(received[0][1])
+        assert first["source_addr"] == "VNEXT"
+        assert first["source_ton"] == 5
+        assert first["source_npi"] == 0
         assert transport.response_success == 100
         assert transport.snapshot()["socket_written_parts_1m"] == 100
         assert transport.snapshot()["response_success_1m"] == 100
@@ -220,13 +224,17 @@ async def _test_async_transport_passes_written_part_count_to_admission_check():
 
 def test_submit_sm_multipart_contains_standard_concat_udh():
     packet = build_submit_sm(
-        7, source_addr="VNEXT", destination_addr="251900000001",
+        7, source_addr="Znexus", destination_addr="251900000001",
         message="x" * 300, part=1, total_parts=3, reference=9,
     )
     length, command, status, sequence = HEADER.unpack(packet[:16])
     assert length == len(packet)
     assert command == SUBMIT_SM
     assert status == 0 and sequence == 7
+    fields = parse_submit_sm(packet[16:])
+    assert fields["source_addr"] == "Znexus"
+    assert fields["source_ton"] == 5
+    assert fields["source_npi"] == 0
     assert b"\x05\x00\x03\x09\x03\x01" in packet
 
 

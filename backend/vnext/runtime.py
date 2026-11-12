@@ -1824,7 +1824,7 @@ class VNextRuntime:
             revision = self._control_version
             state = self._control_state.get(key)
             published_generation = self._control_generations.get(key)
-        if (not self._started or self.supervisor is None or state != "cancelled"
+        if (not self._started or self.supervisor is None or state not in {"paused", "cancelled"}
                 or (generation is not None and published_generation != int(generation))):
             return {"confirmed": False, "reason": "stop_not_published"}
         workers = {int(item["worker_id"]): item for item in self.supervisor.status().get("workers", [])}

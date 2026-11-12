@@ -68,6 +68,37 @@ def test_old_campaign_generation_is_settled_without_send_after_restart(tmp_path)
     assert result["campaign_generations"] == {"batch:6": 2}
 
 
+def test_cancelled_record_after_spool_gap_is_settled_without_send(tmp_path):
+    spool = TaskSpool(
+        tmp_path / "spool", virtual_partition_count=1, segment_max_records=1,
+        max_bytes=100_000,
+    )
+    spool.append_many([_record(f"gap-{ordinal}", ordinal, 2, 1, 0) for ordinal in range(1, 259)])
+    # Simulate a legacy missing prefix: the cancelled tail must not remain
+    # forever behind the dispatch window just because the cursor cannot cross
+    # the missing ordinals.
+    entries = spool._manifest["segments"]["0"]
+    for entry in entries[:-1]:
+        (spool.root / "partition-0000" / entry["filename"]).unlink()
+
+    progress = []
+    worker = ShardWorker(
+        0, (0,), spool, {1: {"route_id": 1}},
+        progress_sink=progress.append,
+        control_loader=lambda: {
+            "version": 1,
+            "campaigns": [{
+                "campaign_type": "batch", "campaign_id": 2,
+                "state": "cancelled", "generation": 1,
+            }],
+        },
+    )
+    result = asyncio.run(worker.run_until_idle())
+
+    assert result["counters"].get("socket_written", 0) == 0
+    assert [item["state"] for item in progress] == ["cancelled"]
+
+
 def test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path):
     return asyncio.run(_test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path))
 

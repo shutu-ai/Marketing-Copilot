@@ -383,11 +383,20 @@ class ShardWorker:
         return max(1, min(self.max_inflight, binds * window))
 
     def _eligible(self, record: SpoolRecord) -> bool:
-        self.refresh_campaign_states()
         key = (record.campaign_type, record.campaign_id)
         return (self._is_stale_generation(record)
                 or key in self._cancelled_campaigns or key not in self._paused_campaigns
                 or not self.spool.is_record_current(record))
+
+    def _settlement_bypasses_dispatch_window(self, record: SpoolRecord) -> bool:
+        """Let terminal/stale records settle even when an earlier gap remains."""
+
+        key = (record.campaign_type, record.campaign_id)
+        return (
+            self._is_stale_generation(record)
+            or key in self._cancelled_campaigns
+            or not self.spool.is_record_current(record)
+        )
 
     def _is_stale_generation(self, record: SpoolRecord) -> bool:
         key = (record.campaign_type, record.campaign_id)
@@ -1142,6 +1151,7 @@ class ShardWorker:
                     control_requested = True
                     break
                 fill()
+                self.refresh_campaign_states()
                 eligible_group = None
                 for offset in range(len(group_order)):
                     index = (self._group_cursor + offset) % len(group_order)
@@ -1151,7 +1161,12 @@ class ShardWorker:
                     if (
                         queue
                         and group not in blocked_groups
-                        and queue[0].ordinal <= self.spool.cursor(group[0]) + max(256, self.max_inflight + self.prefetch_per_partition)
+                        and (
+                            queue[0].ordinal <= self.spool.cursor(group[0]) + max(
+                                256, self.max_inflight + self.prefetch_per_partition,
+                            )
+                            or self._settlement_bypasses_dispatch_window(queue[0])
+                        )
                         and route_key not in self._route_reconfigure_pending
                         and self._active_by_route[route_key] < self._route_inflight_limit(group[3])
                         and self._eligible(queue[0])

@@ -163,6 +163,7 @@ export default {
     start: 'Start',
     stop: 'Stop',
     restart: 'Restart',
+    resume: 'Resume',
     end: 'End',
     copy: 'Copy',
     detail: 'Detail',

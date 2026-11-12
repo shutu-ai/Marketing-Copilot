@@ -29,7 +29,7 @@ VNext 的有效容量契约现在固定为：
 | `system_id`,`password` | `smpp_configs`，无默认 | DB → `_load_routes` → `build_bind`；密码只做 masked API 返回 | SMPP bind 认证 | 密钥/控制面 |
 | `source_addr` | `smpp_configs`，空值回退 `Marketing`/transport 默认 `VNEXT` | DB → `send_task` → `submit_sm` | submit 源地址 | 协议正确性 |
 | `bind_type` | `transceiver` | DB → `build_bind`；支持 receiver/transmitter/transceiver | 由响应 command 校验；receiver 不发送 submit_sm | 协议正确性 |
-| `address_ton`,`address_npi` | 0/0 | DB → `build_submit_sm` source TON/NPI | 不再硬编码 source TON/NPI | 协议正确性 |
+| `address_ton`,`address_npi` | 0/0（字母 source_addr 自动使用 5/0） | DB → `build_submit_sm` source TON/NPI | 非零配置显式覆盖；未配置时按 source_addr 类型使用 SMPP 标准默认值 | 协议正确性 |
 | `data_coding` | 0 | DB → `build_submit_sm` | 显式编码覆盖；未配置时按消息检测 | 协议正确性 |
 | `pool_size` | 1，1–20 | DB → Worker per-route bind target → `acquire_bind` | 连接生命周期 lease；跨 Worker 共享上限；不等于 Worker 数 | 容量/资源 |
 | `window_size` | 10，1–100 | DB → 每个 `AsyncSmppTransport` Semaphore | 每个 bind 独立 PDU window；响应释放 | 容量/正确性 |

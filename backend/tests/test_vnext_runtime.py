@@ -60,6 +60,32 @@ def test_campaign_stop_confirmation_requires_current_worker_and_durable_drain(tm
     assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
 
 
+def test_campaign_stop_confirmation_accepts_maintenance_pause(tmp_path):
+    runtime = VNextRuntime(tmp_path / "paused-stop", {1: {"route_id": 1}}, worker_count=1, virtual_partition_count=8)
+    runtime._started = True
+    runtime._control_state = {("realtime", 6): "paused"}
+    runtime._control_version = 4
+    runtime._control_generations = {("realtime", 6): 4}
+    runtime._load_control_state = lambda: None
+
+    class Supervisor:
+        def status(self):
+            return {"workers": [{"worker_id": 0, "alive": True, "pid": 123}]}
+
+    runtime.supervisor = Supervisor()
+    snapshot = {
+        "applied_control_version": 4, "healthy": True,
+        "campaign_inflight": [], "campaign_generations": {"realtime:6": 4},
+        "progress": {"pending_events_by_campaign": []},
+    }
+    runtime._worker_progress = lambda: [{
+        "worker_id": 0, "process_pid": 123, "run_id": runtime.run_id,
+        "updated_at": time.time(), "snapshot": snapshot,
+    }]
+
+    assert runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
+
+
 def test_restart_reconciles_campaign_controls_before_worker_start(tmp_path):
     root = tmp_path / "recover"
     first = VNextRuntime(root, {1: {"route_id": 1}}, worker_count=1, virtual_partition_count=8)

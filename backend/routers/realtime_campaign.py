@@ -24,7 +24,7 @@ def campaign_stop_confirmation(campaign_id: int):
     campaign = realtime_campaign_service.get_one(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.get("status") != "ended" or not vnext_service.is_active():
+    if campaign.get("status") not in {"ended", "paused"} or not vnext_service.is_active():
         return {"confirmed": False, "reason": "campaign_not_stopped_or_runtime_inactive"}
     return vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(campaign.get("dispatch_generation") or 0))
 

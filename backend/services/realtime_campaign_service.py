@@ -725,7 +725,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             raise ValueError("; ".join(validation_errors))
         if validation_campaign.get("use_whitelist", True) and not validation_campaign.get("row_count", 0):
             raise ValueError("No whitelist uploaded - cannot start campaign")
-    if existing_dict.get("status") == "ended":
+    if existing_dict.get("status") in {"ended", "paused"}:
         restart_only = data.status == "in_progress" and all(
             getattr(data, field, None) is None
             for field in [
@@ -801,15 +801,21 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
         if current_dict.get("status") == "in_progress":
             if schedule_changed:
                 raise ValueError("Stop the campaign and wait for it to finish before changing its schedule")
-        if current_dict.get("status") == "ended" and schedule_changed and vnext_active:
+        stopped_status = current_dict.get("status") in {"ended", "paused"}
+        if stopped_status and schedule_changed and vnext_active:
             if not vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(current_dict.get("dispatch_generation") or 0)).get("confirmed"):
                 raise ValueError("Campaign stop is not yet confirmed by all workers; retry after in-flight work completes")
-        if current_dict.get("status") == "ended" and fields.get("status") == "in_progress":
+        if stopped_status and fields.get("status") == "in_progress":
             if vnext_active and not vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(current_dict.get("dispatch_generation") or 0)).get("confirmed"):
                 raise ValueError("Campaign stop is not yet confirmed by all workers; retry after in-flight work completes")
         status_changed = any(fields[key] != current_dict.get(key) for key in control_fields.intersection(fields))
         next_generation = int(current_dict.get("dispatch_generation") or 0)
-        if status_changed:
+        target_status = fields.get("status", current_dict.get("status"))
+        maintenance_transition = (
+            current_dict.get("status") in {"in_progress", "paused"}
+            and target_status in {"in_progress", "paused"}
+        )
+        if status_changed and not maintenance_transition:
             next_generation += 1
         if fields:
             write_fields = dict(fields)
@@ -868,7 +874,7 @@ def update(campaign_id: int, data: RealtimeCampaignUpdate) -> Optional[dict]:
             logger.debug("Unable to invalidate live realtime SMPP queues", exc_info=True)
     sms_task_service.invalidate_campaign_cache("realtime", campaign_id)
     result = _enrich(updated)
-    if vnext_active and updated.get("status") == "ended":
+    if vnext_active and updated.get("status") in {"ended", "paused"}:
         result["stop_confirmation"] = vnext_service.runtime().campaign_stop_confirmation("realtime", campaign_id, int(updated.get("dispatch_generation") or 0))
     if data.use_custom_directory is not None:
         os.makedirs(os.path.join(result["campaign_dir"], "whitelist"), exist_ok=True)

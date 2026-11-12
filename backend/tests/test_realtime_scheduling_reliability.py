@@ -161,6 +161,37 @@ def test_stopped_campaign_schedule_waits_for_all_workers(isolated_db, monkeypatc
     assert campaigns.update(campaign_id, change)["send_end_time"] == "19:00"
 
 
+def test_manual_pause_preserves_queued_work_and_dispatch_generation(isolated_db, monkeypatch):
+    from services import vnext_service
+
+    campaign_id = _insert_realtime_campaign(isolated_db, end_time="18:00")
+    task_id = _insert_task(campaign_id, "queued", campaign_type="realtime")
+
+    class Runtime:
+        def campaign_stop_confirmation(self, campaign_type, campaign_id, generation):
+            return {"confirmed": True, "waiting_workers": []}
+
+    monkeypatch.setattr(vnext_service, "is_active", lambda: True)
+    monkeypatch.setattr(vnext_service, "runtime", lambda: Runtime())
+    monkeypatch.setattr(vnext_service, "set_campaign_state", lambda *_args: None)
+    monkeypatch.setattr(campaigns.operations_service, "validate_campaign", lambda *_args, **_kwargs: [])
+
+    paused = campaigns.update(campaign_id, RealtimeCampaignUpdate(status="paused"))
+    assert paused["status"] == "paused"
+    assert paused["dispatch_generation"] == 0
+    changed = campaigns.update(campaign_id, RealtimeCampaignUpdate(send_end_time="19:00"))
+    assert changed["send_end_time"] == "19:00"
+    assert changed["dispatch_generation"] == 0
+    resumed = campaigns.update(campaign_id, RealtimeCampaignUpdate(status="in_progress"))
+    assert resumed["status"] == "in_progress"
+    assert resumed["dispatch_generation"] == 0
+
+    conn = database.get_connection()
+    task = conn.execute("SELECT status FROM sms_tasks WHERE id=?", (task_id,)).fetchone()
+    conn.close()
+    assert task["status"] == "queued"
+
+
 def test_finalizer_preserves_authorized_send_for_late_response(isolated_db, monkeypatch):
     campaign_id = _insert_realtime_campaign(isolated_db, end_time="18:00")
     claim = "claim-in-flight"

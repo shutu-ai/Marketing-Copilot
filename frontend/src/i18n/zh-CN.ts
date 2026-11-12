@@ -174,6 +174,7 @@ export default {
     start: '开始活动',
     stop: '停止活动',
     restart: '重新启动',
+    resume: '恢复活动',
     end: '结束活动',
     copy: '复制',
     detail: '详情',

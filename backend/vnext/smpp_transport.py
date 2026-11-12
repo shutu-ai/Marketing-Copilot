@@ -33,6 +33,7 @@ SMPP_ENCODING_DEFAULT = 0x00
 SMPP_ENCODING_ISO10646 = 0x08
 FLASH_DCS_DEFAULT_ALPHABET = 0xF0
 FLASH_DCS_UCS2 = 0x18
+SMPP_TON_ALNUM = 0x05
 
 
 class SmppTransportError(RuntimeError):
@@ -97,10 +98,20 @@ def build_bind(sequence: int, system_id: str, password: str, system_type: str = 
     return HEADER.pack(16 + len(body), command_id, 0, int(sequence)) + body
 
 
+def _effective_source_ton(source_addr: str, source_ton: int | None) -> int:
+    """Use the SMPP alphanumeric TON when the route leaves TON unspecified."""
+
+    configured = int(source_ton or 0)
+    if configured:
+        return configured
+    value = str(source_addr or "").strip()
+    return SMPP_TON_ALNUM if value and not value.isdecimal() else 0
+
+
 def build_submit_sm(sequence: int, *, source_addr: str, destination_addr: str,
                     message: str, part: int = 1, total_parts: int = 1,
                     reference: int = 1, flash_sms: bool = False,
-                    source_ton: int = 0, source_npi: int = 0,
+                    source_ton: int | None = None, source_npi: int = 0,
                     destination_ton: int = 1, destination_npi: int = 1,
                     data_coding: int | None = None,
                     registered_delivery: int = 1) -> bytes:
@@ -123,8 +134,9 @@ def build_submit_sm(sequence: int, *, source_addr: str, destination_addr: str,
         esm_class |= 0x40
     if len(body_message) > 255:
         raise ValueError("SMPP short_message exceeds 255 octets")
+    effective_source_ton = _effective_source_ton(source_addr, source_ton)
     body = b"".join([
-        cstring(""), bytes((int(source_ton) & 0xFF, int(source_npi) & 0xFF)), cstring(source_addr),
+        cstring(""), bytes((effective_source_ton & 0xFF, int(source_npi) & 0xFF)), cstring(source_addr),
         bytes((int(destination_ton) & 0xFF, int(destination_npi) & 0xFF)), cstring(destination_addr),
         bytes((esm_class, 0, 0)), cstring(""), cstring(""),
         bytes((int(registered_delivery) & 0xFF, 0, int(effective_coding) & 0xFF, 0, len(body_message))), body_message,

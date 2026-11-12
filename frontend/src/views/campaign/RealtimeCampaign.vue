@@ -103,10 +103,10 @@
             <el-button text type="primary" size="small" @click="$router.push('/campaign/realtime/' + row.id)">
               {{ $t('campaign.detail') }}
             </el-button>
-            <template v-if="row.status === 'not_started' || row.status === 'ended'">
+            <template v-if="row.status === 'not_started' || row.status === 'paused' || row.status === 'ended'">
               <span :title="startHint(row)">
                 <el-button v-if="canManage" text type="warning" size="small" :disabled="!isReady(row)" @click="handleStart(row)">
-                  {{ row.status === 'ended' ? $t('campaign.restart') : $t('campaign.start') }}
+                  {{ row.status === 'ended' ? $t('campaign.restart') : row.status === 'paused' ? $t('campaign.resume') : $t('campaign.start') }}
                 </el-button>
               </span>
             </template>
@@ -523,7 +523,7 @@ function changePage(nextPage: number) {
 function showDialog(row: Campaign | null) {
   if (row) {
     hasStoredSftpPassword.value = Boolean(row.sftp_password)
-    inProgressEdit.value = row.status !== 'not_started' && row.status !== 'ended'
+    inProgressEdit.value = row.status === 'in_progress'
     customDirectory.value = Boolean(row.use_custom_directory)
     editForm.value = {
       id: row.id,
@@ -693,9 +693,9 @@ async function handleSave() {
      smpp_config_id: editForm.value.smpp_config_id || undefined,
      flash_sms: editForm.value.flash_sms,
    }
-    if (editForm.value.id && editForm.value.status !== 'not_started' && editForm.value.status !== 'ended') {
+    if (editForm.value.id && editForm.value.status === 'in_progress') {
       payload = { smpp_config_id: editForm.value.smpp_config_id || undefined }
-    } else if (editForm.value.id && editForm.value.status === 'ended') {
+    } else if (editForm.value.id && (editForm.value.status === 'ended' || editForm.value.status === 'paused')) {
       payload = {
         name: editForm.value.name,
         end_time: editForm.value.end_time,
@@ -773,7 +773,7 @@ async function handleStart(row: Campaign) {
 
 async function handleEnd(row: Campaign) {
   try {
-    const response = await api.updateRealtimeCampaign(row.id, { status: 'ended' })
+    const response = await api.updateRealtimeCampaign(row.id, { status: 'paused' })
     if (response.data?.stop_confirmation && !response.data.stop_confirmation.confirmed) {
       ElMessage.warning(t('campaign.stopPending'))
     } else {
