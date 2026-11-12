@@ -1532,25 +1532,11 @@ def _open_whitelist_index(path: str):
 
     A version file can be replaced while a worker is starting a read-only
     connection. DuckDB reports that short race as a lock or write conflict;
-    retry the open before treating the index as damaged.
+    the shared opener in the whitelist service retries before treating the
+    index as damaged, and keeps one warmed database instance per index file
+    so per-ingestion-file connections stop paying the cold open cost.
     """
-    last_error = None
-    for attempt in range(3):
-        conn = None
-        try:
-            conn = duckdb.connect(path, read_only=True)
-            # Connecting to a damaged DuckDB file can succeed before the first
-            # table access. Validate the schema before consuming any input rows.
-            conn.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
-            return conn
-        except Exception as exc:
-            last_error = exc
-            if conn:
-                conn.close()
-            if not _is_transient_whitelist_index_error(exc) or attempt >= 2:
-                raise
-            time.sleep(0.2 * (attempt + 1))
-    raise last_error
+    return realtime_whitelist_service.open_whitelist_index_connection(path)
 
 
 def _batch_seen_msisdns(conn, normalized, languages, use_whitelist):
@@ -1594,14 +1580,22 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
     # Do not retain a long-lived DuckDB snapshot while chunk state and tasks are
     # committed through their own short transactions.
     realtime_ingestion_state.check_owned(ingestion_file_id, lease_token)
-    # A previous attempt may have moved the file but failed its final DB commit.
-    # Replay completed chunk checkpoints from received, not a missing inbox path.
-    recovered_archive = False
+    # Crash replay from received/ is intentionally not supported: chunks that
+    # were already committed keep their enqueued tasks, and the archived copy
+    # stays behind only until the daily input retention removes it.  A retry
+    # that finds no inbox copy therefore fails terminally instead of
+    # re-reading archived input; a few missed numbers after a crash are the
+    # accepted tradeoff for the simpler recovery path.
     if not os.path.isfile(file_path):
-        archived = os.path.join(campaign.get("campaign_dir", ""), "received", os.path.basename(original_filename))
-        if os.path.isfile(archived):
-            file_path = archived
-            recovered_archive = True
+        # The "cannot read file" prefix maps to the retry service's terminal
+        # INVALID_INPUT class (no retries) instead of an UNKNOWN retry loop.
+        return {
+            "success": False,
+            "status": "failed",
+            "error_class": "INVALID_INPUT",
+            "retryable": False,
+            "message": "cannot read file: input file is missing from the inbox",
+        }
     # Direct callers without a worker lease still register the authoritative
     # manifest first.  The processed-file row is never used for duplicate
     # decisions; it is only projected after the authority commit.
@@ -1612,7 +1606,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             whitelist_version_id=whitelist_version_id,
         )
         if duplicate_file:
-            duplicate_path = "" if recovered_archive else operations_service.archive_duplicate(
+            duplicate_path = operations_service.archive_duplicate(
                 file_path, campaign.get("campaign_dir", ""), original_filename
             )
             return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
@@ -1629,7 +1623,7 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             raise
         return {"success": False, "message": str(exc), "error_class": "INVALID_INPUT"}
     if duplicate_file:
-        duplicate_path = "" if recovered_archive else operations_service.archive_duplicate(
+        duplicate_path = operations_service.archive_duplicate(
             file_path, campaign.get("campaign_dir", ""), original_filename)
         return {"success": True, "duplicate_file": True, "duplicate_path": duplicate_path,
                 "message": "file already processed"}

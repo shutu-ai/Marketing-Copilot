@@ -331,6 +331,7 @@ def _create_version(campaign_id: int, source_filename: str, source_path: str,
     ):
         try:
             if os.path.isfile(obsolete_index_path):
+                invalidate_warm_index(obsolete_index_path)
                 os.unlink(obsolete_index_path)
         except OSError:
             logger.warning("Unable to remove superseded whitelist index path=%s", obsolete_index_path)
@@ -434,12 +435,140 @@ def schedule_active_rebuild(version_id: int, error_detail: str = "") -> bool:
     return True
 
 
+_whitelist_reader_config: Optional[dict] = None
+_warm_index_lock = threading.Lock()
+_warm_whitelist_index_connections: dict[str, dict] = {}
+
+
+def whitelist_index_connect_config() -> dict:
+    """Return the process-stable DuckDB config shared by all index readers.
+
+    DuckDB refuses to open the same database file twice with different
+    configurations in one process, and identical configs let per-file
+    connections reuse one warmed database instance per index file.  The
+    resolved config is frozen for the process lifetime; changing the
+    memory limit requires a restart.
+    """
+    global _whitelist_reader_config
+    if _whitelist_reader_config is None:
+        try:
+            raw = settings_service.get_setting(
+                "realtime_whitelist_index_memory_limit",
+                os.environ.get("MC_REALTIME_WHITELIST_INDEX_MEMORY_LIMIT", "512MB"),
+            )
+        except Exception:
+            raw = "512MB"
+        _whitelist_reader_config = {"memory_limit": str(raw)}
+    return dict(_whitelist_reader_config)
+
+
+def _index_file_identity(path: str):
+    """Stat identity used to detect published (os.replace) index changes."""
+    stat = os.stat(path)
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _close_warm_entry(entry: dict) -> None:
+    try:
+        entry["conn"].close()
+    except Exception:
+        pass
+
+
+def _drop_stale_warm_index(path: str, identity) -> None:
+    stale = None
+    with _warm_index_lock:
+        entry = _warm_whitelist_index_connections.get(path)
+        if entry and (identity is None or entry["identity"] != identity):
+            stale = _warm_whitelist_index_connections.pop(path)
+    if stale:
+        _close_warm_entry(stale)
+
+
+def open_whitelist_index_connection(path: str, warm: bool = True):
+    """Open and minimally validate a published whitelist index.
+
+    Every reader uses the same process-stable config so concurrent opens
+    share one warmed DuckDB instance per index file instead of re-reading
+    the header, catalog and deserialized ART index per ingestion file.
+    The warm connection itself is never used for queries; callers keep
+    their own connection lifecycle exactly as before, and warm upkeep is
+    best-effort: any warm-maintenance failure never fails the caller's open.
+    """
+    try:
+        identity = _index_file_identity(path)
+    except OSError:
+        identity = None
+    if identity is not None:
+        _drop_stale_warm_index(path, identity)
+    last_error = None
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = duckdb.connect(path, read_only=True, config=whitelist_index_connect_config())
+            # Connecting to a damaged DuckDB file can succeed before the first
+            # table access. Validate the schema before consuming any input rows.
+            conn.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
+        except Exception as exc:
+            last_error = exc
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if not is_transient_database_error(exc) or attempt >= 2:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+            continue
+        if warm and identity is not None:
+            warm_conn = None
+            try:
+                current_identity = _index_file_identity(path)
+                with _warm_index_lock:
+                    existing = _warm_whitelist_index_connections.get(path)
+                    if existing and existing["identity"] != current_identity:
+                        _warm_whitelist_index_connections.pop(path)
+                        _close_warm_entry(existing)
+                        existing = None
+                    if existing is None:
+                        # A second read-only connection on the same path
+                        # attaches to the already-warmed instance, keeping it
+                        # alive after the caller's per-file connection closes.
+                        warm_conn = duckdb.connect(
+                            path, read_only=True, config=whitelist_index_connect_config(),
+                        )
+                        _warm_whitelist_index_connections[path] = {
+                            "conn": warm_conn,
+                            "identity": current_identity,
+                        }
+            except Exception:
+                if warm_conn:
+                    try:
+                        warm_conn.close()
+                    except Exception:
+                        pass
+        return conn
+    raise last_error
+
+
+def invalidate_warm_index(path: str) -> None:
+    """Drop the warm connection for a path, e.g. before a rebuild publish.
+
+    Called under the file lock right before os.replace so the published
+    path keeps working on hosts where replacing an open file fails.
+    """
+    with _warm_index_lock:
+        entry = _warm_whitelist_index_connections.pop(path, None)
+    if entry:
+        _close_warm_entry(entry)
+
+
 def _index_is_usable(index_path: str) -> bool:
     if not index_path or not os.path.isfile(index_path):
         return False
     index = None
     try:
-        index = duckdb.connect(index_path, read_only=True)
+        index = duckdb.connect(index_path, read_only=True, config=whitelist_index_connect_config())
         index.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
         return True
     except Exception:
@@ -494,7 +623,7 @@ def recover_transient_failure(version_id: int) -> str:
     if index_path and os.path.isfile(index_path):
         index = None
         try:
-            index = duckdb.connect(index_path, read_only=True)
+            index = duckdb.connect(index_path, read_only=True, config=whitelist_index_connect_config())
             index.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
             _set_status(version_id, "ready", error_detail="")
             logger.warning(
@@ -796,7 +925,11 @@ def build_version(version_id: int) -> dict:
             db.close()
         with _WHITELIST_FILE_LOCK:
             # temp_path is in the same directory, so replace keeps the active
-            # path continuously readable while a rebuild is published.
+            # path continuously readable while a rebuild is published.  Drop
+            # the warm instance handle first: on hosts where replacing an
+            # open file fails, a lingering warm connection would block the
+            # publish forever.
+            invalidate_warm_index(final_path)
             os.replace(temp_path, final_path)
 
             def write(conn):
@@ -1000,6 +1133,7 @@ def _cleanup_orphan_files(campaign_id: Optional[int], retention_days: int) -> in
                     else:
                         old_enough = entry.stat(follow_symlinks=False).st_mtime < cutoff
                     if old_enough:
+                        invalidate_warm_index(path)
                         os.unlink(entry.path)
                         removed += 1
                 except OSError:
@@ -1066,6 +1200,7 @@ def _cleanup_versions(campaign_id: Optional[int] = None) -> dict:
             if not path or not os.path.isfile(path):
                 continue
             try:
+                invalidate_warm_index(path)
                 os.remove(path)
             except OSError:
                 cleanup_ok = False

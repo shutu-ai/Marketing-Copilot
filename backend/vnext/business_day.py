@@ -140,7 +140,11 @@ class BusinessClock:
     def __init__(self, wall_time: Callable[[], object] | object | None = None,
                  timezone_name: str | tzinfo | None = None):
         self.timezone_name, self.tz = business_timezone(timezone_name)
-        if wall_time is not None and hasattr(wall_time, "now") and not callable(wall_time):
+        # A datetime instance also exposes .now (the classmethod), so exclude
+        # it explicitly: a fixed datetime must stay a fixed point in time, not
+        # be silently turned into a live "always current time" provider.
+        if (wall_time is not None and not isinstance(wall_time, datetime)
+                and hasattr(wall_time, "now") and not callable(wall_time)):
             self._wall_time = lambda: wall_time.now()
         else:
             self._wall_time = wall_time
