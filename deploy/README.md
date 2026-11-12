@@ -68,6 +68,24 @@ sudo systemctl enable --now marketing-copilot.service marketing-copilot-backup.t
 
 The deployment uses only Python, Uvicorn and systemd. It does not require Docker. The service uses one Uvicorn process because DuckDB requires one application writer; `MC_TASK_WORKERS` controls the internal SMS worker threads. `StateDirectory`, `LogsDirectory`, and `RuntimeDirectory` create writable directories for the service account.
 
+## PostgreSQL 15 SLES12SP5 offline server package
+
+The future PostgreSQL server is packaged separately from MarketingCopilot so
+the current DuckDB deployment remains unchanged. Build the package from an
+internet-connected Linux/WSL environment with the official PGDG RPMs; the
+proxy is temporary and is not stored in the archive:
+
+```bash
+bash deploy/build-postgresql15-sles12sp5-offline.sh \
+  --proxy http://192.168.1.2:8080 \
+  --output release
+```
+
+The output is `postgresql15-sles12sp5-offline-*.tar.gz`. Copy it to a SLES
+12 SP5 x86_64 host and follow the package-local `README.md`. The installer
+does not set a database password, open remote access, migrate DuckDB data, or
+start the service unless `./install.sh --start` is requested.
+
 Verify after installation:
 
 ```bash
