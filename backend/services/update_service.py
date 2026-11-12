@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VERSION = "1.2.0"
 STATE_FILE_NAME = "apply.state"
+BACKUP_MANIFEST_NAME = "manifest.json"
+BACKUP_KIND = "marketing-copilot-update-backup"
 RUNNING_STATES = ("prepared", "stopping", "swapping", "starting", "health_checking")
 
 
@@ -479,6 +481,51 @@ def _copy_tree(source: Path, destination: Path) -> None:
         )
 
 
+def _write_backup_manifest(backup_root: Path, manifest: dict) -> Path:
+    path = backup_root / BACKUP_MANIFEST_NAME
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+    return path
+
+
+def _load_backup_manifest(backup_root: Path) -> dict | None:
+    if not backup_root.is_dir():
+        return None
+    path = backup_root / BACKUP_MANIFEST_NAME
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(manifest, dict) or manifest.get("kind") != BACKUP_KIND:
+        return None
+    if not manifest.get("source_version") or not manifest.get("target_version"):
+        return None
+    if not all((backup_root / label).is_dir() for label in ("backend", "frontend")):
+        return None
+    return manifest
+
+
+def _generated_backups(root: Path) -> list[tuple[Path, dict]]:
+    if not root.is_dir():
+        return []
+    backups = []
+    for path in root.iterdir():
+        manifest = _load_backup_manifest(path)
+        if manifest is not None:
+            backups.append((path, manifest))
+    return backups
+
+
+def _backup_sort_key(item: tuple[Path, dict]) -> tuple[str, float, str]:
+    path, manifest = item
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (str(manifest.get("created_at", "")), mtime, path.name)
+
+
 def apply_update(upload_id: str, force: bool = False, operator: str = "system") -> dict:
     if os.name == "nt":
         raise RuntimeError("online updates are only supported on the Linux target; update the dev machine manually")
@@ -516,6 +563,19 @@ def apply_update(upload_id: str, force: bool = False, operator: str = "system") 
     for label, source, _new in trees:
         _copy_tree(source, backup_root / label)
 
+    backup_manifest = _write_backup_manifest(
+        backup_root,
+        {
+            "kind": BACKUP_KIND,
+            "backup_ts": backup_ts,
+            "run_id": f"apply-{backup_ts}",
+            "created_at": now_str(),
+            "source_version": current.get("version", DEFAULT_VERSION),
+            "source_git_sha": current.get("git_sha", ""),
+            "target_version": new_version,
+        },
+    )
+
     state_data = {
         "action": "apply",
         "run_id": f"apply-{backup_ts}",
@@ -524,11 +584,13 @@ def apply_update(upload_id: str, force: bool = False, operator: str = "system") 
         "status": "prepared",
         "payload_dir": str(payload),
         "backup_dir": str(backup_root),
+        "backup_manifest": str(backup_manifest),
         "backup_ts": backup_ts,
         "db_backup": db_backup,
         "operator": operator,
         "version": new_version,
         "previous_version": current.get("version", DEFAULT_VERSION),
+        "previous_git_sha": current.get("git_sha", ""),
         "started_at": now_str(),
     }
     save_state(state_data)
@@ -558,9 +620,15 @@ def rollback(operator: str = "system") -> dict:
     state = load_state()
     if state.get("status") in RUNNING_STATES:
         raise RuntimeError("another update or rollback is already running")
-    backup_root = _latest_backup_dir()
+    current = version_info()
+    current_version = current.get("version", DEFAULT_VERSION)
+    backup_root = _latest_backup_dir(current_version)
     if not backup_root:
-        raise LookupError("no backup found; nothing to roll back")
+        raise LookupError(f"no verified rollback backup found for running version {current_version}")
+    manifest = _load_backup_manifest(backup_root)
+    if manifest is None:
+        raise LookupError(f"rollback backup for running version {current_version} is invalid")
+    restored_version = str(manifest["source_version"])
 
     from services.runtime_service import backup_database
 
@@ -572,10 +640,15 @@ def rollback(operator: str = "system") -> dict:
         "mode": update_mode(),
         "status": "prepared",
         "backup_dir": str(backup_root),
+        "backup_manifest": str(backup_root / BACKUP_MANIFEST_NAME),
         "backup_ts": backup_root.name,
         "db_backup": db_backup,
         "operator": operator,
-        "version": "rollback",
+        "version": restored_version,
+        "previous_version": current_version,
+        "previous_git_sha": current.get("git_sha", ""),
+        "rollback_from_version": current_version,
+        "rollback_to_version": restored_version,
         "started_at": now_str(),
     }
     save_state(state_data)
@@ -684,12 +757,16 @@ def recover_if_runner_dead() -> None:
         logger.exception("failed to restart workers after runner death")
 
 
-def _latest_backup_dir() -> Path:
+def _latest_backup_dir(current_version: str | None = None) -> Path:
     root = ensure_update_dir() / "backups"
-    if not root.is_dir():
-        return None
-    backups = sorted(root.iterdir(), key=lambda p: p.name)
-    return backups[-1] if backups else None
+    backups = _generated_backups(root)
+    if current_version:
+        backups = [
+            item for item in backups
+            if item[1].get("target_version") == current_version
+        ]
+    backups.sort(key=_backup_sort_key)
+    return backups[-1][0] if backups else None
 
 
 def cleanup_staging(max_age_hours: int = 24) -> None:
@@ -728,8 +805,21 @@ def cleanup_staging(max_age_hours: int = 24) -> None:
             shutil.rmtree(ud, ignore_errors=True)
     backups_root = root / "backups"
     if backups_root.is_dir():
-        backups = sorted(backups_root.iterdir(), key=lambda p: p.name)
-        for old in backups[:-keep_backups]:
+        generated = _generated_backups(backups_root)
+        generated.sort(key=_backup_sort_key)
+        active_backup = None
+        if state.get("status") in RUNNING_STATES and state.get("backup_dir"):
+            try:
+                active_backup = Path(state["backup_dir"]).resolve()
+            except (OSError, RuntimeError, TypeError):
+                active_backup = None
+        for old, _manifest in generated[:-keep_backups]:
+            if active_backup is not None:
+                try:
+                    if old.resolve() == active_backup:
+                        continue
+                except (OSError, RuntimeError):
+                    pass
             shutil.rmtree(old, ignore_errors=True)
 
     # Manual-mode runners write outside systemd's journal.  Keep diagnostic

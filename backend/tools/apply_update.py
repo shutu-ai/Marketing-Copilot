@@ -30,6 +30,8 @@ HEALTH_URL = os.environ.get(
 HEALTH_TRIES = int(os.environ.get("MC_UPDATE_HEALTH_TRIES", "180"))
 HEALTH_INTERVAL = float(os.environ.get("MC_UPDATE_HEALTH_INTERVAL", "2.0"))
 STOP_GRACE = float(os.environ.get("MC_UPDATE_STOP_GRACE", "30"))
+BACKUP_MANIFEST_NAME = "manifest.json"
+BACKUP_KIND = "marketing-copilot-update-backup"
 
 # Entries under the application directories that carry runtime configuration or
 # business data. They are preserved across updates (never cleared) and are not
@@ -251,6 +253,37 @@ def _is_protected(name: str) -> bool:
     )
 
 
+def validate_backup_for_state(backup: Path, state: dict, *, rollback: bool = False) -> dict:
+    if not backup.is_dir():
+        raise RuntimeError(f"rollback backup is missing: {backup}")
+    try:
+        manifest = json.loads((backup / BACKUP_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(f"rollback backup manifest is invalid: {backup}") from exc
+    if not isinstance(manifest, dict) or manifest.get("kind") != BACKUP_KIND:
+        raise RuntimeError(f"rollback backup manifest is invalid: {backup}")
+    if not manifest.get("source_version") or not manifest.get("target_version"):
+        raise RuntimeError(f"rollback backup manifest is incomplete: {backup}")
+    if not all((backup / label).is_dir() for label in ("backend", "frontend")):
+        raise RuntimeError(f"rollback backup is incomplete: {backup}")
+
+    expected_target = (
+        state.get("rollback_from_version") if rollback else state.get("version")
+    )
+    expected_source = state.get("version") if rollback else state.get("previous_version")
+    if expected_target and manifest.get("target_version") != expected_target:
+        raise RuntimeError(
+            "rollback backup target version mismatch: "
+            f"expected {expected_target}, got {manifest.get('target_version')}"
+        )
+    if expected_source and manifest.get("source_version") != expected_source:
+        raise RuntimeError(
+            "rollback backup source version mismatch: "
+            f"expected {expected_source}, got {manifest.get('source_version')}"
+        )
+    return manifest
+
+
 def replace_tree(new_tree: Path, target: Path) -> None:
     log(f"replacing {target} with {new_tree}")
     target.mkdir(parents=True, exist_ok=True)
@@ -332,6 +365,7 @@ def swap_into_place(state: dict) -> None:
         log("new version swapped in")
     else:
         backup = Path(state.get("backup_dir", ""))
+        validate_backup_for_state(backup, state, rollback=True)
         for label in ("backend", "frontend", "offline", "bin"):
             source = backup / label
             target = project_root() / label
@@ -347,8 +381,10 @@ def main() -> int:
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
     state = load_state()
     log(f"runner started: action={state.get('action')} mode={state.get('mode')} pid={os.getpid()}")
-    save_state({**load_state(), "status": "stopping", "runner_pid": os.getpid()})
     try:
+        if state.get("action") == "rollback":
+            validate_backup_for_state(Path(state.get("backup_dir", "")), state, rollback=True)
+        save_state({**load_state(), "status": "stopping", "runner_pid": os.getpid()})
         stopped_via = stop_service(state)
         save_state({**load_state(), "status": "swapping", "stopped_via": stopped_via})
         swap_into_place(state)
@@ -379,6 +415,7 @@ def main() -> int:
         try:
             backup = Path(state.get("backup_dir", ""))
             if backup.is_dir():
+                validate_backup_for_state(backup, state)
                 log("attempting automatic rollback")
                 stop_again = stop_service(load_state())
                 for label in ("backend", "frontend", "offline", "bin"):
