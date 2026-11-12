@@ -1842,9 +1842,19 @@ class VNextRuntime:
             current = (process.get("alive") and process.get("pid") == report.get("process_pid")
                        and now - float(report.get("updated_at") or 0) < max(5.0, self.status_interval_seconds * 4))
             def has_campaign(items):
-                return any(str(item.get("campaign_type")) == key[0]
-                           and int(item.get("campaign_id") or 0) == key[1]
-                           for item in items)
+                for item in items:
+                    if (str(item.get("campaign_type")) != key[0]
+                            or int(item.get("campaign_id") or 0) != key[1]):
+                        continue
+                    # ``active`` also includes a worker coroutine that has
+                    # only picked up a cancelled/stale record and is waiting
+                    # to persist its terminal event.  That work cannot send
+                    # after the next generation is published.  A response
+                    # reservation, however, means a PDU crossed the socket
+                    # or is already committed to the response window.
+                    if "reservations" not in item or int(item.get("reservations") or 0) > 0:
+                        return True
+                return False
             if (not current or int(snapshot.get("applied_control_version", -1)) < revision
                     or (published_generation is not None
                         and (applied_generation is None

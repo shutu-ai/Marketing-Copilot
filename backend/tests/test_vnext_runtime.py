@@ -47,8 +47,12 @@ def test_campaign_stop_confirmation_requires_current_worker_and_durable_drain(tm
               "updated_at": time.time(), "snapshot": snapshot}
     runtime._worker_progress = lambda: [report]
     assert runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
-    snapshot["campaign_inflight"] = [{"campaign_type": "realtime", "campaign_id": 6, "active": 1}]
+    snapshot["campaign_inflight"] = [{"campaign_type": "realtime", "campaign_id": 6,
+                                      "active": 1, "reservations": 1}]
     assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
+    snapshot["campaign_inflight"] = [{"campaign_type": "realtime", "campaign_id": 6,
+                                      "active": 1, "reservations": 0}]
+    assert runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
     snapshot["campaign_inflight"] = []
     snapshot["progress"]["pending_events_by_campaign"] = [{"campaign_type": "realtime", "campaign_id": 6, "count": 1}]
     assert not runtime.campaign_stop_confirmation("realtime", 6)["confirmed"]
