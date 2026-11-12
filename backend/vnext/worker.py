@@ -1165,10 +1165,19 @@ class ShardWorker:
                         queue
                         and group not in blocked_groups
                         and (
-                            queue[0].ordinal <= self.spool.cursor(group[0]) + max(
-                                256, self.max_inflight + self.prefetch_per_partition,
+                            self.spool.dispatch_window_open(
+                                group[0], queue[0].ordinal,
+                                max_gap=max(
+                                    256, self.max_inflight + self.prefetch_per_partition,
+                                ),
                             )
-                            or self._settlement_bypasses_dispatch_window(queue[0])
+                            or (
+                                self._settlement_bypasses_dispatch_window(queue[0])
+                                and self.spool.dispatch_window_open(
+                                    group[0], queue[0].ordinal,
+                                    allow_out_of_order=True,
+                                )
+                            )
                         )
                         and route_key not in self._route_reconfigure_pending
                         and self._active_by_route[route_key] < self._route_inflight_limit(group[3])

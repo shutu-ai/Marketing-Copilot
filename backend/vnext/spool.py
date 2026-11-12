@@ -20,6 +20,10 @@ from .business_day import BusinessClock, ensure_clock, normalize_business_day
 
 SPOOL_SCHEMA_VERSION = 1
 DEFAULT_MAX_SPOOL_BYTES = 4 * 1024 * 1024 * 1024
+# Keep an unresolved ordinal gap from turning every checkpoint into a large
+# JSON rewrite.  The worker stops crossing the gap until maintenance repairs
+# a closed-day hole or the missing record is settled.
+MAX_TAKEN_PENDING = 4096
 
 
 class SpoolError(RuntimeError):
@@ -1427,6 +1431,263 @@ class TaskSpool:
                 self._cursors[str(partition)] = current
             for partition in by_partition:
                 self._persist_cursors(partition)
+
+    def dispatch_window_open(
+        self, partition_id: int, ordinal: int, *, max_gap: int = 256,
+        allow_out_of_order: bool = False,
+    ) -> bool:
+        """Bound out-of-order dispatch while preserving the gap record."""
+
+        partition = int(partition_id)
+        value = int(ordinal)
+        # This is called for every candidate group in the worker's event-loop
+        # hot path.  The worker is the only writer in its process, so a
+        # lock-free snapshot is safe and preserves the old cursor-read cost.
+        current = int(self._cursors.get(str(partition), 0))
+        pending = self._taken_pending.get(str(partition), set())
+        if len(pending) >= MAX_TAKEN_PENDING:
+            # Only the record immediately after the cursor can close the
+            # gap; even terminal settlement must remain memory/I/O bounded.
+            return value <= current + 1
+        return allow_out_of_order or value <= current + max(1, int(max_gap))
+
+    def closed_day_gap_snapshot(self) -> dict:
+        """Return cheap evidence for whether maintenance must inspect gaps."""
+
+        with self._lock:
+            manifest_signature = self._file_signature(self._manifest_path)
+            if manifest_signature != self._manifest_signature and manifest_signature is not None:
+                try:
+                    loaded = self._load_manifest()
+                except (OSError, ValueError, TypeError, SpoolError):
+                    loaded = None
+                if loaded is not None:
+                    self._manifest = loaded
+                    self._refresh_current_day_locked()
+                    self._manifest_signature = manifest_signature
+
+            current_day = self.current_business_day
+            partitions: list[int] = []
+            signature: list[tuple] = []
+            for partition in range(self.virtual_partition_count):
+                entries = self._manifest.get("segments", {}).get(str(partition), [])
+                current_entries = [
+                    entry for entry in entries
+                    if str(entry.get("business_day") or "") == current_day
+                ]
+                if not current_entries:
+                    continue
+                try:
+                    first_current = min(
+                        int(entry.get("first_ordinal", 0) or 0)
+                        for entry in current_entries
+                    )
+                except (TypeError, ValueError):
+                    partitions.append(partition)
+                    signature.append((partition, "invalid"))
+                    continue
+                cursor = int(self._cursors.get(str(partition), 0))
+                cursor_path = self._cursor_dir / f"partition-{partition:04d}.json"
+                try:
+                    cursor = int(
+                        json.loads(cursor_path.read_text(encoding="utf-8")).get(
+                            "cursor", cursor,
+                        )
+                    )
+                    self._cursors[str(partition)] = cursor
+                except (FileNotFoundError, OSError, ValueError, TypeError):
+                    pass
+                if first_current <= cursor + 1:
+                    continue
+                start = cursor + 1
+                target = first_current - 1
+                missing_entries: list[tuple] = []
+                try:
+                    present_entry = False
+                    for entry in entries:
+                        first = int(entry.get("first_ordinal", 0) or 0)
+                        last = int(entry.get("last_ordinal", 0) or 0)
+                        if first > target or last < start:
+                            continue
+                        filename = str(entry.get("filename") or "")
+                        path = self._segment_path(partition, filename)
+                        if path.exists():
+                            present_entry = True
+                            break
+                        missing_entries.append((
+                            filename, first, last,
+                            str(entry.get("business_day") or ""),
+                            float(entry.get("max_expires_at", 0.0) or 0.0),
+                        ))
+                    if present_entry:
+                        # A durable segment still owns this range; normal
+                        # worker settlement must advance it first.
+                        continue
+                    known_names = {
+                        str(entry.get("filename") or "") for entry in entries
+                    }
+                except (AttributeError, OSError, SpoolError, TypeError, ValueError):
+                    partitions.append(partition)
+                    signature.append((partition, "invalid"))
+                    continue
+                orphan_signature: list[tuple] = []
+                directory = self.root / f"partition-{partition:04d}"
+                for path in directory.glob("segment-*.jsonl"):
+                    if path.name in known_names or path.is_symlink():
+                        continue
+                    try:
+                        stat = path.stat()
+                        orphan_signature.append((
+                            path.name, int(stat.st_size), int(stat.st_mtime_ns),
+                        ))
+                    except OSError:
+                        orphan_signature.append((path.name, "unreadable"))
+                partitions.append(partition)
+                signature.append((
+                    partition, cursor, first_current,
+                    tuple(missing_entries), tuple(sorted(orphan_signature)),
+                ))
+            return {
+                "partitions": partitions,
+                "signature": tuple(signature),
+                "current_business_day": current_day,
+            }
+
+    def reconcile_closed_day_gaps(self) -> dict:
+        """Advance only gaps left by already-reclaimed closed-day payloads.
+
+        A current-day segment proves where dispatchable data resumes.  The
+        missing range before it is skipped only when no manifest or physical
+        orphan still covers the range; current-day or malformed orphans keep
+        the partition blocked for a later reconciliation pass.
+        """
+
+        with self._lock:
+            self.refresh(scan_segments=False)
+            current_day = self.current_business_day
+            known_paths = {
+                str(self._segment_path(partition, str(entry.get("filename") or "")).resolve())
+                for partition in range(self.virtual_partition_count)
+                for entry in self._manifest.get("segments", {}).get(str(partition), [])
+            }
+            recovered_partitions: list[int] = []
+            blocked_partitions: dict[str, str] = {}
+            recovered_records = 0
+            now = self._now()
+
+            for partition in range(self.virtual_partition_count):
+                entries = list(self._manifest.get("segments", {}).get(str(partition), []))
+                current_entries = [
+                    entry for entry in entries
+                    if str(entry.get("business_day") or "") == current_day
+                ]
+                if not current_entries:
+                    continue
+                try:
+                    first_current = min(
+                        int(entry.get("first_ordinal", 0) or 0)
+                        for entry in current_entries
+                    )
+                except (TypeError, ValueError):
+                    blocked_partitions[str(partition)] = "invalid_current_segment"
+                    continue
+                current_cursor = int(self._cursors.get(str(partition), 0))
+                target = first_current - 1
+                if target <= current_cursor:
+                    continue
+                start = current_cursor + 1
+
+                blocked_reason = ""
+                try:
+                    for entry in entries:
+                        first = int(entry.get("first_ordinal", 0) or 0)
+                        last = int(entry.get("last_ordinal", 0) or 0)
+                        if first > target or last < start:
+                            continue
+                        path = self._segment_path(
+                            partition, str(entry.get("filename") or ""),
+                        )
+                        if path.exists():
+                            blocked_reason = "closed_segment_present"
+                            break
+                        entry_day = str(entry.get("business_day") or "")
+                        max_expiry = float(
+                            entry.get("max_expires_at", 0.0) or 0.0
+                        )
+                        if (
+                            not entry_day
+                            or entry_day >= current_day
+                            or max_expiry <= 0.0
+                            or max_expiry > now
+                        ):
+                            blocked_reason = "missing_segment_unverified"
+                            break
+                except (AttributeError, OSError, SpoolError, TypeError, ValueError):
+                    blocked_reason = "invalid_closed_segment"
+                if blocked_reason:
+                    blocked_partitions[str(partition)] = blocked_reason
+                    continue
+
+                directory = self.root / f"partition-{partition:04d}"
+                unsafe_orphan = False
+                for path in directory.glob("segment-*.jsonl"):
+                    try:
+                        resolved = str(path.resolve())
+                    except (OSError, RuntimeError):
+                        blocked_partitions[str(partition)] = "unsafe_orphan"
+                        unsafe_orphan = True
+                        break
+                    if resolved in known_paths or path.is_symlink():
+                        continue
+                    try:
+                        with path.open("rb") as handle:
+                            for raw in handle:
+                                if not raw.endswith(b"\n"):
+                                    raise SpoolCorruptionError(
+                                        f"incomplete orphan segment: {path.name}"
+                                    )
+                                record = SpoolRecord.from_dict(
+                                    json.loads(raw.decode("utf-8"))
+                                )
+                                if not start <= int(record.ordinal) <= target:
+                                    continue
+                                if (
+                                    not record.business_day
+                                    or record.business_day >= current_day
+                                    or not record.is_expired(now)
+                                ):
+                                    raise SpoolCorruptionError(
+                                        f"unsettled orphan segment: {path.name}"
+                                    )
+                    except (OSError, ValueError, UnicodeError, SpoolError):
+                        blocked_partitions[str(partition)] = "unsettled_orphan"
+                        unsafe_orphan = True
+                        break
+                if unsafe_orphan:
+                    continue
+
+                pending = self._taken_pending.setdefault(str(partition), set())
+                pending.difference_update(
+                    value for value in pending if int(value) <= target
+                )
+                new_cursor = target
+                while new_cursor + 1 in pending:
+                    new_cursor += 1
+                    pending.remove(new_cursor)
+                self._cursors[str(partition)] = new_cursor
+                self._persist_cursors(partition)
+                recovered_partitions.append(partition)
+                recovered_records += max(0, new_cursor - current_cursor)
+
+            if recovered_partitions:
+                self._manifest_signature = self._file_signature(self._manifest_path)
+            return {
+                "state": "completed" if not blocked_partitions else "partial",
+                "current_business_day": current_day,
+                "recovered_partitions": recovered_partitions,
+                "recovered_records": int(recovered_records),
+                "blocked_partitions": blocked_partitions,
+            }
 
     def cursor(self, partition_id: int) -> int:
         return int(self._cursors.get(str(int(partition_id)), 0))

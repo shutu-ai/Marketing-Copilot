@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
+import vnext.spool as spool_module
 from vnext.smpp_transport import SocketWriteResult
 from vnext.spool import SpoolRecord, TaskSpool
 from vnext.worker import ShardWorker
@@ -68,17 +69,18 @@ def test_old_campaign_generation_is_settled_without_send_after_restart(tmp_path)
     assert result["campaign_generations"] == {"batch:6": 2}
 
 
-def test_cancelled_record_after_spool_gap_is_settled_without_send(tmp_path):
+def test_cancelled_records_cross_spool_gap_only_to_bounded_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(spool_module, "MAX_TAKEN_PENDING", 2)
     spool = TaskSpool(
         tmp_path / "spool", virtual_partition_count=1, segment_max_records=1,
         max_bytes=100_000,
     )
-    spool.append_many([_record(f"gap-{ordinal}", ordinal, 2, 1, 0) for ordinal in range(1, 259)])
+    spool.append_many([_record(f"gap-{ordinal}", ordinal, 2, 1, 0) for ordinal in range(1, 261)])
     # Simulate a legacy missing prefix: the cancelled tail must not remain
     # forever behind the dispatch window just because the cursor cannot cross
     # the missing ordinals.
     entries = spool._manifest["segments"]["0"]
-    for entry in entries[:-1]:
+    for entry in entries[:-3]:
         (spool.root / "partition-0000" / entry["filename"]).unlink()
 
     progress = []
@@ -96,7 +98,8 @@ def test_cancelled_record_after_spool_gap_is_settled_without_send(tmp_path):
     result = asyncio.run(worker.run_until_idle())
 
     assert result["counters"].get("socket_written", 0) == 0
-    assert [item["state"] for item in progress] == ["cancelled"]
+    assert [item["state"] for item in progress] == ["cancelled", "cancelled"]
+    assert spool._taken_pending["0"] == {258, 259}
 
 
 def test_worker_is_fair_and_route_failure_does_not_block_other_route(tmp_path):

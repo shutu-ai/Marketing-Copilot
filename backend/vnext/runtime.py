@@ -13,6 +13,7 @@ import queue
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from .business_day import BusinessClock, FileWallClock, ensure_clock
@@ -35,6 +36,9 @@ from .worker import ShardWorker
 
 
 logger = logging.getLogger(__name__)
+
+SPOOL_MAINTENANCE_TIMEOUT_SECONDS = 5.0
+SPOOL_GAP_RETRY_BACKOFF_SECONDS = 300.0
 
 
 def _restartable_progress_failure(snapshot: dict) -> bool:
@@ -179,6 +183,8 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
         "draining": False,
         "phase": "starting",
         "loop_heartbeat_at": 0.0,
+        "spool_maintenance": False,
+        "spool_maintenance_id": "",
         "route_target_revision": int(context.get("route_revision", {}).get("value", 0)),
         "route_applied_revision": int(context.get("route_revision", {}).get("value", 0)),
     }
@@ -207,6 +213,10 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             "updated_at": time.time(),
             "phase": str(status_state.get("phase") or ""),
             "loop_heartbeat_at": float(status_state.get("loop_heartbeat_at") or 0.0),
+            "spool_maintenance": bool(status_state.get("spool_maintenance")),
+            "spool_maintenance_id": str(
+                status_state.get("spool_maintenance_id") or ""
+            ),
             "route_target_revision": status_state["route_target_revision"],
             "route_applied_revision": status_state["route_applied_revision"],
             "route_reload_error": str(getattr(current, "_route_reconfigure_error", "") or ""),
@@ -295,6 +305,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
     idle_poll_interval = max(
         0.1, float(context.get("idle_poll_interval_seconds", 0.5))
     )
+    spool_maintenance_path = Path(context["spool_root"]) / ".maintenance-request"
 
     def status_heartbeat() -> None:
         while not status_stop.wait(status_interval):
@@ -302,6 +313,29 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
 
     async def run() -> None:
         stop_requested = False
+        maintenance_request_id = ""
+        maintenance_sync_at = 0.0
+
+        def set_maintenance_request(request_id: str) -> None:
+            nonlocal maintenance_request_id
+            maintenance_request_id = str(request_id or "")
+            status_state["spool_maintenance"] = bool(maintenance_request_id)
+            status_state["spool_maintenance_id"] = maintenance_request_id
+
+        def sync_maintenance_marker(*, force: bool = False) -> None:
+            nonlocal maintenance_sync_at
+            now = time.monotonic()
+            if not force and now - maintenance_sync_at < 1.0:
+                return
+            maintenance_sync_at = now
+            try:
+                value = json.loads(spool_maintenance_path.read_text(encoding="utf-8"))
+                set_maintenance_request(str(value.get("request_id") or ""))
+            except FileNotFoundError:
+                set_maintenance_request("")
+            except (AttributeError, OSError, TypeError, ValueError):
+                # Fail closed until the parent removes an invalid request.
+                set_maintenance_request("invalid")
 
         def handle_control(*, heartbeat: bool = True) -> bool:
             nonlocal stop_requested
@@ -349,7 +383,18 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                             ),
                         },
                     )
+                if isinstance(message, dict) and message.get("type") == "spool_maintenance":
+                    set_maintenance_request(str(message.get("request_id") or ""))
+                if isinstance(message, dict) and message.get("type") == "spool_maintenance_release":
+                    request_id = str(message.get("request_id") or "")
+                    if not request_id or request_id == maintenance_request_id:
+                        set_maintenance_request("")
             return stop_requested
+
+        def dispatch_control() -> bool:
+            if handle_control():
+                return True
+            return bool(maintenance_request_id)
 
         async def drain_before_exit() -> None:
             status_state["active"] = False
@@ -381,6 +426,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             while not stop_requested:
                 if handle_control(heartbeat=False):
                     return
+                sync_maintenance_marker()
                 worker.schedule_route_reconfigure()
                 if not worker._route_reconfigure_pending:
                     status_state["route_applied_revision"] = status_state["route_target_revision"]
@@ -390,6 +436,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
             control_pump(), name=f"mc-vnext-worker-{int(worker_id)}-control",
         )
         try:
+            sync_maintenance_marker(force=True)
             prewarm_route_ids = tuple(context.get("prewarm_route_ids") or ())
             if prewarm_route_ids:
                 for result in await worker.prewarm_transports(
@@ -409,6 +456,13 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 if handle_control():
                     await drain_before_exit()
                     return
+                sync_maintenance_marker()
+                if maintenance_request_id:
+                    status_state["active"] = False
+                    status_state["phase"] = "idle"
+                    publish_status(False)
+                    await asyncio.sleep(min(0.1, idle_poll_interval))
+                    continue
                 status_state["loop_heartbeat_at"] = time.time()
                 status_state["phase"] = "maintenance"
                 worker.refresh_campaign_states(force=True)
@@ -422,7 +476,7 @@ def _runtime_worker_entry(worker_id: int, partitions: tuple[int, ...], control, 
                 publish_status(True)
                 worker_snapshot = await worker.run_until_idle(
                     close_transports=False,
-                    control_handler=handle_control,
+                    control_handler=dispatch_control,
                 )
                 if stop_requested:
                     await drain_before_exit()
@@ -727,6 +781,9 @@ class VNextRuntime:
             "interval_seconds": self.spool_gc_interval_seconds,
         }
         self._spool_gap_recovery_last_result: dict = {"state": "not_run"}
+        self._spool_gap_retry_signature: tuple = ()
+        self._spool_gap_retry_not_before = 0.0
+        self._spool_gap_blocked_signature: tuple = ()
         write_process_metadata(
             self.diagnostics_root,
             "runtime-parent",
@@ -759,6 +816,111 @@ class VNextRuntime:
                 return False
         return True
 
+    def _workers_ready_for_spool_maintenance(self, request_id: str) -> bool:
+        """Require all workers to finish cursor/progress writes first."""
+
+        if not self._started or self.supervisor is None:
+            return True
+        supervisor_workers = {
+            int(item.get("worker_id")): int(item.get("pid"))
+            for item in self.supervisor.status().get("workers", [])
+            if bool(item.get("alive")) and item.get("pid") is not None
+        }
+        workers = {
+            int(item.get("worker_id")): item
+            for item in self._worker_progress()
+            if str(item.get("run_id") or "") == self.run_id
+        }
+        if (
+            len(supervisor_workers) != max(1, int(self.worker_count))
+            or set(workers) != set(supervisor_workers)
+        ):
+            return False
+        freshness = max(5.0, self.status_interval_seconds * 4.0)
+        now = time.time()
+        for worker_id, item in workers.items():
+            if int(item.get("process_pid") or 0) != supervisor_workers[worker_id]:
+                return False
+            if now - float(item.get("updated_at") or 0.0) > freshness:
+                return False
+            snapshot = item.get("snapshot") or {}
+            if str(item.get("spool_maintenance_id") or "") != request_id:
+                return False
+            if bool(item.get("active")) or int(snapshot.get("inflight", 0) or 0):
+                return False
+            if int((snapshot.get("progress") or {}).get("pending_durability", 0) or 0):
+                return False
+        return True
+
+    def _write_spool_maintenance_request(self, request_id: str) -> None:
+        path = self.spool_root / ".maintenance-request"
+        request_id = str(request_id or "")
+        if not request_id:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            return
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.{os.getpid()}.",
+            dir=str(path.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "request_id": request_id,
+                        "requested_at": time.time(),
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def _enter_spool_maintenance(self) -> str:
+        if not self._started or self.supervisor is None:
+            return "offline"
+        request_id = uuid.uuid4().hex
+        self._write_spool_maintenance_request(request_id)
+        with contextlib.suppress(Exception):
+            self.supervisor.broadcast({
+                "type": "spool_maintenance",
+                "request_id": request_id,
+            })
+        acquired = False
+        try:
+            deadline = time.monotonic() + SPOOL_MAINTENANCE_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if self._workers_ready_for_spool_maintenance(request_id):
+                    acquired = True
+                    return request_id
+                time.sleep(0.05)
+            return ""
+        finally:
+            if not acquired:
+                self._write_spool_maintenance_request("")
+                with contextlib.suppress(Exception):
+                    self.supervisor.broadcast({
+                        "type": "spool_maintenance_release",
+                        "request_id": request_id,
+                    })
+
+    def _leave_spool_maintenance(self, request_id: str) -> None:
+        with contextlib.suppress(OSError):
+            self._write_spool_maintenance_request("")
+        if self.supervisor is not None and request_id != "offline":
+            with contextlib.suppress(Exception):
+                self.supervisor.broadcast({
+                    "type": "spool_maintenance_release",
+                    "request_id": request_id,
+                })
+
     def _run_spool_gc(self, *, force: bool = False, trigger: str = "interval") -> dict:
         now = time.monotonic()
         if not force and now - self._spool_gc_last_at < self.spool_gc_interval_seconds:
@@ -773,7 +935,102 @@ class VNextRuntime:
             return dict(result)
         if not self._spool_gc_lock.acquire(blocking=False):
             return dict(self._spool_gc_last_result)
+        maintenance_request_id = ""
         try:
+            gap_snapshot = self.spool.closed_day_gap_snapshot()
+            gap_signature = tuple(gap_snapshot.get("signature") or ())
+            gap_partitions = list(gap_snapshot.get("partitions") or [])
+            needs_maintenance = (
+                force
+                or not self._started
+                or self.supervisor is None
+                or bool(gap_partitions)
+            )
+            recovery = {"state": "not_run", "reason": "no_closed_day_gap"}
+            cursor_gaps = {"state": "not_run", "reason": "no_closed_day_gap"}
+            if needs_maintenance:
+                structurally_blocked = (
+                    not force
+                    and bool(gap_partitions)
+                    and gap_signature == self._spool_gap_blocked_signature
+                )
+                retrying = (
+                    not force
+                    and bool(gap_partitions)
+                    and gap_signature == self._spool_gap_retry_signature
+                    and time.monotonic() < self._spool_gap_retry_not_before
+                )
+                if structurally_blocked:
+                    recovery = {
+                        "state": "blocked",
+                        "reason": "gap_evidence_unchanged",
+                    }
+                    cursor_gaps = {
+                        "state": "blocked",
+                        "reason": "gap_evidence_unchanged",
+                        "partitions": gap_partitions,
+                    }
+                elif retrying:
+                    recovery = {"state": "blocked", "reason": "retry_backoff"}
+                    cursor_gaps = {
+                        "state": "blocked",
+                        "reason": "retry_backoff",
+                        "partitions": gap_partitions,
+                    }
+                else:
+                    maintenance_request_id = self._enter_spool_maintenance()
+                    if not maintenance_request_id:
+                        self._spool_gap_retry_signature = gap_signature
+                        self._spool_gap_retry_not_before = (
+                            time.monotonic() + SPOOL_GAP_RETRY_BACKOFF_SECONDS
+                        )
+                        self._spool_gc_last_at = now
+                        result = {
+                            "state": "waiting_for_workers",
+                            "trigger": trigger,
+                            "at": time.time(),
+                            "partitions": gap_partitions,
+                        }
+                        self._spool_gc_last_result = result
+                        return dict(result)
+                    # Reconcile task-index rows before reclaiming old payloads.
+                    # The cursor-gap pass is protected by the worker fence and
+                    # never runs on the dispatch hot path.
+                    recovery = self._recover_expired_spool_gaps()
+                    cursor_gaps = {
+                        "state": "blocked",
+                        "reason": "recovery_not_complete",
+                    }
+                    if recovery.get("state") in {"completed", "not_needed"}:
+                        cursor_gaps = self.spool.reconcile_closed_day_gaps()
+                    if recovery.get("state") not in {"completed", "not_needed"}:
+                        self._spool_gap_retry_signature = gap_signature
+                        self._spool_gap_retry_not_before = (
+                            time.monotonic() + SPOOL_GAP_RETRY_BACKOFF_SECONDS
+                        )
+                        self._spool_gap_blocked_signature = ()
+                    elif cursor_gaps.get("state") in {"partial", "blocked"}:
+                        self._spool_gap_blocked_signature = gap_signature
+                        self._spool_gap_retry_signature = ()
+                        self._spool_gap_retry_not_before = 0.0
+                    else:
+                        self._spool_gap_blocked_signature = ()
+                        self._spool_gap_retry_signature = ()
+                        self._spool_gap_retry_not_before = 0.0
+            else:
+                self._spool_gap_blocked_signature = ()
+                self._spool_gap_retry_signature = ()
+                self._spool_gap_retry_not_before = 0.0
+            cursor_state = str(cursor_gaps.get("state") or "blocked")
+            self._spool_gap_recovery_last_result = {
+                "state": (
+                    cursor_state
+                    if cursor_state in {"completed", "partial", "blocked"}
+                    else str(recovery.get("state") or "blocked")
+                ),
+                "recovery": recovery,
+                "cursor_gaps": cursor_gaps,
+            }
             # A segment is reclaimable only after terminal settlement advances
             # its contiguous cursor; an open Windows handle retries next tick.
             # shortcut: 32 segments per maintenance tick, increase only if GC lag is observed.
@@ -800,6 +1057,8 @@ class VNextRuntime:
             logger.exception("VNext spool cleanup failed")
             return dict(result)
         finally:
+            if maintenance_request_id:
+                self._leave_spool_maintenance(maintenance_request_id)
             self._spool_gc_lock.release()
 
     def _recover_expired_spool_gaps(self) -> dict:
@@ -1349,7 +1608,9 @@ class VNextRuntime:
             return
         self.progress_root.mkdir(parents=True, exist_ok=True)
         self.rollover_if_needed()
-        self._spool_gap_recovery_last_result = self._recover_expired_spool_gaps()
+        # A crashed parent may leave the maintenance fence behind; workers
+        # must not inherit that stale pause on the next service start.
+        self._write_spool_maintenance_request("")
         # Bound startup work; the resident loop continues the same plan in the
         # background without holding up ingress for every historical segment.
         self._run_spool_gc(trigger="startup")
@@ -1708,7 +1969,7 @@ class VNextRuntime:
             daily_thread = self._daily_epoch_thread
             self._daily_epoch_thread = None
             if daily_thread and daily_thread.is_alive() and daily_thread is not threading.current_thread():
-                daily_thread.join(timeout=1.0)
+                daily_thread.join(timeout=SPOOL_MAINTENANCE_TIMEOUT_SECONDS + 1.0)
         if self.supervisor:
             self.supervisor.stop()
             self.supervisor = None

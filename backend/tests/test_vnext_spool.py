@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from vnext.business_day import BusinessClock
+from vnext import spool as spool_module
 from vnext.spool import SpoolCapacityError, SpoolCorruptionError, SpoolRecord, TaskSpool
 
 
@@ -146,6 +147,90 @@ def test_spool_gc_reclaims_orphans_and_never_reuses_segment_names(tmp_path):
     assert new.business_day == "2026-10-18"
     assert new.ordinal == 2
     assert not (spool.root / "partition-0000" / "segment-00000001.jsonl").exists()
+
+
+def test_reconcile_closed_day_gap_does_not_block_current_day(tmp_path):
+    wall = _WallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    root = tmp_path / "gap-recovery"
+    spool = TaskSpool(
+        root, virtual_partition_count=1, segment_max_records=1,
+        max_bytes=100_000, clock=BusinessClock(wall, "UTC"),
+    )
+    old, _ = spool.append(record("old-1", partition=0))
+    old2, _ = spool.append(record("old-2", partition=0))
+    wall.value += timedelta(seconds=2)
+    assert spool.rollover_if_needed()["changed"] is True
+    current, _ = spool.append(record("current", partition=0))
+    assert spool.closed_day_gap_snapshot()["partitions"] == []
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    old_entries = [
+        entry for entry in manifest["segments"]["0"]
+        if entry.get("business_day") == old.business_day
+    ]
+    for entry in old_entries:
+        (root / "partition-0000" / entry["filename"]).unlink()
+    manifest["segments"]["0"] = [
+        entry for entry in manifest["segments"]["0"]
+        if entry.get("business_day") != old.business_day
+    ]
+    manifest["total_records"] -= len(old_entries)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    snapshot = spool.closed_day_gap_snapshot()
+    assert snapshot["partitions"] == [0]
+    result = spool.reconcile_closed_day_gaps()
+
+    assert result["state"] == "completed"
+    assert result["recovered_partitions"] == [0]
+    assert spool.cursor(0) == old2.ordinal
+    assert [item.event_id for item in spool.iter_from(0)] == [current.event_id]
+    assert spool.closed_day_gap_snapshot()["partitions"] == []
+
+
+def test_reconcile_expired_manifest_entry_with_missing_payload(tmp_path):
+    wall = _WallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    root = tmp_path / "missing-manifest-payload"
+    spool = TaskSpool(
+        root, virtual_partition_count=1, segment_max_records=1,
+        max_bytes=100_000, clock=BusinessClock(wall, "UTC"),
+    )
+    old, _ = spool.append(record("old", partition=0))
+    wall.value += timedelta(seconds=2)
+    assert spool.rollover_if_needed()["changed"] is True
+    current, _ = spool.append(record("current", partition=0))
+    old_entry = next(
+        entry for entry in spool._manifest["segments"]["0"]
+        if entry.get("business_day") == old.business_day
+    )
+    (root / "partition-0000" / old_entry["filename"]).unlink()
+
+    assert spool.closed_day_gap_snapshot()["partitions"] == [0]
+    result = spool.reconcile_closed_day_gaps()
+
+    assert result["state"] == "completed"
+    assert spool.cursor(0) == old.ordinal
+    assert [item.event_id for item in spool.iter_from(0)] == [current.event_id]
+
+
+def test_dispatch_window_stops_crossing_a_large_unresolved_gap(tmp_path, monkeypatch):
+    monkeypatch.setattr(spool_module, "MAX_TAKEN_PENDING", 2)
+    spool = TaskSpool(tmp_path / "dispatch-gap", virtual_partition_count=1, max_bytes=100_000)
+    spool._taken_pending["0"] = {2, 3}
+
+    assert spool.dispatch_window_open(0, 1) is True
+    assert spool.dispatch_window_open(0, 2) is False
+    assert spool.dispatch_window_open(0, 10, allow_out_of_order=True) is False
+
+
+def test_terminal_settlement_can_cross_only_a_bounded_gap(tmp_path, monkeypatch):
+    monkeypatch.setattr(spool_module, "MAX_TAKEN_PENDING", 2)
+    spool = TaskSpool(tmp_path / "terminal-gap", virtual_partition_count=1, max_bytes=100_000)
+
+    spool._taken_pending["0"] = {2}
+    assert spool.dispatch_window_open(0, 10, allow_out_of_order=True) is True
+    spool._taken_pending["0"].add(3)
+    assert spool.dispatch_window_open(0, 10, allow_out_of_order=True) is False
 
 
 def test_spool_keeps_cross_midnight_records_until_window_expiry(tmp_path):
