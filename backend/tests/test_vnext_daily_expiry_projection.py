@@ -12,7 +12,14 @@ from vnext.pressure import StageCredit
 from vnext.projection_writer import ProjectionWriter
 from vnext.projection_writer import ProgressJournal
 from vnext.progress import ProgressPersistence
+from vnext.runtime import VNextRuntime
 from vnext.spool import SpoolRecord, TaskSpool
+from vnext.task_index import (
+    connect_reader as connect_task_index_reader,
+    connect_writer,
+    mark_ready,
+    upsert_rows,
+)
 from vnext.worker import ShardWorker
 from vnext.smpp_transport import SocketWriteResult
 
@@ -88,6 +95,9 @@ def test_business_day_namespace_fences_old_records_and_reclaims_closed_segments(
     assert new_record.business_day != old_day
     assert new_record.event_id != old_record.event_id
 
+    retained = spool.reclaim_business_day(old_day)
+    assert retained["reason"] == "blocked_unsettled"
+    spool.expire_record(old_record)
     reclaimed = spool.reclaim_business_day(old_day)
     assert reclaimed["reclaimed"] is True
     assert reclaimed["reclaimed_bytes"] > 0
@@ -97,6 +107,70 @@ def test_business_day_namespace_fences_old_records_and_reclaims_closed_segments(
         clock=BusinessClock(wall, "UTC"),
     )
     assert [item.message for item in reopened.iter_from(0)] == ["today"]
+
+
+def test_runtime_recovers_legacy_reclaimed_expired_gap_without_redispatch(tmp_path):
+    wall = FakeWallClock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=timezone.utc))
+    runtime = VNextRuntime(
+        tmp_path / "runtime", {1: {"route_id": 1}}, worker_count=1,
+        virtual_partition_count=1, max_spool_bytes=100_000,
+        clock=BusinessClock(wall, "UTC"),
+    )
+    old, _ = runtime.spool.append(_record("legacy-gap", day="2026-10-17"))
+    segment = next((runtime.spool_root / "partition-0000").glob("*.jsonl"))
+    old_day = old.business_day
+    wall.advance(seconds=1)
+    assert runtime.rollover_if_needed()["changed"] is True
+
+    # Fixture a legacy GC that removed the payload and recovery-index entry
+    # before the worker wrote an expired terminal event.
+    segment.unlink()
+    runtime.spool._manifest["segments"]["0"] = []
+    runtime.spool._rebuild_daily_metadata()
+    runtime.spool._persist_manifest()
+    runtime.spool._recovery_index.execute(
+        "DELETE FROM spool_recovery_records WHERE event_id=?", (old.event_id,)
+    )
+    runtime.spool._recovery_index.commit()
+    runtime.spool._event_ids.discard(old.event_id)
+
+    index = connect_writer(runtime.projection.task_index_path)
+    try:
+        upsert_rows(index, [(
+            old.event_id, old.partition_id, old.ordinal, old.campaign_type,
+            old.campaign_id, old.route_id, old.normalized_msisdn, old.language,
+            "", "queued", 0, old.part_count_hint, old.message, "",
+            old.created_at, old_day, old.expires_at, old.created_at,
+        )])
+        mark_ready(index, True)
+    finally:
+        index.close()
+
+    result = runtime._recover_expired_spool_gaps()
+    assert result == {"state": "completed", "recovered": 1, "retained": 0}
+    assert runtime.spool.cursor(old.partition_id) == old.ordinal
+    events = ProgressJournal(runtime._expiry_recovery_journal_path).read()
+    assert [event["state"] for event in events] == ["expired"]
+    assert events[0]["event_id"] == old.event_id
+    runtime.projection.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            reader = connect_task_index_reader(runtime.projection.task_index_path)
+            try:
+                assert reader is not None
+                state = reader.execute(
+                    "SELECT state FROM vnext_task_index WHERE event_id=?",
+                    (old.event_id,),
+                ).fetchone()[0]
+            finally:
+                reader.close()
+            if state == "expired":
+                break
+            time.sleep(0.02)
+        assert state == "expired"
+    finally:
+        runtime.projection.stop(timeout=10)
 
 
 def test_legacy_record_without_business_day_is_fail_closed_after_restart(tmp_path):

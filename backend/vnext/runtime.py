@@ -26,6 +26,11 @@ from .pressure import StageCredit
 from .route_credits import RouteCreditBroker
 from .spool import DEFAULT_MAX_SPOOL_BYTES, TaskSpool
 from .supervisor import WorkerSupervisor
+from .task_index import (
+    TASK_INDEX_TABLE,
+    connect_reader as connect_task_index_reader,
+    is_ready as task_index_is_ready,
+)
 from .worker import ShardWorker
 
 
@@ -625,10 +630,15 @@ class VNextRuntime:
         self.profile_root = Path(profile_root).resolve() if profile_root else None
         self.profile_interval_seconds = max(0.1, float(profile_interval_seconds))
         self.diagnostics_root = self.root / "diagnostics"
+        self._expiry_recovery_journal_path = self.progress_root / "recovery-expiry.jsonl"
         self.projection = ProjectionWriterProcess(
             self.root / "projection", queue_size=projection_queue_size,
             batch_size=self.projection_batch_size,
-            journal_paths=[self.progress_root / f"worker-{worker_id}.jsonl" for worker_id in range(max(1, int(worker_count)))],
+            journal_paths=[
+                *(self.progress_root / f"worker-{worker_id}.jsonl"
+                  for worker_id in range(max(1, int(worker_count)))),
+                self._expiry_recovery_journal_path,
+            ],
             flush_interval_seconds=self.projection_flush_interval_seconds,
             start_method=self.start_method,
             mp_context=self._mp_context,
@@ -716,6 +726,7 @@ class VNextRuntime:
             "state": "not_run",
             "interval_seconds": self.spool_gc_interval_seconds,
         }
+        self._spool_gap_recovery_last_result: dict = {"state": "not_run"}
         write_process_metadata(
             self.diagnostics_root,
             "runtime-parent",
@@ -763,8 +774,8 @@ class VNextRuntime:
         if not self._spool_gc_lock.acquire(blocking=False):
             return dict(self._spool_gc_last_result)
         try:
-            # Expiry fencing makes old payloads safe; an open Windows handle
-            # simply causes this bounded batch to retry on the next tick.
+            # A segment is reclaimable only after terminal settlement advances
+            # its contiguous cursor; an open Windows handle retries next tick.
             # shortcut: 32 segments per maintenance tick, increase only if GC lag is observed.
             results = self.spool.cleanup_closed_days(
                 max_segments=None if force else 32,
@@ -790,6 +801,119 @@ class VNextRuntime:
             return dict(result)
         finally:
             self._spool_gc_lock.release()
+
+    def _recover_expired_spool_gaps(self) -> dict:
+        """Settle legacy, already-reclaimed old records without redispatching."""
+
+        closed_days = self.spool.closed_business_days()
+        if not closed_days:
+            return {"state": "not_needed", "recovered": 0}
+        connection = connect_task_index_reader(self.projection.task_index_path)
+        if connection is None:
+            return {"state": "blocked", "reason": "task_index_unavailable", "recovered": 0}
+        try:
+            if not task_index_is_ready(connection):
+                return {"state": "blocked", "reason": "task_index_not_ready", "recovered": 0}
+            journal = ProgressJournal(
+                self._expiry_recovery_journal_path,
+                max_bytes=self.max_journal_bytes,
+            )
+            try:
+                recovered_event_ids = {
+                    str(event.get("event_id") or "")
+                    for event in journal.read()
+                    if str(event.get("state") or "") == "expired"
+                }
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                return {
+                    "state": "blocked", "reason": "recovery_journal_invalid",
+                    "error": f"{type(exc).__name__}: {exc}", "recovered": 0,
+                }
+            now = float(self.clock.timestamp())
+            rows = connection.execute(
+                f"""SELECT event_id,partition_id,ordinal,campaign_type,campaign_id,
+                           route_id,normalized_msisdn,language,parts_total,message,
+                           created_at,business_day,expires_at
+                      FROM {TASK_INDEX_TABLE}
+                     WHERE state='queued' AND business_day < ?
+                       AND expires_at > 0 AND expires_at <= ?
+                     ORDER BY partition_id,ordinal,event_id""",
+                (self.spool.current_business_day, now),
+            )
+            recovered = 0
+            retained = 0
+            while True:
+                batch = rows.fetchmany(4096)
+                if not batch:
+                    break
+                missing = []
+                for row in batch:
+                    business_day = str(row[11] or "")
+                    if business_day not in closed_days:
+                        retained += 1
+                        continue
+                    present = self.spool.contains_event(str(row[0] or ""))
+                    if present is None:
+                        return {
+                            "state": "blocked", "reason": "spool_recovery_index_unavailable",
+                            "recovered": recovered, "retained": retained,
+                        }
+                    if present:
+                        retained += 1
+                        continue
+                    missing.append(row)
+                if not missing:
+                    continue
+                events = []
+                for row in missing:
+                    event_id = str(row[0] or "")
+                    if event_id in recovered_event_ids:
+                        continue
+                    events.append({
+                        "event_id": event_id,
+                        "partition_id": int(row[1] or 0),
+                        "ordinal": int(row[2] or 0),
+                        "campaign_type": str(row[3] or ""),
+                        "campaign_id": int(row[4] or 0),
+                        "route_id": int(row[5] or 0),
+                        "normalized_msisdn": str(row[6] or ""),
+                        "language": str(row[7] or ""),
+                        "state": "expired",
+                        "parts_written": 0,
+                        "parts_total": int(row[8] or 0),
+                        "message": str(row[9] or ""),
+                        "error": "expired after legacy spool reclamation",
+                        "created_at": float(row[10] or 0.0),
+                        "business_day": str(row[11] or ""),
+                        "expires_at": float(row[12] or 0.0),
+                        "event_at": time.time(),
+                        "taken": 1,
+                        "accepted": 1,
+                        "socket_written": 0,
+                        "write_failed": 0,
+                        "unknown": 0,
+                        "response_success": 0,
+                        "response_error": 0,
+                        "expired": 1,
+                    })
+                if events:
+                    journal.append_many(events)
+                    recovered_event_ids.update(str(event["event_id"]) for event in events)
+                # The journal fsync above is the recovery transaction's
+                # durable boundary.  Replays are idempotent by event_id.
+                self.spool.checkpoint_many(
+                    (int(row[1] or 0), int(row[2] or 0)) for row in missing
+                )
+                recovered += len(missing)
+            return {"state": "completed", "recovered": recovered, "retained": retained}
+        except Exception as exc:
+            logger.exception("VNext expired spool-gap recovery failed")
+            return {
+                "state": "error", "error": f"{type(exc).__name__}: {exc}",
+                "recovered": 0,
+            }
+        finally:
+            connection.close()
 
     def _daily_epoch_loop(self) -> None:
         while not self._daily_epoch_stop.wait(0.25):
@@ -1225,6 +1349,7 @@ class VNextRuntime:
             return
         self.progress_root.mkdir(parents=True, exist_ok=True)
         self.rollover_if_needed()
+        self._spool_gap_recovery_last_result = self._recover_expired_spool_gaps()
         # Bound startup work; the resident loop continues the same plan in the
         # background without holding up ingress for every historical segment.
         self._run_spool_gc(trigger="startup")
@@ -1799,6 +1924,7 @@ class VNextRuntime:
                 self._projection_restart_cooldown_seconds
             ),
             "spool_gc": dict(self._spool_gc_last_result),
+            "spool_gap_recovery": dict(self._spool_gap_recovery_last_result),
         }
 
     def _idle_snapshot(self) -> dict:

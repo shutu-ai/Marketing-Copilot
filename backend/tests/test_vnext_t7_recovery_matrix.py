@@ -240,9 +240,11 @@ def test_t7_8_spool_capacity_releases_on_day_reclaim_and_new_day_admits(tmp_path
         segment_max_records=2, segment_max_bytes=4096, max_bytes=1_500, clock=clock,
     )
     inserted = 0
+    old_records = []
     while True:
         try:
-            spool.append(_record(f"old-{inserted}"))
+            stored, _ = spool.append(_record(f"old-{inserted}"))
+            old_records.append(stored)
             inserted += 1
         except SpoolCapacityError:
             break
@@ -250,6 +252,9 @@ def test_t7_8_spool_capacity_releases_on_day_reclaim_and_new_day_admits(tmp_path
     now[0] = datetime(2026, 10, 18, 0, 0, 1, tzinfo=timezone.utc)
     transition = spool.rollover_if_needed()
     assert transition["changed"] is True
+    # Capacity is released only after each old task has a durable terminal
+    # settlement; expiry workers perform the same cursor advancement.
+    spool.checkpoint_many((item.partition_id, item.ordinal) for item in old_records)
     reclaimed = spool.cleanup_closed_days(force=True)
     assert sum(int(item.get("reclaimed_records", 0) or 0) for item in reclaimed) >= inserted
     accepted, inserted_new = spool.append(_record("new-day"))

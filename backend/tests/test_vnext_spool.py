@@ -130,6 +130,7 @@ def test_spool_gc_reclaims_orphans_and_never_reuses_segment_names(tmp_path):
     old, _ = spool.append(record("old", partition=0))
     wall.value += timedelta(seconds=2)
     assert spool.rollover_if_needed()["changed"] is True
+    spool.checkpoint(old.partition_id, old.ordinal)
 
     orphan = spool.root / "partition-0000" / "segment-99999999.jsonl"
     orphan.write_text(
@@ -166,6 +167,7 @@ def test_spool_keeps_cross_midnight_records_until_window_expiry(tmp_path):
     assert retained[0]["reason"] == "blocked_active_window"
 
     wall.value = datetime(2026, 10, 18, 0, 31, tzinfo=timezone.utc)
+    spool.checkpoint(item.partition_id, item.ordinal)
     reclaimed = spool.cleanup_closed_days(max_segments=None)
     assert reclaimed[0]["reason"] == "complete"
     assert list(spool.root.glob("partition-0000/*.jsonl")) == []
@@ -179,7 +181,7 @@ def test_spool_legacy_gc_requires_record_expiry_when_recovery_index_is_empty(tmp
         root, virtual_partition_count=1, max_bytes=100_000,
         clock=BusinessClock(wall, "UTC"),
     )
-    spool.append(record("legacy-cross", partition=0, expires_at=expiry))
+    stored, _ = spool.append(record("legacy-cross", partition=0, expires_at=expiry))
     segment = next(root.glob("partition-0000/*.jsonl"))
     spool._recovery_index.close()
 
@@ -201,6 +203,7 @@ def test_spool_legacy_gc_requires_record_expiry_when_recovery_index_is_empty(tmp
     assert segment.exists()
 
     wall.value = datetime(2026, 10, 18, 0, 31, tzinfo=timezone.utc)
+    recovered.checkpoint(stored.partition_id, stored.ordinal)
     reclaimed = recovered.cleanup_closed_days(max_segments=None)
     assert reclaimed[0]["reason"] == "complete"
     assert not segment.exists()

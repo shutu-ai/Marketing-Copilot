@@ -417,6 +417,30 @@ class TaskSpool:
     def _contains_event(self, event_id: str) -> bool:
         return str(event_id) in self._event_ids
 
+    def contains_event(self, event_id: str) -> bool | None:
+        """Return whether the durable spool still owns an event payload.
+
+        ``None`` means the compact recovery index is unavailable, so callers
+        must retain rather than infer that a payload was reclaimed.
+        """
+
+        with self._lock:
+            if not self._recovery_index_ready:
+                return None
+            if not self._contains_event(event_id):
+                return False
+            row = self._recovery_index.execute(
+                "SELECT segment_path FROM spool_recovery_records WHERE event_id=?",
+                (str(event_id),),
+            ).fetchone()
+            return bool(row and Path(str(row[0])).is_file())
+
+    def closed_business_days(self) -> set[str]:
+        """Return the durable set of days fenced by a completed rollover."""
+
+        with self._lock:
+            return set(self._manifest.get("closed_days", {}))
+
     def _remember_record(self, record: SpoolRecord) -> None:
         self._event_ids.add(record.event_id)
         self._event_index[record.event_id] = record
@@ -1382,6 +1406,28 @@ class TaskSpool:
             self._cursors[str(partition)] = current
             self._persist_cursors(partition)
 
+    def checkpoint_many(self, values: Iterable[tuple[int, int]]) -> None:
+        """Advance several durable cursors with one state write per partition."""
+
+        by_partition: dict[int, set[int]] = {}
+        for partition_id, ordinal in values:
+            partition = int(partition_id)
+            if 0 <= partition < self.virtual_partition_count:
+                by_partition.setdefault(partition, set()).add(int(ordinal))
+        if not by_partition:
+            return
+        with self._lock:
+            for partition, ordinals in by_partition.items():
+                current = int(self._cursors.get(str(partition), 0))
+                pending = self._taken_pending.setdefault(str(partition), set())
+                pending.update(value for value in ordinals if value > current)
+                while current + 1 in pending:
+                    current += 1
+                    pending.remove(current)
+                self._cursors[str(partition)] = current
+            for partition in by_partition:
+                self._persist_cursors(partition)
+
     def cursor(self, partition_id: int) -> int:
         return int(self._cursors.get(str(int(partition_id)), 0))
 
@@ -1577,9 +1623,32 @@ class TaskSpool:
 
             entries_by_path: dict[str, tuple[int, int]] = {}
             manifest_entries_by_path: dict[str, dict] = {}
+            manifest_partitions_by_path: dict[str, int] = {}
             manifest_paths: set[str] = set()
             orphan_paths: set[str] = set()
             deferred_active = False
+            deferred_unsettled = False
+
+            def segment_is_settled(partition: int, entry: dict) -> bool:
+                """Only unlink a contiguous range after its cursor is durable."""
+
+                try:
+                    records = int(entry.get("records", 0) or 0)
+                    first = int(entry.get("first_ordinal", 0) or 0)
+                    last = int(entry.get("last_ordinal", 0) or 0)
+                except (TypeError, ValueError):
+                    return False
+                if records <= 0 or first <= 0 or last < first:
+                    return False
+                if last - first + 1 != records:
+                    return False
+                cursor = self.cursor(partition)
+                if last <= cursor:
+                    return True
+                first_pending = max(first, cursor + 1)
+                taken = self._taken_pending.get(str(partition), set())
+                return all(ordinal in taken for ordinal in range(first_pending, last + 1))
+
             for partition in range(self.virtual_partition_count):
                 for entry in self._manifest["segments"].get(str(partition), []):
                     path = safe_path(self._segment_path(partition, str(entry.get("filename") or "")))
@@ -1589,6 +1658,7 @@ class TaskSpool:
                     path_text = str(path)
                     manifest_paths.add(path_text)
                     manifest_entries_by_path[path_text] = entry
+                    manifest_partitions_by_path[path_text] = partition
                     entry_day = str(entry.get("business_day") or "")
                     if entry_day == day:
                         try:
@@ -1606,10 +1676,12 @@ class TaskSpool:
                                 entry["max_expires_at"] = max_expiry
                         if max_expiry > self._now():
                             deferred_active = True
-                        if max_expiry <= self._now():
+                        elif segment_is_settled(partition, entry):
                             entries_by_path[path_text] = (
                                 int(entry.get("records", 0) or 0), 0,
                             )
+                        else:
+                            deferred_unsettled = True
                     elif not entry_day and path.exists():
                         proof = proof_for_orphan(path)
                         if proof and proof[2] <= self._now():
@@ -1651,6 +1723,10 @@ class TaskSpool:
                 path_text = str(safe)
                 entry = manifest_entries_by_path.get(path_text)
                 if entry is not None:
+                    partition = manifest_partitions_by_path.get(path_text)
+                    if partition is None or not segment_is_settled(partition, entry):
+                        deferred_unsettled = True
+                        continue
                     try:
                         max_expiry = float(entry.get("max_expires_at", 0.0) or 0.0)
                     except (TypeError, ValueError):
@@ -1685,6 +1761,7 @@ class TaskSpool:
             if not planned_paths:
                 reclaim_state = (
                     "BLOCKED_ACTIVE_WINDOW" if deferred_active
+                    else "BLOCKED_UNSETTLED" if deferred_unsettled
                     else "BLOCKED_UNKNOWN" if orphan_paths else "DONE"
                 )
                 closed["reclaim_state"] = reclaim_state
@@ -1701,6 +1778,7 @@ class TaskSpool:
                     ),
                     "reason": (
                         "blocked_active_window" if reclaim_state == "BLOCKED_ACTIVE_WINDOW"
+                        else "blocked_unsettled" if reclaim_state == "BLOCKED_UNSETTLED"
                         else "blocked_unknown" if reclaim_state == "BLOCKED_UNKNOWN"
                         else "unattributed_or_empty"
                     ),
@@ -1778,6 +1856,7 @@ class TaskSpool:
             reclaim_state = (
                 "RETIRING" if remaining_paths or failed_paths
                 else "BLOCKED_ACTIVE_WINDOW" if deferred_active
+                else "BLOCKED_UNSETTLED" if deferred_unsettled
                 else "BLOCKED_UNKNOWN" if orphan_paths
                 else "DONE"
             )
@@ -1809,6 +1888,7 @@ class TaskSpool:
                 "reason": "cleanup_error" if failed_paths else (
                     "partial" if remaining_paths else
                     "blocked_active_window" if deferred_active else
+                    "blocked_unsettled" if deferred_unsettled else
                     "blocked_unknown" if orphan_paths else "complete"
                 ),
             }
