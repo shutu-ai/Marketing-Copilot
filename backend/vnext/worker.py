@@ -814,7 +814,10 @@ class ShardWorker:
         )
 
     async def _process(self, record: SpoolRecord) -> SpoolRecord | None:
-        self.refresh_campaign_states(force=True)
+        # The dispatch loop already refreshes controls before scheduling.  Keep
+        # this pass throttled; the forced fence immediately before checkpoint
+        # remains the last-word check before any socket write.
+        self.refresh_campaign_states()
         key = (record.campaign_type, record.campaign_id)
         if self._is_stale_generation(record):
             return None if await self._expire(
