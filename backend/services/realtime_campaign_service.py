@@ -1473,17 +1473,21 @@ def _log_inbox_backpressure(campaign_id: int, rejected: int, reason: str,
 
 
 def _lookup_whitelist_languages(conn, msisdns, query_size: int = 1000) -> dict:
-    """Load only the current input chunk's whitelist matches into memory."""
+    """Load only the current input chunk's whitelist matches into memory.
+
+    Parameterized IN-list point lookups let DuckDB probe the ART primary-key
+    index directly.  The previous VALUES-JOIN made the planner hash-build or
+    stream-scan the whole published table, so a large index needed disk spill
+    and stacked its operator memory onto the shared warm-instance budget.
+    """
     values = list({value for value in msisdns if value})
     result = {}
     query_size = max(100, min(1000, int(query_size)))
     for start in range(0, len(values), query_size):
         current = values[start:start + query_size]
-        values_sql = ",".join("(?)" for _ in current)
+        placeholders = ",".join("?" for _ in current)
         rows = conn.execute(
-            f"""WITH current_chunk(msisdn) AS (VALUES {values_sql})
-                SELECT w.msisdn,w.language FROM whitelist_msisdns w
-                JOIN current_chunk c ON c.msisdn=w.msisdn""",
+            f"SELECT msisdn,language FROM whitelist_msisdns WHERE msisdn IN ({placeholders})",
             current,
         ).fetchall()
         result.update({row[0]: row[1] for row in rows})
@@ -1856,10 +1860,17 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
                     raise RuntimeError(f"realtime chunk {chunk_index} lease is held by another worker")
                 chunk_completed = current_job.get("status") == "completed"
                 chunk_normalized = chunk[msisdn_col].map(sms_task_service.normalize_msisdn)
-                chunk_whitelist_languages = (
-                    _lookup_whitelist_languages(whitelist_conn, chunk_normalized)
-                    if whitelist_conn is not None else whitelist_languages
-                )
+                if whitelist_conn is not None:
+                    # All read-only connections for the index path share one
+                    # warmed DuckDB instance and its memory_limit; the slot
+                    # keeps concurrent chunk lookups from stacking operator
+                    # memory on that single budget.
+                    with realtime_whitelist_service.whitelist_query_slot(whitelist_path):
+                        chunk_whitelist_languages = _lookup_whitelist_languages(
+                            whitelist_conn, chunk_normalized
+                        )
+                else:
+                    chunk_whitelist_languages = whitelist_languages
                 chunk_result = {}
                 positions, invalid, chunk_matched_rows = _batch_seen_msisdns(
                     unique_conn, chunk_normalized, chunk_whitelist_languages,
@@ -1964,9 +1975,10 @@ def receive_file(campaign_id: int, file_path: str, original_filename: str,
             total_msisdn = len(received_msisdns)
             total_rows = len(df)
             if whitelist_conn is not None:
-                chunk_whitelist_languages = _lookup_whitelist_languages(
-                    whitelist_conn, normalized_msisdns
-                )
+                with realtime_whitelist_service.whitelist_query_slot(whitelist_path):
+                    chunk_whitelist_languages = _lookup_whitelist_languages(
+                        whitelist_conn, normalized_msisdns
+                    )
                 matched = received_msisdns & set(chunk_whitelist_languages)
             else:
                 chunk_whitelist_languages = whitelist_languages

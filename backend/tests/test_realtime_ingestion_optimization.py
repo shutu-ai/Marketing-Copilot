@@ -660,3 +660,81 @@ def test_sql_normalization_matches_runtime_normalization(isolated_db):
     ).fetchall()]
     conn.close()
     assert sql_values == [sms_task_service.normalize_msisdn(value) for value in values]
+
+
+def test_whitelist_language_lookup_uses_point_queries(isolated_db):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    source = campaign_dir / "lookup-list.csv"
+    source.write_text(
+        "msisdn,language\n090001,en\n090002,fr\n090003,\n090004,en\n",
+        encoding="utf-8",
+    )
+    realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    version = realtime_whitelist_service.active_version(campaign_id)
+    assert version and version["status"] == "ready"
+    conn = realtime_campaign_service._open_whitelist_index(version["index_path"])
+    try:
+        languages = realtime_campaign_service._lookup_whitelist_languages(
+            conn,
+            ["90001", "90002", "90003", "90001", "missing", ""],
+            query_size=2,
+        )
+    finally:
+        conn.close()
+    # Duplicate inputs collapse, non-whitelisted and blank inputs stay
+    # absent, and batching across query_size=2 preserves every match.
+    assert languages == {"90001": "en", "90002": "fr", "90003": ""}
+
+
+def test_index_usable_positive_result_is_cached(isolated_db, monkeypatch):
+    campaign_id, campaign_dir = _campaign(isolated_db)
+    source = campaign_dir / "usable-list.csv"
+    source.write_text("msisdn,language\n090001,en\n", encoding="utf-8")
+    realtime_campaign_service.upload_customer_list(campaign_id, str(source), source.name)
+    assert realtime_whitelist_service.build_pending() == 1
+    version = realtime_whitelist_service.active_version(campaign_id)
+    index_path = version["index_path"]
+
+    realtime_whitelist_service._INDEX_USABLE_CACHE.clear()
+    connect_calls = []
+    real_connect = realtime_whitelist_service.duckdb.connect
+
+    def counting_connect(path, *args, **kwargs):
+        connect_calls.append(path)
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(realtime_whitelist_service.duckdb, "connect", counting_connect)
+    try:
+        assert realtime_whitelist_service._index_is_usable(index_path) is True
+        assert realtime_whitelist_service._index_is_usable(index_path) is True
+        assert connect_calls == [index_path]
+        Path(index_path).unlink()
+        assert realtime_whitelist_service._index_is_usable(index_path) is False
+    finally:
+        realtime_whitelist_service._INDEX_USABLE_CACHE.clear()
+    # The existence check short-circuits before any connect, even when the
+    # positive result is cached.
+    assert connect_calls == [index_path]
+
+
+def test_whitelist_query_slot_bounds_concurrency(isolated_db, monkeypatch):
+    monkeypatch.setenv("MC_REALTIME_WHITELIST_QUERY_CONCURRENCY", "1")
+    realtime_whitelist_service._whitelist_query_slots.clear()
+    active = []
+    peak = []
+
+    def worker():
+        with realtime_whitelist_service.whitelist_query_slot("slot-index"):
+            active.append(1)
+            peak.append(len(active))
+            time.sleep(0.02)
+            active.pop()
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    realtime_whitelist_service._whitelist_query_slots.clear()
+    assert peak and max(peak) == 1

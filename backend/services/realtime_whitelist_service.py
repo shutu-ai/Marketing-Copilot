@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from typing import Optional
 
 import duckdb
@@ -563,19 +564,72 @@ def invalidate_warm_index(path: str) -> None:
         _close_warm_entry(entry)
 
 
+_whitelist_query_slots: dict[str, tuple[int, threading.BoundedSemaphore]] = {}
+_whitelist_query_slot_lock = threading.Lock()
+
+
+def _whitelist_query_concurrency() -> int:
+    try:
+        return max(1, int(os.environ.get("MC_REALTIME_WHITELIST_QUERY_CONCURRENCY", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+@contextmanager
+def whitelist_query_slot(index_path: str):
+    """Bound concurrent queries against one warmed index instance.
+
+    Every read-only connection for a path attaches to the same warmed DuckDB
+    instance and therefore shares one memory_limit budget; the slot keeps
+    concurrent whitelist lookups from stacking their operator memory on a
+    single small budget.
+    """
+    limit = _whitelist_query_concurrency()
+    with _whitelist_query_slot_lock:
+        entry = _whitelist_query_slots.get(index_path)
+        if entry is None or entry[0] != limit:
+            entry = (limit, threading.BoundedSemaphore(limit))
+            _whitelist_query_slots[index_path] = entry
+        semaphore = entry[1]
+    semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+def _index_usable_cache_ttl() -> float:
+    try:
+        return max(0.0, float(os.environ.get("MC_REALTIME_WHITELIST_INDEX_USABLE_TTL_SECONDS", "60")))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+_INDEX_USABLE_CACHE: dict[str, tuple[float, bool]] = {}
+
+
 def _index_is_usable(index_path: str) -> bool:
     if not index_path or not os.path.isfile(index_path):
         return False
+    now = time.monotonic()
+    cached = _INDEX_USABLE_CACHE.get(index_path)
+    if cached is not None and cached[0] > now:
+        return cached[1]
     index = None
     try:
         index = duckdb.connect(index_path, read_only=True, config=whitelist_index_connect_config())
         index.execute("SELECT 1 FROM whitelist_msisdns LIMIT 1").fetchone()
-        return True
     except Exception:
         return False
     finally:
         if index:
             index.close()
+    # Opening a large published index costs a full instance spin-up (thread
+    # pool + catalog load).  The existence check above stays uncached so a
+    # deleted file is still detected immediately; only the positive result is
+    # cached for a short TTL.
+    _INDEX_USABLE_CACHE[index_path] = (now + _index_usable_cache_ttl(), True)
+    return True
 
 
 def is_transient_database_error(error) -> bool:
